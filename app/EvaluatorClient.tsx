@@ -54,6 +54,7 @@ import {
 } from "@react-pdf/renderer"
 import { useEvaluator } from "./useEvaluator"
 const SmartCameraModal = dynamic(() => import("@/components/smart-camera-modal"), {
+  ssr: false,
   loading: () => <p>Cargando...</p>,
 })
 
@@ -1028,33 +1029,37 @@ export default function EvaluatorClient() {
       } catch {}
     }
   }
-// 🚨 MODIFICACIÓN: handleCapture ahora recibe el modo Y el feedback de certeza.
-const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: CameraFeedback) => {
-  const fb = feedback ?? ({ confidence: 1 } as CameraFeedback)
-
-  // 🚨 Nueva lógica de control para certeza baja
-  if (fb.confidence < 0.98) {
+  // ✅ handleCapture con feedback OPCIONAL (esto arregla TODO)
+const handleCapture = (
+  dataUrl: string,
+  mode: CaptureMode | null,
+  feedback?: CameraFeedback
+) => {
+  if (feedback && feedback.confidence < 0.98) {
     const confirmCapture = window.confirm(
-      `⚠️ Baja Certeza OCR (${(fb.confidence * 100).toFixed(1)}%). ¿Desea continuar con el riesgo de error o reintentar?`,
+      `⚠️ Baja Certeza OCR (${(feedback.confidence * 100).toFixed(1)}%). ¿Desea continuar con el riesgo de error o reintentar?`
     )
-    if (!confirmCapture) return
+    if (!confirmCapture) {
+      return
+    }
   }
 
-  fetch(dataUrl)
-    .then((res) => res.blob())
-    .then((blob) => {
-      const fileName = mode ? `captura-${mode}-${Date.now()}.png` : `captura-${Date.now()}.png`
-      const file = new File([blob], fileName, { type: "image/png" })
-      processFiles([file])
-    })
-    .catch((err) => console.error("Error al crear archivo desde captura:", err))
 
-  setIsCameraOpen(false)
-  setIsCaptureModeSelectionOpen(false)
-  setCaptureMode(null)
-  setCameraFeedback(null)
-}
-
+    fetch(dataUrl)
+      .then((res) => res.blob())
+      .then((blob) => {
+        // @ts-ignore
+        // Opcional: Agregar el modo al nombre para el debug
+        const fileName = mode ? `captura-${mode}-${Date.now()}.png` : `captura-${Date.now()}.png`
+        const file = new File([blob], fileName, { type: "image/png" })
+        processFiles([file])
+      })
+      .catch((err) => console.error("Error al crear archivo desde captura:", err))
+    setIsCameraOpen(false) // Cierra la cámara
+    setIsCaptureModeSelectionOpen(false) // Cierra la selección
+    setCaptureMode(null) // Resetea el modo
+    setCameraFeedback(null) // Limpia el feedback de la cámara
+  }
   const handleLogoChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file) {
@@ -1876,55 +1881,6 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                 <CardTitle className="text-[var(--text-accent)]">Paso 1.1: Personalización del Informe</CardTitle>
               </CardHeader>
 
-<<<<<<< Updated upstream
-              <CardContent className="space-y-6">
-                <div>
-                  <h3 className="font-bold text-[var(--text-accent)]">Cargar Archivos</h3>
-                  <div className="flex flex-wrap gap-4 mt-2 items-center">
-                    <Button
-                      type="button"
-                      onClick={() => {
-                        fileInputRef.current?.click()
-                      }}
-                    >
-                      <FileUp className="mr-2 h-4 w-4" /> Subir Archivos (PDF/DOCX/Imágenes)
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      // 🚨 MODIFICACIÓN CRÍTICA: Abrir el modal de selección
-                      onClick={() => setIsCaptureModeSelectionOpen(true)}
-                    >
-                      <Camera className="mr-2 h-4 w-4" /> Usar Cámara (Captura Guiada)
-                    </Button>
-                    <input
-                      type="file"
-                      multiple
-                      accept="image/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                      ref={fileInputRef}
-                      onChange={handleFilesSelected}
-                      className="hidden"
-                    />
-                    <input
-                      ref={cameraInputRef}
-                      type="file"
-                      accept="image/*"
-                      capture="environment"
-                      onChange={handleFilesSelected}
-                      className="hidden"
-                    />
-                    {/* Se mantiene el input por si el modal decide usarlo */}
-                    <p className="text-sm text-[var(--text-secondary)]">
-                      Consejo: Sube primero la página con el nombre.
-                    </p>
-                  </div>
-                </div>
-                {unassignedFiles.length > 0 && (
-                  <div className="p-4 border rounded-lg bg-[var(--bg-muted-subtle)] border-[var(--border-color)]">
-                    <h3 className="font-semibold mb-3 flex items-center text-[var(--text-accent)]">
-                      <ClipboardList className="mr-2 h-5 w-5" /> Archivos Pendientes
-                    </h3>
-=======
               <CardContent>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <FormField
@@ -1984,7 +1940,6 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                     render={({ field }) => (
                       <FormItem className="flex flex-col">
                         <FormLabel className="text-[var(--text-accent)]">Fecha</FormLabel>
->>>>>>> Stashed changes
 
                         <Popover>
                           <PopoverTrigger asChild>

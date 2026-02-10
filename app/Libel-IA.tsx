@@ -1,30 +1,31 @@
 "use client"
 
 import { useState } from "react"
-<<<<<<< Updated upstream
 import { useEvaluator } from "./useEvaluator"
 import SmartCameraModal from "@/components/smart-camera-modal"
 
+type CameraFeedback = { confidence: number }
+
 export default function LibelIA() {
-  // ==================================================================
-  // INICIO DE LA ZONA DE HOOKS
-  // ==================================================================
+  // =========================
+  // ESTADOS
+  // =========================
   const [fileUrl, setFileUrl] = useState<string>("")
   const [rubrica, setRubrica] = useState<string>("")
-  const { evaluate, isLoading } = useEvaluator()
   const [result, setResult] = useState<any>(null)
-
-  // CORRECCIÓN: Se añade el estado para controlar la visibilidad del modal de la cámara.
   const [isCameraOpen, setIsCameraOpen] = useState(false)
-  // ==================================================================
-  // FIN DE LA ZONA DE HOOKS
-  // ==================================================================
 
+  const { evaluate, isLoading } = useEvaluator()
+
+  // =========================
+  // HANDLERS
+  // =========================
   const handleEvaluate = async () => {
     if (!fileUrl) {
       alert("Primero debes tomar o subir una imagen.")
       return
     }
+
     if (!rubrica.trim()) {
       alert("Por favor, ingresa una rúbrica de evaluación.")
       return
@@ -32,7 +33,7 @@ export default function LibelIA() {
 
     const payload = {
       fileUrls: [fileUrl],
-      rubrica: rubrica,
+      rubrica,
       puntajeTotal: 100,
       flexibilidad: 3,
     }
@@ -41,17 +42,20 @@ export default function LibelIA() {
     setResult(evaluationResult)
   }
 
-  // Función para manejar la captura de la imagen desde el modal
-  const handleCapture = (dataUrl: string) => {
+  // ✅ acepta feedback opcional (si SmartCameraModal lo envía)
+  const handleCapture = (dataUrl: string, feedback?: CameraFeedback) => {
     setFileUrl(dataUrl)
-    setIsCameraOpen(false) // Cierra el modal después de capturar
+    setIsCameraOpen(false)
   }
 
+  // =========================
+  // RENDER
+  // =========================
   return (
     <div className="p-6 max-w-3xl mx-auto bg-white min-h-screen">
       <h1 className="text-2xl font-bold text-gray-800 mb-6">📝 Evaluación con IA</h1>
 
-      {/* Rúbrica */}
+      {/* RÚBRICA */}
       <div className="mb-6">
         <label className="block mb-2 font-medium text-gray-700">Rúbrica de evaluación</label>
         <textarea
@@ -59,61 +63,42 @@ export default function LibelIA() {
           onChange={(e) => setRubrica(e.target.value)}
           className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
           rows={4}
-          placeholder="Ej: Evalúa ortografía, claridad, estructura, coherencia, uso de vocabulario técnico..."
-=======
-import SmartCameraModal from "@/components/smart-camera-modal"
-
-type CameraFeedback = { confidence: number }
-type CaptureMode = "sm_vf" | "terminos_pareados" | "desarrollo" | null
-
-export default function LibelIA() {
-  const [isCameraOpen, setIsCameraOpen] = useState(false)
-  const [currentFeedback, setCurrentFeedback] = useState<CameraFeedback | null>(null)
-
-  const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: CameraFeedback) => {
-    // si aquí tú usas processFiles u otra lógica real, déjala como la tienes en tu app principal
-    // este archivo solo debe compilar
-    console.log({ dataUrl, mode, feedback })
-  }
-
-  return (
-    <div>
-      {isCameraOpen && (
-        <SmartCameraModal
-          onCapture={(dataUrl: string, feedback?: CameraFeedback) => handleCapture(dataUrl, null, feedback)}
-          onClose={() => setIsCameraOpen(false)}
-          captureMode={null}
-          onFeedbackChange={setCurrentFeedback}
-          currentFeedback={currentFeedback}
->>>>>>> Stashed changes
+          placeholder="Ej: Evalúa ortografía, coherencia, estructura, claridad de ideas..."
         />
       </div>
 
-      {/* CORRECCIÓN: Se añade un botón para abrir el modal de la cámara */}
+      {/* BOTÓN CÁMARA */}
       <div className="mb-4">
-        <button onClick={() => setIsCameraOpen(true)} className="bg-gray-200 px-4 py-2 rounded-lg">
-          Abrir Cámara
+        <button
+          onClick={() => setIsCameraOpen(true)}
+          className="bg-gray-200 px-4 py-2 rounded-lg"
+        >
+          📷 Abrir cámara
         </button>
       </div>
 
-      {/* Módulo de cámara y subida */}
-      {/* CORRECCIÓN: El modal ahora se renderiza condicionalmente y se le pasa la propiedad 'onClose' obligatoria. */}
-      {isCameraOpen && <SmartCameraModal onCapture={handleCapture} onClose={() => setIsCameraOpen(false)} />}
+      {/* MODAL CÁMARA */}
+      {isCameraOpen && (
+        <SmartCameraModal
+          onCapture={handleCapture}
+          onClose={() => setIsCameraOpen(false)}
+          captureMode={null}
+        />
+      )}
 
-      {/* Previsualización de la imagen capturada */}
+      {/* PREVISUALIZACIÓN */}
       {fileUrl && (
         <div className="mb-4">
-          <p className="font-medium">Imagen capturada:</p>
+          <p className="font-medium mb-2">Imagen capturada:</p>
           <img
-            src={fileUrl || "/placeholder.svg"}
+            src={fileUrl}
             alt="Imagen capturada"
             className="border rounded-lg max-w-full h-auto"
           />
         </div>
       )}
-<<<<<<< Updated upstream
 
-      {/* Resultado de evaluación */}
+      {/* RESULTADO */}
       {isLoading && <p className="text-center mt-6">🔄 Evaluando con IA...</p>}
 
       {result && (
@@ -122,39 +107,40 @@ export default function LibelIA() {
             result.success ? "bg-green-50 border-green-400 text-green-800" : "bg-red-50 border-red-400 text-red-800"
           }`}
         >
-          <h3 className="font-bold text-lg">{result.success ? "✅ Éxito" : "❌ Error"}</h3>
+          <h3 className="font-bold text-lg">{result.success ? "✅ Evaluación completada" : "❌ Error"}</h3>
+
           {result.success ? (
-            <div>
+            <>
               <p className="mt-2">
-                <strong>Retroalimentación:</strong> {result.retroalimentacion?.resumen_general?.fortalezas}{" "}
-                {result.retroalimentacion?.resumen_general?.areas_mejora}
-              </p>
-              <p className="mt-1">
                 <strong>Puntaje:</strong> {result.puntaje}
               </p>
               <p className="mt-1">
                 <strong>Nota:</strong> {result.nota}
               </p>
-            </div>
+              <p className="mt-2">
+                <strong>Retroalimentación:</strong>{" "}
+                {result.retroalimentacion?.resumen_general?.fortalezas}{" "}
+                {result.retroalimentacion?.resumen_general?.areas_mejora}
+              </p>
+            </>
           ) : (
-            <p className="mt-1">{result.error}</p>
+            <p className="mt-2">{result.error}</p>
           )}
         </div>
       )}
 
-      {/* Botón de evaluar */}
+      {/* BOTÓN EVALUAR */}
       <div className="mt-6">
         <button
           onClick={handleEvaluate}
           disabled={isLoading || !fileUrl || !rubrica.trim()}
-          className={`w-full py-3 px-6 rounded-lg font-medium text-white transition
-            ${isLoading ? "bg-gray-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"}`}
+          className={`w-full py-3 px-6 rounded-lg font-medium text-white transition ${
+            isLoading ? "bg-gray-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
+          }`}
         >
           {isLoading ? "Evaluando..." : "⚡ Evaluar con IA"}
         </button>
       </div>
-=======
->>>>>>> Stashed changes
     </div>
   )
 }
