@@ -8,9 +8,28 @@ function generateCode() {
 
 export async function POST(req: Request) {
   try {
+    // 🔒 BLINDAJE CRÍTICO (NO EXISTÍA)
+    if (!supabaseAdmin) {
+      return NextResponse.json(
+        { ok: false, error: "SUPABASE NO CONFIGURADO" },
+        { status: 503 }
+      );
+    }
+
+    if (typeof sendEmail !== "function") {
+      return NextResponse.json(
+        { ok: false, error: "EMAIL NO CONFIGURADO" },
+        { status: 503 }
+      );
+    }
+
     const { email } = await req.json();
+
     if (!email || !/\S+@\S+\.\S+/.test(email)) {
-      return NextResponse.json({ ok: false, error: "Email inválido" }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "Email inválido" },
+        { status: 400 }
+      );
     }
 
     const code = generateCode();
@@ -18,10 +37,18 @@ export async function POST(req: Request) {
 
     const { error: e1 } = await supabaseAdmin
       .from("auth_codes")
-      .insert({ email: email.toLowerCase(), code, expires_at: expiresAt });
+      .insert({
+        email: email.toLowerCase(),
+        code,
+        expires_at: expiresAt,
+      });
+
     if (e1) {
       console.error("auth/start insert error", e1);
-      return NextResponse.json({ ok: false, error: "No se pudo generar el código" }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "No se pudo generar el código" },
+        { status: 500 }
+      );
     }
 
     await sendEmail({
@@ -38,6 +65,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error("auth/start error", err);
-    return NextResponse.json({ ok: false, error: err?.message || "Error" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: err?.message || "Error" },
+      { status: 500 }
+    );
   }
 }
