@@ -8,11 +8,31 @@ import {
 
 type Body =
   | { type: "bienvenida-gratis"; to: string }
-  | { type: "compra-ok"; to: string; plan: string; creditos: number; facturaUrl?: string }
-  | { type: "resultado"; to: string; titulo: string; nota?: string; enlacePDF?: string };
+  | {
+      type: "compra-ok";
+      to: string;
+      plan: string;
+      creditos: number;
+      facturaUrl?: string;
+    }
+  | {
+      type: "resultado";
+      to: string;
+      titulo: string;
+      nota?: string;
+      enlacePDF?: string;
+    };
 
 export async function POST(req: Request) {
   try {
+    // 🔒 BLINDAJE CRÍTICO (EVITA QUE CAIGA TODA LA APP)
+    if (typeof sendEmail !== "function") {
+      return NextResponse.json(
+        { ok: false, error: "EMAIL NO CONFIGURADO" },
+        { status: 503 }
+      );
+    }
+
     const body = (await req.json()) as Body;
 
     if (!("to" in body) || !body.to) {
@@ -51,7 +71,12 @@ export async function POST(req: Request) {
       );
     }
 
-    const r = await sendEmail({ to: body.to, subject, html });
+    const r = await sendEmail({
+      to: body.to,
+      subject,
+      html,
+    });
+
     return NextResponse.json(r);
   } catch (e: any) {
     console.error("Error en /api/email/notify:", e);
