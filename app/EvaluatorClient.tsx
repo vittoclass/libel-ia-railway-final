@@ -1,5 +1,6 @@
-// EVALAJUDRO CLIENT CUENTA CON PORCENTAJES Y PUATAS CON PUBTJAE TB.txt (EvaluatorClient.tsx)
 
+
+// EVALAJUDRO CLIENT CUENTA CON PORCENTAJES Y PUATAS CON PUBTJAE TB.txt (EvaluatorClient.tsx)
 "use client"
 import * as React from "react"
 import { useState, useRef, type ChangeEvent, useEffect } from "react"
@@ -54,7 +55,6 @@ import {
 } from "@react-pdf/renderer"
 import { useEvaluator } from "./useEvaluator"
 const SmartCameraModal = dynamic(() => import("@/components/smart-camera-modal"), {
-  ssr: false,
   loading: () => <p>Cargando...</p>,
 })
 
@@ -937,6 +937,9 @@ export default function EvaluatorClient() {
   const [isExtractingNames, setIsExtractingNames] = useState(false)
   const [theme, setTheme] = useState("theme-ocaso")
   const [previewGroupId, setPreviewGroupId] = useState<string | null>(null)
+  // Progreso de evaluacion por lotes
+  const batchInitial = { isActive: false, totalItems: 0, completedItems: 0, successCount: 0, errorCount: 0, currentBatch: 0, totalBatches: 0 }
+  const [batchProgress, setBatchProgress] = useState(batchInitial)
   const isMobile = typeof window !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const cameraInputRef = useRef<HTMLInputElement>(null)
@@ -1029,37 +1032,33 @@ export default function EvaluatorClient() {
       } catch {}
     }
   }
-  // ✅ handleCapture con feedback OPCIONAL (esto arregla TODO)
-const handleCapture = (
-  dataUrl: string,
-  mode: CaptureMode | null,
-  feedback?: CameraFeedback
-) => {
-  if (feedback && feedback.confidence < 0.98) {
+// 🚨 MODIFICACIÓN: handleCapture ahora recibe el modo Y el feedback de certeza.
+const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: CameraFeedback) => {
+  const fb = feedback ?? ({ confidence: 1 } as CameraFeedback)
+
+  // 🚨 Nueva lógica de control para certeza baja
+  if (fb.confidence < 0.98) {
     const confirmCapture = window.confirm(
-      `⚠️ Baja Certeza OCR (${(feedback.confidence * 100).toFixed(1)}%). ¿Desea continuar con el riesgo de error o reintentar?`
+      `⚠️ Baja Certeza OCR (${(fb.confidence * 100).toFixed(1)}%). ¿Desea continuar con el riesgo de error o reintentar?`,
     )
-    if (!confirmCapture) {
-      return
-    }
+    if (!confirmCapture) return
   }
 
+  fetch(dataUrl)
+    .then((res) => res.blob())
+    .then((blob) => {
+      const fileName = mode ? `captura-${mode}-${Date.now()}.png` : `captura-${Date.now()}.png`
+      const file = new File([blob], fileName, { type: "image/png" })
+      processFiles([file])
+    })
+    .catch((err) => console.error("Error al crear archivo desde captura:", err))
 
-    fetch(dataUrl)
-      .then((res) => res.blob())
-      .then((blob) => {
-        // @ts-ignore
-        // Opcional: Agregar el modo al nombre para el debug
-        const fileName = mode ? `captura-${mode}-${Date.now()}.png` : `captura-${Date.now()}.png`
-        const file = new File([blob], fileName, { type: "image/png" })
-        processFiles([file])
-      })
-      .catch((err) => console.error("Error al crear archivo desde captura:", err))
-    setIsCameraOpen(false) // Cierra la cámara
-    setIsCaptureModeSelectionOpen(false) // Cierra la selección
-    setCaptureMode(null) // Resetea el modo
-    setCameraFeedback(null) // Limpia el feedback de la cámara
-  }
+  setIsCameraOpen(false)
+  setIsCaptureModeSelectionOpen(false)
+  setCaptureMode(null)
+  setCameraFeedback(null)
+}
+
   const handleLogoChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file) {
@@ -1104,15 +1103,19 @@ const handleCapture = (
   const removeUnassignedFile = (fileId: string) => {
     setUnassignedFiles((prev) => prev.filter((f) => f.id !== fileId))
   }
-  const handleNameExtraction = async () => {
-    if (unassignedFiles.length === 0) {
-      alert("Sube primero la página que contiene el nombre.")
+  const handleNameExtraction = async (groupId: string) => {
+    const grp = studentGroups.find((g) => g.id === groupId)
+    if (!grp || grp.files.length === 0) {
+      alert("Este estudiante/grupo no tiene archivos para extraer el nombre.")
       return
     }
+
     setIsExtractingNames(true)
     const formDataFD = new FormData()
-    formDataFD.append("files", unassignedFiles[0].file)
+    // ✅ Enviamos SOLO los archivos de este grupo (no unassignedFiles)
+    grp.files.forEach((f) => formDataFD.append("files", f.file))
     formDataFD.append("nameList", "[]")
+
     try {
       const response = await fetch("/api/extract-name", { method: "POST", body: formDataFD })
       const data = await response.json()
@@ -1121,28 +1124,18 @@ const handleCapture = (
       const numDetected = detectedNames.length
       if (numDetected > 0) {
         const allNamesList = detectedNames.map((n) => n.trim())
-        const allNamesString = allNamesList.join("; ")
         const visibleGroupName = allNamesList.join(", ")
+
         setStudentGroups((groups) => {
           if (groups.length === 0) return groups
-          return groups.map((g, index) => {
-            if (index === 0) {
-              return { ...g, studentName: visibleGroupName }
-            }
-
-            return g
-          })
+          return groups.map((g) => (g.id === groupId ? { ...g, studentName: visibleGroupName } : g))
         })
-        form.setValue("nombresGrupales", allNamesString)
-        alert(
-          `✅ Éxito: Se detectaron ${numDetected} nombres. El grupo fue renombrado a "${visibleGroupName}". La lista completa se adjuntará a la evaluación.`,
-        )
       } else {
-        alert("⚠️ Advertencia: No se detectaron nombres en la imagen.")
+        alert("No se detectó ningún nombre.")
       }
-    } catch (error) {
-      console.error("Error en extracción:", error)
-      alert(`❌ Error al extraer nombres: ${error instanceof Error ? error.message : "Error desconocido"}`)
+    } catch (error: any) {
+      console.error("[ExtractName] Error:", error)
+      alert(error?.message || "Error desconocido.")
     } finally {
       setIsExtractingNames(false)
     }
@@ -1230,7 +1223,79 @@ const handleCapture = (
     return text
   }
 
-  // Función para manejar la evaluación de grupos específicos (útil para la confirmación OMR)
+  // Función para manejar la evaluación de un solo grupo (usada para confirmación OMR individual)
+  const handleEvaluateSingleGroup = async (groupId: string) => {
+    const {
+      rubrica,
+      pauta,
+      flexibilidad,
+      tipoEvaluacion,
+      areaConocimiento,
+      puntajeTotal,
+      nivelEducativo,
+      nombresGrupales,
+      porcentajeExigencia,
+      pautaEstructurada,
+      pautaCorrectaAlternativas,
+    } = form.getValues()
+    const puntajeTotalNum = Number(puntajeTotal)
+    const porcentajeExigenciaNum = Number(porcentajeExigencia)
+
+    const group = studentGroups.find((g) => g.id === groupId)
+    if (!group || group.files.length === 0) return
+
+    setStudentGroups((prev) =>
+      prev.map((g) => (g.id === groupId ? { ...g, isEvaluating: true, isEvaluated: false, error: undefined } : g)),
+    )
+
+    const payload = {
+      fileUrls: group.files.map((f) => f.dataUrl),
+      fileMimeTypes: group.files.map((f) => f.file.type),
+      rubrica,
+      pauta,
+      flexibilidad: flexibilidad[0],
+      tipoEvaluacion,
+      areaConocimiento,
+      userEmail,
+      puntajeTotal: puntajeTotalNum,
+      nivelEducativo,
+      nombresGrupales,
+      porcentajeExigencia: porcentajeExigenciaNum,
+      pautaEstructurada,
+      pautaCorrectaAlternativas,
+      respuestasAlternativas: group.alternativas_corregidas,
+      captureMode: captureMode,
+    }
+
+    const result = await evaluate(payload)
+
+    setStudentGroups((prev) =>
+      prev.map((g) => {
+        if (g.id !== groupId) return g
+        if (result.success) {
+          return {
+            ...g,
+            isEvaluating: false,
+            isEvaluated: true,
+            isValidationStep: false,
+            retroalimentacion: result.retroalimentacion,
+            puntaje: result.puntaje,
+            nota: result.nota,
+            detalle_desarrollo: result.detalle_desarrollo,
+            puntosAprobacion: result.puntosAprobacion,
+            puntosMaximos: result.puntosMaximos,
+            alternativas_corregidas:
+              result.alternativas_corregidas || result.retroalimentacion?.retroalimentacion_alternativas,
+            error: undefined,
+          }
+        } else {
+          return { ...g, isEvaluating: false, error: result.error }
+        }
+      }),
+    )
+  }
+
+  // Función para manejar evaluación masiva en lotes paralelos (3 lotes x 45 simultáneos)
   const handleEvaluateGroups = async (groupIDsToEvaluate: string[]) => {
     const {
       rubrica,
@@ -1249,7 +1314,7 @@ const handleCapture = (
     const porcentajeExigenciaNum = Number(porcentajeExigencia)
 
     if (!rubrica) {
-      form.setError("rubrica", { type: "manual", message: "La rúbrica es requerida." })
+      form.setError("rubrica", { type: "manual", message: "La rubrica es requerida." })
       return
     }
     if (!pautaEstructurada) {
@@ -1260,15 +1325,39 @@ const handleCapture = (
       return
     }
 
-    for (const groupId of groupIDsToEvaluate) {
-      const group = studentGroups.find((g) => g.id === groupId)
-      if (!group || group.files.length === 0) continue
+    // Filtrar grupos validos
+    const validGroups = studentGroups.filter(
+      (g) => groupIDsToEvaluate.includes(g.id) && g.files.length > 0
+    )
 
-      setStudentGroups((prev) =>
-        prev.map((g) => (g.id === groupId ? { ...g, isEvaluating: true, isEvaluated: false, error: undefined } : g)),
-      )
+    if (validGroups.length === 0) return
 
-      const payload = {
+    // Marcar todos como evaluando
+    setStudentGroups((prev) =>
+      prev.map((g) => {
+        if (groupIDsToEvaluate.includes(g.id) && g.files.length > 0) {
+          return { ...g, isEvaluating: true, isEvaluated: false, error: undefined }
+        }
+        return g
+      }),
+    )
+
+    // Inicializar progreso de batch
+    const totalBatches = Math.ceil(validGroups.length / 45)
+    setBatchProgress({
+      isActive: true,
+      totalItems: validGroups.length,
+      completedItems: 0,
+      successCount: 0,
+      errorCount: 0,
+      currentBatch: 1,
+      totalBatches,
+    })
+
+    // Construir items para el batch endpoint
+    const batchItems = validGroups.map((group) => ({
+      groupId: group.id,
+      payload: {
         fileUrls: group.files.map((f) => f.dataUrl),
         fileMimeTypes: group.files.map((f) => f.file.type),
         rubrica,
@@ -1283,38 +1372,110 @@ const handleCapture = (
         porcentajeExigencia: porcentajeExigenciaNum,
         pautaEstructurada,
         pautaCorrectaAlternativas,
-        // Al confirmar OMR, enviamos las alternativas corregidas.
         respuestasAlternativas: group.alternativas_corregidas,
-        captureMode: captureMode, // Mantenemos el modo de captura si está definido
+        captureMode: captureMode,
+      },
+    }))
+
+    try {
+      const response = await fetch("/api/evaluate/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: batchItems }),
+      })
+
+      if (!response.ok || !response.body) {
+        throw new Error("Error HTTP " + response.status + ": " + response.statusText)
       }
 
-      const result = await evaluate(payload)
+      // Leer stream NDJSON línea por línea
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ""
+      let completed = 0
+      let successes = 0
+      let errors = 0
 
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() || ""
+
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const msg = JSON.parse(line)
+
+            if (msg.type === "meta") {
+              setBatchProgress((prev) => ({
+                ...prev,
+                totalBatches: msg.totalBatches,
+              }))
+            } else if (msg.type === "result") {
+              completed++
+              if (msg.success) successes++
+              else errors++
+
+              const currentBatch = Math.floor((completed - 1) / 45) + 1
+
+              setBatchProgress((prev) => ({
+                ...prev,
+                completedItems: completed,
+                successCount: successes,
+                errorCount: errors,
+                currentBatch,
+              }))
+
+              // Actualizar el grupo específico con su resultado
+              setStudentGroups((prev) =>
+                prev.map((g) => {
+                  if (g.id !== msg.groupId) return g
+                  if (msg.success && msg.data) {
+                    return {
+                      ...g,
+                      isEvaluating: false,
+                      isEvaluated: true,
+                      isValidationStep: false,
+                      retroalimentacion: msg.data.retroalimentacion,
+                      puntaje: msg.data.puntaje,
+                      nota: msg.data.nota,
+                      detalle_desarrollo: msg.data.detalle_desarrollo,
+                      puntosAprobacion: msg.data.puntosAprobacion,
+                      puntosMaximos: msg.data.puntosMaximos,
+                      alternativas_corregidas:
+                        msg.data.alternativas_corregidas ||
+                        msg.data.retroalimentacion?.retroalimentacion_alternativas,
+                      error: undefined,
+                    }
+                  } else {
+                    return { ...g, isEvaluating: false, error: msg.error || "Error en la evaluacion" }
+                  }
+                }),
+              )
+            } else if (msg.type === "done") {
+              // Completado
+            }
+          } catch (_e) {
+            // Línea JSON inválida, ignorar
+          }
+        }
+      }
+    } catch (err) {
+      // Si falla el batch, marcar todos como error
+      const errorMsg = err instanceof Error ? err.message : "Error en evaluacion batch"
       setStudentGroups((prev) =>
         prev.map((g) => {
-          if (g.id !== groupId) return g
-          if (result.success) {
-            // Si la IA es exitosa, actualizamos los datos.
-            return {
-              ...g,
-              isEvaluating: false,
-              isEvaluated: true,
-              isValidationStep: false, // Finalizamos el paso de validación OMR
-              retroalimentacion: result.retroalimentacion,
-              puntaje: result.puntaje,
-              nota: result.nota,
-              detalle_desarrollo: result.detalle_desarrollo,
-              puntosAprobacion: result.puntosAprobacion,
-              puntosMaximos: result.puntosMaximos,
-              alternativas_corregidas:
-                result.alternativas_corregidas || result.retroalimentacion?.retroalimentacion_alternativas,
-              error: undefined,
-            }
-          } else {
-            return { ...g, isEvaluating: false, error: result.error }
+          if (groupIDsToEvaluate.includes(g.id) && g.isEvaluating) {
+            return { ...g, isEvaluating: false, error: errorMsg }
           }
+          return g
         }),
       )
+    } finally {
+      setBatchProgress((prev) => ({ ...prev, isActive: false }))
     }
   }
 
@@ -1328,10 +1489,10 @@ const handleCapture = (
       return
     }
 
-    // Si algún grupo está en el paso de validación OMR, solo evaluamos ese grupo.
+    // Si algún grupo está en el paso de validación OMR, solo evaluamos ese grupo (individual).
     const validationGroup = studentGroups.find((g) => g.isValidationStep)
     if (validationGroup) {
-      await handleEvaluateGroups([validationGroup.id])
+      await handleEvaluateSingleGroup(validationGroup.id)
     } else {
       await handleEvaluateGroups(groupsToEvaluate)
     }
@@ -2060,20 +2221,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           </div>
                         ))}
 
-                        <Button
-                          type="button"
-                          variant="outline"
-                          onClick={handleNameExtraction}
-                          disabled={isExtractingNames}
-                          className="self-center bg-transparent"
-                        >
-                          {isExtractingNames ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <Sparkles className="mr-2 h-4 w-4 text-purple-500" />
-                          )}{" "}
-                          Detectar Nombre
-                        </Button>
+                        
                       </div>
                     </div>
                   )}
@@ -2095,6 +2243,21 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           value={group.studentName}
                           onChange={(e) => updateStudentName(group.id, e.target.value)}
                         />
+
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => handleNameExtraction(group.id)}
+                          disabled={isExtractingNames}
+                          className="mb-3 bg-transparent"
+                        >
+                          {isExtractingNames ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Sparkles className="mr-2 h-4 w-4 text-purple-500" />
+                          )}{" "}
+                          Detectar Nombre
+                        </Button>
 
                         <div className="flex flex-wrap gap-2 min-h-[50px] bg-[var(--bg-muted-subtle)] p-2 rounded-md">
                           {/* ✅ USO DE renderFilePreview */}
@@ -2132,31 +2295,90 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                       </div>
                     ))}
                   </CardContent>
-                  <CardFooter>
-                    {/* 🚨 REEMPLAZO CRÍTICO: Botón de Evaluación por Flujo OMR Interactivo */}
+                  <CardFooter className="flex flex-col items-stretch gap-4">
+                    {/* Botón de Evaluación */}
                     <Button
                       size="lg"
                       onClick={onEvaluateAll}
+                      className="w-full"
                       disabled={
                         isCurrentlyEvaluatingAny ||
+                        batchProgress.isActive ||
                         studentGroups.every((g) => g.files.length === 0) ||
                         isCurrentlyValidatingAny
                       }
                     >
                       {isCurrentlyValidatingAny ? (
                         <>
-                          <CheckCircle2 className="mr-2 h-4 w-4 text-white" /> Confirmar Correcciones OMR
+                          <CheckCircle2 className="mr-2 h-4 w-4 text-white" /> {"Confirmar Correcciones OMR"}
                         </>
-                      ) : isLoading || isCurrentlyEvaluatingAny ? (
+                      ) : isLoading || isCurrentlyEvaluatingAny || batchProgress.isActive ? (
                         <>
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Evaluando...
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" /> {"Evaluando"}{batchProgress.isActive ? (" (" + batchProgress.completedItems + "/" + batchProgress.totalItems + ")") : "..."}
                         </>
                       ) : (
                         <>
-                          <Sparkles className="mr-2 h-4 w-4" /> Evaluar Todo
+                          <Sparkles className="mr-2 h-4 w-4" /> {"Evaluar Todo (" + studentGroups.filter((g) => g.files.length > 0 && !g.isEvaluated).length + " pendientes)"}
                         </>
                       )}
                     </Button>
+
+                    {/* Panel de progreso del batch */}
+                    {batchProgress.isActive && (
+                      <div className="p-4 rounded-lg border border-[var(--border-color)] bg-[var(--bg-muted)] space-y-3">
+                        <div className="flex items-center justify-between text-sm font-semibold text-[var(--text-primary)]">
+                          <span>Procesamiento por lotes</span>
+                          <span className="text-[var(--text-accent)]">
+                            Lote {batchProgress.currentBatch}/{batchProgress.totalBatches}
+                          </span>
+                        </div>
+
+                        {/* Barra de progreso general */}
+                        <div className="space-y-1">
+                          <div className="relative h-3 w-full bg-gray-200 rounded-full overflow-hidden">
+                            <div
+                              style={{
+                                width: (batchProgress.totalItems > 0
+                                  ? Math.round((batchProgress.completedItems / batchProgress.totalItems) * 100)
+                                  : 0) + "%",
+                              }}
+                              className="h-full bg-[var(--bg-primary)] transition-all duration-500 rounded-full"
+                            />
+                          </div>
+                          <div className="flex justify-between text-xs text-[var(--text-secondary)]">
+                            <span>{batchProgress.completedItems} de {batchProgress.totalItems} evaluaciones</span>
+                            <span>
+                              {batchProgress.totalItems > 0
+                                ? Math.round((batchProgress.completedItems / batchProgress.totalItems) * 100)
+                                : 0}%
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Contadores de estado */}
+                        <div className="flex gap-4 text-xs">
+                          <div className="flex items-center gap-1.5">
+                            <div className="h-2 w-2 rounded-full bg-green-500" />
+                            <span className="text-[var(--text-secondary)]">Completadas: <b className="text-[var(--text-primary)]">{batchProgress.successCount}</b></span>
+                          </div>
+                          {batchProgress.errorCount > 0 && (
+                            <div className="flex items-center gap-1.5">
+                              <div className="h-2 w-2 rounded-full bg-red-500" />
+                              <span className="text-[var(--text-secondary)]">Errores: <b className="text-[var(--text-primary)]">{batchProgress.errorCount}</b></span>
+                            </div>
+                          )}
+                          <div className="flex items-center gap-1.5">
+                            <Loader2 className="h-2.5 w-2.5 animate-spin text-[var(--text-accent)]" />
+                            <span className="text-[var(--text-secondary)]">En proceso: <b className="text-[var(--text-primary)]">{batchProgress.totalItems - batchProgress.completedItems}</b></span>
+                          </div>
+                        </div>
+
+                        {/* Info de lotes */}
+                        <p className="text-[10px] text-[var(--text-secondary)]">
+                          Sistema de evaluacion masiva: hasta 3 lotes de 45 evaluaciones procesandose simultaneamente.
+                        </p>
+                      </div>
+                    )}
                   </CardFooter>
                 </Card>
               )}
