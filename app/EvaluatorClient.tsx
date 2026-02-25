@@ -54,6 +54,7 @@ import {
   pdf,
 } from "@react-pdf/renderer"
 import { useEvaluator } from "./useEvaluator"
+import ClosedAnswerOMRModal, { type ClosedAnswerOMRResult } from "@/components/ClosedAnswerOMRModal"
 const SmartCameraModal = dynamic(() => import("@/components/smart-camera-modal"), {
   loading: () => <p>Cargando...</p>,
 })
@@ -816,7 +817,7 @@ interface StudentGroup {
 }
 
 // *** TIPOS DECLARADOS PARA RESOLVER ERRORES LINT ***
-type CaptureMode = "sm_vf" | "terminos_pareados" | "desarrollo" | null
+type CaptureMode = "sm_vf" | "terminos_pareados" | "desarrollo" | "closed_answer" | null
 interface CameraFeedback {
   confidence: number
   // Agrega aquí otras propiedades si son necesarias para el feedback
@@ -932,6 +933,11 @@ export default function EvaluatorClient() {
   // 🔥 AÑADIDO: Estado para el feedback de certeza en tiempo real
   const [cameraFeedback, setCameraFeedback] = useState<CameraFeedback | null>(null)
 
+  // Estados para OMR de respuestas cerradas
+  const [isClosedAnswerOMROpen, setIsClosedAnswerOMROpen] = useState(false)
+  const [closedAnswerImageUrl, setClosedAnswerImageUrl] = useState<string>("")
+  const [closedAnswerTargetGroupId, setClosedAnswerTargetGroupId] = useState<string | null>(null)
+
   const [logoPreview, setLogoPreview] = useState<string | null>(null)
   const [classSize, setClassSize] = useState(1)
   const [isExtractingNames, setIsExtractingNames] = useState(false)
@@ -1036,12 +1042,36 @@ export default function EvaluatorClient() {
 const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: CameraFeedback) => {
   const fb = feedback ?? ({ confidence: 1 } as CameraFeedback)
 
-  // 🚨 Nueva lógica de control para certeza baja
   if (fb.confidence < 0.98) {
     const confirmCapture = window.confirm(
-      `⚠️ Baja Certeza OCR (${(fb.confidence * 100).toFixed(1)}%). ¿Desea continuar con el riesgo de error o reintentar?`,
+      `Baja Certeza OCR (${(fb.confidence * 100).toFixed(1)}%). Desea continuar con el riesgo de error o reintentar?`,
     )
     if (!confirmCapture) return
+  }
+
+  // Si es modo closed_answer, abrir el modal de OMR cerradas con la imagen capturada
+  if (mode === "closed_answer") {
+    fetch(dataUrl)
+      .then((res) => res.blob())
+      .then((blob) => {
+        const fileName = `captura-omr-cerradas-${Date.now()}.png`
+        const file = new File([blob], fileName, { type: "image/png" })
+        const filePreview: FilePreview = {
+          id: `omr-${Date.now()}`,
+          file,
+          previewUrl: URL.createObjectURL(file),
+          dataUrl,
+        }
+        setUnassignedFiles((prev) => [...prev, filePreview])
+        handleOpenClosedAnswerOMR(dataUrl)
+      })
+      .catch((err) => console.error("Error al crear archivo desde captura:", err))
+
+    setIsCameraOpen(false)
+    setIsCaptureModeSelectionOpen(false)
+    setCaptureMode(null)
+    setCameraFeedback(null)
+    return
   }
 
   fetch(dataUrl)
@@ -1058,6 +1088,86 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   setCaptureMode(null)
   setCameraFeedback(null)
 }
+
+  // Handler para abrir OMR cerradas desde archivos pendientes o grupo
+  const handleOpenClosedAnswerOMR = (imageDataUrl: string, groupId?: string) => {
+    setClosedAnswerImageUrl(imageDataUrl)
+    setClosedAnswerTargetGroupId(groupId || null)
+    setIsClosedAnswerOMROpen(true)
+  }
+
+  // Handler para confirmar respuestas del OMR cerradas
+  const handleClosedAnswerConfirm = (result: ClosedAnswerOMRResult) => {
+    const { pautaCorrectaAlternativas } = form.getValues()
+
+    // Parsear la pauta correcta para comparar
+    const pautaCorrecta: { [key: string]: string } = {}
+    if (pautaCorrectaAlternativas) {
+      const pairs = pautaCorrectaAlternativas.split(";").map((p: string) => p.trim()).filter((p: string) => p)
+      for (const pair of pairs) {
+        const [id, resp] = pair.split(":").map((s: string) => s.trim())
+        if (id && resp) pautaCorrecta[id.toUpperCase()] = resp.toUpperCase()
+      }
+    }
+
+    // Convertir las respuestas OMR al formato que el sistema ya usa (alternativas_corregidas)
+    const alternativasCorregidas = result.respuestas.map((r) => {
+      const preguntaKey = r.pregunta.trim()
+      // Buscar la respuesta correcta en la pauta (por numero o por SM+numero)
+      const correcta =
+        pautaCorrecta[preguntaKey.toUpperCase()] ||
+        pautaCorrecta[`SM${preguntaKey}`] ||
+        pautaCorrecta[`${preguntaKey}`] ||
+        ""
+
+      return {
+        pregunta: preguntaKey,
+        respuesta_estudiante: r.respuesta === "SIN_RESPUESTA" || r.respuesta === "DOBLE_MARCA" ? "" : r.respuesta,
+        respuesta_correcta: correcta,
+      }
+    })
+
+    // Si hay un grupo objetivo, asignar las respuestas directamente
+    if (closedAnswerTargetGroupId) {
+      setStudentGroups((prev) =>
+        prev.map((g) => {
+          if (g.id !== closedAnswerTargetGroupId) return g
+          return {
+            ...g,
+            alternativas_corregidas: alternativasCorregidas,
+            studentName: result.alumnoDetectado || g.studentName,
+          }
+        })
+      )
+    } else {
+      // Si no hay grupo objetivo, asignar al primer grupo que no tenga alternativas
+      setStudentGroups((prev) => {
+        const targetIdx = prev.findIndex((g) => !g.alternativas_corregidas || g.alternativas_corregidas.length === 0)
+        if (targetIdx === -1 && prev.length > 0) {
+          // Si todos tienen, asignar al primero
+          const updated = [...prev]
+          updated[0] = {
+            ...updated[0],
+            alternativas_corregidas: alternativasCorregidas,
+            studentName: result.alumnoDetectado || updated[0].studentName,
+          }
+          return updated
+        }
+        return prev.map((g, idx) => {
+          if (idx !== targetIdx) return g
+          return {
+            ...g,
+            alternativas_corregidas: alternativasCorregidas,
+            studentName: result.alumnoDetectado || g.studentName,
+          }
+        })
+      })
+    }
+
+    setIsClosedAnswerOMROpen(false)
+    setClosedAnswerImageUrl("")
+    setClosedAnswerTargetGroupId(null)
+  }
 
   const handleLogoChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -1611,7 +1721,24 @@ ${evaluatedGroups
         />
       )}
 
-      {/* 🚨 NUEVO: Modal de Selección de Modo de Captura */}
+      {/* Modal OMR de Respuestas Cerradas */}
+      {isClosedAnswerOMROpen && closedAnswerImageUrl && (
+        <ClosedAnswerOMRModal
+          imageUrl={closedAnswerImageUrl}
+          onClose={() => {
+            setIsClosedAnswerOMROpen(false)
+            setClosedAnswerImageUrl("")
+            setClosedAnswerTargetGroupId(null)
+          }}
+          onConfirm={handleClosedAnswerConfirm}
+          onRescan={() => {
+            setIsClosedAnswerOMROpen(false)
+            setClosedAnswerImageUrl("")
+          }}
+        />
+      )}
+
+      {/* Modal de Seleccion de Modo de Captura */}
       {isCaptureModeSelectionOpen && (
         <div className="pdf-modal-backdrop">
           <Card className="max-w-md w-full p-6 space-y-4">
@@ -1652,6 +1779,17 @@ ${evaluatedGroups
                 }}
               >
                 <FileText className="mr-2 h-4 w-4" /> Desarrollo / Preguntas Abiertas (Texto)
+              </Button>
+              <Button
+                className="w-full justify-start bg-transparent border-indigo-300 text-indigo-700"
+                variant="outline"
+                onClick={() => {
+                  setIsCaptureModeSelectionOpen(false)
+                  setCaptureMode("closed_answer")
+                  setIsCameraOpen(true)
+                }}
+              >
+                <ClipboardList className="mr-2 h-4 w-4" /> Plantilla Respuestas Cerradas (OMR)
               </Button>
             </div>
             <Button variant="ghost" className="w-full" onClick={() => setIsCaptureModeSelectionOpen(false)}>
@@ -2173,10 +2311,44 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                       <Button
                         type="button"
                         variant="secondary"
-                        // 🚨 MODIFICACIÓN CRÍTICA: Abrir el modal de selección
                         onClick={() => setIsCaptureModeSelectionOpen(true)}
                       >
-                        <Camera className="mr-2 h-4 w-4" /> Usar Cámara (Captura Guiada)
+                        <Camera className="mr-2 h-4 w-4" /> Usar Camara (Captura Guiada)
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="border-indigo-300 text-indigo-700 hover:bg-indigo-50"
+                        onClick={() => {
+                          // Usar un input file oculto para seleccionar imagen de plantilla OMR
+                          const input = document.createElement("input")
+                          input.type = "file"
+                          input.accept = "image/*"
+                          input.onchange = (e: any) => {
+                            const file = e.target?.files?.[0]
+                            if (!file) return
+                            const reader = new FileReader()
+                            reader.onload = (ev) => {
+                              const dataUrl = ev.target?.result as string
+                              if (dataUrl) {
+                                // Tambien agregar como archivo al pool
+                                const filePreview: FilePreview = {
+                                  id: `omr-${Date.now()}`,
+                                  file,
+                                  previewUrl: URL.createObjectURL(file),
+                                  dataUrl,
+                                }
+                                setUnassignedFiles((prev) => [...prev, filePreview])
+                                // Abrir el modal OMR cerradas
+                                handleOpenClosedAnswerOMR(dataUrl)
+                              }
+                            }
+                            reader.readAsDataURL(file)
+                          }
+                          input.click()
+                        }}
+                      >
+                        <ClipboardList className="mr-2 h-4 w-4" /> OMR Respuestas Cerradas
                       </Button>
                       <input
                         type="file"
