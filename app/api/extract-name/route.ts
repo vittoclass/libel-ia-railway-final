@@ -39,6 +39,7 @@ async function ocrAzure(imageBuffer: Buffer): Promise<string> {
 
 // --- FUNCIÓN ORIGINAL: FALLBACK DE IA (Modo 2) ---
 // 🚀 MEJORA: Prompt más estricto para excluir nombres de profesores y asegurar formato array de Nombres de ALUMNOS.
+// Reintentos ante 503/502 (Mistral overload) para mejorar extracción de nombres.
 async function extractNameWithAI(combinedText: string): Promise<string[]> {
     const prompt = `Actúa como un extractor de datos de un examen o trabajo. Tu ÚNICO OBJETIVO es identificar y extraer los nombres completos de los estudiantes que realizaron el examen. 
     
@@ -56,31 +57,47 @@ async function extractNameWithAI(combinedText: string): Promise<string[]> {
     {"suggestions": ["Juan Pérez", "Ana Gómez", "Carlos Rojas"]}
     `;
 
-    try {
-        const aiResponse = await openai.chat.completions.create({
-            model: "mistral-large-latest",
-            messages: [{ role: "user", content: prompt }],
-            response_format: { type: "json_object" },
-            temperature: 0.1,
-            max_tokens: 500
-        });
+    const maxRetries = 3
+    const retryStatuses = [502, 503, 429]
+    let lastError: unknown = null
 
-        const content = aiResponse.choices[0].message.content;
-        // Se añade una comprobación para asegurar que 'content' no es null.
-        if (!content) {
-            console.error("❌ La respuesta de la IA para extraer nombres vino vacía (null).");
-            return [];
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const aiResponse = await openai.chat.completions.create({
+                model: "mistral-large-latest",
+                messages: [{ role: "user", content: prompt }],
+                response_format: { type: "json_object" },
+                temperature: 0.1,
+                max_tokens: 500
+            });
+
+            const content = aiResponse.choices[0].message.content;
+            if (!content) {
+                console.error("❌ La respuesta de la IA para extraer nombres vino vacía (null).");
+                return [];
+            }
+            const match = content.match(/({[\s\S]*})/);
+            const cleanedContent = match ? match[1] : "{\"suggestions\":[]}";
+            const result = JSON.parse(cleanedContent);
+            return Array.isArray(result.suggestions) ? result.suggestions : [];
+        } catch (error) {
+            lastError = error
+            const err = error as { status?: number; message?: string }
+            const status = err?.status
+            const msg = err?.message ?? ""
+            const isRetryable = (status != null && retryStatuses.includes(status)) || /503|502|429|overflow/.test(msg)
+            if (isRetryable && attempt < maxRetries) {
+                const delayMs = 2000 * Math.pow(2, attempt - 1)
+                console.warn(`[API /extract-name] Fallback IA error (intento ${attempt}/${maxRetries}), reintento en ${delayMs}ms`);
+                await new Promise(r => setTimeout(r, delayMs))
+            } else {
+                console.error("❌ Fallback de IA falló:", error);
+                return [];
+            }
         }
-        const match = content.match(/({[\s\S]*})/);
-        const cleanedContent = match ? match[1] : "{\"suggestions\":[]}";
-        const result = JSON.parse(cleanedContent);
-
-        // Se asegura de que 'suggestions' sea un array antes de devolverlo.
-        return Array.isArray(result.suggestions) ? result.suggestions : [];
-    } catch (error) {
-        console.error("❌ Fallback de IA falló:", error);
-        return []; 
     }
+    console.error("❌ Fallback de IA falló tras reintentos:", lastError);
+    return [];
 }
 
 // --- FUNCIÓN PRINCIPAL: FUZZY MATCHING (Modo 1) ---
@@ -169,9 +186,8 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ success: true, suggestions }); 
 
     } catch (error) {
-        console.error("[API /extract-name] ❌ ERROR CRÍTICO EN EL BLOQUE POST:", error);
-        const errorMessage = error instanceof Error ? error.message : "Error desconocido en el servidor";
-        // Si el error es una falla de credenciales, igual devuelve 500.
-        return NextResponse.json({ success: false, error: errorMessage }, { status: 500 });
+        console.error("[API /extract-name] ❌ ERROR EN EL BLOQUE POST:", error);
+        // Siempre devolver 200 con suggestions vacías para no bloquear el flujo de evaluación.
+        return NextResponse.json({ success: true, suggestions: [] });
     }
 }

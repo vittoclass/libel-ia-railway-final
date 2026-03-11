@@ -1,0 +1,8 @@
+# Aspose.OMR Cloud — variables de entorno para el flujo robusto LibelIA
+# Copiar a .env.local y rellenar los valores.
+# Obtener credenciales en: https://dashboard.aspose.cloud/
+# La plantilla .omr se genera al diseñar una forma en Aspose que coincida con la hoja LibelIA (mismo número de preguntas y opciones).
+
+ASPOSE_CLIENT_ID=
+ASPOSE_CLIENT_SECRET=
+ASPOSE_OMR_TEMPLATE_BASE64=

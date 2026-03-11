@@ -1,206 +1,73 @@
-import { type NextRequest, NextResponse } from "next/server"
+// app/api/evaluate/route.ts
+// Endpoint principal para evaluar pruebas de estudiantes
+// Integra OMR para respuestas cerradas con retroalimentación IA
+// Soporta imágenes, PDF y Word: si hay PDF/Word se usa Azure OCR + Mistral texto; si solo imágenes, Mistral Vision.
+import { NextRequest, NextResponse } from "next/server"
 import { AzureKeyCredential, DocumentAnalysisClient } from "@azure/ai-form-recognizer"
-import OpenAI from "openai"
+import { getTemplate, getTemplateImage } from "@/app/lib/omrTemplateCache"
+import { fileToImageBase64List, isPdfBase64 } from "@/app/lib/pdfToImages"
+import { extractTextFromFiles } from "./utils"
+import { persistEvaluation } from "@/app/lib/persist-evaluation"
+import { getAuthUser } from "@/app/lib/supabase-route"
+import { getSupabaseServer } from "@/app/lib/supabase-server"
 
-const PDFJS_VERSION = "3.11.174"
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
+export const maxDuration = 60
 
-const AZURE_ENDPOINT = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
-const AZURE_KEY = process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY
 
-interface PautaItem {
-  pregunta: string
-  puntajeMaximo: number
-}
-
-interface AlternativaCorrecta {
-  pregunta: string
-  respuestaCorrecta: string
-}
-
-interface AlternativaEstudiante {
-  pregunta: string
-  respuesta_estudiante: string
-  respuesta_correcta: string
-  es_correcta: boolean
-  puntaje_obtenido: number
-  puntaje_maximo: number
-}
-
-interface DetalleDesarrollo {
-  pregunta: string
-  respuesta_estudiante: string
-  puntaje_obtenido: number
-  puntaje_maximo: number
-  comentario: string
-}
-
-interface ResumenGeneral {
-  fortalezas: string
-  areas_mejora: string
-  recomendaciones: string
-}
-
-interface RetroalimentacionCompleta {
-  resumen_general: ResumenGeneral
-  retroalimentacion_alternativas?: AlternativaEstudiante[]
-  detalle_desarrollo?: DetalleDesarrollo[]
-}
-
-interface PautaCorrectaAlternativa {
-  pregunta: string
-  respuestaCorrecta: string
-}
-
-function parsePautaEstructurada(pautaText: string): PautaItem[] {
-  if (!pautaText || typeof pautaText !== "string") return []
-  const parts = pautaText.split(";").map((p) => p.trim())
-  const items: PautaItem[] = []
-  for (const part of parts) {
-    const [pregunta, puntaje] = part.split(":").map((x) => x.trim())
-    if (pregunta && puntaje) {
-      items.push({ pregunta, puntajeMaximo: Number(puntaje) || 0 })
-    }
-  }
-  return items
-}
-
-function parseAlternativasCorrectas(pautaCorrectaText: string): AlternativaCorrecta[] {
-  if (!pautaCorrectaText || typeof pautaCorrectaText !== "string") return []
-  const parts = pautaCorrectaText.split(";").map((p) => p.trim())
-  const items: AlternativaCorrecta[] = []
-  for (const part of parts) {
-    const [pregunta, respuesta] = part.split(":").map((x) => x.trim())
-    if (pregunta && respuesta) {
-      items.push({ pregunta, respuestaCorrecta: respuesta.toUpperCase() })
-    }
-  }
-  return items
-}
-
-async function extractTextFromImages(
-  fileUrls: string[],
-  mimeTypes: string[],
-  client: DocumentAnalysisClient,
-): Promise<string[]> {
-  const allTexts: string[] = []
-  for (let i = 0; i < fileUrls.length; i++) {
-    const fileUrl = fileUrls[i]
-    const mimeType = mimeTypes[i] || "image/png"
+/** Reintentos para 502/503/429 (overload/servicio no disponible). */
+async function fetchMistralWithRetry(url: string, init: RequestInit): Promise<Response> {
+  const maxRetries = 3
+  const retryStatuses = [502, 503, 429]
+  let lastError: Error | null = null
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const base64Data = fileUrl.replace(/^data:.*?;base64,/, "")
-      const buffer = Buffer.from(base64Data, "base64")
-      const poller = await client.beginAnalyzeDocument("prebuilt-read", buffer)
-      const result = await poller.pollUntilDone()
-      let text = ""
-      if (result.content) {
-        text = result.content
+      const res = await fetch(url, init)
+      if (res.ok) return res
+      const body = await res.text()
+      const errMsg = `Mistral API error: ${res.status} - ${body.slice(0, 300)}`
+      if (!retryStatuses.includes(res.status) || attempt === maxRetries) {
+        throw new Error(errMsg)
       }
-      allTexts.push(text)
-    } catch (error) {
-      console.error(`Error OCR en imagen ${i}:`, error)
-      allTexts.push("")
+      const delayMs = 2000 * Math.pow(2, attempt - 1)
+      console.warn(`[Mistral] ${res.status} (intento ${attempt}/${maxRetries}), reintento en ${delayMs}ms`)
+      await new Promise(r => setTimeout(r, delayMs))
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e))
+      if (attempt === maxRetries) throw lastError
+      const delayMs = 2000 * Math.pow(2, attempt - 1)
+      console.warn(`[Mistral] Error (intento ${attempt}/${maxRetries}):`, lastError.message)
+      await new Promise(r => setTimeout(r, delayMs))
     }
   }
-  return allTexts
+  throw lastError || new Error("Mistral API error: servicio no disponible")
 }
 
-async function callMistral(messages: any[], temperature = 0.2) {
-  const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${MISTRAL_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "mistral-large-latest",
-      messages,
-      temperature,
-      response_format: { type: "json_object" },
-    }),
-  })
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Error Mistral: ${response.status} - ${errorText}`)
-  }
-
-  const data = await response.json()
-  return data.choices[0]?.message?.content || "{}"
-}
-
-function applyRFM(alternativas: AlternativaEstudiante[], pautaEstructurada: PautaItem[]): AlternativaEstudiante[] {
-  const seen = new Set<string>()
-  const uniqueAlternativas = alternativas.filter((alt) => {
-    if (seen.has(alt.pregunta)) {
-      console.log("[v0] RFM: Eliminando duplicado detectado:", alt.pregunta)
-      return false
-    }
-    seen.add(alt.pregunta)
-    return true
-  })
-
-  return uniqueAlternativas.map((alt) => {
-    const pautaItem = pautaEstructurada.find((p) => p.pregunta === alt.pregunta)
-    if (pautaItem) {
-      const puntajeMaximo = pautaItem.puntajeMaximo
-      const esCorrecta = alt.es_correcta
-      return {
-        ...alt,
-        puntaje_maximo: puntajeMaximo,
-        puntaje_obtenido: esCorrecta ? puntajeMaximo : 0,
-      }
-    }
-    return alt
-  })
-}
-
-const calculateGrade = (score: number, maxScore: number, porcentajeExigencia: number): number => {
-  if (maxScore <= 0 || porcentajeExigencia <= 0) return 1.0
-
-  const exigenciaDecimal = Math.min(100, porcentajeExigencia) / 100
-  const puntosAprobacion = Math.ceil(maxScore * exigenciaDecimal)
-
-  const puntajeEfectivo = Math.max(0, score)
-
-  if (puntajeEfectivo === 0) return 1.0
-
-  const APROBACION_PUNTOS = puntosAprobacion
-  const PUNTAJE_MAXIMO = maxScore
-  let grade: number
-
-  if (puntajeEfectivo <= APROBACION_PUNTOS) {
-    grade = 1.0 + 3.0 * (puntajeEfectivo / APROBACION_PUNTOS)
-    grade = Math.min(4.0, grade)
-  } else {
-    const remainingPoints = PUNTAJE_MAXIMO - APROBACION_PUNTOS
-    if (remainingPoints === 0) return 7.0
-    grade = 4.0 + 3.0 * ((puntajeEfectivo - APROBACION_PUNTOS) / remainingPoints)
-  }
-
-  const finalRoundedGrade = Math.min(7.0, Math.round(grade * 10) / 10)
-  return finalRoundedGrade
-}
-
+// Tipos para la pauta estructurada
 interface ItemScore {
   id: string
   maxScore: number
   isDevelopment: boolean
 }
 
-// Redeclared parsePautaEstructurada, removed the duplicate.
-const parsePautaEstructuradaItems = (pautaStr: string): ItemScore[] => {
+interface AlternativeResult {
+  pregunta: string
+  respuesta_estudiante: string
+  respuesta_correcta: string
+}
+
+// Parsear la pauta estructurada (formato: "SM1:1; SM2:1; P1:5; ...")
+function parsePautaEstructurada(pautaStr: string): ItemScore[] {
   const items: ItemScore[] = []
   if (!pautaStr) return items
 
-  const pairs = pautaStr
-    .split(";")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0)
+  const pairs = pautaStr.split(";").map(p => p.trim()).filter(p => p.length > 0)
 
   for (const pair of pairs) {
-    const [id, scoreStr] = pair.split(":").map((s) => s.trim())
-    const maxScore = Number.parseInt(scoreStr, 10)
+    const [id, scoreStr] = pair.split(":").map(s => s.trim())
+    const maxScore = parseInt(scoreStr, 10)
 
     if (id && !isNaN(maxScore) && maxScore > 0) {
       items.push({
@@ -213,1122 +80,1252 @@ const parsePautaEstructuradaItems = (pautaStr: string): ItemScore[] => {
   return items
 }
 
-const parsePautaAlternativas = (pautaStr: string): { [key: string]: string } => {
-  const map: { [key: string]: string } = {}
-  if (!pautaStr) return map
-  const pairs = pautaStr
-    .split(";")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0)
-  for (const pair of pairs) {
-    const [id, answer] = pair.split(":").map((s) => s.trim())
-    if (id && answer) {
-      map[id] = answer
-    }
-  }
-  return map
+/** Extrae solo la opción marcada: A-E, V, F, o número. Evita frases completas. */
+function normalizeRespuestaCerrada(texto: string): string {
+  if (!texto || typeof texto !== "string") return "SIN_RESPUESTA"
+  const t = texto.trim().toUpperCase()
+  if (t === "SIN_RESPUESTA" || t === "SIN RESPUESTA") return "SIN_RESPUESTA"
+  const letraMatch = t.match(/^([A-E])[\s):.(]?/) || t.match(/\b([A-E])\b/)
+  if (letraMatch) return letraMatch[1]
+  if (t.match(/^([VF])[\s):.(]?/) || t === "V" || t === "F") return t.charAt(0)
+  const numMatch = t.match(/(\d+)/)
+  if (numMatch) return numMatch[1]
+  if (/^[A-EVF]$/.test(t)) return t
+  return "SIN_RESPUESTA"
 }
 
-// Redeclared applyRFM, removed the duplicate.
-const applyRFMText = (
-  extractedText: string,
-  preguntaId: string,
-  captureMode: string | undefined,
-): { text: string; confidence: "high" | "low" } => {
-  if (!extractedText) return { text: "SIN_RESPUESTA", confidence: "low" }
+// Calcular nota en escala chilena (1.0 - 7.0)
+// Curva ligeramente generosa: debajo de 4.0 se usa exponente < 1 para que el mismo puntaje rinda una nota un poco mayor.
+function calculateGrade(score: number, maxScore: number, porcentajeExigencia: number): number {
+  if (maxScore <= 0 || porcentajeExigencia <= 0) return 1.0
 
-  const cleanText = extractedText.trim().toUpperCase()
+  const exigenciaDecimal = Math.min(100, Math.max(1, porcentajeExigencia)) / 100
+  const puntosAprobacion = Math.ceil(maxScore * exigenciaDecimal)
+  const puntajeEfectivo = Math.max(0, score)
 
-  // EXTRACCIÓN RADICAL: Solo la letra o número, sin afirmaciones
+  if (puntajeEfectivo === 0) return 1.0
 
-  // Para Selección Múltiple: Extraer SOLO la letra A-E
-  if (captureMode === "sm_vf" || preguntaId.includes("SM") || preguntaId.match(/^\d+$/)) {
-    // Buscar patrón: letra seguida de ) o : o espacio o paréntesis
-    const matchWithSeparator = cleanText.match(/^([A-E])[\s):(.]/)
-    if (matchWithSeparator) {
-      return { text: matchWithSeparator[1], confidence: "high" }
-    }
+  let grade: number
 
-    // Buscar solo la primera letra si está al inicio
-    const matchFirstLetter = cleanText.match(/^([A-E])/)
-    if (matchFirstLetter) {
-      return { text: matchFirstLetter[1], confidence: cleanText.length > 1 ? "low" : "high" }
-    }
+  if (puntajeEfectivo <= puntosAprobacion) {
+    // Curva menos severa: (x)^0.95 da un pequeño boost a puntajes intermedios
+    const ratio = Math.min(1, puntajeEfectivo / puntosAprobacion)
+    grade = 1.0 + 3.0 * Math.pow(ratio, 0.95)
+    grade = Math.min(4.0, grade)
+  } else {
+    const remainingPoints = maxScore - puntosAprobacion
+    if (remainingPoints === 0) return 7.0
+    grade = 4.0 + 3.0 * ((puntajeEfectivo - puntosAprobacion) / remainingPoints)
   }
 
-  // Para Verdadero/Falso: Extraer SOLO V o F
-  if (captureMode === "sm_vf" || preguntaId.includes("VF")) {
-    const matchVF = cleanText.match(/^([VF])/)
-    if (matchVF) {
-      return { text: matchVF[1], confidence: cleanText.length > 1 ? "low" : "high" }
-    }
-  }
-
-  // Para Términos Pareados: Extraer SOLO el número
-  if (captureMode === "terminos_pareados" || preguntaId.includes("TP")) {
-    const numMatch = cleanText.match(/(\d+)/)
-    if (numMatch) {
-      return { text: numMatch[1], confidence: "high" }
-    }
-  }
-
-  // Si no se encontró nada específico, buscar cualquier letra o número válido
-  const fallbackMatch = cleanText.match(/^([A-F]|\d+)/)
-  if (fallbackMatch) {
-    return { text: fallbackMatch[1], confidence: "low" }
-  }
-
-  return { text: "SIN_RESPUESTA", confidence: "low" }
+  return Math.min(7.0, Math.round(grade * 10) / 10)
 }
 
-const generalPromptBase = (
-  rubrica: string,
-  pauta: string,
-  puntajeTotal: number,
-  flexibilidad: number,
-  pautaEstructurada: ItemScore[],
-  itemsEsperados?: string,
-  nombreEstudiante?: string,
-  respuestasAlternativas?: { [key: string]: string },
-  pautaCorrectaAlternativas?: { [key: string]: string },
-) => {
-  const scoreTotal = Number(puntajeTotal) > 0 ? Number(puntajeTotal) : 51
-  const desarrolloItems = pautaEstructurada ? pautaEstructurada.filter((i) => i.isDevelopment) : []
+// Convertir imagen a base64 si es URL
+async function urlToBase64(url: string): Promise<string> {
+  if (url.startsWith("data:")) {
+    return url.replace(/^data:.*?;base64,/, "")
+  }
 
-  const desarrolloPuntajes = desarrolloItems.map((item) => `${item.id} (Máx: ${item.maxScore} puntos)`).join(", ")
+  const response = await fetch(url)
+  const buffer = await response.arrayBuffer()
+  return Buffer.from(buffer).toString("base64")
+}
 
-  const nombreInstruccion =
-    nombreEstudiante && nombreEstudiante.trim() && nombreEstudiante !== "Estudiante"
-      ? `\n**IMPORTANTE: El nombre del estudiante es "${nombreEstudiante}". DEBES usar este nombre al escribir las fortalezas y áreas de mejora (ej: "${nombreEstudiante} demuestra...", "${nombreEstudiante} debe mejorar..."). NO uses "El estudiante" si tienes el nombre real.**\n`
-      : `\n**IMPORTANTE: No se proporcionó el nombre del estudiante. DEBES usar "El estudiante" o "La estudiante" al escribir las fortalezas y áreas de mejora (ej: "El estudiante demuestra...", "El estudiante debe mejorar..."). NUNCA dejes el sujeto sin especificar.**\n`
+/** Mistral solo acepta imágenes (JPEG, PNG, WEBP, etc.). PDF/Word se convierten antes con fileToImageBase64List. */
 
-  return (
-    `Actúa como un profesor universitario riguroso. El objetivo es la **EVALUACIÓN CUALITATIVA** y la **PUNTUACIÓN DIRECTA**, priorizando la precisión de la rúbrica.
-    
-    El puntaje máximo de la evaluación es: ${scoreTotal} puntos.
-    
-    ${nombreInstruccion}
-    
-    ${pauta ? `PAUTA DE RESPUESTAS (Preguntas de Desarrollo/Abiertas):\n${pauta}\n\n` : ""}` +
-    `RÚBRICA DE EVALUACIÓN (CRITERIO PARA DESARROLLO - APLICAR ESCALA 0 A MÁXIMO DEL ÍTEM):\n${rubrica}
-    
-    ---
-    REGLAS DE ORO PROCEDIMENTALES (OBLIGATORIO Y NO NEGOCIABLE):
-    
-    1. EVALUACIÓN DE ALTERNATIVAS (S.M., V/F, TÉRMINOS PAREADOS): **EXTRACCIÓN DE SOLO LA OPCIÓN MARCADA - NO LA AFIRMACIÓN COMPLETA**
-        
-        **CRÍTICO - EXTRACCIÓN OBLIGATORIA:**
-        * Para **SELECCIÓN MÚLTIPLE (SM)**: Extrae SOLO la **LETRA** que marcó el estudiante (A, B, C, D, E). **NUNCA extraigas la afirmación completa que acompaña a la letra**. 
-          - CORRECTO: "B"
-          - INCORRECTO: "B) La fotosíntesis es un proceso..." 
-          - Si el OCR dice "El estudiante marcó B) La fotosíntesis...", extrae SOLO "B"
-        
-        * Para **VERDADERO/FALSO (VF)**: Extrae SOLO "V" o "F". **NUNCA extraigas la afirmación**.
-          - CORRECTO: "V"
-          - INCORRECTO: "V) La tierra es redonda"
-        
-        * Para **TÉRMINOS PAREADOS**: Extrae SOLO el **NÚMERO** que empareja (1, 2, 3, 4, etc.). **NUNCA extraigas el término completo**.
-          - CORRECTO: "3"
-          - INCORRECTO: "3) Proceso de respiración celular"
-        
-        * **SI NO HAY RESPUESTA VISIBLE**: Escribe "SIN_RESPUESTA"
-        
-        * **PAUTA DEL PROFESOR**: Usa ÚNICAMENTE las respuestas correctas de la pauta oficial. NUNCA inventes.
+/**
+ * Resuelve fileUrls a una lista plana de imágenes en base64.
+ * - Si es imagen: 1 elemento.
+ * - Si es PDF: N elementos (una por página).
+ * - Si es Word: lanza con mensaje para exportar a PDF.
+ */
+async function resolveToImageBase64List(
+  fileUrls: string[],
+  fileMimeTypes?: string[]
+): Promise<string[]> {
+  const list: string[] = []
+  for (let i = 0; i < fileUrls.length; i++) {
+    const url = fileUrls[i]
+    const mime = fileMimeTypes?.[i]
+    const pages = await fileToImageBase64List(url, mime)
+    list.push(...pages)
+  }
+  return list
+}
 
-    2. PUNTUACIÓN DE DESARROLLO (DIRECTA Y CONSISTENTE): Para generar el puntaje de las Preguntas de Desarrollo, **UTILIZA EL PUNTAJE MÁXIMO REAL DEL PROFESOR** (ej. 2 puntos). **Asigna un puntaje de 0 a MÁXIMO (ej. /2) basándote en la Rúbrica y la Generosidad.**
-        * Ítems de Desarrollo y sus Máximos: ${desarrolloPuntajes}
-        * **CRITERIO DE GENEROSIDAD CALIBRADA:** Si el concepto principal de la respuesta (según la pauta) es identificable **(AUNQUE SEA BREVE O MAL ESCRITO)**, el puntaje debe ser **MÍNIMO 1 PUNTO** (si Máx > 1). Solo asigna 0/Máx si la respuesta es totalmente incomprensible o está en blanco.
-        * **FORMATO DE PUNTAJE:** El campo "puntaje" debe ser "PUNTAJE OBTENIDO/MAX_ITEM" (ej. "2/2", "1/3").
-    
-    3. **CITACIÓN CON NOMBRE:** En 'fortalezas' y 'áreas de mejora', **DEBES usar el nombre del estudiante proporcionado** (si existe). Si no hay nombre, usa "El estudiante" o "La estudiante". **NUNCA escribas frases sin sujeto.**
-        * CORRECTO: "${nombreEstudiante || "El estudiante"} demuestra excelente comprensión..."
-        * INCORRECTO: "Demuestra excelente comprensión..." (sin sujeto)
-    
-    4. **EVIDENCIA TEXTUAL:** El campo 'evidencia' en evaluacion_habilidades **DEBE ser una CITA TEXTUAL EXACTA** del trabajo del estudiante.
-    
-    5. JUSTIFICACIÓN: Indica **CLARAMENTE** POR QUÉ (según la rúbrica) la cita es una fortaleza o un área de mejora.
+/** Obtiene base64 listo para Mistral. Si es PDF, convierte la primera página a imagen. */
+async function getImageBase64ForVision(url: string): Promise<string> {
+  const base64 = await urlToBase64(url)
+  if (isPdfBase64(base64)) {
+    const pages = await fileToImageBase64List(url, "application/pdf")
+    if (pages.length === 0) throw new Error("El PDF no pudo convertirse a imágenes.")
+    return pages[0]
+  }
+  return base64
+}
 
-    ---
-    INSTRUCCIONES DE DATOS CRÍTICAS:
-    
-    **El campo "nota" en el JSON DEBE ser un valor PLACEHOLDER 0.0.**
-    
-    ---
-    
-    INSTRUCCIONES DE FORMATO: Devuelve un JSON con la estructura exacta solicitada, sin texto explicativo. **DEBES POBLAR EL ARRAY 'retroalimentacion_alternativas'.** El campo \`puntaje\` debe reflejar solo la suma de los puntos de desarrollo (ya que el servidor calcula el resto).
-    
-    \`\`\`json
-    {
-      "puntaje": "PUNTAJE_DESARROLLO_OBTENIDO/PUNTAJE_TOTAL", 
-      "nota": 0.0, 
-      "retroalimentacion": {
-        "resumen_general": { 
-          "fortalezas": "${nombreEstudiante || "El estudiante"} [CITA TEXTUAL Y JUSTIFICACIÓN].", 
-          "areas_mejora": "${nombreEstudiante || "El estudiante"} [CITA TEXTUAL Y JUSTIFICACIÓN]." 
-        },
-        "detalle_puntaje_desarrollo": { 
-              "P1": { 
-                "puntaje": "PUNTAJE_OBTENIDO/MAX_ITEM", 
-                "cita_estudiante": "CITA TEXTUAL COMPLETA DE LA RESPUESTA DEL ESTUDIANTE A ESTA PREGUNTA DE DESARROLLO.",
-                "justificacion": "JUSTIFICACIÓN DEL PUNTAJE ASIGNADO BASADO EN LA CITA Y RÚBRICA."
-              }
-        },
-        "correccion_detallada": [ {"seccion": "...", "detalle": "..."} ],
-        "evaluacion_habilidades": [ {"habilidad": "...", "evaluacion": "...", "evidencia": "CITA TEXTUAL EXACTA. OBLIGATORIO."} ],
-        "retroalimentacion_alternativas": [
-            { 
-              "pregunta": "N° de ítem (ej: SM1, 1, VF2, TP1)", 
-              "respuesta_estudiante": "SOLO LA LETRA/NÚMERO MARCADO (ej: A, C, V, F, 4, SIN_RESPUESTA) - NUNCA LA AFIRMACIÓN COMPLETA", 
-              "respuesta_correcta": "RESPUESTA CORRECTA SEGÚN PAUTA (ej: B, D, F, 2)",
-              "confidence": "high o low"
-            }
-        ]
-      }
-    }
-    \`\`\`
-    
-    Considera un nivel de flexibilidad de ${flexibilidad} (1=estricto, 5=flexible) al asignar el puntaje de desarrollo.`
+/** Devuelve true si algún archivo es PDF o Word/Office (para usar rama Azure OCR en lugar de conversión a imágenes). */
+function hasPdfOrWord(fileMimeTypes: string[] | undefined): boolean {
+  if (!Array.isArray(fileMimeTypes) || fileMimeTypes.length === 0) return false
+  return fileMimeTypes.some(
+    (m) =>
+      m === "application/pdf" ||
+      (typeof m === "string" && (m.includes("officedocument") || m.includes("spreadsheetml")))
   )
 }
 
-const promptsExpertos = {
-  general: (
-    textoExtraido: string,
-    rubrica: string,
-    pauta: string,
-    puntajeTotal: number,
-    flexibilidad: number,
-    pautaEstructurada: ItemScore[],
-    itemsEsperados?: string,
-    nombreEstudiante?: string,
-    respuestasAlternativas?: { [key: string]: string },
-    pautaCorrectaAlternativas?: { [key: string]: string },
-  ) =>
-    `**INSTRUCCIÓN DE TRANSCRIPCIÓN (OCR):** El siguiente texto fue extraído por el OCR (Azure Document Intelligence) y contiene la transcripción de las respuestas marcadas (alternativas/V/F) y el texto de desarrollo. **Debes utilizar esta transcripción para inferir las respuestas de desarrollo y citar las respuestas del estudiante.**\n**PAUTA DE RESPUESTAS CERRADAS (CLAVE):** ${JSON.stringify(pautaCorrectaAlternativas)}\n--- INICIO DE LA TRANSCRIPCIÓN ---\n${textoExtraido}\n--- FIN DE LA TRANSCRIPCIÓN ---\n\n${generalPromptBase(rubrica, pauta, puntajeTotal, flexibilidad, pautaEstructurada, itemsEsperados, nombreEstudiante, respuestasAlternativas, pautaCorrectaAlternativas)}`,
-  artes: (
-    rubrica: string,
-    pauta: string,
-    puntajeTotal: number,
-    flexibilidad: number,
-    pautaEstructurada: ItemScore[],
-    itemsEsperados?: string,
-    nombreEstudiante?: string,
-    respuestasAlternativas?: { [key: string]: string },
-    pautaCorrectaAlternativas?: { [key: string]: string },
-  ) => {
-    const visualFocusInstruction = `
-        **INSTRUCCIÓN CRÍTICA DE ASIGNATURA: ARTES VISUALES - PROFESOR CRÍTICO Y CONCEPTUAL** 🎨
-        Tu rol es actuar como un Profesor de Arte Constructivo. Tu objetivo es fomentar el crecimiento y la intención conceptual. Tu análisis debe ser principalmente constructivo, siguiendo esta secuencia OBLIGATORIA:
-        
-        **SECUENCIA OBLIGATORIA DE EVALUACIÓN VISUAL:**
-        1.  **DESCRIPCIÓN FORMAL:** Describe la obra objetivamente (medio, trazo, composición, paleta, textura, etc.).
-        2.  **INTERPRETACIÓN CONCEPTUAL:** Analiza la intención y el mensaje de la obra.
-        3.  **APLICACIÓN DE RÚBRICA:** Engancha la interpretación conceptual con los criterios de la Rúbrica para asignar la puntuación.
-        
-        REGLA DE ORO ESPECÍFICA DE ARTES:
-        1.  PRIORIZACIÓN DEL LOGRO CONCEPTUAL: Si el logro conceptual y compositivo es evidente, la nota debe ser generosa (6.5 a 7.0). El rigor técnico tiene un peso insignificante.
-        2.  CLÁUSULA DE CITACIÓN VISUAL: Las 'fortalezas', 'mejoras' y 'evidencia' deben ser **DESCRIPCIONES FORMALES Y TÉCNICAS** referidas al logro general.
-        ---
-        `
-    return (
-      visualFocusInstruction +
-      generalPromptBase(
-        rubrica,
-        pauta,
-        Number(puntajeTotal),
-        flexibilidad,
-        pautaEstructurada,
-        itemsEsperados,
-        nombreEstudiante,
-        respuestasAlternativas,
-        pautaCorrectaAlternativas,
-      )
-    )
-  },
-  matematicas: (
-    textoExtraido: string,
-    rubrica: string,
-    pauta: string,
-    puntajeTotal: number,
-    flexibilidad: number,
-    pautaEstructurada: ItemScore[],
-    itemsEsperados?: string,
-    nombreEstudiante?: string,
-    respuestasAlternativas?: { [key: string]: string },
-    pautaCorrectaAlternativas?: { [key: string]: string },
-  ) =>
-    promptsExpertos.general(
-      textoExtraido,
-      rubrica,
-      pauta,
-      puntajeTotal,
-      flexibilidad,
-      pautaEstructurada,
-      itemsEsperados,
-      nombreEstudiante,
-      respuestasAlternativas,
-      pautaCorrectaAlternativas,
-    ),
-  lenguaje: (
-    textoExtraido: string,
-    rubrica: string,
-    pauta: string,
-    puntajeTotal: number,
-    flexibilidad: number,
-    pautaEstructurada: ItemScore[],
-    itemsEsperados?: string,
-    nombreEstudiante?: string,
-    respuestasAlternativas?: { [key: string]: string },
-    pautaCorrectaAlternativas?: { [key: string]: string },
-  ) =>
-    promptsExpertos.general(
-      textoExtraido,
-      rubrica,
-      pauta,
-      puntajeTotal,
-      flexibilidad,
-      pautaEstructurada,
-      itemsEsperados,
-      nombreEstudiante,
-      respuestasAlternativas,
-      pautaCorrectaAlternativas,
-    ),
-  ciencias: (
-    textoExtraido: string,
-    rubrica: string,
-    pauta: string,
-    puntajeTotal: number,
-    flexibilidad: number,
-    pautaEstructurada: ItemScore[],
-    itemsEsperados?: string,
-    nombreEstudiante?: string,
-    respuestasAlternativas?: { [key: string]: string },
-    pautaCorrectaAlternativas?: { [key: string]: string },
-  ) =>
-    promptsExpertos.general(
-      textoExtraido,
-      rubrica,
-      pauta,
-      puntajeTotal,
-      flexibilidad,
-      pautaEstructurada,
-      itemsEsperados,
-      nombreEstudiante,
-      respuestasAlternativas,
-      pautaCorrectaAlternativas,
-    ),
-  humanidades: (
-    textoExtraido: string,
-    rubrica: string,
-    pauta: string,
-    puntajeTotal: number,
-    flexibilidad: number,
-    pautaEstructurada: ItemScore[],
-    itemsEsperados?: string,
-    nombreEstudiante?: string,
-    respuestasAlternativas?: { [key: string]: string },
-    pautaCorrectaAlternativas?: { [key: string]: string },
-  ) =>
-    promptsExpertos.general(
-      textoExtraido,
-      rubrica,
-      pauta,
-      puntajeTotal,
-      flexibilidad,
-      pautaEstructurada,
-      itemsEsperados,
-      nombreEstudiante,
-      respuestasAlternativas,
-      pautaCorrectaAlternativas,
-    ),
-  ingles: (
-    textoExtraido: string,
-    rubrica: string,
-    pauta: string,
-    puntajeTotal: number,
-    flexibilidad: number,
-    pautaEstructurada: ItemScore[],
-    itemsEsperados?: string,
-    nombreEstudiante?: string,
-    respuestasAlternativas?: { [key: string]: string },
-    pautaCorrectaAlternativas?: { [key: string]: string },
-  ) =>
-    promptsExpertos.general(
-      textoExtraido,
-      rubrica,
-      pauta,
-      puntajeTotal,
-      flexibilidad,
-      pautaEstructurada,
-      itemsEsperados,
-      nombreEstudiante,
-      respuestasAlternativas,
-      pautaCorrectaAlternativas,
-    ),
-}
-
-async function extractTextFromPDF(buffer: Buffer): Promise<string> {
-  try {
-    const pdfjs = require("pdfjs-dist")
-    if (typeof (pdfjs as any).GlobalWorkerOptions !== "undefined") {
-    }
-    const doc = await pdfjs.getDocument({ data: new Uint8Array(buffer) }).promise
-    let fullText = ""
-    for (let i = 1; i <= doc.numPages; i++) {
-      const page = await doc.getPage(i)
-      const textContent = await page.getTextContent()
-      const pageText = textContent.items.map((item: any) => item.str || "").join(" ")
-      fullText += pageText + "\n"
-    }
-    return fullText
-  } catch (error) {
-    console.error("Error extrayendo texto de PDF digital:", error)
-    return ""
-  }
-}
-async function extractTextFromDigitalDocument(buffer: Buffer, mimeType: string): Promise<string> {
-  if (mimeType === "application/pdf" || mimeType.includes("officedocument") || mimeType.includes("spreadsheetml")) {
-    return ""
-  }
-  return ""
-}
-async function extractTextFromFiles(
-  fileBuffers: { buffer: Buffer; mimeType: string; captureMode?: string }[],
-  docIntelClient: DocumentAnalysisClient,
-): Promise<string> {
-  let allText = ""
-  let needsOCR = false
-  const ocrFiles: { buffer: Buffer; mimeType: string; captureMode?: string }[] = []
-  for (const { buffer, mimeType, captureMode } of fileBuffers) {
-    if (
-      mimeType.startsWith("image/") ||
-      mimeType === "application/pdf" ||
-      mimeType.includes("officedocument") ||
-      mimeType.includes("spreadsheetml")
-    ) {
-      ocrFiles.push({ buffer, mimeType, captureMode })
-      needsOCR = true
+/** Obtiene buffers desde fileUrls (data URLs o URLs) para enviar a Azure Document Intelligence. */
+async function getFileBuffersFromUrls(
+  fileUrls: string[],
+  fileMimeTypes: string[]
+): Promise<{ buffer: Buffer; mimeType: string }[]> {
+  const out: { buffer: Buffer; mimeType: string }[] = []
+  for (let i = 0; i < fileUrls.length; i++) {
+    const url = fileUrls[i]
+    const mimeType = fileMimeTypes[i] || "application/octet-stream"
+    let buffer: Buffer
+    if (url.startsWith("data:")) {
+      const base64 = url.replace(/^data:.*?;base64,/, "")
+      buffer = Buffer.from(base64, "base64")
     } else {
-      console.warn(`Archivo ignorado: Tipo MIME no soportado para extracción de texto: ${mimeType}`)
+      const res = await fetch(url)
+      const ab = await res.arrayBuffer()
+      buffer = Buffer.from(ab)
     }
+    out.push({ buffer, mimeType })
   }
-  if (needsOCR && ocrFiles.length > 0) {
-    console.log(`Ejecutando OCR de Azure para ${ocrFiles.length} archivo(s) (Imágenes/PDF Escaneados)...`)
-    const ocrText = await extractTextFromImagesOCR(ocrFiles, docIntelClient) // Changed function name
-    allText += ocrText
-  }
-
-  allText = allText.replace(/\[OMR_MARK\][^]*?\n/g, "")
-
-  return allText.trim() || "NO SE PUDO EXTRAER TEXTO."
+  return out
 }
 
-// Redeclared extractTextFromImages, renamed to extractTextFromImagesOCR to avoid conflict.
-async function extractTextFromImagesOCR(
-  ocrFiles: { buffer: Buffer; mimeType: string; captureMode?: string }[],
-  docIntelClient: DocumentAnalysisClient,
-): Promise<string> {
-  const textPromises = ocrFiles.map(async ({ buffer, mimeType, captureMode }) => {
-    try {
-      const processedBuffer = buffer
-
-      const poller = await docIntelClient.beginAnalyzeDocument("prebuilt-read", processedBuffer)
-      const result = await poller.pollUntilDone()
-      const content = result.content || ""
-
-      return content
-    } catch (e) {
-      console.error("Error durante la extracción OCR:", e)
-      return "ERROR DE EXTRACCIÓN OCR. Asegúrate de que el PDF o imagen contenga texto legible."
-    }
-  })
-  const results = await Promise.all(textPromises)
-  return results.join("\n\n--- FIN DE PÁGINA ---\n\n")
-}
-
-function buildPromptByArea(
-  areaConocimiento: string,
-  nivelEducativo: string,
+/** Evalúa usando solo el texto extraído por Azure (PDF/Word/imagen). Alineado con la API antigua: generosidad calibrada, fortalezas con aspectos positivos, puntaje por ítem. */
+async function analyzeWithMistralText(
+  textoExtraido: string,
   rubrica: string,
   pauta: string,
-  flexibilidad: number,
-  textosExtraidos: string[],
-  pautaEstructurada: PautaItem[],
-  pautaCorrectaAlternativas: PautaCorrectaAlternativa[],
-  respuestasAlternativas?: AlternativaEstudiante[],
-): any[] {
-  const textoCompleto = textosExtraidos.join("\n\n--- PÁGINA SIGUIENTE ---\n\n")
-  const listaPautaEstructurada = pautaEstructurada.map((p) => `${p.pregunta}: ${p.puntajeMaximo} pts`).join("; ")
+  pautaEstructurada: string,
+  pautaCorrectaAlternativas: string,
+  nivelEducativo: string,
+  areaConocimiento: string,
+  puntajeTotal: number,
+  porcentajeExigencia: number,
+  tipoPrueba: "mixta" | "solo_desarrollo" | "solo_alternativas",
+  flexibilidad: number = 3,
+  nombreEstudiante?: string
+): Promise<{
+  nombreEstudiante: string | null
+  respuestas_cerradas: { pregunta: string; respuesta_detectada: string; confianza: number }[]
+  respuestas_desarrollo: Record<string, { texto_estudiante: string; puntaje: string; justificacion: string }>
+  retroalimentacion: { fortalezas: string; areas_mejora: string; correccion_detallada: { seccion: string; detalle: string }[] }
+}> {
+  const itemScores = parsePautaEstructurada(pautaEstructurada)
+  const soloDesarrollo = tipoPrueba === "solo_desarrollo"
+  const soloAlternativas = tipoPrueba === "solo_alternativas"
+  const desarrolloItems = itemScores.filter((i) => i.isDevelopment)
+  const desarrolloPuntajes = desarrolloItems.map((item) => `${item.id} (Máx: ${item.maxScore} pts)`).join(", ")
+  const alternativasItems = itemScores.filter((i) => !i.isDevelopment)
+  const listaIdsAlternativas = alternativasItems.map((i) => i.id).join(", ")
+  const nombreInstruccion =
+    nombreEstudiante && nombreEstudiante.trim() && nombreEstudiante !== "Estudiante"
+      ? `**IMPORTANTE:** El nombre del estudiante es "${nombreEstudiante}". USA este nombre en fortalezas y áreas de mejora (ej: "${nombreEstudiante} demuestra...", "${nombreEstudiante} debe mejorar...").`
+      : `**IMPORTANTE:** Si no hay nombre, usa "El estudiante" o "La estudiante" en fortalezas y áreas de mejora. NUNCA dejes frases sin sujeto.`
 
-  const listaPautaCorrecta = pautaCorrectaAlternativas.map((a) => `${a.pregunta}: ${a.respuestaCorrecta}`).join("; ")
+  const prompt = `Actúa como un profesor universitario riguroso pero justo. El objetivo es la EVALUACIÓN CUALITATIVA y la PUNTUACIÓN DIRECTA.
 
-  let promptBase = `Eres un evaluador pedagógico experto para ${areaConocimiento} en nivel ${nivelEducativo}.
+Puntaje máximo de la evaluación: ${puntajeTotal} puntos. Exigencia para aprobar: ${porcentajeExigencia}%.
 
-**REGLA CRÍTICA DE EXTRACCIÓN:**
-- DEBES extraer EXACTAMENTE lo que aparece en el texto OCR del estudiante
-- SI el estudiante marca o escribe algo, extráelo LITERALMENTE
-- NO inventes ni supongas respuestas que no están visibles
-- SI una pregunta no tiene respuesta visible, marca como "SIN_RESPUESTA"
+${nombreInstruccion}
 
-**REGLA CRÍTICA DE NO ALUCINACIÓN:**
-- SOLO usa las respuestas correctas que te proporciono en la PAUTA OFICIAL
-- NUNCA inventes respuestas correctas
-- Si la pauta oficial está vacía para alternativas, NO corrijas alternativas
+RÚBRICA DE EVALUACIÓN (criterio para desarrollo - escala 0 a máximo del ítem):
+${rubrica}
 
-**PAUTA OFICIAL DE PUNTAJES (OBLIGATORIA):**
-${listaPautaEstructurada}
+${pauta ? `PAUTA DE RESPUESTAS (Desarrollo/Abiertas):\n${pauta}\n\n` : ""}
 
-**PAUTA OFICIAL DE ALTERNATIVAS CORRECTAS (OBLIGATORIA):**
-${listaPautaCorrecta || "NO HAY ALTERNATIVAS EN ESTA PRUEBA"}
+REGLAS DE ORO:
 
-Texto OCR extraído:
-${textoCompleto}
+1) ALTERNATIVAS (OBLIGATORIO - EXTRACCIÓN CERRETERA):
+   - La prueba tiene exactamente estos ítems de respuestas cerradas: ${listaIdsAlternativas || "ninguno (solo desarrollo)"}.
+   - Debes extraer del texto OCR ÚNICAMENTE lo que el estudiante marcó o escribió para cada ítem. En "respuesta_detectada" escribe SOLO la letra o el número (A, B, C, D, E, V, F, o un dígito). NUNCA pongas la afirmación completa.
+   - Devuelve en "respuestas_cerradas" UNA entrada por cada ítem de la lista anterior, con "pregunta" igual al ID exacto (ej: SM1, VF2, TP1). Si en la transcripción no aparece la respuesta de un ítem, pon "SIN_RESPUESTA". NO inventes; solo lo que aparece en el texto.
+   - La pauta de alternativas correctas es solo para que sepas las opciones válidas; lo que debes extraer es lo que REALMENTE marcó el estudiante según la transcripción.
 
-Rúbrica de desarrollo: ${rubrica || "No aplica"}
-Pauta de desarrollo: ${pauta || "No aplica"}
-Flexibilidad: ${flexibilidad}/5`
+2) PUNTUACIÓN DE DESARROLLO (generosidad calibrada):
+   - Ítems de desarrollo y sus máximos: ${desarrolloPuntajes || "No especificados"}
+   - **CRITERIO DE GENEROSIDAD:** Si el concepto principal de la respuesta (según la pauta) es identificable AUNQUE SEA BREVE O MAL ESCRITO, el puntaje debe ser MÍNIMO 1 PUNTO (si el máximo del ítem > 1). Solo asigna 0 cuando la respuesta es totalmente incomprensible o en blanco.
+   - **FORMATO:** "puntaje" = "OBTENIDO/MAX_ITEM" (ej. "2/2", "1/3").
+   - Considera flexibilidad ${flexibilidad}/5 (1=estricto, 5=flexible) al asignar puntaje.
 
-  if (areaConocimiento.toLowerCase().includes("artes")) {
-    promptBase += `
+3) FORTALEZAS: DEBES reconocer aspectos POSITIVOS concretos del trabajo. Cita entre comillas lo que escribió el estudiante y explica por qué es un logro (concepto bien aplicado, buena argumentación, claridad, etc.). No seas genérico; menciona logros específicos que veas en el texto. Tono de educador que valora el avance.
 
-**IMPORTANTE PARA ARTES:**
-- NO calcules puntajes numéricos automáticos para preguntas de desarrollo
-- SOLO proporciona retroalimentación cualitativa descriptiva
-- Deja puntaje_obtenido en 0 para todas las preguntas de desarrollo
-- El profesor asignará la nota final manualmente`
-  }
+4) ÁREAS DE MEJORA: Orienta el crecimiento citando lo que escribió e indicando qué puede mejorar y cómo. Tono de apoyo, sin desvalorizar.
 
-  promptBase += `
+5) En respuestas_desarrollo: "texto_estudiante" = CITA LITERAL de la respuesta del estudiante. "justificacion" = por qué tiene ese puntaje según la rúbrica (incluye cita).
 
-Debes responder OBLIGATORIAMENTE en formato JSON con esta estructura:`
+6) LENGUAJE RESPONSABLE: Nunca escribas frases que afirmen que el estudiante "no respondió", "no contestó" o "no escribió nada". Si en la TRANSCRIPCIÓN OCR no ves respuesta para una pregunta, describe la LIMITACIÓN de la transcripción, por ejemplo: "En la transcripción OCR no se observa una respuesta legible para esta pregunta", sin culpar al estudiante.
 
-  if (areaConocimiento.toLowerCase().includes("artes")) {
-    promptBase += `
+---
+PAUTA DE PUNTAJES POR ÍTEM:
+${pautaEstructurada || "No especificada"}
+
+PAUTA DE ALTERNATIVAS CORRECTAS (para comparar):
+${pautaCorrectaAlternativas || "No especificada"}
+
+--- TRANSCRIPCIÓN OCR ---
+${textoExtraido}
+--- FIN TRANSCRIPCIÓN ---
+
+Tipo de prueba: ${soloDesarrollo ? "SOLO DESARROLLO" : soloAlternativas ? "SOLO ALTERNATIVAS" : "MIXTA"}. Nivel: ${nivelEducativo}. Área: ${areaConocimiento}.
+
+Responde ÚNICAMENTE con este JSON (sin markdown):
 {
-  "resumen_general": {
-    "fortalezas": "string",
-    "areas_mejora": "string",
-    "recomendaciones": "string"
+  "nombreEstudiante": "nombre encontrado en el texto o null",
+  "respuestas_cerradas": [${listaIdsAlternativas ? listaIdsAlternativas.split(", ").map(id => `{"pregunta": "${id.trim()}", "respuesta_detectada": "SOLO LETRA O NÚMERO O SIN_RESPUESTA", "confianza": 0.95}`).join(", ") : ""}],
+  "respuestas_desarrollo": {
+    "P1": {"texto_estudiante": "CITA LITERAL de lo que escribió el estudiante", "puntaje": "2/2", "justificacion": "Explicación que incluye cita y por qué ese puntaje según rúbrica"}
   },
-  "retroalimentacion_alternativas": [
-    {
-      "pregunta": "ID_PREGUNTA",
-      "respuesta_estudiante": "EXACTAMENTE lo que escribió/marcó el estudiante",
-      "respuesta_correcta": "EXACTAMENTE lo de la pauta oficial",
-      "es_correcta": boolean,
-      "puntaje_obtenido": number (0 o puntaje_maximo según es_correcta),
-      "puntaje_maximo": number
-    }
-  ],
-  "detalle_desarrollo": [
-    {
-      "pregunta": "ID_PREGUNTA",
-      "respuesta_estudiante": "LITERALMENTE lo que escribió el estudiante",
-      "puntaje_obtenido": 0,
-      "puntaje_maximo": number (de la pauta estructurada),
-      "comentario": "Retroalimentación CUALITATIVA detallada sin puntaje numérico"
-    }
-  ]
-}`
-  } else {
-    promptBase += `
-{
-  "resumen_general": {
-    "fortalezas": "string",
-    "areas_mejora": "string",
-    "recomendaciones": "string"
-  },
-  "retroalimentacion_alternativas": [
-    {
-      "pregunta": "ID_PREGUNTA",
-      "respuesta_estudiante": "EXACTAMENTE lo que escribió/marcó el estudiante",
-      "respuesta_correcta": "EXACTAMENTE lo de la pauta oficial",
-      "es_correcta": boolean,
-      "puntaje_obtenido": number (0 o puntaje_maximo según es_correcta),
-      "puntaje_maximo": number
-    }
-  ],
-  "detalle_desarrollo": [
-    {
-      "pregunta": "ID_PREGUNTA",
-      "respuesta_estudiante": "LITERALMENTE lo que escribió el estudiante",
-      "puntaje_obtenido": number (0 a puntaje_maximo),
-      "puntaje_maximo": number (de la pauta estructurada),
-      "comentario": "string"
-    }
-  ]
-}`
+  "retroalimentacion": {
+    "fortalezas": "Aspectos POSITIVOS concretos del trabajo, citando al estudiante. Reconocer logros específicos (ej: buena estructura, concepto bien aplicado).",
+    "areas_mejora": "Orientaciones de mejora citando lo que escribió, tono de apoyo.",
+    "correccion_detallada": [{"seccion": "P1 o nombre ítem", "detalle": "explicación con cita del estudiante"}]
   }
-
-  if (respuestasAlternativas && respuestasAlternativas.length > 0) {
-    const alternativasStr = JSON.stringify(respuestasAlternativas, null, 2)
-    promptBase += `
-
-**ALTERNATIVAS YA CORREGIDAS POR EL PROFESOR (USA ESTAS):**
-${alternativasStr}
-
-Usa EXACTAMENTE estas alternativas corregidas. NO las recalcules.`
-  }
-
-  return [{ role: "user", content: promptBase }]
 }
 
-function calculateScore(
-  retroalimentacion: RetroalimentacionCompleta,
-  puntajeTotalMaximo: number,
-  porcentajeExigencia: number,
-  pautaEstructurada: PautaItem[],
+Las claves de respuestas_desarrollo pueden ser P1, P2, P3, etc. según los ítems de desarrollo en la pauta. Asigna puntaje de 0 a máximo de cada ítem aplicando generosidad calibrada. Para respuestas_cerradas, usa exactamente los IDs: ${listaIdsAlternativas || "[]"}.`
+
+  const res = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "mistral-large-latest",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      max_tokens: 8192,
+    }),
+  })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Mistral (texto) error: ${res.status} - ${err}`)
+  }
+  const data = await res.json()
+  const content = data.choices?.[0]?.message?.content
+  if (!content) throw new Error("Respuesta vacía de Mistral")
+  const parsed = JSON.parse(content)
+  const rawCerradas = Array.isArray(parsed.respuestas_cerradas) ? parsed.respuestas_cerradas : []
+  const byPregunta = new Map<string, { respuesta_detectada: string; confianza: number }>()
+  for (const r of rawCerradas) {
+    const id = String(r.pregunta || "").trim()
+    if (!id) continue
+    const detectada = normalizeRespuestaCerrada(String(r.respuesta_detectada ?? ""))
+    byPregunta.set(id, { respuesta_detectada: detectada, confianza: Number(r.confianza) || 0.8 })
+  }
+  const respuestas_cerradas: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
+  for (const item of alternativasItems) {
+    const existing = byPregunta.get(item.id)
+    respuestas_cerradas.push({
+      pregunta: item.id,
+      respuesta_detectada: existing ? existing.respuesta_detectada : "SIN_RESPUESTA",
+      confianza: existing ? existing.confianza : 0,
+    })
+  }
+  return {
+    nombreEstudiante: parsed.nombreEstudiante ?? null,
+    respuestas_cerradas,
+    respuestas_desarrollo: parsed.respuestas_desarrollo && typeof parsed.respuestas_desarrollo === "object" ? parsed.respuestas_desarrollo : {},
+    retroalimentacion: {
+      fortalezas: parsed.retroalimentacion?.fortalezas ?? "",
+      areas_mejora: parsed.retroalimentacion?.areas_mejora ?? "",
+      correccion_detallada: Array.isArray(parsed.retroalimentacion?.correccion_detallada) ? parsed.retroalimentacion.correccion_detallada : [],
+    },
+  }
+}
+
+/** Extrae SOLO lo que el estudiante marcó. Si hay imagen de plantilla, se envían AMBAS imágenes:
+ *  imagen 1 = plantilla del profesor (mismo layout), imagen 2 = hoja del estudiante.
+ *  El modelo usa la plantilla solo como referencia de estructura; extrae únicamente de la imagen 2. */
+async function extractStudentClosedAnswersOnly(
+  studentImageBase64: string,
+  totalPreguntas: number,
+  alternativas: string[],
+  columnas: number = 2,
+  templateImageBase64?: string
+): Promise<{ pregunta: string; respuesta_detectada: string; confianza: number }[]> {
+  const half = Math.ceil(totalPreguntas / 2)
+  const alts = alternativas.length ? alternativas : ["A", "B", "C", "D"]
+
+  const conPlantilla = !!templateImageBase64 && templateImageBase64.length > 50
+  const prompt = conPlantilla
+    ? `Tienes DOS imágenes de la MISMA plantilla de respuestas (mismo formato, mismas posiciones de preguntas).
+
+IMAGEN 1 = PLANTILLA DEL PROFESOR (respuestas correctas). Solo sirve para ver la ESTRUCTURA y posición de las preguntas.
+IMAGEN 2 = HOJA DEL ESTUDIANTE. Aquí debes leer QUÉ LETRA está marcada en cada pregunta.
+
+TU TAREA: Extraer ÚNICAMENTE lo que está marcado en la IMAGEN 2 (hoja del estudiante). NO copies las respuestas de la imagen 1. El estudiante puede marcar distinto al profesor.
+
+Estructura: ${columnas} columnas. Preguntas 1 a ${half}, luego ${half + 1} a ${totalPreguntas}. Opciones: ${alts.join(", ")}.
+
+Para cada pregunta (1 a ${totalPreguntas}) indica SOLO la letra que VES MARCADA EN LA IMAGEN 2. Si en la imagen 2 no hay marca, escribe "SIN_RESPUESTA".
+
+Responde SOLO este JSON:
+{"r":[{"p":1,"a":"?"},{"p":2,"a":"?"},...,{"p":${totalPreguntas},"a":"?"}]}
+"p" = número de pregunta, "a" = letra marcada EN LA IMAGEN 2 (${alts.join("/")}) o "" si no hay marca.
+Exactamente ${totalPreguntas} elementos en "r".`
+    : `TAREA: Lee ÚNICAMENTE esta imagen de una HOJA DE RESPUESTAS DE UN ESTUDIANTE.
+
+NO tienes acceso a las respuestas correctas. Indica QUÉ LETRA está marcada (con X o relleno) en cada pregunta.
+
+ESTRUCTURA: ${columnas} columnas. Preguntas 1 a ${half}, luego ${half + 1} a ${totalPreguntas}. Opciones: ${alts.join(", ")}.
+
+Para cada pregunta (1 a ${totalPreguntas}) indica SOLO la letra que VES marcada. Si no hay marca, "SIN_RESPUESTA". NO inventes. El estudiante puede marcar mal; refleja exactamente lo marcado.
+
+Responde SOLO este JSON:
+{"r":[{"p":1,"a":"?"},{"p":2,"a":"?"},...,{"p":${totalPreguntas},"a":"?"}]}
+"p" = número de pregunta, "a" = letra (${alts.join("/")}) o "" si no hay marca. Exactamente ${totalPreguntas} elementos en "r".`
+
+  const content: any[] = []
+  if (conPlantilla) {
+    content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${templateImageBase64}` } })
+  }
+  content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${studentImageBase64}` } })
+  content.push({ type: "text", text: prompt })
+
+  const res = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "pixtral-12b-2409",
+      messages: [{ role: "user", content }],
+      temperature: 0,
+      max_tokens: 2048,
+      response_format: { type: "json_object" },
+    }),
+  })
+
+  if (!res.ok) throw new Error(`Mistral OMR error: ${res.status}`)
+  const data = await res.json()
+  const responseText = data.choices?.[0]?.message?.content || ""
+  const match = responseText.match(/\{[\s\S]*\}/)
+  if (!match) return []
+
+  const parsed = JSON.parse(match[0])
+  const rawR = Array.isArray(parsed?.r) ? parsed.r : []
+  const respMap = new Map<number, string>()
+  for (const r of rawR) {
+    const num = Number(r?.p)
+    if (num >= 1 && num <= totalPreguntas && !respMap.has(num)) {
+      const ans = String(r?.a || "").trim().toUpperCase()
+      respMap.set(num, alts.includes(ans) ? ans : ans || "SIN_RESPUESTA")
+    }
+  }
+
+  const out: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
+  for (let i = 1; i <= totalPreguntas; i++) {
+    const a = respMap.get(i) || "SIN_RESPUESTA"
+    out.push({
+      pregunta: `SM${i}`,
+      respuesta_detectada: a,
+      confianza: a && a !== "SIN_RESPUESTA" ? 0.9 : 0.4,
+    })
+  }
+  return out
+}
+
+// Llamar a Mistral Vision para analizar la prueba.
+// CRÍTICO: La pauta de respuestas CORRECTAS (pautaCorrectaAlternativas) NUNCA se envía al modelo
+// en esta función. Solo se usa en calculateFinalScore para comparar. Así evitamos que la IA
+// devuelva las correctas como si fueran lo que marcó el estudiante.
+async function analyzeWithMistralVision(
+  imageBase64: string,
+  rubrica: string,
+  pauta: string,
+  pautaEstructurada: string,
+  pautaCorrectaAlternativas: string, // Solo para construir itemScores; NO se incluye en el prompt de extracción
+  nivelEducativo: string,
   areaConocimiento: string,
-): { puntaje: string; nota: number; puntosAprobacion: number; puntosMaximos: number } {
-  console.log("[v0] INICIO calculateScore")
-  console.log("[v0] puntajeTotalMaximo:", puntajeTotalMaximo)
-  console.log("[v0] porcentajeExigencia:", porcentajeExigencia)
-  console.log("[v0] areaConocimiento:", areaConocimiento)
+  puntajeTotal: number,
+  porcentajeExigencia: number,
+  tipoPrueba: "mixta" | "solo_desarrollo" | "solo_alternativas" = "mixta"
+): Promise<any> {
+  const itemScores = parsePautaEstructurada(pautaEstructurada)
+  const soloDesarrollo = tipoPrueba === "solo_desarrollo"
+  const soloAlternativas = tipoPrueba === "solo_alternativas"
 
-  // Removed conditional for 'artes' area. Now it calculates normally.
-  let scoreAlternativasObtenido = 0
-  let scoreDesarrolloObtenido = 0
+  // NO usar pautaCorrectaAlternativas en el prompt: la extracción debe ser fiel a lo que ve en la imagen.
+  // La corrección se hace después en calculateFinalScore comparando con la plantilla del profesor.
 
-  const alternativas = retroalimentacion.retroalimentacion_alternativas || []
-  const seenAlternativas = new Set<string>()
-  const uniqueAlternativas = alternativas.filter((alt) => {
-    if (seenAlternativas.has(alt.pregunta)) {
-      console.log("[v0] Eliminando alternativa duplicada:", alt.pregunta)
-      return false
+  const prompt = `Eres un evaluador pedagógico experto chileno. Analiza esta imagen de una prueba de un estudiante y genera una evaluación completa. Esta imagen puede ser de CUALQUIER tipo de prueba (mixta, solo desarrollo, solo alternativas); adapta tu respuesta al contenido visible.
+
+CONTEXTO:
+- Nivel educativo: ${nivelEducativo}
+- Área de conocimiento: ${areaConocimiento}
+- Puntaje total máximo: ${puntajeTotal} puntos
+- Porcentaje de exigencia para aprobar: ${porcentajeExigencia}%
+- Tipo de prueba: ${soloDesarrollo ? "SOLO DESARROLLO (no hay alternativas)" : soloAlternativas ? "SOLO ALTERNATIVAS (no hay desarrollo)" : "MIXTA (alternativas + desarrollo)"}
+
+RÚBRICA DE EVALUACIÓN:
+${rubrica}
+
+${pauta && !soloAlternativas ? `PAUTA DE CORRECCIÓN (Desarrollo):\n${pauta}` : ""}
+
+PAUTA DE PUNTAJES POR ÍTEM:
+${pautaEstructurada || "No especificada"}
+
+TAREA:
+1. Identifica el nombre del estudiante si está visible.
+${soloDesarrollo ? "" : `2. EXTRAE ÚNICAMENTE lo que el estudiante marcó en esta hoja. Para cada pregunta de alternativas (SM, V/F, términos pareados): lee la letra o número que está marcado con X o relleno en la imagen. Responde SOLO con lo que VES marcado (A, B, C, D, E, V, F, o número). Si no hay marca clara, escribe "SIN_RESPUESTA". NO inventes ni uses ninguna lista de respuestas correctas: extrae solo lo que muestra la imagen.`}
+${soloAlternativas ? "" : `3. PREGUNTAS DE DESARROLLO (OBLIGATORIO):
+   - En "texto_estudiante" DEBES copiar LITERALMENTE lo que el estudiante escribió. Si hay texto manuscrito visible, CÍTALO aquí.
+   - En "justificacion" explica POR QUÉ tiene ese puntaje citando partes concretas de su respuesta.
+   - PROHIBIDO escribir "no contestó", "sin respuesta" o "no respondió" si en la imagen hay CUALQUIER texto manuscrito en la pregunta. Solo "Sin respuesta" cuando la zona de respuesta está realmente en blanco.
+   - El puntaje debe reflejar lo que se ve; si hay texto, debe haber cita en texto_estudiante.`}
+4. RETROALIMENTACIÓN (tono de educador, preciso y técnico):
+   - "fortalezas": Escribe como un docente que reconoce el avance del estudiante. Cita entre comillas frases exactas de lo que escribió o marcó y explica por qué son un logro (concepto bien aplicado, buena argumentación, etc.). Sé cálido pero preciso; evita generalidades.
+   - "areas_mejora": Escribe como un docente que orienta el crecimiento. Cita entre comillas lo que escribió el estudiante y indica qué puede mejorar y cómo (sin desvalorizar). Sé claro y técnico, con clima de apoyo. No digas que no contestó si en la imagen hay respuesta visible.
+
+FORMATO DE RESPUESTA (JSON estricto):
+{
+  "nombreEstudiante": "nombre detectado o null",
+  "respuestas_cerradas": ${soloDesarrollo ? "[]" : `[
+    {"pregunta": "SM1", "respuesta_detectada": "LETRA O NUMERO QUE VES MARCADO EN LA HOJA", "confianza": 0.95}
+  ]`},
+  "respuestas_desarrollo": ${soloAlternativas ? "{}" : `{
+    "P39": {
+      "texto_estudiante": "CITA TEXTUAL EXACTA de lo que escribió el estudiante",
+      "puntaje": "X/Y",
+      "justificacion": "explicación que INCLUYE al menos una cita entre comillas del texto del estudiante y por qué tiene ese puntaje"
     }
-    seenAlternativas.add(alt.pregunta)
-    return true
+  }`},
+  "retroalimentacion": {
+    "fortalezas": "Como docente: reconoce logros CITANDO entre comillas texto exacto del estudiante y explicando por qué es fortaleza (preciso y con clima educativo).",
+    "areas_mejora": "Como docente: orienta mejoras CITANDO entre comillas lo que escribió y qué puede mejorar, con tono de apoyo y precisión técnica.",
+    "correccion_detallada": [{"seccion": "Seccion", "detalle": "explicación con al menos UNA cita textual entre comillas del estudiante y por qué tuvo ese puntaje"}]
+  }
+}
+
+REGLA CRÍTICA PARA ALTERNATIVAS: En "respuesta_detectada" debes poner ÚNICAMENTE la letra o número que el estudiante marcó en esta hoja (lo que se ve en la imagen). No uses ninguna pauta de respuestas correctas para rellenar este campo. Si el estudiante marcó mal, debes poner lo que marcó, no la respuesta correcta.
+
+INSTRUCCIONES PARA PREGUNTAS DE DESARROLLO (si la prueba tiene desarrollo):
+1. BUSCA en la imagen el número de la pregunta y el texto manuscrito debajo.
+2. En "texto_estudiante" COPIA EXACTAMENTE lo que escribió el estudiante (cita literal). Si hay texto visible, DEBE aparecer aquí; no resumas.
+3. En "justificacion" explica POR QUÉ tiene ese puntaje e INCLUYE al menos una cita entre comillas de lo que escribió el estudiante.
+4. En "correccion_detallada" cada elemento en "detalle" DEBE contener al menos una cita entre comillas del texto del estudiante.
+5. PROHIBIDO: No escribas "Sin respuesta", "no contestó", "no respondió" ni "no hay texto escrito por el estudiante" en desarrollo si hay CUALQUIER texto manuscrito en la zona de esa pregunta. Solo usa "Sin respuesta" cuando la zona está realmente en blanco.`
+
+  const response = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+    },
+    body: JSON.stringify({
+      // IMPORTANTE: Usar pixtral-12b-2409 que SI tiene vision
+      model: "pixtral-12b-2409",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      max_tokens: 4096,
+    }),
   })
 
-  console.log("[v0] Alternativas únicas:", uniqueAlternativas.length)
-
-  for (const alt of uniqueAlternativas) {
-    console.log(`[v0] Alternativa ${alt.pregunta}: ${alt.puntaje_obtenido}/${alt.puntaje_maximo}`)
-    scoreAlternativasObtenido += alt.puntaje_obtenido || 0
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`Mistral API error: ${response.status} - ${errorText}`)
   }
 
-  const desarrollo = retroalimentacion.detalle_desarrollo || []
-  const seenDesarrollo = new Set<string>()
-  const uniqueDesarrollo = desarrollo.filter((det) => {
-    if (seenDesarrollo.has(det.pregunta)) {
-      console.log("[v0] Eliminando desarrollo duplicado:", det.pregunta)
-      return false
-    }
-    seenDesarrollo.add(det.pregunta)
-    return true
+  const data = await response.json()
+  const content = data.choices?.[0]?.message?.content
+  if (!content) throw new Error("Respuesta vacía de Mistral Vision")
+  
+  return JSON.parse(content)
+}
+
+/** Llamada dedicada SOLO a preguntas de desarrollo: extracción con CITAS textuales obligatorias y retroalimentación profunda. */
+async function analyzeDevelopmentOnly(
+  imageBase64: string,
+  rubrica: string,
+  pauta: string,
+  pautaEstructurada: string,
+  nivelEducativo: string,
+  areaConocimiento: string
+): Promise<{ respuestas_desarrollo: Record<string, any>; retroalimentacion: any }> {
+  const prompt = `Eres un evaluador experto con mirada pedagógica. Esta imagen es de una prueba con PREGUNTAS DE DESARROLLO (respuestas abiertas, escritas a mano).
+
+CITAS OBLIGATORIAS EN DESARROLLO (no omitas ninguna):
+- En CADA "texto_estudiante" debes poner la CITA LITERAL de lo que el estudiante escribió. Si hay texto visible, copia el texto exacto; no resumas. Si la zona está en blanco, escribe "Sin respuesta".
+- En CADA "justificacion" debes incluir al menos UNA cita entre comillas del texto del estudiante y explicar por qué tiene ese puntaje.
+- En "correccion_detallada" CADA ítem en "detalle" debe contener al menos UNA cita entre comillas de lo que escribió el estudiante y por qué tuvo ese puntaje.
+
+FORTALEZAS Y ÁREAS DE MEJORA (tono de educador, preciso y técnico):
+- "fortalezas": Escribe como un docente que reconoce el avance. Cita entre comillas frases exactas de lo que escribió el estudiante y explica por qué son un logro (concepto bien aplicado, argumentación, etc.). Tono cálido y preciso.
+- "areas_mejora": Escribe como un docente que orienta el crecimiento. Cita entre comillas lo que escribió e indica qué puede mejorar y cómo, con tono de apoyo y precisión técnica. No desvalorices.
+
+PROHIBIDO: No digas "no contestó" ni "no respondió" si hay CUALQUIER texto manuscrito visible en la pregunta. Solo "Sin respuesta" si la zona está realmente en blanco.
+
+RÚBRICA:
+${rubrica}
+
+PAUTA DE CORRECCIÓN (Desarrollo):
+${pauta || "No especificada"}
+
+PAUTA DE PUNTAJES:
+${pautaEstructurada || "No especificada"}
+
+Nivel: ${nivelEducativo}. Área: ${areaConocimiento}.
+
+Responde ÚNICAMENTE con este JSON (cada texto_estudiante y cada detalle con cita literal):
+{
+  "respuestas_desarrollo": {
+    "P1": { "texto_estudiante": "cita literal exacta de lo que escribió el estudiante", "puntaje": "X/Y", "justificacion": "explicación que incluye al menos una cita entre comillas del estudiante" }
+  },
+  "retroalimentacion": {
+    "fortalezas": "Como docente: reconoce logros citando entre comillas texto del estudiante; tono educativo y preciso.",
+    "areas_mejora": "Como docente: orienta mejoras citando entre comillas lo que escribió; tono de apoyo y técnico.",
+    "correccion_detallada": [{"seccion": "Nombre pregunta", "detalle": "explicación con al menos una cita entre comillas del estudiante y por qué tuvo ese puntaje"}]
+  }
+}
+Las claves de respuestas_desarrollo pueden ser P1, P2, P39, P40, etc. según los números de pregunta que veas. texto_estudiante DEBE ser el texto real escrito por el estudiante, no un resumen.`
+
+  const res = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "pixtral-12b-2409",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+          { type: "text", text: prompt },
+        ],
+      }],
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      max_tokens: 8192,
+    }),
   })
 
-  console.log("[v0] Desarrollo único:", uniqueDesarrollo.length)
+  if (!res.ok) throw new Error(`Mistral Development error: ${res.status}`)
+  const data = await res.json()
+  const content = data.choices?.[0]?.message?.content
+  if (!content) return { respuestas_desarrollo: {}, retroalimentacion: {} }
+  const parsed = JSON.parse(content)
+  return {
+    respuestas_desarrollo: parsed.respuestas_desarrollo || {},
+    retroalimentacion: parsed.retroalimentacion || {},
+  }
+}
 
-  for (const det of uniqueDesarrollo) {
-    console.log(`[v0] Desarrollo ${det.pregunta}: ${det.puntaje_obtenido}/${det.puntaje_maximo}`)
-    scoreDesarrolloObtenido += det.puntaje_obtenido || 0
+// Calcular puntaje final combinando alternativas y desarrollo
+function calculateFinalScore(
+  respuestasCerradas: any[],
+  respuestasDesarrollo: any,
+  pautaEstructurada: string,
+  pautaCorrectaAlternativas: string,
+  puntajeTotal: number,
+  porcentajeExigencia: number
+) {
+  const itemScores = parsePautaEstructurada(pautaEstructurada)
+  
+  // Parsear pauta de alternativas correctas
+  // Soporta formatos: "SM1:A", "1:A", "pregunta1:A"
+  const pautaMap = new Map<string, string>()
+  if (pautaCorrectaAlternativas) {
+    const pairs = pautaCorrectaAlternativas.split(";").map(p => p.trim()).filter(p => p)
+    for (const pair of pairs) {
+      const [pregunta, respuesta] = pair.split(":").map(s => s.trim())
+      if (pregunta && respuesta) {
+        const key = pregunta.toUpperCase()
+        const val = respuesta.toUpperCase()
+        pautaMap.set(key, val)
+        // Tambien guardar variantes
+        const numMatch = key.match(/(\d+)/)
+        if (numMatch) {
+          const num = numMatch[1]
+          pautaMap.set(num, val)
+          pautaMap.set(`SM${num}`, val)
+          pautaMap.set(`PREGUNTA${num}`, val)
+        }
+      }
+    }
   }
 
-  const puntajeObtenido = scoreAlternativasObtenido + scoreDesarrolloObtenido
+  let scoreAlternativas = 0
+  let scoreDesarrollo = 0
+  const alternativasCorregidas: AlternativeResult[] = []
 
-  console.log("[v0] scoreAlternativasObtenido:", scoreAlternativasObtenido)
-  console.log("[v0] scoreDesarrolloObtenido:", scoreDesarrolloObtenido)
-  console.log("[v0] puntajeObtenido TOTAL:", puntajeObtenido)
+  // Corregir respuestas cerradas
+  for (const resp of respuestasCerradas || []) {
+    const preguntaId = String(resp.pregunta).toUpperCase()
+    const respuestaDetectada = String(resp.respuesta_detectada || "").toUpperCase()
+    
+    // Buscar respuesta correcta con variantes
+    const numMatch = preguntaId.match(/(\d+)/)
+    const num = numMatch ? numMatch[1] : preguntaId
+    const respuestaCorrecta = pautaMap.get(preguntaId) 
+      || pautaMap.get(num) 
+      || pautaMap.get(`SM${num}`) 
+      || ""
 
-  const puntosAprobacion = (puntajeTotalMaximo * porcentajeExigencia) / 100
-  const puntosRestantes = puntajeTotalMaximo - puntosAprobacion
-  const notasRestantes = 7.0 - 4.0
+    alternativasCorregidas.push({
+      pregunta: preguntaId,
+      respuesta_estudiante: respuestaDetectada,
+      respuesta_correcta: respuestaCorrecta,
+    })
 
-  console.log("[v0] puntosAprobacion (60%):", puntosAprobacion)
-  console.log("[v0] puntosRestantes:", puntosRestantes)
-
-  let notaFinal = 1.0
-
-  if (puntajeObtenido >= puntosAprobacion) {
-    const puntosExtra = puntajeObtenido - puntosAprobacion
-    const proporcion = puntosRestantes > 0 ? puntosExtra / puntosRestantes : 0
-    notaFinal = 4.0 + proporcion * notasRestantes
-  } else {
-    const proporcion = puntosAprobacion > 0 ? puntajeObtenido / puntosAprobacion : 0
-    notaFinal = 1.0 + proporcion * 3.0
+    if (respuestaCorrecta && respuestaDetectada === respuestaCorrecta) {
+      const itemMatch = itemScores.find(i => i.id.toUpperCase() === preguntaId)
+      scoreAlternativas += itemMatch?.maxScore || 1
+    }
   }
 
-  notaFinal = Math.max(1.0, Math.min(7.0, notaFinal))
-  notaFinal = Math.round(notaFinal * 10) / 10
+  // Sumar puntajes de desarrollo
+  for (const itemId in respuestasDesarrollo || {}) {
+    const item = respuestasDesarrollo[itemId]
+    if (!item || typeof item !== "object") continue
+    let puntajeObtenido = 0
+    let puntajeMaximoItem = 1
+    if (typeof item.puntaje === "string" && item.puntaje.includes("/")) {
+      const parts = item.puntaje.split("/")
+      puntajeObtenido = parseInt(parts[0], 10) || 0
+      puntajeMaximoItem = parseInt(parts[1], 10) || 1
+    } else if (typeof item.puntaje === "number") {
+      puntajeObtenido = item.puntaje
+      puntajeMaximoItem = item.puntaje
+    } else if (item.puntaje && typeof item.puntaje === "object") {
+      const p = item.puntaje as Record<string, unknown>
+      if (typeof p.total === "number") {
+        puntajeObtenido = p.total
+        puntajeMaximoItem = p.total
+      }
+    } else if (typeof (item as any).total === "number") {
+      puntajeObtenido = (item as any).total
+      puntajeMaximoItem = (item as any).total
+    }
+    scoreDesarrollo += puntajeObtenido
+  }
 
-  console.log("[v0] notaFinal calculada:", notaFinal)
-  console.log("[v0] FIN calculateScore")
+  const totalScore = scoreAlternativas + scoreDesarrollo
+  const nota = calculateGrade(totalScore, puntajeTotal, porcentajeExigencia)
+  
+  const exigenciaDecimal = Math.min(100, porcentajeExigencia) / 100
+  const puntosAprobacion = Math.ceil(puntajeTotal * exigenciaDecimal)
 
   return {
-    puntaje: `${puntajeObtenido}/${puntajeTotalMaximo}`,
-    nota: notaFinal,
-    puntosAprobacion: Math.round(puntosAprobacion * 10) / 10,
-    puntosMaximos: puntajeTotalMaximo,
+    puntaje: `${totalScore}/${puntajeTotal}`,
+    nota,
+    puntosAprobacion,
+    puntosMaximos: puntajeTotal,
+    alternativas_corregidas: alternativasCorregidas,
+    scoreAlternativas,
+    scoreDesarrollo,
   }
 }
 
-interface EvaluationResponse {
-  puntaje: string
-  nota: number | string
-  retroalimentacion: {
-    resumen_general: { fortalezas: string; areas_mejora: string }
-    detalle_puntaje_desarrollo: { [key: string]: any }
-    correccion_detallada: { seccion: string; detalle: string }[]
-    evaluacion_habilidades: { habilidad: string; evaluacion: string; evidencia: string }[]
-    retroalimentacion_alternativas: { pregunta: string; respuesta_estudiante: string; respuesta_correcta: string }[]
+/** Normaliza respuestas_desarrollo para que cada ítem tenga puntaje como string "X/Y" (evita [object Object] y permite calcular nota). */
+function normalizeRespuestasDesarrollo(
+  respuestasDesarrollo: Record<string, any> | null | undefined
+): Record<string, { texto_estudiante?: string; cita_estudiante?: string; puntaje: string; justificacion?: string }> {
+  const out: Record<string, { texto_estudiante?: string; cita_estudiante?: string; puntaje: string; justificacion?: string }> = {}
+  if (!respuestasDesarrollo || typeof respuestasDesarrollo !== "object") return out
+  for (const [key, item] of Object.entries(respuestasDesarrollo)) {
+    if (item == null || typeof item !== "object") continue
+    let puntajeStr = "0/1"
+    if (typeof item.puntaje === "string" && item.puntaje.includes("/")) {
+      puntajeStr = item.puntaje
+    } else if (typeof item.puntaje === "number") {
+      puntajeStr = `${item.puntaje}/${item.puntaje}`
+    } else if (item.puntaje && typeof item.puntaje === "object" && typeof (item.puntaje as any).total === "number") {
+      const t = (item.puntaje as any).total
+      puntajeStr = `${t}/${t}`
+    } else if (typeof (item as any).total === "number") {
+      const t = (item as any).total
+      puntajeStr = `${t}/${t}`
+    }
+    const texto = item.texto_estudiante ?? item.cita_estudiante ?? ""
+    const justif = typeof item.justificacion === "string" ? item.justificacion : (item.justificacion ? JSON.stringify(item.justificacion) : "")
+    out[key] = {
+      texto_estudiante: texto,
+      cita_estudiante: texto,
+      puntaje: puntajeStr,
+      justificacion: justif,
+    }
   }
+  return out
 }
 
-const validateEvaluationResponse = (obj: any): EvaluationResponse => {
-  if (!obj || typeof obj !== "object" || !obj.puntaje || !obj.retroalimentacion) {
-    throw new Error(
-      "Invalid structure returned from AI model. Missing critical base fields (puntaje or retroalimentacion).",
+/** Suaviza mensajes que culpan al estudiante cuando puede ser un problema de lectura/OCR. */
+function sanitizeStudentBlameText(text: string | null | undefined): string {
+  if (!text || typeof text !== "string") return text || ""
+  let out = text
+  const patterns = [
+    /no hay texto escrito por el estudiante/gi,
+    /no hay texto del estudiante/gi,
+    /no respondi[oó]/gi,
+    /no contest[oó]/gi,
+    /no respondi[oó] la pregunta/gi,
+    /no contest[oó] la pregunta/gi,
+  ]
+  for (const p of patterns) {
+    out = out.replace(
+      p,
+      "en la transcripción disponible no se observa una respuesta legible para esta pregunta"
     )
   }
-
-  obj.retroalimentacion.detalle_puntaje_desarrollo = obj.retroalimentacion.detalle_puntaje_desarrollo || {}
-  obj.retroalimentacion.correccion_detallada = obj.retroalimentacion.correccion_detallada || []
-  obj.retroalimentacion.evaluacion_habilidades = obj.retroalimentacion.evaluacion_habilidades || []
-  obj.retroalimentacion.retroalimentacion_alternativas = obj.retroalimentacion.retroalimentacion_alternativas || []
-
-  obj.nota = typeof obj.nota === "number" ? obj.nota : 0.0
-
-  return obj as EvaluationResponse
+  return out
 }
 
-const cleanJson = (str: string): string => {
-  let content = str.trim()
-  const match = str.match(/```json\n([\s\S]*?)\n```/)
-
-  if (match) {
-    content = match[1].trim()
-  } else {
-    const start = content.indexOf("{")
-    const end = content.lastIndexOf("}")
-
-    if (start !== -1 && end !== -1 && end > start) {
-      content = content.substring(start, end + 1)
-      console.warn("CleanJson: Forzado el corte del contenido a los delimitadores JSON.")
-    }
-
-    try {
-      JSON.parse(content)
-    } catch (e) {
-      content = content
-        .replace(/(\r\n|\n|\r)/gm, " ")
-        .replace(/\\/g, "\\\\")
-        .replace(/([^\\])"/g, '$1\\"')
-      console.warn("CleanJson: Aplicada reparación de caracteres forzada.")
-    }
+function sanitizeRetroalimentacion(retro: any): any {
+  if (!retro || typeof retro !== "object") return retro
+  const cleaned: any = { ...retro }
+  if (typeof cleaned.fortalezas === "string") {
+    cleaned.fortalezas = sanitizeStudentBlameText(cleaned.fortalezas)
   }
-
-  return content
-}
-
-const cleanUrlFromEnv = (url: string | undefined): string => {
-  const defaultUrl = "https://api.mistral.ai/v1"
-  if (!url) return defaultUrl
-
-  let cleanedUrl = url.trim()
-
-  const markdownMatch = cleanedUrl.match(/\[([^\]]+)\]$$([^)]+)$$/)
-  if (markdownMatch && markdownMatch.length > 2) {
-    cleanedUrl = markdownMatch[2]
+  if (typeof cleaned.areas_mejora === "string") {
+    cleaned.areas_mejora = sanitizeStudentBlameText(cleaned.areas_mejora)
   }
-
-  cleanedUrl = cleanedUrl.replace(/['"`]/g, "").trim()
-
-  if (!cleanedUrl.startsWith("http")) {
-    cleanedUrl = "https://" + cleanedUrl
+  if (Array.isArray(cleaned.correccion_detallada)) {
+    cleaned.correccion_detallada = cleaned.correccion_detallada.map((c: any) => {
+      if (!c || typeof c !== "object") return c
+      return {
+        ...c,
+        detalle: sanitizeStudentBlameText(c.detalle),
+      }
+    })
   }
-
-  if (!cleanedUrl.endsWith("/v1")) {
-    cleanedUrl = cleanedUrl.replace(/\/$/, "") + "/v1"
-  }
-
-  try {
-    new URL(cleanedUrl)
-    return cleanedUrl
-  } catch {
-    console.error("Fallo al validar la URL final del entorno. Usando valor seguro por defecto.")
-    return defaultUrl
-  }
+  return cleaned
 }
 
 export async function POST(req: NextRequest) {
-  const MISTRAL_API_KEY_FINAL = process.env.MISTRAL_API_KEY
-  const AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT_FINAL = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
-  const AZURE_DOCUMENT_INTELLIGENCE_KEY_FINAL = process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY
+  try {
+    if (!MISTRAL_API_KEY) {
+      return NextResponse.json(
+        { success: false, error: "MISTRAL_API_KEY no configurada en el servidor" },
+        { status: 500 }
+      )
+    }
 
-  const MISTRAL_BASE_URL = process.env.MISTRAL_BASE_URL_CORRUPTA || "https://api.mistral.ai/v1"
-  const cleanedBaseUrl = cleanUrlFromEnv(MISTRAL_BASE_URL)
+    const body = await req.json()
+    const {
+      fileUrls = [],
+      fileMimeTypes = [],
+      rubrica = "",
+      pauta = "",
+      puntajeTotal = 100,
+      porcentajeExigencia = 55,
+      pautaEstructurada = "",
+      pautaCorrectaAlternativas = "",
+      nivelEducativo = "Educación Media",
+      areaConocimiento = "general",
+      respuestasAlternativas,
+      answerKeyFromTemplate: answerKeyFromBody,
+      templateImageUrl,
+      templateId,
+      tipoPrueba = "mixta", // "mixta" | "solo_desarrollo" | "solo_alternativas"
+      flexibilidad = 3,
+      nombreEstudiante: nombreEstudianteBody,
+      // Persistencia Supabase (opcional; no afecta la respuesta)
+      teacher_id: teacherIdBody,
+      school_id: schoolIdBody,
+      course_id: courseIdBody,
+      evaluation_title: evaluationTitleBody,
+      evaluation_subject: evaluationSubjectBody,
+    } = body
 
-  if (!MISTRAL_API_KEY_FINAL || !AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT_FINAL || !AZURE_DOCUMENT_INTELLIGENCE_KEY_FINAL) {
-    console.error("ERROR CRÍTICO: Una o más claves de API son nulas. Verifique .env.local y reinicie el servidor.")
+    // Regla de oro: teacher_id/school_id SOLO desde perfil en BD. Ignorar body.
+    let effectiveTeacherId: string | null = null
+    let effectiveSchoolId: string | null = null
+    let authUserId: string | null = null
+    const user = await getAuthUser()
+    if (user) {
+      authUserId = user.id
+      const supabase = getSupabaseServer()
+      if (supabase) {
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("teacher_id, school_id")
+          .eq("user_id", user.id)
+          .maybeSingle()
+        if (profile?.teacher_id) {
+          effectiveTeacherId = profile.teacher_id
+          effectiveSchoolId = profile.school_id ?? null
+          if (process.env.NODE_ENV !== "production") console.info("[evaluate] teacher_id desde perfil:", profile.teacher_id)
+        }
+      }
+    }
+
+    // Memoria interna: si se envía templateId, cargar plantilla desde caché (Redis o memoria)
+    let answerKeyFromTemplate = answerKeyFromBody
+    let cachedTemplateBase64: string | undefined
+    if (templateId && typeof templateId === "string") {
+      try {
+        const cached = await getTemplate(templateId)
+        const cachedImg = await getTemplateImage(templateId)
+        if (cached) {
+          answerKeyFromTemplate = {
+            respuestas: cached.respuestas,
+            totalPreguntas: cached.totalPreguntas,
+          }
+          if (cachedImg) cachedTemplateBase64 = cachedImg.base64
+        }
+      } catch (_) {
+        // Si falla la caché, seguir con answerKeyFromBody y templateImageUrl
+      }
+    }
+
+    if (!fileUrls.length) {
+      return NextResponse.json(
+        { success: false, error: "No se proporcionaron imágenes para evaluar" },
+        { status: 400 }
+      )
+    }
+
+    const validFileUrls = fileUrls.filter((u: string) => u && String(u).length > 0)
+    const fileMimeTypesArray = Array.isArray(fileMimeTypes) ? fileMimeTypes : []
+
+    // Rama PDF/Word: Azure Document Intelligence extrae texto y Mistral evalúa por texto (sin convertir PDF a imágenes).
+    const useAzurePath = hasPdfOrWord(fileMimeTypesArray)
+    const azureEndpoint = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
+    const azureKey = process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY
+
+    let combinedAnalysis: any = {
+      respuestas_cerradas: [],
+      respuestas_desarrollo: {},
+      retroalimentacion: { fortalezas: "", areas_mejora: "", correccion_detallada: [] },
+      nombreEstudiante: null,
+    }
+
+    // Variables comunes para ambos caminos (imágenes o PDF/Word)
+    let pautaAlternativasFinal = pautaCorrectaAlternativas
+    if (answerKeyFromTemplate?.respuestas && answerKeyFromTemplate.respuestas.length > 0) {
+      pautaAlternativasFinal = answerKeyFromTemplate.respuestas
+        .map((r: any) => `${r.pregunta}:${(r.respuestaCorrecta || "").toString().trim().toUpperCase()}`)
+        .filter((s: string) => s.length > 0)
+        .join("; ")
+    }
+    const tipoPruebaReal = tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
+    const tieneAlternativas = tipoPruebaReal !== "solo_desarrollo"
+    let respuestasCerradasDesdeOMR: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
+
+    if (useAzurePath) {
+      if (!azureEndpoint || !azureKey) {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              "Para evaluar PDF o Word debe configurar Azure Document Intelligence (AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT y AZURE_DOCUMENT_INTELLIGENCE_KEY en .env.local).",
+          },
+          { status: 400 }
+        )
+      }
+      try {
+        const fileBuffers = await getFileBuffersFromUrls(validFileUrls, fileMimeTypesArray)
+        const docIntelClient = new DocumentAnalysisClient(azureEndpoint, new AzureKeyCredential(azureKey))
+        const textoExtraido = await extractTextFromFiles(fileBuffers, docIntelClient)
+        if (!textoExtraido || textoExtraido === "NO SE PUDO EXTRAER TEXTO.") {
+          return NextResponse.json(
+            {
+              success: false,
+              error: "No se pudo extraer texto del PDF o documento. Verifique que el archivo no esté protegido o dañado.",
+            },
+            { status: 400 }
+          )
+        }
+        combinedAnalysis = await analyzeWithMistralText(
+          textoExtraido,
+          rubrica,
+          pauta,
+          pautaEstructurada,
+          pautaAlternativasFinal,
+          nivelEducativo,
+          areaConocimiento,
+          Number(puntajeTotal),
+          Number(porcentajeExigencia),
+          tipoPruebaReal,
+          Number(flexibilidad) || 3,
+          typeof nombreEstudianteBody === "string" ? nombreEstudianteBody.trim() || undefined : undefined
+        )
+      } catch (e: any) {
+        console.error("[evaluate] Rama Azure (PDF/Word):", e)
+        let errMsg = e?.message || "Error al evaluar el documento (Azure/Mistral)."
+        if (/503|502|429|upstream connect error|overflow/.test(errMsg)) {
+          errMsg = "El servicio de IA no está disponible en este momento. Espera unos minutos e intenta de nuevo."
+        }
+        return NextResponse.json(
+          { success: false, error: errMsg },
+          { status: 500 }
+        )
+      }
+    } else {
+    // Rama imágenes: convertir a listado (solo imágenes; sin PDF/Word) y evaluar con Mistral Vision
+    let imageBase64List: string[]
+    try {
+      imageBase64List = await resolveToImageBase64List(validFileUrls, fileMimeTypesArray)
+    } catch (e: any) {
+      const msg = e?.message || "Error al procesar archivos"
+      const isClientError = typeof msg === "string" && (msg.includes("Word") || msg.includes("PDF") || msg.includes("Exporta"))
+      return NextResponse.json(
+        { success: false, error: msg },
+        { status: isClientError ? 400 : 500 }
+      )
+    }
+    if (!imageBase64List.length) {
+      return NextResponse.json(
+        { success: false, error: "No se obtuvieron imágenes de los archivos subidos" },
+        { status: 400 }
+      )
+    }
+
+    // Cuando hay plantilla del profesor: extraer respuestas cerradas SOLO de la imagen del estudiante (OMR dedicado)
+    if (tieneAlternativas && answerKeyFromTemplate?.respuestas?.length) {
+      const totalPreg = Number(answerKeyFromTemplate.totalPreguntas) || answerKeyFromTemplate.respuestas.length
+      const altsSet = new Set<string>()
+      for (const r of answerKeyFromTemplate.respuestas) {
+        const v = (r.respuestaCorrecta || "").toString().trim().toUpperCase()
+        if (v) altsSet.add(v)
+      }
+      const alternativasArray = altsSet.size > 0 ? Array.from(altsSet) : ["A", "B", "C", "D"]
+      const columnas = 2
+
+      for (let i = 0; i < imageBase64List.length; i++) {
+        try {
+          const studentBase64 = imageBase64List[i]
+          let templateBase64: string | undefined = cachedTemplateBase64
+          if (!templateBase64 && templateImageUrl && typeof templateImageUrl === "string") {
+            try {
+              templateBase64 = await urlToBase64(templateImageUrl)
+              if (templateBase64 && isPdfBase64(templateBase64)) templateBase64 = undefined
+            } catch (_) {}
+          }
+          const extraidas = await extractStudentClosedAnswersOnly(
+            studentBase64,
+            totalPreg,
+            alternativasArray,
+            columnas,
+            templateBase64
+          )
+          for (const item of extraidas) {
+            const pid = item.pregunta.toUpperCase()
+            if (!respuestasCerradasDesdeOMR.some((r: any) => String(r.pregunta).toUpperCase() === pid)) {
+              respuestasCerradasDesdeOMR.push(item)
+            }
+          }
+        } catch (e) {
+          console.warn("[Evaluate] OMR dedicado falló para imagen", i, e)
+        }
+      }
+    }
+
+    // Procesar cada imagen
+    combinedAnalysis = {
+      respuestas_cerradas: [],
+      respuestas_desarrollo: {},
+      retroalimentacion: {
+        fortalezas: "",
+        areas_mejora: "",
+        correccion_detallada: [],
+      },
+      nombreEstudiante: null,
+    }
+
+    for (let i = 0; i < imageBase64List.length; i++) {
+      const imageBase64 = imageBase64List[i]
+
+      const analysis = await analyzeWithMistralVision(
+        imageBase64,
+        rubrica,
+        pauta,
+        pautaEstructurada,
+        pautaAlternativasFinal,
+        nivelEducativo,
+        areaConocimiento,
+        Number(puntajeTotal),
+        Number(porcentajeExigencia),
+        tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
+      )
+
+      // Combinar resultados
+      if (analysis.nombreEstudiante && !combinedAnalysis.nombreEstudiante) {
+        combinedAnalysis.nombreEstudiante = analysis.nombreEstudiante
+      }
+
+      if (analysis.respuestas_cerradas && respuestasCerradasDesdeOMR.length === 0) {
+        // Evitar duplicados al combinar respuestas de multiples paginas
+        for (const resp of analysis.respuestas_cerradas) {
+          const preguntaId = String(resp.pregunta).toUpperCase()
+          const exists = combinedAnalysis.respuestas_cerradas.some(
+            (r: any) => String(r.pregunta).toUpperCase() === preguntaId
+          )
+          if (!exists) {
+            combinedAnalysis.respuestas_cerradas.push(resp)
+          }
+        }
+      }
+
+      if (analysis.respuestas_desarrollo) {
+        combinedAnalysis.respuestas_desarrollo = {
+          ...combinedAnalysis.respuestas_desarrollo,
+          ...analysis.respuestas_desarrollo,
+        }
+      }
+
+      if (analysis.retroalimentacion) {
+        if (i === 0) {
+          combinedAnalysis.retroalimentacion = analysis.retroalimentacion
+        } else {
+          // Combinar retroalimentación de múltiples páginas
+          combinedAnalysis.retroalimentacion.correccion_detallada.push(
+            ...(analysis.retroalimentacion.correccion_detallada || [])
+          )
+        }
+      }
+
+      // Llamada dedicada a desarrollo: citas obligatorias y retroalimentación profunda (mixta o solo_desarrollo)
+      // Para "solo_desarrollo" siempre se ejecuta; para "mixta" solo si hay pauta o pautaEstructurada
+      const tieneDesarrollo = tipoPrueba !== "solo_alternativas"
+      const ejecutarDesarrolloDedicado = tieneDesarrollo && (tipoPrueba === "solo_desarrollo" || !!pauta || !!pautaEstructurada)
+      if (ejecutarDesarrolloDedicado) {
+        try {
+          const devResult = await analyzeDevelopmentOnly(
+            imageBase64,
+            rubrica,
+            pauta,
+            pautaEstructurada,
+            nivelEducativo,
+            areaConocimiento
+          )
+          if (Object.keys(devResult.respuestas_desarrollo || {}).length > 0) {
+            combinedAnalysis.respuestas_desarrollo = {
+              ...combinedAnalysis.respuestas_desarrollo,
+              ...devResult.respuestas_desarrollo,
+            }
+          }
+          if (devResult.retroalimentacion && (devResult.retroalimentacion.fortalezas || devResult.retroalimentacion.areas_mejora || (Array.isArray(devResult.retroalimentacion.correccion_detallada) && devResult.retroalimentacion.correccion_detallada.length > 0))) {
+            if (i === 0) {
+              combinedAnalysis.retroalimentacion = {
+                ...combinedAnalysis.retroalimentacion,
+                ...devResult.retroalimentacion,
+              }
+            } else {
+              combinedAnalysis.retroalimentacion.fortalezas = combinedAnalysis.retroalimentacion.fortalezas || devResult.retroalimentacion.fortalezas
+              combinedAnalysis.retroalimentacion.areas_mejora = combinedAnalysis.retroalimentacion.areas_mejora || devResult.retroalimentacion.areas_mejora
+              combinedAnalysis.retroalimentacion.correccion_detallada.push(
+                ...(devResult.retroalimentacion.correccion_detallada || [])
+              )
+            }
+          }
+        } catch (e) {
+          console.warn("[Evaluate] Análisis desarrollo dedicado falló", e)
+        }
+      }
+    }
+
+    }  // fin else (rama imágenes: Mistral Vision)
+
+    // REGLA RADICAL: Con plantilla del profesor, las respuestas cerradas SOLO vienen de la extracción OMR del estudiante en este servidor.
+    // NUNCA usar respuestasAlternativas enviadas por el cliente cuando hay plantilla (podrían ser de una evaluación anterior errónea o la clave).
+    if (tieneAlternativas && answerKeyFromTemplate?.respuestas?.length) {
+      // Solo fuentes válidas: extracción OMR dedicada aquí, o (si falló) lo que Mistral extrajo de la imagen en este request.
+      if (respuestasCerradasDesdeOMR.length > 0) {
+        combinedAnalysis.respuestas_cerradas = respuestasCerradasDesdeOMR.map((r) => ({
+          pregunta: r.pregunta,
+          respuesta_detectada: r.respuesta_detectada || "",
+          confianza: r.confianza ?? 0.9,
+        }))
+      }
+      // Si la extracción OMR dedicada falló, usar combinedAnalysis.respuestas_cerradas de Mistral y normalizar más abajo.
+    }
+
+    if (!(tieneAlternativas && answerKeyFromTemplate?.respuestas?.length) || combinedAnalysis.respuestas_cerradas.length === 0) {
+      if (respuestasAlternativas && respuestasAlternativas.length > 0 && !answerKeyFromTemplate?.respuestas?.length) {
+        const respMap = new Map<string, any>()
+      for (const r of respuestasAlternativas) {
+        const preguntaRaw = String(r.pregunta).toUpperCase()
+        const numMatch = preguntaRaw.match(/(\d+)/)
+        const num = numMatch ? numMatch[1] : preguntaRaw
+        const preguntaId = `SM${num}`
+
+        // Solo usar campos que son claramente respuesta DEL ESTUDIANTE (lo que marcó). NUNCA usar respuestaCorrecta aquí.
+        const respuestaEstudiante = (r.respuesta_estudiante ?? r.respuesta ?? "").toString().trim()
+        if (!respMap.has(preguntaId)) {
+          respMap.set(preguntaId, {
+            pregunta: preguntaId,
+            respuesta_detectada: respuestaEstudiante,
+            confianza: r.confianza ?? 1.0,
+          })
+        }
+      }
+      combinedAnalysis.respuestas_cerradas = Array.from(respMap.values())
+    } else {
+      // Normalizar respuestas de Mistral (formato consistente)
+      const respMap = new Map<string, any>()
+      for (const r of combinedAnalysis.respuestas_cerradas) {
+        const preguntaRaw = String(r.pregunta).toUpperCase()
+        const numMatch = preguntaRaw.match(/(\d+)/)
+        const num = numMatch ? numMatch[1] : preguntaRaw
+        const preguntaId = `SM${num}`
+        
+        if (!respMap.has(preguntaId)) {
+          respMap.set(preguntaId, {
+            pregunta: preguntaId,
+            respuesta_detectada: r.respuesta_detectada || "",
+            confianza: r.confianza || 1.0,
+          })
+        }
+      }
+      combinedAnalysis.respuestas_cerradas = Array.from(respMap.values())
+    }
+    }
+
+    // Normalización final: una entrada por ítem de alternativas de la pauta, respuesta_detectada solo letra/número
+    const itemScoresForNorm = parsePautaEstructurada(pautaEstructurada)
+    const expectedAltIds = itemScoresForNorm.filter((i) => !i.isDevelopment).map((i) => i.id)
+    const respMapByPregunta = new Map<string, { respuesta_detectada: string; confianza: number }>()
+    for (const r of combinedAnalysis.respuestas_cerradas) {
+      const rawId = String(r.pregunta ?? "").trim().toUpperCase()
+      const num = rawId.replace(/\D/g, "")
+      const detectada = normalizeRespuestaCerrada(String(r.respuesta_detectada ?? r.respuesta ?? ""))
+      respMapByPregunta.set(rawId, { respuesta_detectada: detectada, confianza: Number(r.confianza) || 0.8 })
+      if (num) {
+        respMapByPregunta.set(num, { respuesta_detectada: detectada, confianza: Number(r.confianza) || 0.8 })
+        respMapByPregunta.set(`SM${num}`, { respuesta_detectada: detectada, confianza: Number(r.confianza) || 0.8 })
+      }
+    }
+    const normalizadas: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
+    for (const expectedId of expectedAltIds) {
+      const idUpper = expectedId.toUpperCase()
+      const existing = respMapByPregunta.get(idUpper) || respMapByPregunta.get(expectedId) || (idUpper.replace(/\D/g, "") ? respMapByPregunta.get(idUpper.replace(/\D/g, "")) : undefined)
+      normalizadas.push({
+        pregunta: expectedId,
+        respuesta_detectada: existing ? existing.respuesta_detectada : "SIN_RESPUESTA",
+        confianza: existing ? existing.confianza : 0,
+      })
+    }
+    if (normalizadas.length === 0 && combinedAnalysis.respuestas_cerradas.length > 0) {
+      combinedAnalysis.respuestas_cerradas = combinedAnalysis.respuestas_cerradas.map((r: any, idx: number) => ({
+        pregunta: String(r.pregunta || "").trim() || `SM${idx + 1}`,
+        respuesta_detectada: normalizeRespuestaCerrada(String(r.respuesta_detectada ?? r.respuesta ?? "")),
+        confianza: Number(r.confianza) || 0.8,
+      }))
+    } else {
+      combinedAnalysis.respuestas_cerradas = normalizadas
+    }
+
+    // Normalizar respuestas_desarrollo para que puntaje sea siempre string "X/Y" (evita [object Object] y permite calcular nota)
+    combinedAnalysis.respuestas_desarrollo = normalizeRespuestasDesarrollo(combinedAnalysis.respuestas_desarrollo)
+
+    // Sanitizar retroalimentación para no culpar al estudiante cuando es problema de lectura/OCR
+    combinedAnalysis.retroalimentacion = sanitizeRetroalimentacion(combinedAnalysis.retroalimentacion)
+
+    // Calcular puntaje final
+    const scores = calculateFinalScore(
+      combinedAnalysis.respuestas_cerradas,
+      combinedAnalysis.respuestas_desarrollo,
+      pautaEstructurada,
+      pautaAlternativasFinal,
+      Number(puntajeTotal),
+      Number(porcentajeExigencia)
+    )
+
+    // Construir respuesta
+    const result = {
+      success: true,
+      retroalimentacion: sanitizeRetroalimentacion({
+        ...combinedAnalysis.retroalimentacion,
+        resumen_general: {
+          fortalezas: combinedAnalysis.retroalimentacion?.fortalezas || "Análisis pendiente",
+          areas_mejora: combinedAnalysis.retroalimentacion?.areas_mejora || "Análisis pendiente",
+        },
+        retroalimentacion_alternativas: scores.alternativas_corregidas,
+      }),
+      puntaje: scores.puntaje,
+      nota: scores.nota,
+      puntosAprobacion: scores.puntosAprobacion,
+      puntosMaximos: scores.puntosMaximos,
+      detalle_desarrollo: combinedAnalysis.respuestas_desarrollo,
+      alternativas_corregidas: scores.alternativas_corregidas,
+      nombreEstudianteDetectado: combinedAnalysis.nombreEstudiante,
+    }
+
+    // Persistencia: solo si hay sesión y perfil con teacher_id. Nunca usar IDs del body.
+    let saveResult: Awaited<ReturnType<typeof persistEvaluation>>
+    const canSave = !!effectiveTeacherId && !!authUserId
+    if (!canSave) {
+      const reason = !user ? "NO_SESSION" : "PROFILE_NOT_ONBOARDED"
+      saveResult = { saved: false, success: false, error: { step: "auth", message: reason === "NO_SESSION" ? "Inicia sesión para guardar" : "Completa tu perfil para guardar" }, reason }
+    } else {
+      try {
+        const nombreFromBody = typeof nombreEstudianteBody === "string" ? nombreEstudianteBody.trim() || null : null
+        const nombreFromResult = result.nombreEstudianteDetectado != null && String(result.nombreEstudianteDetectado).trim() !== ""
+          ? String(result.nombreEstudianteDetectado).trim()
+          : null
+        const confirmedStudentName = nombreFromBody ?? nombreFromResult ?? null
+        if (process.env.NODE_ENV !== "production") {
+          console.info("[student] detected_students_raw =", JSON.stringify([result.nombreEstudianteDetectado].filter(Boolean)))
+          console.info("[student] confirmed_students_before_save =", JSON.stringify(confirmedStudentName ? [confirmedStudentName] : []))
+        }
+        saveResult = await persistEvaluation(result, {
+          user_id: authUserId,
+          teacher_id: effectiveTeacherId,
+          school_id: effectiveSchoolId,
+          course_id: typeof courseIdBody === "string" ? courseIdBody.trim() || null : null,
+          title: typeof evaluationTitleBody === "string" ? evaluationTitleBody.trim() || null : null,
+          subject: typeof evaluationSubjectBody === "string" ? evaluationSubjectBody.trim() || null : null,
+          student_name: confirmedStudentName,
+        })
+      } catch (e) {
+        if (process.env.NODE_ENV !== "production") console.error("[Evaluate] persistEvaluation threw:", e)
+        saveResult = {
+          saved: false,
+          success: false,
+          error: { step: "persist_throw", message: e instanceof Error ? e.message : String(e) },
+        }
+      }
+    }
+
+    const saved = saveResult.saved
+    const evaluationId = saved ? saveResult.evaluation_id : null
+    const status = saved ? saveResult.status : null
+    const save_error: string | null =
+      !saved && saveResult.error ? `${saveResult.error.step}: ${saveResult.error.message}` : null
+    const save_reason: string | undefined = !saved && "reason" in saveResult ? (saveResult as { reason?: string }).reason : undefined
+
     return NextResponse.json(
       {
-        success: false,
-        error: "Error de configuración interna del servidor. Faltan claves de API. Verifique su archivo .env.local.",
+        ...result,
+        saved,
+        evaluation_id: evaluationId,
+        status,
+        save_error,
+        ...(save_reason && { reason: save_reason }),
       },
-      { status: 500 },
+      { status: 200 }
     )
-  }
-
-  const openai = new OpenAI({
-    apiKey: MISTRAL_API_KEY_FINAL,
-    baseURL: cleanedBaseUrl,
-  })
-  const docIntelClient = new DocumentAnalysisClient(
-    AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT_FINAL, // Changed from AZURE_ENDPOINT to AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT_FINAL
-    new AzureKeyCredential(AZURE_DOCUMENT_INTELLIGENCE_KEY_FINAL), // Changed from AZURE_KEY to AZURE_DOCUMENT_INTELLIGENCE_KEY_FINAL
-  )
-
-  try {
-    const {
-      fileUrls,
-      rubrica,
-      pauta,
-      flexibilidad,
-      areaConocimiento,
-      puntajeTotal,
-      porcentajeExigencia,
-      pautaEstructurada,
-      pautaCorrectaAlternativas: pautaAlternativasStr,
-      itemsEsperados,
-      nombreEstudiante,
-      respuestasAlternativas,
-      fileMimeTypes,
-      captureMode,
-      asignatura, // Added asignatura
-    } = await req.json()
-
-    const pautaCorrectaAlternativasMap = parsePautaAlternativas(pautaAlternativasStr || "")
-
-    console.log("[v0] DEBUG - respuestasAlternativas recibidas:", respuestasAlternativas)
-
-    if (!rubrica || !puntajeTotal || !pautaEstructurada) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Faltan datos de configuración esenciales (rúbrica, puntaje total o pauta estructurada).",
-        },
-        { status: 400 },
-      )
+  } catch (error: any) {
+    console.error("[Evaluate] Error:", error)
+    let msg = error?.message || "Error procesando la evaluación"
+    if (/503|502|429|upstream connect error|overflow/.test(msg)) {
+      msg = "El servicio de IA no está disponible en este momento. Espera unos minutos e intenta de nuevo."
     }
-
-    const itemScores = parsePautaEstructuradaItems(pautaEstructurada) // Changed function name
-    let maxTotalScore = Number(puntajeTotal)
-
-    const maxDesarrolloScore = itemScores.filter((i) => i.isDevelopment).reduce((sum, item) => sum + item.maxScore, 0)
-    const maxScoreAlternativas = itemScores
-      .filter((i) => !i.isDevelopment)
-      .reduce((sum, item) => sum + item.maxScore, 0)
-
-    // NO aplicar CFC automático si el profesor no puso alternativas
-    if (maxScoreAlternativas === 0) {
-      console.log("[v0] No hay alternativas en la pauta estructurada del profesor")
-    }
-
-    const calculatedMaxScore = maxDesarrolloScore + maxScoreAlternativas
-
-    if (maxTotalScore !== calculatedMaxScore && calculatedMaxScore > 0) {
-      console.warn(
-        `[v0] ADVERTENCIA: Puntaje total (${maxTotalScore}) difiere de la suma de ítems (${calculatedMaxScore})`,
-      )
-      maxTotalScore = calculatedMaxScore
-    }
-
-    if (maxTotalScore === 0) {
-      console.error("[v0] ERROR: Puntaje total es 0. Usar valor por defecto.")
-      maxTotalScore = 100
-    }
-
-    const validFileUrls = fileUrls.filter((url: string) => url && url.length > 0)
-    const fileBuffers = await Promise.all(
-      validFileUrls.map(async (url: string, i: number) => {
-        const response = await fetch(url)
-        const arrayBuffer = await response.arrayBuffer()
-        return {
-          buffer: Buffer.from(arrayBuffer),
-          mimeType: fileMimeTypes[i] || "application/octet-stream",
-          captureMode,
-        }
-      }),
-    )
-
-    if (validFileUrls.length === 0) {
-      const calculatedNote = calculateGrade(0, maxTotalScore, Number(porcentajeExigencia))
-      return NextResponse.json(
-        {
-          success: true,
-          puntaje: `0/${maxTotalScore}`,
-          nota: calculatedNote,
-          retroalimentacion: {
-            resumen_general: {
-              fortalezas: "Ningún archivo de respuesta enviado.",
-              areas_mejora: "No se encontraron archivos válidos para evaluar.",
-            },
-            detalle_puntaje_desarrollo: {},
-            correccion_detallada: [],
-            evaluacion_habilidades: [],
-            retroalimentacion_alternativas: [],
-          },
-        },
-        { status: 200 },
-      )
-    }
-
-    let aiResponse
-    let finalResult: EvaluationResponse
-
-    if (areaConocimiento === "artes") {
-      const imageMimeTypes = ["image/jpeg", "image/png", "image/webp"]
-      const validImageUrls = validFileUrls.filter((_: string, i: number) =>
-        imageMimeTypes.some((m) => fileMimeTypes[i]?.includes(m)),
-      )
-      const base64Images = await Promise.all(
-        validImageUrls.map(async (url: string) => {
-          const response = await fetch(url)
-          const arrayBuffer = await response.arrayBuffer()
-          const buffer = Buffer.from(arrayBuffer)
-          return `data:image/jpeg;base64,${buffer.toString("base64")}`
-        }),
-      )
-
-      if (base64Images.length === 0) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "Asignatura ARTES requiere imágenes (JPG/PNG/WEBP), pero no se encontraron archivos compatibles.",
-          },
-          { status: 400 },
-        )
-      }
-
-      const getPrompt = promptsExpertos.artes
-      const prompt = (getPrompt as typeof promptsExpertos.artes)(
-        rubrica,
-        pauta,
-        maxTotalScore,
-        flexibilidad,
-        itemScores,
-        nombreEstudiante,
-        respuestasAlternativas,
-        pautaCorrectaAlternativasMap,
-      )
-
-      const messages = [
-        {
-          role: "user" as const,
-          content: [
-            { type: "text" as const, text: prompt },
-            ...base64Images.map((url) => ({ type: "image_url" as const, image_url: { url } })),
-          ],
-        },
-      ]
-
-      aiResponse = await openai.chat.completions.create({
-        model: "mistral-large-latest",
-        messages: messages as any,
-        response_format: { type: "json_object" },
-        temperature: 0.1,
-        max_tokens: 4000,
-      })
-    } else {
-      const textoExtraido = await extractTextFromFiles(fileBuffers, docIntelClient)
-
-      if (textoExtraido === "NO SE PUDO EXTRAER TEXTO.") {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "No se pudo extraer texto del archivo subido. Asegúrese de que no esté protegido o sea ilegible.",
-          },
-          { status: 400 },
-        )
-      }
-
-      const getPrompt = promptsExpertos[areaConocimiento as keyof typeof promptsExpertos] || promptsExpertos.general
-      const prompt = (getPrompt as typeof promptsExpertos.general)(
-        textoExtraido,
-        rubrica,
-        pauta,
-        maxTotalScore,
-        flexibilidad,
-        itemScores,
-        nombreEstudiante,
-        respuestasAlternativas,
-        pautaCorrectaAlternativasMap,
-      )
-
-      aiResponse = await openai.chat.completions.create({
-        model: "mistral-large-latest",
-        messages: [{ role: "user", content: prompt }],
-        response_format: { type: "json_object" },
-        temperature: 0.1,
-        max_tokens: 4000,
-      })
-    }
-
-    const content = aiResponse.choices[0].message.content
-    if (!content) {
-      return NextResponse.json({ success: false, error: "La IA no devolvió contenido de evaluación." }, { status: 500 })
-    }
-    const cleanedContent = cleanJson(content)
-    let resultado
-    try {
-      resultado = JSON.parse(cleanedContent)
-    } catch (error) {
-      console.error("Error al parsear JSON:", error)
-      return NextResponse.json(
-        { success: false, error: "La respuesta de la IA no es un JSON válido." },
-        { status: 500 },
-      )
-    }
-    finalResult = validateEvaluationResponse(resultado)
-
-    let scoreAlternativasObtenido = 0
-    let scoreDesarrolloObtenido = 0
-
-    const alternativasExtraidas = finalResult.retroalimentacion.retroalimentacion_alternativas || []
-
-    let alternativasFinales = alternativasExtraidas
-
-    if (
-      respuestasAlternativas &&
-      typeof respuestasAlternativas === "object" &&
-      Object.keys(respuestasAlternativas).length > 0
-    ) {
-      console.log("[v0] USANDO alternativas corregidas del frontend (OMR manual)")
-
-      // Convertir el objeto en array
-      alternativasFinales = Object.entries(respuestasAlternativas).map(([pregunta, respuesta]) => {
-        const correcta = pautaCorrectaAlternativasMap[pregunta] || ""
-        const respuestaUpper = String(respuesta).trim().toUpperCase()
-        const correctaUpper = correcta.trim().toUpperCase()
-
-        return {
-          pregunta: pregunta,
-          respuesta_estudiante: String(respuesta),
-          respuesta_correcta: correcta,
-          confidence: "high" as const,
-        }
-      })
-
-      // Actualizar el resultado final con las alternativas manuales
-      finalResult.retroalimentacion.retroalimentacion_alternativas = alternativasFinales
-    }
-
-    const alternativaScores = itemScores.filter((i) => !i.isDevelopment)
-
-    const seenAlternativas = new Set<string>()
-
-    for (const alt of alternativasFinales) {
-      const preguntaId = alt.pregunta.trim().toUpperCase()
-
-      if (seenAlternativas.has(preguntaId)) {
-        console.log("[v0] Alternativa duplicada eliminada:", preguntaId)
-        continue
-      }
-      seenAlternativas.add(preguntaId)
-
-      const { text: filteredExtraida, confidence } = applyRFMText(
-        alt.respuesta_estudiante || "",
-        preguntaId,
-        fileBuffers[0]?.captureMode,
-      )
-
-      const itemMatch = alternativaScores.find((scoreItem) => {
-        const scoreIdUpper = scoreItem.id.trim().toUpperCase()
-        return scoreIdUpper === preguntaId || scoreIdUpper.includes(preguntaId) || preguntaId.includes(scoreIdUpper)
-      })
-
-      let maxItemScore = 1
-
-      if (itemMatch) {
-        maxItemScore = itemMatch.maxScore
-      }
-
-      const correcta = pautaCorrectaAlternativasMap[itemMatch?.id || preguntaId]
-        ? pautaCorrectaAlternativasMap[itemMatch?.id || preguntaId].trim().toUpperCase()
-        : ""
-
-      alt.respuesta_estudiante = filteredExtraida
-      ;(alt as any).confidence = confidence
-
-      if (correcta && filteredExtraida && correcta === filteredExtraida) {
-        scoreAlternativasObtenido += maxItemScore
-      }
-    }
-
-    const desarrolloItemsCorregidos = finalResult.retroalimentacion.detalle_puntaje_desarrollo || {}
-
-    console.log("[v0] DEBUG ARTES - desarrolloItemsCorregidos:", JSON.stringify(desarrolloItemsCorregidos, null, 2))
-    console.log("[v0] DEBUG ARTES - itemScores:", JSON.stringify(itemScores, null, 2))
-
-    const seenDesarrollo = new Set<string>()
-
-    for (const itemId in desarrolloItemsCorregidos) {
-      if (seenDesarrollo.has(itemId)) {
-        console.log("[v0] Desarrollo duplicado eliminado:", itemId)
-        continue
-      }
-      seenDesarrollo.add(itemId)
-
-      const item = desarrolloItemsCorregidos[itemId]
-
-      console.log("[v0] DEBUG ARTES - Procesando itemId:", itemId)
-      console.log("[v0] DEBUG ARTES - item:", JSON.stringify(item, null, 2))
-
-      if (item.puntaje && typeof item.puntaje === "string") {
-        const match = item.puntaje.match(/^(\d+)\/(\d+)$/)
-        if (match) {
-          const puntajeObtenido = Number.parseInt(match[1], 10) || 0
-          const puntajeMaximo = Number.parseInt(match[2], 10) || 0
-
-          console.log("[v0] DEBUG ARTES - puntajeObtenido extraído:", puntajeObtenido)
-          console.log("[v0] DEBUG ARTES - puntajeMaximo extraído:", puntajeMaximo)
-
-          scoreDesarrolloObtenido += puntajeObtenido
-        } else {
-          console.log("[v0] DEBUG ARTES - No se pudo parsear puntaje:", item.puntaje)
-        }
-      } else {
-        console.log("[v0] DEBUG ARTES - item.puntaje no es string o está vacío")
-      }
-    }
-
-    const finalScore = scoreAlternativasObtenido + scoreDesarrolloObtenido
-
-    console.log("[v0] DEBUG PUNTAJE - Alternativas:", scoreAlternativasObtenido)
-    console.log("[v0] DEBUG PUNTAJE - Desarrollo:", scoreDesarrolloObtenido)
-    console.log("[v0] DEBUG PUNTAJE - Total:", finalScore, "/", maxTotalScore)
-    console.log("[v0] DEBUG ARTES - areaConocimiento:", areaConocimiento)
-    console.log("[v0] DEBUG ARTES - porcentajeExigencia:", porcentajeExigencia)
-    console.log("[v0] DEBUG ARTES - finalScore:", finalScore)
-    console.log("[v0] DEBUG ARTES - maxTotalScore:", maxTotalScore)
-
-    finalResult.puntaje = `${finalScore}/${maxTotalScore}`
-
-    // Removed the 'if' that prevented grade calculation for Artes. Now it calculates normally.
-    finalResult.nota = calculateGrade(finalScore, maxTotalScore, Number(porcentajeExigencia))
-
-    console.log("[v0] DEBUG ARTES - nota calculada:", finalResult.nota)
-
-    const exigenciaDecimal = Math.min(100, Number(porcentajeExigencia)) / 100
-    const puntosAprobacionCalculados = Math.ceil(maxTotalScore * exigenciaDecimal)
-
-    return NextResponse.json({
-      success: true,
-      puntaje: finalResult.puntaje,
-      nota: finalResult.nota,
-      puntosAprobacion: puntosAprobacionCalculados,
-      puntosMaximos: maxTotalScore,
-      alternativas_corregidas: finalResult.retroalimentacion.retroalimentacion_alternativas,
-      detalle_desarrollo: finalResult.retroalimentacion.detalle_puntaje_desarrollo,
-      retroalimentacion: finalResult.retroalimentacion,
-      // Removed the 'esArtes' field as Artes is now evaluated the same as other subjects.
-    })
-  } catch (error) {
-    console.error("Error en la evaluación:", error)
+    const isPdfError = typeof msg === "string" && msg.includes("PDF") && msg.includes("solo acepta imágenes")
     return NextResponse.json(
-      { success: false, error: "Error interno del servidor. Por favor, intente de nuevo más tarde." },
-      { status: 500 },
+      { success: false, error: msg },
+      { status: isPdfError ? 400 : 500 }
     )
   }
 }

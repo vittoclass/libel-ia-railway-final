@@ -7,10 +7,14 @@ const openai = new OpenAI({
 
 async function processJobs() {
     console.log("Worker iniciado, esperando trabajos...");
+    if (!redis) {
+        console.log("Redis no configurado (REDIS_URL ausente). Worker no iniciado.");
+        return;
+    }
     while (true) {
         try {
             // Espera un trabajo de la cola 'evaluation-jobs'
-            const result = await redis.blpop('evaluation-jobs', 0);
+            const result = redis ? await redis.blpop('evaluation-jobs', 0) : null;
 
             // ==================================================================
             // INICIO DE LA CORRECCIÓN
@@ -26,7 +30,7 @@ async function processJobs() {
             // ==================================================================
             
             // Carga los detalles del trabajo desde Redis
-            const jobData = await redis.get(jobId);
+            const jobData = redis ? await redis.get(jobId) : null;
             if (!jobData) {
                 console.error(`Error: Datos del trabajo ${jobId} no encontrados.`);
                 continue;
@@ -55,8 +59,10 @@ async function processJobs() {
             const aiResult = JSON.parse(completion.choices[0].message.content);
 
             // === Actualiza el estado del trabajo en Redis ===
-            await redis.set(`job:${jobId}:result`, JSON.stringify(aiResult));
-            await redis.set(`job:${jobId}:status`, 'completed');
+            if (redis) {
+                await redis.set(`job:${jobId}:result`, JSON.stringify(aiResult));
+                await redis.set(`job:${jobId}:status`, 'completed');
+            }
 
             console.log(`Evaluación completada para Job ID: ${jobId}`);
             

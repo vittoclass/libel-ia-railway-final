@@ -18,6 +18,7 @@ interface Props {
   nota: string | number;
   retroalimentacion: any;
   areaConocimiento: string;
+  usedAnswerKeyTemplate?: boolean; // Indica si se uso la plantilla del profesor
 }
 
 // 🔥 CORRECCIÓN: elimina caracteres que causan superposición
@@ -35,6 +36,7 @@ export default function EvaluacionPDF({
   nota,
   retroalimentacion,
   areaConocimiento,
+  usedAnswerKeyTemplate,
 }: Props) {
   const [isClient, setIsClient] = useState(false);
   useEffect(() => setIsClient(true), []);
@@ -53,10 +55,15 @@ export default function EvaluacionPDF({
               {nombreEstudiante || 'Informe de Evaluación'}
             </Text>
 
-            <View style={styles.section}>
+<View style={styles.section}>
               <Text><Text style={{ fontWeight: 'bold' }}>Puntaje:</Text> {puntaje}</Text>
               <Text><Text style={{ fontWeight: 'bold' }}>Nota:</Text> {nota}</Text>
               <Text><Text style={{ fontWeight: 'bold' }}>Área:</Text> {areaConocimiento}</Text>
+              {usedAnswerKeyTemplate && (
+                <Text style={{ color: '#16a34a', fontSize: 9, marginTop: 4 }}>
+                  Alternativas corregidas con Plantilla del Profesor (100% precision)
+                </Text>
+              )}
             </View>
 
             <View style={styles.section}>

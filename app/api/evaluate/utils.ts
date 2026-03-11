@@ -15,29 +15,32 @@ export async function extractTextFromFiles(fileBuffers: FileBuffer[], client: Do
 
   for (const fileBuffer of fileBuffers) {
     try {
-      // Determinar si es imagen o PDF basándose en el MIME type
       const isImage = fileBuffer.mimeType.startsWith("image/")
       const isPdf = fileBuffer.mimeType === "application/pdf"
+      const isOffice =
+        fileBuffer.mimeType.includes("officedocument") ||
+        fileBuffer.mimeType.includes("spreadsheetml") ||
+        fileBuffer.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-      if (!isImage && !isPdf) {
-        console.warn(`[v0] Tipo de archivo no soportado: ${fileBuffer.mimeType}`)
+      if (!isImage && !isPdf && !isOffice) {
+        console.warn(`[evaluate] Tipo de archivo no soportado para OCR: ${fileBuffer.mimeType}`)
         continue
       }
 
-      console.log(`[v0] Ejecutando OCR de Azure para archivo tipo: ${fileBuffer.mimeType}`)
+      console.log(`[evaluate] OCR Azure (prebuilt-read) para: ${fileBuffer.mimeType}`)
 
       // Usar Azure Document Intelligence para extraer texto
       const poller = await client.beginAnalyzeDocument("prebuilt-read", fileBuffer.buffer)
       const result = await poller.pollUntilDone()
 
       if (!result.content || result.content.trim().length === 0) {
-        console.warn("[v0] OCR no pudo extraer contenido del archivo")
+        console.warn("[evaluate] OCR no extrajo contenido de este archivo")
         continue
       }
 
       textResults.push(result.content)
     } catch (error) {
-      console.error("[v0] Error al extraer texto con OCR:", error)
+      console.error("[evaluate] Error OCR Azure:", error)
       continue
     }
   }
@@ -46,7 +49,7 @@ export async function extractTextFromFiles(fileBuffers: FileBuffer[], client: Do
     return "NO SE PUDO EXTRAER TEXTO."
   }
 
-  console.log(`[v0] Texto extraído exitosamente de ${textResults.length} archivo(s)`)
+  console.log(`[evaluate] Texto extraído de ${textResults.length} archivo(s) (Azure prebuilt-read)`)
 
   return textResults.join("\n\n--- PÁGINA SIGUIENTE ---\n\n")
 }

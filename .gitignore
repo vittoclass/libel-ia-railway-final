@@ -18,6 +18,11 @@ yarn-error.log*
 
 # env files
 .env*
+.env
+.env.local
+
+# os
+.DS_Store
 
 # vercel
 .vercel

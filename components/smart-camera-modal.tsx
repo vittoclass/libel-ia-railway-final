@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
-export type CaptureMode = "sm_vf" | "terminos_pareados" | "desarrollo"
+export type CaptureMode = "sm_vf" | "terminos_pareados" | "desarrollo" | "closed_answer"
 
 export type CameraFeedback = {
   confidence: number

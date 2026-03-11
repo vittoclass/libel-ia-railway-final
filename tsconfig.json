@@ -28,6 +28,7 @@
     "supabase",
     "app/supabase",
     "app/supabase/functions",
-    "app/supabase/functions/**"
+    "app/supabase/functions/**",
+    "libel-ia-railway-final"
   ]
 }

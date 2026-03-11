@@ -1,151 +1,111 @@
-import { type NextRequest, NextResponse } from "next/server"
+// app/api/evaluate/batch/route.ts
+// Endpoint para evaluación masiva en paralelo con streaming NDJSON
+import { NextRequest } from "next/server"
 
-/**
- * POST /api/evaluate/batch
- * 
- * Recibe un array de payloads de evaluación y los procesa en paralelo.
- * Soporta hasta 3 lotes de 45 evaluaciones simultáneas (135 total).
- * 
- * Cada evaluación individual se envía internamente a /api/evaluate.
- * Los resultados se transmiten via streaming (NDJSON) para que el cliente
- * pueda actualizar el progreso en tiempo real.
- */
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
+export const maxDuration = 300
 
-const BATCH_SIZE = 45      // Máximo de evaluaciones por lote
-const MAX_CONCURRENT_BATCHES = 3 // Máximo de lotes simultáneos
-const MAX_TOTAL = BATCH_SIZE * MAX_CONCURRENT_BATCHES // 135 evaluaciones máximas
+const BATCH_SIZE = 45 // Procesar 45 evaluaciones en paralelo
 
 interface BatchItem {
   groupId: string
-  payload: Record<string, unknown>
+  payload: any
 }
-
-interface BatchResult {
-  groupId: string
-  success: boolean
-  data?: Record<string, unknown>
-  error?: string
-}
-
-export const maxDuration = 300 // 5 minutos de timeout para batches grandes
 
 export async function POST(req: NextRequest) {
-  try {
-    const { items } = (await req.json()) as { items: BatchItem[] }
+  const { items } = await req.json() as { items: BatchItem[] }
 
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return NextResponse.json(
-        { success: false, error: "No se proporcionaron evaluaciones para procesar." },
-        { status: 400 },
-      )
-    }
-
-    if (items.length > MAX_TOTAL) {
-      return NextResponse.json(
-        { success: false, error: `Máximo ${MAX_TOTAL} evaluaciones por batch (${MAX_CONCURRENT_BATCHES} lotes x ${BATCH_SIZE}).` },
-        { status: 400 },
-      )
-    }
-
-    // Dividir los items en lotes de hasta BATCH_SIZE
-    const batches: BatchItem[][] = []
-    for (let i = 0; i < items.length; i += BATCH_SIZE) {
-      batches.push(items.slice(i, i + BATCH_SIZE))
-    }
-
-    // Construir la URL base para llamar a /api/evaluate internamente
-    const protocol = req.headers.get("x-forwarded-proto") || "https"
-    const host = req.headers.get("host") || "localhost:3000"
-    const evaluateUrl = `${protocol}://${host}/api/evaluate`
-
-    // Streaming NDJSON response para progreso en tiempo real
-    const encoder = new TextEncoder()
-    const stream = new ReadableStream({
-      async start(controller) {
-        // Enviar metadata inicial
-        const meta = {
-          type: "meta",
-          totalItems: items.length,
-          totalBatches: batches.length,
-          batchSize: BATCH_SIZE,
-          maxConcurrent: MAX_CONCURRENT_BATCHES,
-        }
-        controller.enqueue(encoder.encode(JSON.stringify(meta) + "\n"))
-
-        // Procesar lotes con concurrencia limitada a MAX_CONCURRENT_BATCHES
-        const processBatch = async (batch: BatchItem[], batchIndex: number) => {
-          // Dentro de cada lote, procesamos TODAS las evaluaciones en paralelo
-          const promises = batch.map(async (item) => {
-            const result: BatchResult = { groupId: item.groupId, success: false }
-            try {
-              const response = await fetch(evaluateUrl, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify(item.payload),
-              })
-
-              const data = await response.json()
-              
-              if (response.ok && data.success) {
-                result.success = true
-                result.data = data
-              } else {
-                result.success = false
-                result.error = data.error || `Error HTTP ${response.status}`
-              }
-            } catch (err) {
-              result.success = false
-              result.error = err instanceof Error ? err.message : "Error desconocido en evaluación"
-            }
-
-            // Enviar resultado individual al stream
-            const progressItem = {
-              type: "result",
-              batchIndex,
-              groupId: result.groupId,
-              success: result.success,
-              data: result.data,
-              error: result.error,
-            }
-            controller.enqueue(encoder.encode(JSON.stringify(progressItem) + "\n"))
-            
-            return result
-          })
-
-          return Promise.all(promises)
-        }
-
-        // Ejecutar lotes con concurrencia controlada
-        // Procesamos MAX_CONCURRENT_BATCHES lotes a la vez
-        for (let i = 0; i < batches.length; i += MAX_CONCURRENT_BATCHES) {
-          const concurrentBatches = batches.slice(i, i + MAX_CONCURRENT_BATCHES)
-          const batchPromises = concurrentBatches.map((batch, idx) => 
-            processBatch(batch, i + idx)
-          )
-          await Promise.all(batchPromises)
-        }
-
-        // Enviar señal de finalización
-        const done = { type: "done" }
-        controller.enqueue(encoder.encode(JSON.stringify(done) + "\n"))
-        controller.close()
-      },
-    })
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "application/x-ndjson",
-        "Cache-Control": "no-cache, no-store",
-        "Transfer-Encoding": "chunked",
-      },
-    })
-  } catch (error) {
-    console.error("Error en /api/evaluate/batch:", error)
-    return NextResponse.json(
-      { success: false, error: "Error interno del servidor en procesamiento batch." },
-      { status: 500 },
+  if (!items || items.length === 0) {
+    return new Response(
+      JSON.stringify({ type: "error", error: "No se proporcionaron items para evaluar" }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
     )
   }
+
+  // Regla de oro: /api/evaluate obtiene user y profile desde cookies; NO inyectar teacher_id/school_id en el body.
+  // Solo reenviar las cookies para que cada item se guarde con el mismo user_id y profile.teacher_id.
+  const itemsToProcess = items
+  const totalBatches = Math.ceil(itemsToProcess.length / BATCH_SIZE)
+
+  // Crear stream para respuestas NDJSON
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream({
+    async start(controller) {
+      // Enviar metadata inicial
+      controller.enqueue(
+        encoder.encode(JSON.stringify({ type: "meta", totalItems: itemsToProcess.length, totalBatches }) + "\n")
+      )
+
+      let completedCount = 0
+
+      // Procesar en batches
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+        const batchStart = batchIndex * BATCH_SIZE
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, itemsToProcess.length)
+        const currentBatch = itemsToProcess.slice(batchStart, batchEnd)
+
+        // Procesar batch en paralelo
+        const promises = currentBatch.map(async (item) => {
+          try {
+            const cookieHeader = req.headers.get("cookie") || ""
+            const response = await fetch(new URL("/api/evaluate", req.url), {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...(cookieHeader ? { Cookie: cookieHeader } : {}) },
+              body: JSON.stringify(item.payload),
+            })
+
+            const data = await response.json()
+
+            if (data.success) {
+              return {
+                type: "result",
+                groupId: item.groupId,
+                success: true,
+                data,
+              }
+            } else {
+              return {
+                type: "result",
+                groupId: item.groupId,
+                success: false,
+                error: data.error || "Error en evaluación",
+              }
+            }
+          } catch (error: any) {
+            return {
+              type: "result",
+              groupId: item.groupId,
+              success: false,
+              error: error?.message || "Error de red",
+            }
+          }
+        })
+
+        // Esperar resultados del batch actual
+        const results = await Promise.all(promises)
+
+        // Enviar cada resultado al stream
+        for (const result of results) {
+          completedCount++
+          controller.enqueue(encoder.encode(JSON.stringify(result) + "\n"))
+        }
+      }
+
+      // Enviar mensaje de finalización
+      controller.enqueue(
+        encoder.encode(JSON.stringify({ type: "done", completedCount }) + "\n")
+      )
+
+      controller.close()
+    },
+  })
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson",
+      "Transfer-Encoding": "chunked",
+      "Cache-Control": "no-cache",
+    },
+  })
 }

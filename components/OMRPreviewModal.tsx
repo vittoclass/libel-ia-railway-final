@@ -47,7 +47,7 @@ export default function OMRPreviewModal({
           body: JSON.stringify({
             fileUrl: imageUrl,
             mimeType: 'image/jpeg',
-            expectedItemCount: 30,
+            expectedItemCount: 40,
             useAzureFallback: true,
           }),
         });

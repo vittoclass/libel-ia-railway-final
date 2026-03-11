@@ -1,10 +1,10 @@
-// app/evaluador/page.tsx
-import EvaluatorClient from '../EvaluatorClient';
+// app/evaluar/page.tsx
+import OnboardingBanner from "@/app/components/OnboardingBanner"
 
 export const metadata = {
-  title: 'Evaluador | Libel-IA',
-};
+  title: "Evaluar | Libel-IA",
+}
 
-export default function EvaluadorPage() {
-  return <EvaluatorClient />;
+export default function EvaluarPage() {
+  return <OnboardingBanner />
 }

@@ -1,12 +1,32 @@
-// lib/redis.ts
+// app/lib/redis.ts
 import Redis from 'ioredis';
 
-// Esta línea lee la URL de conexión que Railway configura automáticamente
 const redisUrl = process.env.REDIS_URL;
 
-if (!redisUrl) {
-    console.error("No se encontró la variable de entorno REDIS_URL. Asegúrate de que Redis esté añadido en Railway.");
+// Redis solo se usa si REDIS_URL existe. Si no, la app funciona sin Redis.
+let redis: Redis | null = null;
+if (redisUrl) {
+    try {
+        redis = new Redis(redisUrl, {
+            maxRetriesPerRequest: 3,
+            retryStrategy(times) {
+                if (times > 3) return null; // dejar de reintentar tras 3 intentos
+                return Math.min(2000 * times, 5000);
+            },
+        });
+        redis.on('error', (err) => {
+            console.warn('[redis] error:', err?.message || err);
+        });
+        redis.on('close', () => {
+            console.warn('[redis] conexión cerrada');
+        });
+    } catch (e) {
+        const err = e instanceof Error ? e.message : e
+        console.warn('[redis] init failed:', err);
+        redis = null;
+    }
+} else {
+    console.warn('REDIS_URL no definida. Redis desactivado (modo local sin cola).');
 }
 
-// Creamos y exportamos una única instancia del cliente de Redis
-export const redis = new Redis(redisUrl as string);
+export { redis };

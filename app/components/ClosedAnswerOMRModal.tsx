@@ -36,6 +36,7 @@ interface Props {
   onRescan: () => void
   totalPreguntas?: number
   opciones?: string
+  columnas?: number
 }
 
 export default function ClosedAnswerOMRModal({
@@ -45,6 +46,7 @@ export default function ClosedAnswerOMRModal({
   onRescan,
   totalPreguntas: initialTotal = 40,
   opciones: initialOpciones = "A, B, C, D",
+  columnas: initialColumnas = 2,
 }: Props) {
   const [respuestas, setRespuestas] = useState<ClosedAnswerItem[]>([])
   const [loading, setLoading] = useState(false)
@@ -54,6 +56,7 @@ export default function ClosedAnswerOMRModal({
   const [cursoDetectado, setCursoDetectado] = useState<string>("")
   const [totalPreguntas, setTotalPreguntas] = useState(initialTotal)
   const [opciones, setOpciones] = useState(initialOpciones)
+  const [columnas, setColumnas] = useState(initialColumnas)
   const [showSettings, setShowSettings] = useState(false)
   const [hasExtracted, setHasExtracted] = useState(false)
 
@@ -77,11 +80,12 @@ export default function ClosedAnswerOMRModal({
       const res = await fetch("/api/omr/closed-answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+body: JSON.stringify({
           dataUrl: imageUrl,
           mimeType: "image/jpeg",
           totalPreguntas,
           opciones,
+          columnas,
           dobleVerificacion: true,
         }),
       })
@@ -99,10 +103,10 @@ export default function ClosedAnswerOMRModal({
       }
     } catch (e) {
       setError("Error de red o servidor al intentar la extraccion OMR de respuestas cerradas.")
-    } finally {
+} finally {
       setLoading(false)
     }
-  }, [imageUrl, totalPreguntas, opciones])
+  }, [imageUrl, totalPreguntas, opciones, columnas])
 
   const handleRespuestaChange = (index: number, newValue: string) => {
     setRespuestas((prev) => {
