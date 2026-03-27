@@ -10,6 +10,7 @@ import { extractTextFromFiles } from "./utils"
 import { persistEvaluation } from "@/app/lib/persist-evaluation"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { runAzureLayoutOmrPipeline } from "@/app/lib/omr/experimental/azure-layout-omr-pipeline"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -82,16 +83,18 @@ function parsePautaEstructurada(pautaStr: string): ItemScore[] {
 
 /** Extrae solo la opción marcada: A-E, V, F, o número. Evita frases completas. */
 function normalizeRespuestaCerrada(texto: string): string {
-  if (!texto || typeof texto !== "string") return "SIN_RESPUESTA"
+  if (!texto || typeof texto !== "string") return "BLANK"
   const t = texto.trim().toUpperCase()
-  if (t === "SIN_RESPUESTA" || t === "SIN RESPUESTA") return "SIN_RESPUESTA"
+  if (t === "" || t === "SIN_RESPUESTA" || t === "SIN RESPUESTA") return "BLANK"
+  if (t === "BLANK") return "BLANK"
+  if (t === "MULTIPLE") return "MULTIPLE"
   const letraMatch = t.match(/^([A-E])[\s):.(]?/) || t.match(/\b([A-E])\b/)
   if (letraMatch) return letraMatch[1]
   if (t.match(/^([VF])[\s):.(]?/) || t === "V" || t === "F") return t.charAt(0)
   const numMatch = t.match(/(\d+)/)
   if (numMatch) return numMatch[1]
   if (/^[A-EVF]$/.test(t)) return t
-  return "SIN_RESPUESTA"
+  return "BLANK"
 }
 
 // Calcular nota en escala chilena (1.0 - 7.0)
@@ -434,6 +437,85 @@ Responde SOLO este JSON:
     })
   }
   return out
+}
+
+async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
+  studentImageBase64: string
+  teacherAnswerKey: Array<{ pregunta: string; respuestaCorrecta: string }>
+  /** Si se pasa >0, el pipeline completa huecos con BLANK inferido (completedByExpectation). Omitir para solo lectura sensorial. */
+  expectedQuestionCount?: number
+  templateKey: string
+  templateVariant?: "odd_even_dual_column" | "sequential_dual_column"
+}): Promise<{
+  detectedAnswers: { pregunta: string; respuesta_detectada: string; confianza: number }[]
+  officialOmrPerQuestionRaw: any[]
+  officialOmrDetectedAnswersPreview: Array<{ pregunta: string; respuesta_detectada: string; confianza: number }>
+  officialOmrQuestionCountFromPipeline: number
+  officialOmrDetectedAnswersCount: number
+  officialOmrDetectedVsPipelineMismatch: boolean
+  officialOmrAdapterMode: "direct_passthrough_from_experimental"
+}> {
+  console.info("[official_azure_layout_family] invoking runAzureLayoutOmrPipeline")
+  const raw = params.studentImageBase64.replace(/^data:image\/\w+;base64,/, "").trim()
+  const imageBuffer = Buffer.from(raw, "base64")
+  const expectation =
+    typeof params.expectedQuestionCount === "number" && params.expectedQuestionCount > 0
+      ? params.expectedQuestionCount
+      : undefined
+  const azure = await runAzureLayoutOmrPipeline({
+    imageBuffer,
+    templateKey: params.templateKey,
+    ...(expectation !== undefined ? { expectedQuestionCount: expectation } : {}),
+    canonicalWidth: 1200,
+    canonicalHeight: 1700,
+    omrTemplateVariant: params.templateVariant ?? "odd_even_dual_column",
+  })
+  if (!azure || (azure as any).success !== true) {
+    if ((azure as any)?.errorCode === "AZURE_LAYOUT_PIPELINE_UNAVAILABLE") {
+      throw new Error(
+        "[official_azure_layout_family] experimental pipeline unavailable (stub detectado)"
+      )
+    }
+    throw new Error(
+      `[official_azure_layout_family] ${String((azure as any)?.errorCode ?? "UNKNOWN")} ${String((azure as any)?.error ?? "falló lectura")}`
+    )
+  }
+
+  const perQuestion = Array.isArray((azure as any).perQuestion) ? (azure as any).perQuestion : []
+  const sorted = [...perQuestion].sort(
+    (a, b) => Number(a?.questionNumber ?? 0) - Number(b?.questionNumber ?? 0),
+  )
+
+  const out: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
+  for (const row of sorted) {
+    const qn = Number(row?.questionNumber ?? 0)
+    if (qn < 1) continue
+    const keyIdRaw = String(params.teacherAnswerKey[qn - 1]?.pregunta ?? `SM${qn}`).trim()
+    const keyId = keyIdRaw || `SM${qn}`
+    // Passthrough desde el pipeline: vacío / BLANK / SIN_RESPUESTA → BLANK (no confundir "BLANK" con letra B en normalización).
+    const ansRaw = String(row?.selectedAnswer ?? "").trim().toUpperCase()
+    const ans =
+      ansRaw === "" || ansRaw === "SIN_RESPUESTA" || ansRaw === "BLANK" ? "BLANK" : ansRaw
+    out.push({
+      pregunta: keyId,
+      respuesta_detectada: ans,
+      confianza: ans !== "BLANK" && ans !== "SIN_RESPUESTA" ? 0.92 : 0.4,
+    })
+  }
+  console.info("[official_azure_layout_family] pipeline_success", {
+    pipelineExpectationPassed: expectation ?? null,
+    perQuestionCount: perQuestion.length,
+    detectedAnswersCount: out.length,
+  })
+  return {
+    detectedAnswers: out,
+    officialOmrPerQuestionRaw: perQuestion,
+    officialOmrDetectedAnswersPreview: out.slice(0, 12),
+    officialOmrQuestionCountFromPipeline: perQuestion.length,
+    officialOmrDetectedAnswersCount: out.length,
+    officialOmrDetectedVsPipelineMismatch: out.length !== perQuestion.length,
+    officialOmrAdapterMode: "direct_passthrough_from_experimental",
+  }
 }
 
 // Llamar a Mistral Vision para analizar la prueba.
@@ -845,7 +927,39 @@ export async function POST(req: NextRequest) {
       course_id: courseIdBody,
       evaluation_title: evaluationTitleBody,
       evaluation_subject: evaluationSubjectBody,
+      officialOmrIntegrationEnabled: officialOmrIntegrationEnabledIn,
+      officialOmrEngineSelected: officialOmrEngineSelectedIn,
+      omrTemplateVariant: omrTemplateVariantIn,
+      officialOmrAllowFallbackToLegacy: officialOmrAllowFallbackToLegacyIn,
     } = body
+    const officialOmrIntegrationEnabled = true
+    const officialOmrEngineSelected: "legacy" | "azure_layout_family" = "azure_layout_family"
+    const omrTemplateVariant: "odd_even_dual_column" | "sequential_dual_column" =
+      omrTemplateVariantIn === "sequential_dual_column" ? "sequential_dual_column" : "odd_even_dual_column"
+    let officialOmrEngineUsed: "legacy" | "azure_layout_family" = "legacy"
+    let officialOmrFallbackUsed = false
+    let officialOmrFallbackReason: string | null = null
+    const officialOmrAllowFallbackToLegacy = officialOmrAllowFallbackToLegacyIn !== false
+    let officialOmrPerQuestionRaw: any[] = []
+    let officialOmrDetectedAnswersPreview: Array<{ pregunta: string; respuesta_detectada: string; confianza: number }> = []
+    let officialOmrQuestionCountFromPipeline = 0
+    let officialOmrDetectedAnswersCount = 0
+    let officialOmrDetectedVsPipelineMismatch = false
+    let officialOmrAdapterMode: "direct_passthrough_from_experimental" | "legacy_extract_student_only" =
+      "legacy_extract_student_only"
+    let officialOmrExpectedQuestionCountUsed = 0
+    let officialOmrTeacherAnswerKeyLength = 0
+    let officialOmrTotalPregResolved = 0
+    let officialOmrTemplateKeyUsed = "template_38_4"
+    let officialOmrTemplateVariantUsed: "odd_even_dual_column" | "sequential_dual_column" = "odd_even_dual_column"
+    const teacherAnswersSource = "teacher_key"
+    const studentAnswersSource = "student_omr_read"
+    console.info("[trace][omr_official][request_flags]", {
+      officialOmrIntegrationEnabledIn,
+      officialOmrEngineSelectedIn,
+      officialOmrAllowFallbackToLegacyIn,
+      omrTemplateVariantIn,
+    })
 
     // Regla de oro: teacher_id/school_id SOLO desde perfil en BD. Ignorar body.
     let effectiveTeacherId: string | null = null
@@ -991,11 +1105,27 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // Cuando hay plantilla del profesor: extraer respuestas cerradas SOLO de la imagen del estudiante (OMR dedicado)
-    if (tieneAlternativas && answerKeyFromTemplate?.respuestas?.length) {
-      const totalPreg = Number(answerKeyFromTemplate.totalPreguntas) || answerKeyFromTemplate.respuestas.length
+    // Extraer respuestas cerradas desde la imagen del estudiante (OMR dedicado), independiente de si hay pauta.
+    if (imageBase64List.length > 0) {
+      const teacherAnswerKeyBase = Array.isArray(answerKeyFromTemplate?.respuestas)
+        ? answerKeyFromTemplate.respuestas
+        : []
+      const templateKeyUsed = "template_38_4"
+      const expectedByTemplateKey = templateKeyUsed === "template_38_4" ? 38 : 0
+      const closedQuestionsFromPauta = parsePautaEstructurada(pautaEstructurada).filter(
+        (i) => !i.isDevelopment
+      ).length
+      const totalPreg =
+        Number(answerKeyFromTemplate?.totalPreguntas) ||
+        teacherAnswerKeyBase.length ||
+        closedQuestionsFromPauta ||
+        expectedByTemplateKey ||
+        1
+      officialOmrTotalPregResolved = totalPreg
+      officialOmrTeacherAnswerKeyLength = teacherAnswerKeyBase.length
+      officialOmrTemplateKeyUsed = templateKeyUsed
       const altsSet = new Set<string>()
-      for (const r of answerKeyFromTemplate.respuestas) {
+      for (const r of teacherAnswerKeyBase) {
         const v = (r.respuestaCorrecta || "").toString().trim().toUpperCase()
         if (v) altsSet.add(v)
       }
@@ -1012,13 +1142,94 @@ export async function POST(req: NextRequest) {
               if (templateBase64 && isPdfBase64(templateBase64)) templateBase64 = undefined
             } catch (_) {}
           }
-          const extraidas = await extractStudentClosedAnswersOnly(
-            studentBase64,
+          let extraidas: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
+          const tryOfficialAzure =
+            officialOmrIntegrationEnabled === true && officialOmrEngineSelected === "azure_layout_family"
+          console.info("[trace][omr_official][engine_selector]", {
+            tryOfficialAzure,
+            officialOmrIntegrationEnabled,
+            officialOmrEngineSelected,
+            officialOmrAllowFallbackToLegacy,
+            hasTemplateAnswerKey: Boolean(answerKeyFromTemplate?.respuestas?.length),
             totalPreg,
-            alternativasArray,
-            columnas,
-            templateBase64
-          )
+          })
+          if (tryOfficialAzure) {
+            try {
+              const teacherAnswerKey = teacherAnswerKeyBase.map((r: any) => ({
+                pregunta: String(r?.pregunta ?? ""),
+                respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
+              }))
+              const expectedQuestionCountUsed = Math.max(1, totalPreg, expectedByTemplateKey)
+              officialOmrExpectedQuestionCountUsed = expectedQuestionCountUsed
+              officialOmrTemplateKeyUsed = templateKeyUsed
+              officialOmrTemplateVariantUsed = omrTemplateVariant
+              const azureOfficial = await extractStudentClosedAnswersAzureLayoutOfficial({
+                studentImageBase64: studentBase64,
+                teacherAnswerKey,
+                // No pasar expectedQuestionCount: evita completedByExpectation masivo en el pipeline cuando hay pocos rows observados.
+                templateKey: templateKeyUsed,
+                templateVariant: omrTemplateVariant,
+              })
+              console.info("[official_azure_layout_family] adapter_result", {
+                detectedAnswersCount: azureOfficial.detectedAnswers.length,
+                questionCountFromPipeline: azureOfficial.officialOmrQuestionCountFromPipeline,
+              })
+              extraidas = azureOfficial.detectedAnswers
+              console.info("[CRITICAL] USING EXPERIMENTAL OMR", extraidas.slice(0,5))
+              console.info("[trace][omr_official][extraidas_after_azure]", {
+                extraidasFirst10: extraidas.slice(0, 10),
+                extraidasCount: extraidas.length,
+                officialOmrPerQuestionRawCount: Array.isArray(azureOfficial.officialOmrPerQuestionRaw)
+                  ? azureOfficial.officialOmrPerQuestionRaw.length
+                  : 0,
+              })
+              officialOmrPerQuestionRaw = azureOfficial.officialOmrPerQuestionRaw
+              officialOmrDetectedAnswersPreview = azureOfficial.officialOmrDetectedAnswersPreview
+              officialOmrQuestionCountFromPipeline = azureOfficial.officialOmrQuestionCountFromPipeline
+              officialOmrDetectedAnswersCount = azureOfficial.officialOmrDetectedAnswersCount
+              officialOmrDetectedVsPipelineMismatch = azureOfficial.officialOmrDetectedVsPipelineMismatch
+              officialOmrAdapterMode = azureOfficial.officialOmrAdapterMode
+              officialOmrEngineUsed = "azure_layout_family"
+            } catch (engineErr) {
+              if (!officialOmrAllowFallbackToLegacy) {
+                throw engineErr
+              }
+              officialOmrFallbackUsed = true
+              officialOmrFallbackReason =
+                engineErr instanceof Error ? engineErr.message : String(engineErr)
+              console.warn("[Evaluate] official azure_layout_family falló, fallback legacy:", engineErr)
+              extraidas = await extractStudentClosedAnswersOnly(
+                studentBase64,
+                totalPreg,
+                alternativasArray,
+                columnas,
+                templateBase64
+              )
+              console.info("[trace][omr_official][extraidas_after_fallback_legacy]", {
+                extraidasFirst10: extraidas.slice(0, 10),
+                extraidasCount: extraidas.length,
+                officialOmrFallbackUsed: true,
+                officialOmrFallbackReason:
+                  engineErr instanceof Error ? engineErr.message : String(engineErr),
+              })
+              officialOmrAdapterMode = "legacy_extract_student_only"
+              officialOmrEngineUsed = "legacy"
+            }
+          } else {
+            extraidas = await extractStudentClosedAnswersOnly(
+              studentBase64,
+              totalPreg,
+              alternativasArray,
+              columnas,
+              templateBase64
+            )
+            console.info("[trace][omr_official][extraidas_after_legacy_direct]", {
+              extraidasFirst10: extraidas.slice(0, 10),
+              extraidasCount: extraidas.length,
+            })
+            officialOmrAdapterMode = "legacy_extract_student_only"
+            officialOmrEngineUsed = "legacy"
+          }
           for (const item of extraidas) {
             const pid = item.pregunta.toUpperCase()
             if (!respuestasCerradasDesdeOMR.some((r: any) => String(r.pregunta).toUpperCase() === pid)) {
@@ -1026,6 +1237,39 @@ export async function POST(req: NextRequest) {
             }
           }
         } catch (e) {
+          if (
+            officialOmrIntegrationEnabled === true &&
+            officialOmrEngineSelected === "azure_layout_family" &&
+            officialOmrAllowFallbackToLegacy === false
+          ) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: e instanceof Error ? e.message : String(e),
+                officialOmrIntegrationEnabled,
+                officialOmrEngineSelected,
+                officialOmrAllowFallbackToLegacy,
+                officialOmrEngineUsed,
+                officialOmrFallbackUsed,
+                officialOmrFallbackReason:
+                  (e instanceof Error ? e.message : String(e)) || officialOmrFallbackReason,
+                officialOmrPerQuestionRaw,
+                officialOmrDetectedAnswersPreview,
+                officialOmrQuestionCountFromPipeline,
+                officialOmrDetectedAnswersCount,
+                officialOmrDetectedVsPipelineMismatch,
+                officialOmrAdapterMode,
+                teacherAnswersSource,
+                studentAnswersSource,
+                teacherClosedAnswersCount:
+                  typeof answerKeyFromTemplate?.respuestas?.length === "number"
+                    ? answerKeyFromTemplate.respuestas.length
+                    : 0,
+                studentClosedAnswersCount: respuestasCerradasDesdeOMR.length,
+              },
+              { status: 500 }
+            )
+          }
           console.warn("[Evaluate] OMR dedicado falló para imagen", i, e)
         }
       }
@@ -1137,18 +1381,13 @@ export async function POST(req: NextRequest) {
 
     }  // fin else (rama imágenes: Mistral Vision)
 
-    // REGLA RADICAL: Con plantilla del profesor, las respuestas cerradas SOLO vienen de la extracción OMR del estudiante en este servidor.
-    // NUNCA usar respuestasAlternativas enviadas por el cliente cuando hay plantilla (podrían ser de una evaluación anterior errónea o la clave).
-    if (tieneAlternativas && answerKeyFromTemplate?.respuestas?.length) {
-      // Solo fuentes válidas: extracción OMR dedicada aquí, o (si falló) lo que Mistral extrajo de la imagen en este request.
-      if (respuestasCerradasDesdeOMR.length > 0) {
-        combinedAnalysis.respuestas_cerradas = respuestasCerradasDesdeOMR.map((r) => ({
-          pregunta: r.pregunta,
-          respuesta_detectada: r.respuesta_detectada || "",
-          confianza: r.confianza ?? 0.9,
-        }))
-      }
-      // Si la extracción OMR dedicada falló, usar combinedAnalysis.respuestas_cerradas de Mistral y normalizar más abajo.
+    // Conservar siempre las respuestas cerradas detectadas por OMR del estudiante, aun sin pauta cargada.
+    if (respuestasCerradasDesdeOMR.length > 0) {
+      combinedAnalysis.respuestas_cerradas = respuestasCerradasDesdeOMR.map((r) => ({
+        pregunta: r.pregunta,
+        respuesta_detectada: r.respuesta_detectada || "",
+        confianza: r.confianza ?? 0.9,
+      }))
     }
 
     if (!(tieneAlternativas && answerKeyFromTemplate?.respuestas?.length) || combinedAnalysis.respuestas_cerradas.length === 0) {
@@ -1212,7 +1451,7 @@ export async function POST(req: NextRequest) {
       const existing = respMapByPregunta.get(idUpper) || respMapByPregunta.get(expectedId) || (idUpper.replace(/\D/g, "") ? respMapByPregunta.get(idUpper.replace(/\D/g, "")) : undefined)
       normalizadas.push({
         pregunta: expectedId,
-        respuesta_detectada: existing ? existing.respuesta_detectada : "SIN_RESPUESTA",
+        respuesta_detectada: existing ? existing.respuesta_detectada : "BLANK",
         confianza: existing ? existing.confianza : 0,
       })
     }
@@ -1225,6 +1464,17 @@ export async function POST(req: NextRequest) {
     } else {
       combinedAnalysis.respuestas_cerradas = normalizadas
     }
+    console.info("[trace][omr_official][combined_before_scoring]", {
+      combinedRespuestasCerradasCount: Array.isArray(combinedAnalysis.respuestas_cerradas)
+        ? combinedAnalysis.respuestas_cerradas.length
+        : 0,
+      combinedRespuestasCerradasFirst10: Array.isArray(combinedAnalysis.respuestas_cerradas)
+        ? combinedAnalysis.respuestas_cerradas.slice(0, 10)
+        : [],
+      officialOmrEngineUsed,
+      officialOmrFallbackUsed,
+      officialOmrFallbackReason,
+    })
 
     // Normalizar respuestas_desarrollo para que puntaje sea siempre string "X/Y" (evita [object Object] y permite calcular nota)
     combinedAnalysis.respuestas_desarrollo = normalizeRespuestasDesarrollo(combinedAnalysis.respuestas_desarrollo)
@@ -1232,12 +1482,39 @@ export async function POST(req: NextRequest) {
     // Sanitizar retroalimentación para no culpar al estudiante cuando es problema de lectura/OCR
     combinedAnalysis.retroalimentacion = sanitizeRetroalimentacion(combinedAnalysis.retroalimentacion)
 
+    // Copias defensivas y separación explícita de fuentes (teacher key vs student OMR read).
+    const teacherClosedAnswersForScoring = JSON.parse(JSON.stringify(pautaAlternativasFinal))
+    const studentClosedAnswersDetected = Array.isArray(combinedAnalysis.respuestas_cerradas)
+      ? combinedAnalysis.respuestas_cerradas.map((r: any) => ({ ...r }))
+      : []
+    console.info("[trace][omr_official][student_before_calculateFinalScore]", {
+      teacherAnswersSource,
+      studentAnswersSource,
+      teacherClosedAnswersLength:
+        typeof answerKeyFromTemplate?.respuestas?.length === "number"
+          ? answerKeyFromTemplate.respuestas.length
+          : 0,
+      studentClosedAnswersDetectedCount: studentClosedAnswersDetected.length,
+      studentClosedAnswersDetectedFirst10: studentClosedAnswersDetected.slice(0, 10),
+    })
+    if (Object.is(teacherClosedAnswersForScoring, studentClosedAnswersDetected)) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Separación de fuentes inválida: teacher key y student answers comparten referencia.",
+          teacherAnswersSource,
+          studentAnswersSource,
+        },
+        { status: 500 }
+      )
+    }
+
     // Calcular puntaje final
     const scores = calculateFinalScore(
-      combinedAnalysis.respuestas_cerradas,
+      studentClosedAnswersDetected,
       combinedAnalysis.respuestas_desarrollo,
       pautaEstructurada,
-      pautaAlternativasFinal,
+      teacherClosedAnswersForScoring,
       Number(puntajeTotal),
       Number(porcentajeExigencia)
     )
@@ -1260,7 +1537,43 @@ export async function POST(req: NextRequest) {
       detalle_desarrollo: combinedAnalysis.respuestas_desarrollo,
       alternativas_corregidas: scores.alternativas_corregidas,
       nombreEstudianteDetectado: combinedAnalysis.nombreEstudiante,
+      officialOmrIntegrationEnabled,
+      officialOmrEngineSelected,
+      officialOmrAllowFallbackToLegacy,
+      officialOmrEngineUsed,
+      officialOmrFallbackUsed,
+      officialOmrFallbackReason,
+      officialOmrPerQuestionRaw,
+      officialOmrDetectedAnswersPreview,
+      officialOmrQuestionCountFromPipeline,
+      officialOmrDetectedAnswersCount,
+      officialOmrDetectedVsPipelineMismatch,
+      officialOmrAdapterMode,
+      teacherAnswersSource,
+      studentAnswersSource,
+      teacherClosedAnswersCount:
+        typeof answerKeyFromTemplate?.respuestas?.length === "number"
+          ? answerKeyFromTemplate.respuestas.length
+          : 0,
+      studentClosedAnswersCount: studentClosedAnswersDetected.length,
     }
+    console.info("[trace][omr_official][response_summary]", {
+      success: true,
+      officialOmrIntegrationEnabled,
+      officialOmrEngineSelected,
+      officialOmrEngineUsed,
+      officialOmrFallbackUsed,
+      officialOmrFallbackReason,
+      officialOmrAdapterMode,
+      officialOmrQuestionCountFromPipeline,
+      officialOmrDetectedAnswersCount,
+      officialOmrDetectedVsPipelineMismatch,
+      teacherClosedAnswersCount:
+        typeof answerKeyFromTemplate?.respuestas?.length === "number"
+          ? answerKeyFromTemplate.respuestas.length
+          : 0,
+      studentClosedAnswersCount: studentClosedAnswersDetected.length,
+    })
 
     // Persistencia: solo si hay sesión y perfil con teacher_id. Nunca usar IDs del body.
     let saveResult: Awaited<ReturnType<typeof persistEvaluation>>
@@ -1308,6 +1621,32 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(
       {
         ...result,
+        omrDebug: {
+          engineSelected: officialOmrEngineSelected,
+          engineUsed: officialOmrEngineUsed,
+          fallbackUsed: officialOmrFallbackUsed,
+          integrationEnabled: officialOmrIntegrationEnabled,
+          studentAnswersSource,
+          teacherAnswersSource,
+          expectedQuestionCountUsed: officialOmrExpectedQuestionCountUsed,
+          teacherAnswerKeyLength: officialOmrTeacherAnswerKeyLength,
+          totalPregResolved: officialOmrTotalPregResolved,
+          templateKeyUsed: officialOmrTemplateKeyUsed,
+          omrTemplateVariantUsed: officialOmrTemplateVariantUsed,
+          officialOmrQuestionCountFromPipeline,
+          officialOmrDetectedAnswersCount,
+          officialOmrDetectedVsPipelineMismatch,
+          officialOmrAdapterMode,
+          officialOmrPerQuestionRawPreview: Array.isArray(officialOmrPerQuestionRaw)
+            ? officialOmrPerQuestionRaw.slice(0, 10)
+            : [],
+          detectedAnswersPreview: Array.isArray(studentClosedAnswersDetected)
+            ? studentClosedAnswersDetected.slice(0, 10)
+            : [],
+          totalDetectedAnswers: Array.isArray(studentClosedAnswersDetected)
+            ? studentClosedAnswersDetected.length
+            : 0,
+        },
         saved,
         evaluation_id: evaluationId,
         status,
@@ -1324,7 +1663,19 @@ export async function POST(req: NextRequest) {
     }
     const isPdfError = typeof msg === "string" && msg.includes("PDF") && msg.includes("solo acepta imágenes")
     return NextResponse.json(
-      { success: false, error: msg },
+      {
+        success: false,
+        error: msg,
+        officialOmrIntegrationEnabled: false,
+        officialOmrEngineSelected: "legacy",
+        officialOmrEngineUsed: "legacy",
+        officialOmrFallbackUsed: false,
+        officialOmrFallbackReason: null,
+        teacherAnswersSource: "teacher_key",
+        studentAnswersSource: "student_omr_read",
+        teacherClosedAnswersCount: 0,
+        studentClosedAnswersCount: 0,
+      },
       { status: isPdfError ? 400 : 500 }
     )
   }

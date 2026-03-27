@@ -38,6 +38,7 @@ import {
   FileText,
   File as FileIcon,
   CheckCircle2,
+  AlertCircle,
   History,
   Pencil,
   Archive,
@@ -322,6 +323,141 @@ const splitCorreccionForTwoPages = (lista: any[] | undefined) => {
   const MAX_P1 = Math.min(5, lista.length)
   return { first: lista.slice(0, MAX_P1), rest: lista.slice(MAX_P1) }
 }
+
+/** PDF desarrollo: solo texto legible; nunca JSON.stringify. */
+function formatDetalleDesarrolloPdf(raw: any): string {
+  if (raw == null) return ""
+  if (typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean") return String(raw)
+  if (Array.isArray(raw)) return raw.map((x) => formatDetalleDesarrolloPdf(x)).filter(Boolean).join(" — ")
+  if (typeof raw !== "object") return String(raw)
+  const o = raw as Record<string, unknown>
+  const pVal = o.puntaje
+  const p =
+    pVal != null && String(pVal).trim() !== ""
+      ? `Puntaje: ${String(pVal).trim()}`
+      : ""
+  const txtSource = (o.cita_estudiante ?? o.texto_estudiante ?? o.respuesta ?? o.respuesta_estudiante) as unknown
+  const txt = txtSource != null ? String(txtSource).trim() : ""
+  const txtPart = txt ? `Respuesta: "${txt.replace(/"/g, "'")}"` : ""
+  const jVal = o.justificacion
+  const j = jVal != null ? String(jVal).trim() : ""
+  const jPart = j ? `Justificación: ${j}` : ""
+  const main = [p, txtPart, jPart].filter(Boolean).join("\n")
+  if (main) return main
+  const fallback = Object.entries(o)
+    .filter(([, v]) => v != null && typeof v !== "object" && typeof v !== "function")
+    .map(([k, v]) => `${k}: ${String(v)}`)
+    .join(" — ")
+  return fallback || "(Sin detalle estructurado disponible)"
+}
+
+function normalizePdfMatchText(s: string): string {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function extractDevQuestionNumbersFromKeys(devKeys: string[]): Set<number> {
+  const nums = new Set<number>()
+  for (const key of devKeys) {
+    const m = /^P\s*(\d+)$/i.exec(key.trim())
+    if (m) nums.add(parseInt(m[1], 10))
+  }
+  return nums
+}
+
+function buildDetalleDesarrolloMatchCorpus(detalleDesarrollo: Record<string, any> | undefined): string {
+  if (!detalleDesarrollo || typeof detalleDesarrollo !== "object") return ""
+  const parts: string[] = []
+  for (const v of Object.values(detalleDesarrollo)) {
+    if (v == null) continue
+    if (typeof v === "object" && !Array.isArray(v)) {
+      parts.push(String((v as any).justificacion ?? ""))
+      parts.push(String((v as any).cita_estudiante ?? (v as any).texto_estudiante ?? (v as any).respuesta ?? ""))
+    } else {
+      parts.push(String(v))
+    }
+  }
+  return normalizePdfMatchText(parts.join("\n"))
+}
+
+function textoMencionaNumerosDesarrollo(texto: string, nums: Set<number>): boolean {
+  const t = normalizePdfMatchText(texto)
+  if (!t) return false
+  for (const n of nums) {
+    if (new RegExp(`\\bp\\s*${n}\\b`, "i").test(t)) return true
+    if (new RegExp(`pregunta\\s*[:-]?\\s*${n}\\b`, "i").test(t)) return true
+  }
+  return false
+}
+
+function seccionRelatesToDetalleDesarrolloKeys(seccion: string, devKeys: string[]): boolean {
+  if (!devKeys.length) return false
+  const s = String(seccion || "")
+  const upper = s.toUpperCase()
+  for (const key of devKeys) {
+    const k = key.trim()
+    if (!k) continue
+    const ku = k.toUpperCase()
+    const kSpaced = k.replace(/_/g, " ").toUpperCase()
+    if (upper.includes(ku) || upper.includes(kSpaced)) return true
+    const num = /^P(\d+)$/i.exec(k)?.[1]
+    if (num && new RegExp(`\\bP\\s*${num}\\b`, "i").test(s)) return true
+  }
+  return false
+}
+
+/**
+ * PDF: si hay detalle_desarrollo, no mostrar en correccion_detallada ninguna fila del "mundo desarrollo"
+ * (misma pregunta por número, subtítulos repetidos en justificación, cita solapada, etc.).
+ */
+function excludeCorreccionDetalladaRowForPdfDesarrollo(
+  row: any,
+  devKeys: string[],
+  detalleDesarrollo: Record<string, any> | undefined,
+): boolean {
+  if (!devKeys.length) return false
+  const seccion = String(row?.seccion ?? "")
+  const detalleRow = String(row?.detalle ?? row?.detalles ?? "")
+  const nums = extractDevQuestionNumbersFromKeys(devKeys)
+  const corpus = buildDetalleDesarrolloMatchCorpus(detalleDesarrollo)
+  const secNorm = normalizePdfMatchText(seccion)
+  const detNorm = normalizePdfMatchText(detalleRow)
+
+  if (seccionRelatesToDetalleDesarrolloKeys(seccion, devKeys)) return true
+  if (/pregunta\s+desarrollo/i.test(seccion)) return true
+  if (/\bdesarrollo\b/i.test(seccion) && /\bpregunta\b/i.test(seccion)) return true
+
+  for (const n of nums) {
+    if (new RegExp(`pregunta\\s*[:-]?\\s*${n}\\b`, "i").test(seccion)) return true
+  }
+
+  if (secNorm.length >= 10 && corpus.length >= 24 && corpus.includes(secNorm)) return true
+  if (detNorm.length >= 28 && corpus.length >= 24 && corpus.includes(detNorm)) return true
+
+  if (textoMencionaNumerosDesarrollo(seccion, nums)) return true
+  if (textoMencionaNumerosDesarrollo(detalleRow, nums)) return true
+
+  if (detNorm.length >= 22 && detalleDesarrollo && typeof detalleDesarrollo === "object") {
+    for (const v of Object.values(detalleDesarrollo)) {
+      if (!v || typeof v !== "object") continue
+      const cite = normalizePdfMatchText(
+        String((v as any).cita_estudiante ?? (v as any).texto_estudiante ?? (v as any).respuesta ?? ""),
+      )
+      if (cite.length < 18) continue
+      const head = cite.slice(0, 44)
+      if (head.length >= 18 && detNorm.includes(head)) return true
+      const headRow = detNorm.slice(0, 44)
+      if (headRow.length >= 18 && cite.includes(headRow)) return true
+    }
+  }
+
+  return false
+}
+
 const ReportDocument = ({ group, formData, logoPreview }: any) => {
   const resumen = (group.retroalimentacion && group.retroalimentacion.resumen_general) || {
     fortalezas: "N/A",
@@ -331,29 +467,22 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
   const notaNum = Number(group.nota) || 0
   const notaFinal = (notaNum + (group.decimasAdicionales || 0)).toFixed(1)
   const correccion = group.retroalimentacion?.correccion_detallada || []
-  const correccionDesarrolloArray = Object.keys(group.detalle_desarrollo || {}).map((key) => {
+  const devKeys = Object.keys(group.detalle_desarrollo || {})
+  const correccionSinDuplicarDesarrollo = correccion.filter(
+    (row: any) => !excludeCorreccionDetalladaRowForPdfDesarrollo(row, devKeys, group.detalle_desarrollo),
+  )
+  const correccionDesarrolloArray = devKeys.map((key) => {
     const raw = group.detalle_desarrollo![key]
-    const isDevItem =
-      raw != null &&
-      typeof raw === "object" &&
-      (Object.prototype.hasOwnProperty.call(raw, "puntaje") ||
-        Object.prototype.hasOwnProperty.call(raw, "texto_estudiante") ||
-        Object.prototype.hasOwnProperty.call(raw, "cita_estudiante") ||
-        Object.prototype.hasOwnProperty.call(raw, "justificacion"))
     const detalle =
       typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean"
         ? String(raw)
-        : isDevItem && raw != null
-          ? `Puntaje: ${safeStr((raw as any).puntaje)} - Respuesta: "${safeStr((raw as any).cita_estudiante ?? (raw as any).texto_estudiante)}" - ${safeStr((raw as any).justificacion)}`
-          : raw != null && typeof raw === "object"
-            ? JSON.stringify(raw)
-            : ""
+        : formatDetalleDesarrolloPdf(raw)
     return {
       seccion: `Pregunta Desarrollo: ${key.replace(/_/g, " ")}`,
       detalle,
     }
   })
-  const correccionConDesarrollo = [...correccion, ...correccionDesarrolloArray]
+  const correccionConDesarrollo = [...correccionSinDuplicarDesarrollo, ...correccionDesarrolloArray]
   const { first: correccionP1, rest: correccionP2 } = splitCorreccionForTwoPages(correccionConDesarrollo)
   const isSuperior = ["Técnico Superior", "Universitario", "Postgrado"].includes(formData.nivelEducativo)
   const cursoLabel = isSuperior ? "Sección" : "Curso"
@@ -881,6 +1010,14 @@ interface StudentGroup {
   puntosMaximos?: number
   /** Id de la evaluación en BD cuando ya fue guardada; permite aplicar cambios de la tabla al resto de la app */
   evaluation_id?: string | null
+  shouldUseOfficialAzureOmr?: boolean
+  officialOmrActivationReason?: string
+  officialOmrIntegrationEnabled?: boolean
+  officialOmrEngineSelected?: string
+  officialOmrEngineUsed?: string
+  officialOmrFallbackUsed?: boolean
+  officialOmrFallbackReason?: string | null
+  omrDebug?: any
 }
 
 // *** TIPOS DECLARADOS PARA RESOLVER ERRORES LINT ***
@@ -1012,10 +1149,39 @@ export default function EvaluatorClient() {
 
   const [logoPreview, setLogoPreview] = useState<string | null>(null)
   const [classSize, setClassSize] = useState(1)
+  /** Imágenes por estudiante para agrupación automática (solo UI, no altera contratos). */
+  const [imagesPerStudent, setImagesPerStudent] = useState(1)
   const [isExtractingNames, setIsExtractingNames] = useState(false)
   const [theme, setTheme] = useState("theme-ocaso")
   const [previewGroupId, setPreviewGroupId] = useState<string | null>(null)
+  /** Foco en un estudiante en Paso 3: al seleccionar una tarjeta del panorama, solo se muestra su detalle (reversible con "Ver todos"). */
+  const [focusedGroupId, setFocusedGroupId] = useState<string | null>(null)
+  /** Variante de plantilla OMR enviada a /api/evaluate (flujo oficial; no toca experimental). */
+  const [selectedOmrTemplateVariant, setSelectedOmrTemplateVariant] = useState<
+    "odd_even_dual_column" | "sequential_dual_column"
+  >("odd_even_dual_column")
   // Progreso de evaluacion por lotes
+
+  /** Cuenta incorrectas y a revisar desde alternativas_corregidas (misma lógica que la tabla OMR; solo lectura). */
+  const countAlternativasSummary = (alts: Array<{ pregunta?: string; respuesta_estudiante?: string; respuesta_correcta?: string }> | undefined) => {
+    if (!alts?.length) return { incorrect: 0, revisar: 0 }
+    let incorrect = 0
+    let revisar = 0
+    for (const item of alts) {
+      const respuestaEst = (item.respuesta_estudiante ?? "").trim().toUpperCase()
+      const respuestaCorr = (item.respuesta_correcta ?? "").trim().toUpperCase()
+      const esIncorrecta = Boolean(respuestaEst && respuestaCorr && respuestaEst !== respuestaCorr)
+      const tieneBajaConfianza =
+        respuestaEst.length > 2 ||
+        (String(item.pregunta ?? "").includes("VF") && !["V", "F"].includes(respuestaEst)) ||
+        (String(item.pregunta ?? "").includes("TP") && isNaN(Number.parseInt(respuestaEst))) ||
+        (String(item.pregunta ?? "").includes("SM") && !["A", "B", "C", "D", "E"].includes(respuestaEst)) ||
+        respuestaEst === ""
+      if (esIncorrecta) incorrect++
+      if (esIncorrecta || tieneBajaConfianza) revisar++
+    }
+    return { incorrect, revisar }
+  }
   const batchInitial = { isActive: false, totalItems: 0, completedItems: 0, successCount: 0, errorCount: 0, currentBatch: 0, totalBatches: 0 }
   const [batchProgress, setBatchProgress] = useState(batchInitial)
   const isMobile = typeof window !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
@@ -1753,6 +1919,42 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   const removeUnassignedFile = (fileId: string) => {
     setUnassignedFiles((prev) => prev.filter((f) => f.id !== fileId))
   }
+
+  /** Agrupación automática: distribuye unassignedFiles en studentGroups según imagesPerStudent. Reversible; no toca evaluación ni contratos. */
+  const applyAutoGroup = () => {
+    const per = Math.max(1, Math.min(50, imagesPerStudent))
+    if (studentGroups.length === 0) {
+      toast({ title: "Indica primero el Nº de estudiantes para crear los grupos.", variant: "default" })
+      return
+    }
+    if (unassignedFiles.length === 0) {
+      toast({ title: "No hay archivos pendientes para agrupar.", variant: "default" })
+      return
+    }
+    const toAssign: { fileId: string; groupId: string }[] = []
+    let idx = 0
+    for (const g of studentGroups) {
+      const need = Math.max(0, per - g.files.length)
+      for (let i = 0; i < need && idx < unassignedFiles.length; i++) {
+        toAssign.push({ fileId: unassignedFiles[idx].id, groupId: g.id })
+        idx++
+      }
+    }
+    const assignedFileIds = new Set(toAssign.map((x) => x.fileId))
+    const fileById = new Map(unassignedFiles.map((f) => [f.id, f]))
+    setUnassignedFiles((prev) => prev.filter((f) => !assignedFileIds.has(f.id)))
+    setStudentGroups((prev) =>
+      prev.map((g) => {
+        const add = toAssign
+          .filter((x) => x.groupId === g.id)
+          .map((x) => fileById.get(x.fileId))
+          .filter(Boolean) as FilePreview[]
+        return { ...g, files: [...g.files, ...add] }
+      }),
+    )
+    toast({ title: "Agrupación automática completada. Revisa los grupos antes de evaluar." })
+  }
+
   const handleNameExtraction = async (groupId: string) => {
     const grp = studentGroups.find((g) => g.id === groupId)
     if (!grp || grp.files.length === 0) {
@@ -1788,6 +1990,67 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       alert(error?.message || "Error desconocido.")
     } finally {
       setIsExtractingNames(false)
+    }
+  }
+
+  /** Nombre genérico que se puede sobrescribir de forma segura (solo "Alumno N" o vacío). */
+  const isGenericGroupName = (name: string | undefined) => {
+    if (!name || typeof name !== "string") return true
+    const t = name.trim()
+    return t === "" || /^Alumno\s+\d+$/i.test(t)
+  }
+
+  /** Extracción masiva de nombres: recorre grupos con archivos y nombre genérico, reutiliza /api/extract-name. No toca evaluación ni contratos. */
+  const handleBulkNameExtraction = async () => {
+    const groupsWithFiles = studentGroups.filter((g) => g.files.length > 0)
+    const toProcess = groupsWithFiles.filter((g) => isGenericGroupName(g.studentName))
+    if (toProcess.length === 0) {
+      toast({
+        title: groupsWithFiles.length === 0
+          ? "No hay grupos con archivos para extraer nombres."
+          : "Todos los grupos ya tienen un nombre asignado. Solo se actualizan nombres genéricos (Alumno 1, Alumno 2…).",
+        variant: "default",
+      })
+      return
+    }
+    setIsExtractingNames(true)
+    let found = 0
+    let notFound = 0
+    let errors = 0
+    for (const grp of toProcess) {
+      try {
+        const formDataFD = new FormData()
+        grp.files.forEach((f) => formDataFD.append("files", f.file))
+        formDataFD.append("nameList", "[]")
+        const response = await fetch("/api/extract-name", { method: "POST", body: formDataFD })
+        const data = await response.json()
+        if (!response.ok || !data.success) {
+          notFound++
+          continue
+        }
+        const detectedNames = Array.isArray(data.suggestions) ? (data.suggestions as string[]) : []
+        const numDetected = detectedNames.length
+        if (numDetected > 0) {
+          const visibleGroupName = detectedNames.map((n) => n.trim()).join(", ")
+          setStudentGroups((groups) =>
+            groups.map((g) => (g.id === grp.id ? { ...g, studentName: visibleGroupName } : g)),
+          )
+          found++
+        } else {
+          notFound++
+        }
+      } catch (_e) {
+        errors++
+      }
+    }
+    setIsExtractingNames(false)
+    const total = toProcess.length
+    if (found > 0 || notFound > 0 || errors > 0) {
+      toast({
+        title: "Extracción masiva finalizada.",
+        description: `Procesados: ${total}. Encontrados: ${found}. No encontrados: ${notFound}.${errors > 0 ? ` Errores: ${errors}.` : ""}`,
+        variant: errors > 0 ? "default" : "default",
+      })
     }
   }
 
@@ -1990,6 +2253,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       evaluation_subject: form.getValues("asignatura") ?? "",
       course_id: form.getValues("curso") ?? "",
       nombreEstudiante: group.studentName && String(group.studentName).trim() !== "" ? String(group.studentName).trim() : undefined,
+      omrTemplateVariant: selectedOmrTemplateVariant,
     }
 
     const result = await evaluate(payload)
@@ -2114,11 +2378,31 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             puntosMaximos: result.puntosMaximos,
             alternativas_corregidas:
               result.alternativas_corregidas || result.retroalimentacion?.retroalimentacion_alternativas,
+            shouldUseOfficialAzureOmr: result.shouldUseOfficialAzureOmr,
+            officialOmrActivationReason: result.officialOmrActivationReason,
+            officialOmrIntegrationEnabled: result.officialOmrIntegrationEnabled,
+            officialOmrEngineSelected: result.officialOmrEngineSelected,
+            officialOmrEngineUsed: result.officialOmrEngineUsed,
+            officialOmrFallbackUsed: result.officialOmrFallbackUsed,
+            officialOmrFallbackReason: result.officialOmrFallbackReason ?? null,
+            omrDebug: result.omrDebug,
             error: undefined,
             evaluation_id: (result as { evaluation_id?: string }).evaluation_id ?? undefined,
           }
         } else {
-          return { ...g, isEvaluating: false, error: result.error }
+          return {
+            ...g,
+            isEvaluating: false,
+            shouldUseOfficialAzureOmr: result.shouldUseOfficialAzureOmr,
+            officialOmrActivationReason: result.officialOmrActivationReason,
+            officialOmrIntegrationEnabled: result.officialOmrIntegrationEnabled,
+            officialOmrEngineSelected: result.officialOmrEngineSelected,
+            officialOmrEngineUsed: result.officialOmrEngineUsed,
+            officialOmrFallbackUsed: result.officialOmrFallbackUsed,
+            officialOmrFallbackReason: result.officialOmrFallbackReason ?? null,
+            omrDebug: result.omrDebug,
+            error: result.error,
+          }
         }
       }),
     )
@@ -2225,6 +2509,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         evaluation_subject: asignatura ?? "",
         course_id: curso ?? "",
         nombreEstudiante: group.studentName && String(group.studentName).trim() !== "" ? String(group.studentName).trim() : undefined,
+        omrTemplateVariant: selectedOmrTemplateVariant,
       },
     }))
 
@@ -2311,6 +2596,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                       alternativas_corregidas:
                         msg.data.alternativas_corregidas ||
                         msg.data.retroalimentacion?.retroalimentacion_alternativas,
+                      omrDebug: msg.data.omrDebug,
                       error: undefined,
                       evaluation_id: (msg.data as { evaluation_id?: string }).evaluation_id ?? undefined,
                     }
@@ -3449,7 +3735,45 @@ La IA usará una escala 0-10 por criterio de desarrollo."
             </Card>
           </TabsContent>
           {activeTab === "evaluator" && (
-            <>
+            <div className="flex gap-4">
+              {studentGroups.length > 0 && (
+                <aside className="sticky top-4 self-start w-52 shrink-0 rounded-xl border border-[var(--border-color)] bg-[var(--bg-card)] p-3 shadow-sm">
+                  <h4 className="font-semibold text-sm text-[var(--text-accent)] mb-2 flex items-center gap-2">
+                    <Users className="h-4 w-4" /> Estudiantes / Grupos
+                  </h4>
+                  <nav className="flex flex-col gap-1 max-h-[70vh] overflow-y-auto">
+                    {studentGroups.map((group) => {
+                      const isInResults = group.isEvaluated || group.isEvaluating || !!group.error
+                      const targetId = isInResults ? `group-paso3-${group.id}` : `group-paso2-${group.id}`
+                      const stateIcon = group.error ? (
+                        <AlertCircle className="h-4 w-4 text-red-500 shrink-0" />
+                      ) : group.isEvaluating ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-amber-500 shrink-0" />
+                      ) : group.isEvaluated ? (
+                        <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
+                      ) : group.files.length > 0 ? (
+                        <FileUp className="h-4 w-4 text-blue-500 shrink-0" />
+                      ) : (
+                        <FileIcon className="h-4 w-4 text-[var(--text-secondary)] shrink-0" />
+                      )
+                      return (
+                        <button
+                          key={group.id}
+                          type="button"
+                          onClick={() =>
+                            document.getElementById(targetId)?.scrollIntoView({ behavior: "smooth", block: "start" })
+                          }
+                          className="flex items-center gap-2 w-full text-left px-2 py-2 rounded-lg hover:bg-[var(--bg-muted)] text-sm truncate border border-transparent hover:border-[var(--border-color)]"
+                        >
+                          {stateIcon}
+                          <span className="truncate">{group.studentName || "Sin nombre"}</span>
+                        </button>
+                      )
+                    })}
+                  </nav>
+                </aside>
+              )}
+              <div className="flex-1 min-w-0 space-y-4">
               <Card className="bg-[var(--bg-card)] border-[var(--border-color)]">
                 <CardHeader>
                   <CardTitle className="text-[var(--text-accent)]">Paso 2: Cargar y Agrupar Trabajos</CardTitle>
@@ -3531,16 +3855,119 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                       </p>
                     </div>
                   </div>
-                  {unassignedFiles.length > 0 && (
-                    <div className="p-4 border rounded-lg bg-[var(--bg-muted-subtle)] border-[var(--border-color)]">
-                      <h3 className="font-semibold mb-3 flex items-center text-[var(--text-accent)]">
-                        <ClipboardList className="mr-2 h-5 w-5" /> Archivos Pendientes
-                      </h3>
 
-                      <div className="flex flex-wrap gap-4 items-center">
-                        {/* ✅ USO DE renderFilePreview */}
+                  {/* Agrupación automática por reglas (solo UI; no toca evaluación ni contratos). */}
+                  {studentGroups.length > 0 ? (
+                    <div className="p-4 rounded-xl border-2 border-indigo-200 dark:border-indigo-800 bg-indigo-50/30 dark:bg-indigo-950/20 space-y-3">
+                      <h3 className="font-bold text-[var(--text-accent)] flex items-center gap-2">
+                        <Users className="h-5 w-5 text-indigo-600" />
+                        Agrupación automática
+                      </h3>
+                      <p className="text-sm text-[var(--text-secondary)]">
+                        Indica cuántas imágenes corresponden a cada estudiante. Luego usa el botón para distribuir los archivos pendientes en orden.
+                      </p>
+                      <div className="flex flex-wrap items-end gap-4">
+                        <div className="space-y-1">
+                          <Label htmlFor="images-per-student" className="text-sm font-medium">
+                            Imágenes por estudiante
+                          </Label>
+                          <Input
+                            id="images-per-student"
+                            type="number"
+                            min={1}
+                            max={50}
+                            value={imagesPerStudent}
+                            onChange={(e) => setImagesPerStudent(Math.max(1, Math.min(50, Number(e.target.value) || 1)))}
+                            className="w-24"
+                          />
+                        </div>
+                        <div className="text-sm text-[var(--text-secondary)]">
+                          Estudiantes del curso: <strong className="text-[var(--text-primary)]">{studentGroups.length}</strong>
+                          {" · "}
+                          Esperadas en total: <strong className="text-[var(--text-primary)]">{studentGroups.length * Math.max(1, imagesPerStudent)}</strong>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="default"
+                          onClick={applyAutoGroup}
+                          disabled={unassignedFiles.length === 0}
+                        >
+                          Agrupar automáticamente
+                        </Button>
+                      </div>
+                      {(() => {
+                        const totalLoaded = unassignedFiles.length + studentGroups.reduce((acc, g) => acc + g.files.length, 0)
+                        const expected = studentGroups.length * Math.max(1, imagesPerStudent)
+                        const missing = Math.max(0, expected - totalLoaded)
+                        const surplus = Math.max(0, totalLoaded - expected)
+                        const complete = studentGroups.filter((g) => g.files.length >= Math.max(1, imagesPerStudent)).length
+                        const incomplete = studentGroups.filter((g) => g.files.length > 0 && g.files.length < Math.max(1, imagesPerStudent)).length
+                        return (
+                          <div className="text-sm space-y-1 pt-2 border-t border-indigo-200 dark:border-indigo-800">
+                            <p className="font-medium text-[var(--text-primary)]">
+                              Se detectaron {totalLoaded} imagen{totalLoaded !== 1 ? "es" : ""} en total.
+                            </p>
+                            <p className="text-[var(--text-secondary)]">
+                              Configuración actual: {studentGroups.length} estudiantes × {Math.max(1, imagesPerStudent)} imágenes = {expected} esperadas.
+                            </p>
+                            {missing > 0 && (
+                              <p className="text-amber-700 dark:text-amber-400 font-medium">
+                                Faltan {missing} imagen{missing !== 1 ? "es" : ""} para completar la configuración.
+                              </p>
+                            )}
+                            {surplus > 0 && (
+                              <p className="text-amber-700 dark:text-amber-400 font-medium">
+                                Sobran {surplus} imagen{surplus !== 1 ? "es" : ""} no agrupadas.
+                              </p>
+                            )}
+                            {missing === 0 && surplus === 0 && totalLoaded > 0 && (
+                              <p className="text-green-700 dark:text-green-400 font-medium">
+                                La configuración coincide con el total de archivos.
+                              </p>
+                            )}
+                            <div className="flex flex-wrap gap-3 pt-1">
+                              <span className="text-[var(--text-secondary)]">
+                                Grupos completos: <strong className="text-[var(--text-primary)]">{complete}</strong>
+                              </span>
+                              {incomplete > 0 && (
+                                <span className="text-amber-600">
+                                  Grupos incompletos: <strong>{incomplete}</strong>
+                                </span>
+                              )}
+                              <span className="text-[var(--text-secondary)]">
+                                Sin asignar: <strong className="text-[var(--text-primary)]">{unassignedFiles.length}</strong>
+                              </span>
+                            </div>
+                          </div>
+                        )
+                      })()}
+                    </div>
+                  ) : (
+                    <p className="text-sm text-[var(--text-secondary)]">
+                      Indica el <strong>Nº de estudiantes</strong> en la pestaña de configuración para crear los grupos y usar la agrupación automática.
+                    </p>
+                  )}
+
+                  {unassignedFiles.length > 0 && (
+                    <div className="p-4 border-2 rounded-xl bg-[var(--bg-muted-subtle)] border-amber-200 dark:border-amber-800">
+                      <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+                        <h3 className="font-bold text-[var(--text-accent)] flex items-center gap-2">
+                          <ClipboardList className="h-5 w-5 text-amber-600" />
+                          Archivos pendientes de asignar
+                          <span className="inline-flex items-center justify-center min-w-[1.75rem] h-7 px-2 rounded-full bg-amber-500/20 text-amber-800 dark:text-amber-200 text-sm font-bold">
+                            {unassignedFiles.length}
+                          </span>
+                        </h3>
+                        <p className="text-sm text-[var(--text-secondary)]">
+                          Asigna cada archivo a un estudiante usando el selector &quot;Asignar&quot; en cada grupo.
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-3 items-center">
                         {unassignedFiles.map((file) => (
-                          <div key={file.id} className="relative w-24 h-24">
+                          <div
+                            key={file.id}
+                            className="relative w-24 h-24 rounded-lg overflow-hidden border-2 border-amber-200 dark:border-amber-800 bg-white dark:bg-gray-800 shadow-sm"
+                          >
                             {renderFilePreview(file)}
                             <button
                               onClick={() => removeUnassignedFile(file.id)}
@@ -3551,8 +3978,6 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                             </button>
                           </div>
                         ))}
-
-                        
                       </div>
                     </div>
                   )}
@@ -3561,72 +3986,150 @@ La IA usará una escala 0-10 por criterio de desarrollo."
               {studentGroups.length > 0 && (
                 <Card className="bg-[var(--bg-card)] border-[var(--border-color)]">
                   <CardHeader>
-                    <CardTitle className="flex items-center gap-2 text-[var(--text-accent)]">
-                      <Users className="text-green-500" />
-                      Grupos de Estudiantes
-                    </CardTitle>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <CardTitle className="flex items-center gap-2 text-[var(--text-accent)]">
+                        <Users className="text-green-500" />
+                        Grupos de Estudiantes
+                        <span className="text-sm font-normal text-[var(--text-secondary)]">
+                          ({studentGroups.filter((g) => g.files.length > 0).length} con archivos · {studentGroups.filter((g) => g.files.length > 0 && !g.isEvaluated && !g.isEvaluating).length} listos para evaluar)
+                        </span>
+                      </CardTitle>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isExtractingNames || studentGroups.filter((g) => g.files.length > 0 && isGenericGroupName(g.studentName)).length === 0}
+                        onClick={handleBulkNameExtraction}
+                        title="Extrae el nombre del estudiante para cada grupo que aún tenga nombre genérico (Alumno 1, Alumno 2…). No sobrescribe nombres ya asignados."
+                      >
+                        {isExtractingNames ? (
+                          <>
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            Extrayendo…
+                          </>
+                        ) : (
+                          "Extraer nombres de todos los grupos"
+                        )}
+                      </Button>
+                    </div>
                   </CardHeader>
                   <CardContent className="space-y-4">
-                    {studentGroups.map((group) => (
-                      <div key={group.id} className="border p-4 rounded-lg border-[var(--border-color)]">
-                        <Input
-                          className="text-lg font-bold border-0 shadow-none focus-visible:ring-0 p-1 mb-2 bg-transparent"
-                          value={group.studentName}
-                          onChange={(e) => updateStudentName(group.id, e.target.value)}
-                        />
-
-                        <Button
-                          type="button"
-                          variant="outline"
-                          onClick={() => handleNameExtraction(group.id)}
-                          disabled={isExtractingNames}
-                          className="mb-3 bg-transparent"
+                    {studentGroups.map((group) => {
+                      const stateLabel =
+                        group.error
+                          ? "Con error"
+                          : group.isEvaluating
+                            ? "Evaluando"
+                            : group.isEvaluated
+                              ? "Evaluado"
+                              : group.files.length > 0
+                                ? "Listo para evaluar"
+                                : "Sin archivos"
+                      const stateColor =
+                        group.error
+                          ? "border-red-300 bg-red-50/50 dark:bg-red-950/20"
+                          : group.isEvaluating
+                            ? "border-amber-300 bg-amber-50/50 dark:bg-amber-950/20"
+                            : group.isEvaluated
+                              ? "border-green-300 bg-green-50/50 dark:bg-green-950/20"
+                              : group.files.length > 0
+                                ? "border-blue-300 bg-blue-50/50 dark:bg-blue-950/20"
+                                : "border-[var(--border-color)] bg-[var(--bg-muted-subtle)]"
+                      return (
+                        <div
+                          key={group.id}
+                          id={`group-paso2-${group.id}`}
+                          className={`border-2 p-4 rounded-xl ${stateColor}`}
                         >
-                          {isExtractingNames ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <Sparkles className="mr-2 h-4 w-4 text-purple-500" />
-                          )}{" "}
-                          Detectar Nombre
-                        </Button>
+                          <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+                            <Input
+                              className="text-lg font-bold border-0 shadow-none focus-visible:ring-0 p-1 bg-transparent flex-1 min-w-0"
+                              value={group.studentName}
+                              onChange={(e) => updateStudentName(group.id, e.target.value)}
+                            />
+                            <span className="text-xs font-semibold px-2 py-1 rounded-full bg-[var(--bg-muted)] text-[var(--text-secondary)]">
+                              {group.files.length} archivo{group.files.length !== 1 ? "s" : ""}
+                            </span>
+                            <span className="text-xs font-medium px-2 py-1 rounded-full border bg-white/80 dark:bg-gray-900/80">
+                              {stateLabel}
+                            </span>
+                          </div>
 
-                        <div className="flex flex-wrap gap-2 min-h-[50px] bg-[var(--bg-muted-subtle)] p-2 rounded-md">
-                          {/* ✅ USO DE renderFilePreview */}
-                          {group.files.map((file) => (
-                            <div key={file.id} className="relative w-20 h-20">
-                              {renderFilePreview(file)}
-                              <button
-                                onClick={() => removeFileFromGroup(file.id, group.id)}
-                                className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5"
-                              >
-                                <X className="h-3 w-3" />
-                              </button>
-                            </div>
-                          ))}
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => handleNameExtraction(group.id)}
+                            disabled={isExtractingNames}
+                            className="mb-3 bg-transparent"
+                          >
+                            {isExtractingNames ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <Sparkles className="mr-2 h-4 w-4 text-purple-500" />
+                            )}{" "}
+                            Detectar Nombre
+                          </Button>
 
-                          {unassignedFiles.length > 0 && (
-                            <div className="flex items-center justify-center w-20 h-20 border-2 border-dashed rounded-md border-[var(--border-color)]">
-                              <select
-                                onChange={(e) => {
-                                  if (e.target.value) assignFileToGroup(e.target.value, group.id)
-                                  e.target.value = ""
-                                }}
-                                className="text-sm bg-transparent"
-                              >
-                                <option value="">Asignar</option>
-                                {unassignedFiles.map((f) => (
-                                  <option key={f.id} value={f.id}>
-                                    {f.file.name}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                          )}
+                          <div className="flex flex-wrap gap-2 min-h-[50px] bg-[var(--bg-muted-subtle)] p-3 rounded-lg border border-[var(--border-color)]">
+                            {group.files.map((file) => (
+                              <div key={file.id} className="relative w-20 h-20 rounded-md overflow-hidden border border-[var(--border-color)]">
+                                {renderFilePreview(file)}
+                                <button
+                                  onClick={() => removeFileFromGroup(file.id, group.id)}
+                                  className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5"
+                                >
+                                  <X className="h-3 w-3" />
+                                </button>
+                              </div>
+                            ))}
+
+                            {unassignedFiles.length > 0 && (
+                              <div className="flex items-center justify-center w-20 h-20 border-2 border-dashed rounded-lg border-[var(--border-color)]">
+                                <select
+                                  onChange={(e) => {
+                                    if (e.target.value) assignFileToGroup(e.target.value, group.id)
+                                    e.target.value = ""
+                                  }}
+                                  className="text-sm bg-transparent"
+                                >
+                                  <option value="">Asignar</option>
+                                  {unassignedFiles.map((f) => (
+                                    <option key={f.id} value={f.id}>
+                                      {f.file.name}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      )
+                    })}
                   </CardContent>
                   <CardFooter className="flex flex-col items-stretch gap-4">
+                    <div className="rounded-md border border-[var(--border-color)] bg-[var(--bg-muted-subtle)] p-3 space-y-2">
+                      <Label htmlFor="omr-template-variant" className="text-[var(--text-accent)]">
+                        Tipo de plantilla OMR
+                      </Label>
+                      <Select
+                        value={selectedOmrTemplateVariant}
+                        onValueChange={(v) =>
+                          setSelectedOmrTemplateVariant(v as "odd_even_dual_column" | "sequential_dual_column")
+                        }
+                      >
+                        <SelectTrigger id="omr-template-variant" className="w-full max-w-md bg-[var(--bg-card)]">
+                          <SelectValue placeholder="Seleccionar" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="odd_even_dual_column">Pares e impares</SelectItem>
+                          <SelectItem value="sequential_dual_column">Continua / secuencial</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        Se envía a la evaluación como <span className="font-mono">omrTemplateVariant</span>. Comprueba{" "}
+                        <span className="font-mono">omrTemplateVariantUsed</span> en OMR DEBUG (REAL).
+                      </p>
+                    </div>
                     {/* Botón de Evaluación */}
                     <Button
                       size="lg"
@@ -3713,18 +4216,152 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                   </CardFooter>
                 </Card>
               )}
-              {studentGroups.some((g) => g.isEvaluated || g.isEvaluating || g.isValidationStep) && (
+              {(studentGroups.some((g) => g.isEvaluated || g.isEvaluating || g.isValidationStep || !!g.error) || focusedGroupId) && (
                 <Card className="bg-[var(--bg-card)] border-[var(--border-color)]">
                   <CardHeader>
-                    <CardTitle className="text-[var(--text-accent)]">Paso 3: Resultados</CardTitle>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <CardTitle className="text-[var(--text-accent)]">Paso 3: Resultados</CardTitle>
+                      {focusedGroupId && (
+                        <Button type="button" variant="outline" size="sm" onClick={() => setFocusedGroupId(null)}>
+                          Ver todos
+                        </Button>
+                      )}
+                    </div>
                   </CardHeader>
                   <CardContent className="space-y-4">
-                    {studentGroups
-                      .filter((g) => g.isEvaluated || g.isEvaluating || g.isValidationStep || !!g.error)
-                      .map((group) => {
+                    {/* Panorama resumido por estudiante: tarjetas clicables para enfocar el detalle */}
+                    {studentGroups.length > 0 && (
+                      <div className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-muted-subtle)] p-3">
+                        <h4 className="font-semibold text-sm text-[var(--text-accent)] mb-2">
+                          Panorama del curso
+                          {form.watch("curso")?.trim() && (
+                            <span className="font-normal text-[var(--text-secondary)] ml-1">– {form.watch("curso")?.trim()}</span>
+                          )}
+                        </h4>
+                        <div className="flex gap-2 overflow-x-auto pb-2">
+                          {studentGroups.map((group) => {
+                            const { incorrect, revisar } = countAlternativasSummary(group.alternativas_corregidas)
+                            const isFocused = focusedGroupId === group.id
+                            const todoCorrecto =
+                              group.isEvaluated && !group.error && incorrect === 0 && revisar === 0
+                            const tieneIncorrectas = group.isEvaluated && !group.error && incorrect > 0
+                            const tieneRevisar = group.isEvaluated && !group.error && revisar > 0
+                            const pendienteEvaluar = !group.isEvaluated || group.isEvaluating
+                            const stateLabel = group.error
+                              ? "Con error"
+                              : group.isEvaluating
+                                ? "Evaluando"
+                                : group.isEvaluated
+                                  ? "Evaluado"
+                                  : group.files.length > 0
+                                    ? "Listo para evaluar"
+                                    : "Sin archivos"
+                            return (
+                              <button
+                                key={group.id}
+                                type="button"
+                                onClick={() => {
+                                  setFocusedGroupId(group.id)
+                                  setTimeout(
+                                    () => document.getElementById(`group-paso3-${group.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" }),
+                                    80,
+                                  )
+                                }}
+                                className={cn(
+                                  "shrink-0 w-44 rounded-lg border-2 p-3 text-left transition-colors",
+                                  isFocused && "border-[var(--bg-primary)] bg-[var(--bg-primary)]/10 ring-2 ring-[var(--bg-primary)]/30",
+                                  !isFocused && group.error && "border-red-300 bg-red-50/50 dark:bg-red-950/20",
+                                  !isFocused && group.isEvaluating && "border-amber-300 bg-amber-50/50 dark:bg-amber-950/20",
+                                  !isFocused && todoCorrecto && "border-green-400 bg-green-50/50 dark:bg-green-950/20",
+                                  !isFocused && tieneIncorrectas && "border-red-400 bg-red-50/50 dark:bg-red-950/20",
+                                  !isFocused && tieneRevisar && "border-amber-400 bg-amber-50/50 dark:bg-amber-950/20",
+                                  !isFocused && pendienteEvaluar && !group.error && "border-[var(--border-color)] bg-[var(--bg-card)] hover:border-[var(--text-accent)]/50",
+                                )}
+                              >
+                                <p className="font-semibold text-sm truncate text-[var(--text-primary)]" title={group.studentName}>
+                                  {group.studentName || "Sin nombre"}
+                                </p>
+                                <p className="text-xs text-[var(--text-secondary)] mt-0.5">
+                                  {group.files.length} archivo{group.files.length !== 1 ? "s" : ""}
+                                  {!pendienteEvaluar && stateLabel ? ` · ${stateLabel}` : ""}
+                                </p>
+                                {todoCorrecto && (
+                                  <p className="text-xs mt-1.5 flex items-center gap-1 text-green-700 dark:text-green-400 font-medium">
+                                    <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                                    Sin correcciones pendientes
+                                  </p>
+                                )}
+                                {tieneIncorrectas && (
+                                  <p className="text-xs mt-1.5 font-medium text-red-700 dark:text-red-400">
+                                    {incorrect} incorrecta{incorrect !== 1 ? "s" : ""}
+                                  </p>
+                                )}
+                                {tieneRevisar && (
+                                  <p className="text-xs mt-1.5 font-medium text-amber-700 dark:text-amber-400">
+                                    {revisar} a revisar
+                                  </p>
+                                )}
+                                {pendienteEvaluar && !group.error && (
+                                  <p className="text-xs mt-1.5 text-[var(--text-secondary)]">
+                                    Pendiente de evaluación
+                                  </p>
+                                )}
+                                {group.error && (
+                                  <p className="text-xs mt-1.5 font-medium text-red-600 dark:text-red-400">
+                                    Error
+                                  </p>
+                                )}
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {(() => {
+                      const baseGroups = studentGroups.filter(
+                        (g) => g.isEvaluated || g.isEvaluating || g.isValidationStep || !!g.error,
+                      )
+                      const displayGroups = focusedGroupId ? baseGroups.filter((g) => g.id === focusedGroupId) : baseGroups
+                      if (focusedGroupId && displayGroups.length === 0) {
+                        const focusedGroup = studentGroups.find((g) => g.id === focusedGroupId)
+                        return (
+                          <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20 p-4 text-center">
+                            <p className="text-[var(--text-primary)] font-medium">
+                              {focusedGroup?.studentName || "Este estudiante"} aún no tiene resultados.
+                            </p>
+                            <p className="text-sm text-[var(--text-secondary)] mt-1">
+                              Evalúa para ver su detalle aquí o revisa en el paso 2.
+                            </p>
+                          </div>
+                        )
+                      }
+                      return displayGroups.map((group) => {
                         const notaNumber = Number(group.nota) || 0
                         const finalNota = notaNumber + (group.decimasAdicionales || 0)
                         const isReadyToValidate = group.isValidationStep && group.alternativas_corregidas?.length
+                        const debug = group.omrDebug
+                        const expectedClosedCount = Math.max(
+                          0,
+                          Number(debug?.expectedQuestionCountUsed ?? 0) || 0
+                        )
+                        const currentAlternativas = Array.isArray(group.alternativas_corregidas)
+                          ? group.alternativas_corregidas
+                          : []
+                        const tableAlternativas =
+                          expectedClosedCount > currentAlternativas.length
+                            ? [
+                                ...currentAlternativas,
+                                ...Array.from(
+                                  { length: expectedClosedCount - currentAlternativas.length },
+                                  (_, idx) => ({
+                                    pregunta: `SM${currentAlternativas.length + idx + 1}`,
+                                    respuesta_estudiante: "",
+                                    respuesta_correcta: "",
+                                  }),
+                                ),
+                              ]
+                            : currentAlternativas
 
                         // 🔥 EXTRACCIÓN DE VALORES PARA EL VELOCÍMETRO
                         const puntajeObtenido = Number.parseInt(group.puntaje?.split("/")[0] || "0", 10)
@@ -3735,6 +4372,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         return (
                           <div
                             key={group.id}
+                            id={`group-paso3-${group.id}`}
                             className={`p-6 rounded-lg border-l-4 ${
                               group.error ? "border-red-500" : "border-green-500"
                             } bg-[var(--bg-card)] shadow`}
@@ -3783,11 +4421,100 @@ h-4 w-4 animate-spin"
                             </div>
 
                             {group.error ? (
-                              <p className="text-red-600">Error: {group.error}</p>
+                              <div className="space-y-3">
+                                <p className="text-red-600">Error: {group.error}</p>
+                                {(typeof group.shouldUseOfficialAzureOmr !== "undefined" ||
+                                  typeof group.officialOmrEngineSelected !== "undefined") && (
+                                  <div className="rounded-md border border-cyan-300 bg-cyan-50 dark:bg-cyan-950/30 p-3 text-xs">
+                                    <p className="font-semibold text-cyan-900 dark:text-cyan-100 mb-1">
+                                      Debug OMR oficial (temporal)
+                                    </p>
+                                    <ul className="font-mono space-y-0.5 break-all">
+                                      <li>shouldUseOfficialAzureOmr: {String(group.shouldUseOfficialAzureOmr ?? "—")}</li>
+                                      <li>officialOmrActivationReason: {String(group.officialOmrActivationReason ?? "—")}</li>
+                                      <li>officialOmrIntegrationEnabled: {String(group.officialOmrIntegrationEnabled ?? "—")}</li>
+                                      <li>officialOmrEngineSelected: {String(group.officialOmrEngineSelected ?? "—")}</li>
+                                      <li>officialOmrEngineUsed: {String(group.officialOmrEngineUsed ?? "—")}</li>
+                                      <li>officialOmrFallbackUsed: {String(group.officialOmrFallbackUsed ?? "—")}</li>
+                                      <li>officialOmrFallbackReason: {String(group.officialOmrFallbackReason ?? "—")}</li>
+                                    </ul>
+                                    {group.officialOmrEngineSelected === "azure_layout_family" &&
+                                      group.officialOmrEngineUsed === "legacy" && (
+                                        <div className="mt-2 rounded border-2 border-rose-600 bg-rose-50 dark:bg-rose-950/50 p-2 text-rose-900 dark:text-rose-100 font-bold">
+                                          El motor Azure oficial NO se usó. Se hizo fallback a legacy.
+                                        </div>
+                                      )}
+                                  </div>
+                                )}
+                              </div>
                             ) : (
                               <div className="mt-4 space-y-6">
+                                {(typeof group.shouldUseOfficialAzureOmr !== "undefined" ||
+                                  typeof group.officialOmrEngineSelected !== "undefined") && (
+                                  <div className="rounded-md border border-cyan-300 bg-cyan-50 dark:bg-cyan-950/30 p-3 text-xs">
+                                    <p className="font-semibold text-cyan-900 dark:text-cyan-100 mb-1">
+                                      Debug OMR oficial (temporal)
+                                    </p>
+                                    <ul className="font-mono space-y-0.5 break-all">
+                                      <li>shouldUseOfficialAzureOmr: {String(group.shouldUseOfficialAzureOmr ?? "—")}</li>
+                                      <li>officialOmrActivationReason: {String(group.officialOmrActivationReason ?? "—")}</li>
+                                      <li>officialOmrIntegrationEnabled: {String(group.officialOmrIntegrationEnabled ?? "—")}</li>
+                                      <li>officialOmrEngineSelected: {String(group.officialOmrEngineSelected ?? "—")}</li>
+                                      <li>officialOmrEngineUsed: {String(group.officialOmrEngineUsed ?? "—")}</li>
+                                      <li>officialOmrFallbackUsed: {String(group.officialOmrFallbackUsed ?? "—")}</li>
+                                      <li>officialOmrFallbackReason: {String(group.officialOmrFallbackReason ?? "—")}</li>
+                                    </ul>
+                                    {group.officialOmrEngineSelected === "azure_layout_family" &&
+                                      group.officialOmrEngineUsed === "legacy" && (
+                                        <div className="mt-2 rounded border-2 border-rose-600 bg-rose-50 dark:bg-rose-950/50 p-2 text-rose-900 dark:text-rose-100 font-bold">
+                                          El motor Azure oficial NO se usó. Se hizo fallback a legacy.
+                                        </div>
+                                      )}
+                                  </div>
+                                )}
                                 {group.isEvaluated && (
                                   <>
+                                    {debug && (
+                                      <div style={{
+                                        marginTop: "20px",
+                                        padding: "12px",
+                                        border: "3px solid red",
+                                        background: "#000",
+                                        color: "#00ff00",
+                                        fontSize: "12px",
+                                        zIndex: 9999
+                                      }}>
+                                        <div><b>OMR DEBUG (REAL)</b></div>
+
+                                        <div>engineSelected: {String(debug.engineSelected)}</div>
+                                        <div>engineUsed: {String(debug.engineUsed)}</div>
+                                        <div>fallbackUsed: {String(debug.fallbackUsed)}</div>
+                                        <div>integrationEnabled: {String(debug.integrationEnabled)}</div>
+
+                                        <div>studentAnswersSource: {String(debug.studentAnswersSource)}</div>
+                                        <div>teacherAnswersSource: {String(debug.teacherAnswersSource)}</div>
+                                        <div>expectedQuestionCountUsed: {String(debug.expectedQuestionCountUsed)}</div>
+                                        <div>teacherAnswerKeyLength: {String(debug.teacherAnswerKeyLength)}</div>
+                                        <div>totalPregResolved: {String(debug.totalPregResolved)}</div>
+                                        <div>templateKeyUsed: {String(debug.templateKeyUsed)}</div>
+                                        <div>omrTemplateVariantUsed: {String(debug.omrTemplateVariantUsed)}</div>
+
+                                        <div>totalDetectedAnswers: {String(debug.totalDetectedAnswers)}</div>
+                                        <div>officialOmrQuestionCountFromPipeline: {String(debug.officialOmrQuestionCountFromPipeline)}</div>
+                                        <div>officialOmrDetectedAnswersCount: {String(debug.officialOmrDetectedAnswersCount)}</div>
+                                        <div>officialOmrDetectedVsPipelineMismatch: {String(debug.officialOmrDetectedVsPipelineMismatch)}</div>
+                                        <div>officialOmrAdapterMode: {String(debug.officialOmrAdapterMode)}</div>
+
+                                        <div style={{ marginTop: "10px" }}>detectedAnswersPreview:</div>
+                                        <pre style={{ maxHeight: "200px", overflow: "auto" }}>
+                                          {JSON.stringify(debug.detectedAnswersPreview, null, 2)}
+                                        </pre>
+                                        <div style={{ marginTop: "10px" }}>officialOmrPerQuestionRawPreview:</div>
+                                        <pre style={{ maxHeight: "200px", overflow: "auto" }}>
+                                          {JSON.stringify(debug.officialOmrPerQuestionRawPreview, null, 2)}
+                                        </pre>
+                                      </div>
+                                    )}
                                     {/* REEMPLAZO DE PUNTAJE Y NOTA PARA INCLUIR VELOCÍMETRO */}
                                     <div className="flex justify-between items-start bg-[var(--bg-muted-subtle)] p-4 rounded-lg">
                                       <div>
@@ -3920,9 +4647,7 @@ h-4 w-4 animate-spin"
                                     </div>
                                     {/* 🚨 VALIDACIÓN OMR INTERACTIVA - TABLA EDITABLE (PASO CRÍTICO DE LA METACONIGICIÓN) */}
                                     {/* Asegurar que la tabla editable SIEMPRE esté visible cuando hay alternativas cerradas */}
-                                    {group.isEvaluated &&
-                                      group.alternativas_corregidas &&
-                                      group.alternativas_corregidas.length > 0 && (
+                                    {group.isEvaluated && (
                                         <div className="mt-4 border-2 border-blue-500 rounded-lg p-4 bg-blue-50">
                                           <h4 className="font-bold mb-2 flex items-center text-blue-700">
                                             <Eye className="h-4 w-4 mr-2" />
@@ -3952,17 +4677,18 @@ h-4 w-4 animate-spin"
                                           </div>
 
                                           <div className="overflow-x-auto">
-                                            <Table>
-                                              <TableHeader>
-                                                <TableRow className="bg-blue-50">
-                                                  <TableHead>Pregunta</TableHead>
-                                                  <TableHead>R. Estudiante (Editable)</TableHead>
-                                                  <TableHead>R. Correcta</TableHead>
-                                                  <TableHead>Estado</TableHead>
-                                                </TableRow>
-                                              </TableHeader>
-                                              <TableBody>
-                                                {group.alternativas_corregidas?.map((item, index) => {
+                                            {tableAlternativas.length > 0 ? (
+                                              <Table>
+                                                <TableHeader>
+                                                  <TableRow className="bg-blue-50">
+                                                    <TableHead>Pregunta</TableHead>
+                                                    <TableHead>R. Estudiante (Editable)</TableHead>
+                                                    <TableHead>R. Correcta</TableHead>
+                                                    <TableHead>Estado</TableHead>
+                                                  </TableRow>
+                                                </TableHeader>
+                                                <TableBody>
+                                                  {tableAlternativas.map((item, index) => {
                                                   const respuestaEst =
                                                     item.respuesta_estudiante?.trim().toUpperCase() || ""
                                                   const respuestaCorr =
@@ -4003,6 +4729,7 @@ h-4 w-4 animate-spin"
                                                               : "border-gray-300",
                                                           )}
                                                           defaultValue={item.respuesta_estudiante}
+                                                          disabled={!currentAlternativas.some((a) => a.pregunta === item.pregunta)}
                                                           onChange={(e) =>
                                                             handleAlternativeChange(
                                                               group.id,
@@ -4017,6 +4744,7 @@ h-4 w-4 animate-spin"
                                                           type="text"
                                                           className="h-8 w-16 text-center font-bold text-green-700 border-green-300 bg-green-50/50"
                                                           value={item.respuesta_correcta || ""}
+                                                          disabled={!currentAlternativas.some((a) => a.pregunta === item.pregunta)}
                                                           onChange={(e) =>
                                                             handleCorrectAnswerChange(
                                                               group.id,
@@ -4040,9 +4768,14 @@ h-4 w-4 animate-spin"
                                                       </TableCell>
                                                     </TableRow>
                                                   )
-                                                })}
-                                              </TableBody>
-                                            </Table>
+                                                  })}
+                                                </TableBody>
+                                              </Table>
+                                            ) : (
+                                              <div className="text-sm text-blue-800 bg-blue-100 p-3 rounded border border-blue-300">
+                                                No hay respuestas cerradas detectadas para mostrar en esta evaluación.
+                                              </div>
+                                            )}
                                           </div>
                                           {group.evaluation_id && (
                                             <div className="mt-3 flex items-center gap-2">
@@ -4197,11 +4930,13 @@ h-4 w-4 animate-spin"
                             )}
                           </div>
                         )
-                      })}
+                      })
+                    })()}
                   </CardContent>
                 </Card>
               )}
-            </>
+              </div>
+            </div>
           )}
           <TabsContent value="dashboard" className="mt-4 space-y-4">
             <div className="flex items-center justify-between gap-2">
