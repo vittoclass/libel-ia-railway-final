@@ -69,6 +69,7 @@ import {
   pdf,
 } from "@react-pdf/renderer"
 import { useEvaluator, AnswerKeyData } from "./useEvaluator"
+import { sanitizeRetroalimentacionCorreccionDetallada } from "@/app/lib/sanitize-retro-correccion-detallada"
 import OMRPreviewModal from "@/app/components/OMRPreviewModal"
 import AnswerKeyUploadModal from "../components/AnswerKeyUploadModal"
 import { RealtimeOMRModal } from "@/app/components/RealtimeOMRModal"
@@ -351,111 +352,34 @@ function formatDetalleDesarrolloPdf(raw: any): string {
   return fallback || "(Sin detalle estructurado disponible)"
 }
 
-function normalizePdfMatchText(s: string): string {
-  return String(s || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{M}/gu, "")
-    .replace(/\s+/g, " ")
-    .trim()
+// Pauta estructurada (misma regla que en route): antes de ReportDocument para calculateFinalScore y resto del módulo.
+interface ItemScore {
+  id: string
+  maxScore: number
+  isDevelopment: boolean
 }
+const parsePautaEstructurada = (pautaStr: string): ItemScore[] => {
+  const items: ItemScore[] = []
+  if (!pautaStr) return items
 
-function extractDevQuestionNumbersFromKeys(devKeys: string[]): Set<number> {
-  const nums = new Set<number>()
-  for (const key of devKeys) {
-    const m = /^P\s*(\d+)$/i.exec(key.trim())
-    if (m) nums.add(parseInt(m[1], 10))
-  }
-  return nums
-}
+  const pairs = pautaStr
+    .split(";")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
 
-function buildDetalleDesarrolloMatchCorpus(detalleDesarrollo: Record<string, any> | undefined): string {
-  if (!detalleDesarrollo || typeof detalleDesarrollo !== "object") return ""
-  const parts: string[] = []
-  for (const v of Object.values(detalleDesarrollo)) {
-    if (v == null) continue
-    if (typeof v === "object" && !Array.isArray(v)) {
-      parts.push(String((v as any).justificacion ?? ""))
-      parts.push(String((v as any).cita_estudiante ?? (v as any).texto_estudiante ?? (v as any).respuesta ?? ""))
-    } else {
-      parts.push(String(v))
+  for (const pair of pairs) {
+    const [id, scoreStr] = pair.split(":").map((s) => s.trim())
+    const maxScore = Number.parseInt(scoreStr, 10)
+
+    if (id && !isNaN(maxScore) && maxScore > 0) {
+      items.push({
+        id: id,
+        maxScore: maxScore,
+        isDevelopment: id.toLowerCase().includes("desarrollo") || id.toLowerCase().match(/^p\d+/) !== null,
+      })
     }
   }
-  return normalizePdfMatchText(parts.join("\n"))
-}
-
-function textoMencionaNumerosDesarrollo(texto: string, nums: Set<number>): boolean {
-  const t = normalizePdfMatchText(texto)
-  if (!t) return false
-  for (const n of nums) {
-    if (new RegExp(`\\bp\\s*${n}\\b`, "i").test(t)) return true
-    if (new RegExp(`pregunta\\s*[:-]?\\s*${n}\\b`, "i").test(t)) return true
-  }
-  return false
-}
-
-function seccionRelatesToDetalleDesarrolloKeys(seccion: string, devKeys: string[]): boolean {
-  if (!devKeys.length) return false
-  const s = String(seccion || "")
-  const upper = s.toUpperCase()
-  for (const key of devKeys) {
-    const k = key.trim()
-    if (!k) continue
-    const ku = k.toUpperCase()
-    const kSpaced = k.replace(/_/g, " ").toUpperCase()
-    if (upper.includes(ku) || upper.includes(kSpaced)) return true
-    const num = /^P(\d+)$/i.exec(k)?.[1]
-    if (num && new RegExp(`\\bP\\s*${num}\\b`, "i").test(s)) return true
-  }
-  return false
-}
-
-/**
- * PDF: si hay detalle_desarrollo, no mostrar en correccion_detallada ninguna fila del "mundo desarrollo"
- * (misma pregunta por número, subtítulos repetidos en justificación, cita solapada, etc.).
- */
-function excludeCorreccionDetalladaRowForPdfDesarrollo(
-  row: any,
-  devKeys: string[],
-  detalleDesarrollo: Record<string, any> | undefined,
-): boolean {
-  if (!devKeys.length) return false
-  const seccion = String(row?.seccion ?? "")
-  const detalleRow = String(row?.detalle ?? row?.detalles ?? "")
-  const nums = extractDevQuestionNumbersFromKeys(devKeys)
-  const corpus = buildDetalleDesarrolloMatchCorpus(detalleDesarrollo)
-  const secNorm = normalizePdfMatchText(seccion)
-  const detNorm = normalizePdfMatchText(detalleRow)
-
-  if (seccionRelatesToDetalleDesarrolloKeys(seccion, devKeys)) return true
-  if (/pregunta\s+desarrollo/i.test(seccion)) return true
-  if (/\bdesarrollo\b/i.test(seccion) && /\bpregunta\b/i.test(seccion)) return true
-
-  for (const n of nums) {
-    if (new RegExp(`pregunta\\s*[:-]?\\s*${n}\\b`, "i").test(seccion)) return true
-  }
-
-  if (secNorm.length >= 10 && corpus.length >= 24 && corpus.includes(secNorm)) return true
-  if (detNorm.length >= 28 && corpus.length >= 24 && corpus.includes(detNorm)) return true
-
-  if (textoMencionaNumerosDesarrollo(seccion, nums)) return true
-  if (textoMencionaNumerosDesarrollo(detalleRow, nums)) return true
-
-  if (detNorm.length >= 22 && detalleDesarrollo && typeof detalleDesarrollo === "object") {
-    for (const v of Object.values(detalleDesarrollo)) {
-      if (!v || typeof v !== "object") continue
-      const cite = normalizePdfMatchText(
-        String((v as any).cita_estudiante ?? (v as any).texto_estudiante ?? (v as any).respuesta ?? ""),
-      )
-      if (cite.length < 18) continue
-      const head = cite.slice(0, 44)
-      if (head.length >= 18 && detNorm.includes(head)) return true
-      const headRow = detNorm.slice(0, 44)
-      if (headRow.length >= 18 && cite.includes(headRow)) return true
-    }
-  }
-
-  return false
+  return items
 }
 
 const ReportDocument = ({ group, formData, logoPreview }: any) => {
@@ -468,9 +392,7 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
   const notaFinal = (notaNum + (group.decimasAdicionales || 0)).toFixed(1)
   const correccion = group.retroalimentacion?.correccion_detallada || []
   const devKeys = Object.keys(group.detalle_desarrollo || {})
-  const correccionSinDuplicarDesarrollo = correccion.filter(
-    (row: any) => !excludeCorreccionDetalladaRowForPdfDesarrollo(row, devKeys, group.detalle_desarrollo),
-  )
+  const correccionSinDuplicarDesarrollo = correccion
   const correccionDesarrolloArray = devKeys.map((key) => {
     const raw = group.detalle_desarrollo![key]
     const detalle =
@@ -857,37 +779,6 @@ interface AlternativeResult {
   respuesta_estudiante: string
   respuesta_correcta: string
 } // Definición para el tipo de alternativa
-// 🔥 INTERFAZ PARA PAUTA ESTRUCTURADA
-interface ItemScore {
-  id: string
-  maxScore: number
-  isDevelopment: boolean
-}
-// 🔥 FUNCIÓN HELPER PARA PARSEAR LA PAUTA ESTRUCTURADA (Tomada de route.ts para el cálculo local)
-const parsePautaEstructurada = (pautaStr: string): ItemScore[] => {
-  const items: ItemScore[] = []
-  if (!pautaStr) return items
-
-  const pairs = pautaStr
-    .split(";")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0)
-
-  for (const pair of pairs) {
-    const [id, scoreStr] = pair.split(":").map((s) => s.trim())
-    const maxScore = Number.parseInt(scoreStr, 10)
-
-    if (id && !isNaN(maxScore) && maxScore > 0) {
-      items.push({
-        id: id,
-        maxScore: maxScore,
-        // Lógica de route.ts: es desarrollo si incluye 'desarrollo' o es P#
-        isDevelopment: id.toLowerCase().includes("desarrollo") || id.toLowerCase().match(/^p\d+/) !== null,
-      })
-    }
-  }
-  return items
-}
 
 // 🔥 FUNCIÓN HELPER PARA CALCULAR LA NOTA (escala chilena 1.0–7.0, curva ligeramente generosa)
 const calculateGrade = (score: number, maxScore: number, porcentajeExigencia: number): number => {
@@ -2587,7 +2478,13 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                       isEvaluating: false,
                       isEvaluated: true,
                       isValidationStep: false,
-                      retroalimentacion: msg.data.retroalimentacion,
+                      retroalimentacion:
+                        sanitizeRetroalimentacionCorreccionDetallada(
+                          msg.data.retroalimentacion as Record<string, unknown>,
+                          msg.data.detalle_desarrollo as Record<string, unknown> | undefined,
+                          (msg.data.alternativas_corregidas as unknown[]) ??
+                            msg.data.retroalimentacion?.retroalimentacion_alternativas,
+                        ) ?? msg.data.retroalimentacion,
                       puntaje: msg.data.puntaje,
                       nota: msg.data.nota,
                       detalle_desarrollo: msg.data.detalle_desarrollo,

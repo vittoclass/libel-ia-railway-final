@@ -2,6 +2,7 @@
 'use client';
 
 import { useState, useCallback } from 'react';
+import { sanitizeRetroalimentacionCorreccionDetallada } from '@/app/lib/sanitize-retro-correccion-detallada';
 
 // Tipo para la plantilla de respuestas del profesor
 export interface AnswerKeyItem {
@@ -243,7 +244,17 @@ export const useEvaluator = () => {
         };
       }
 
-      return data;
+      return {
+        ...data,
+        retroalimentacion:
+          sanitizeRetroalimentacionCorreccionDetallada(
+            data.retroalimentacion as Record<string, unknown>,
+            data.detalle_desarrollo as Record<string, unknown> | undefined,
+            (data.alternativas_corregidas as unknown[]) ??
+              (data.retroalimentacion as { retroalimentacion_alternativas?: unknown[] } | undefined)
+                ?.retroalimentacion_alternativas,
+          ) ?? data.retroalimentacion,
+      };
     } catch (err: any) {
       return { success: false, error: err.message };
     } finally {
