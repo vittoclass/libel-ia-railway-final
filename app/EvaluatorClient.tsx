@@ -69,6 +69,11 @@ import {
   pdf,
 } from "@react-pdf/renderer"
 import { useEvaluator, AnswerKeyData } from "./useEvaluator"
+import { pickStudentDesarrolloVisibleText } from "@/app/lib/pick-student-desarrollo-text"
+import {
+  buildPedagogicalResumenFromGroup,
+  countAlternativasSummary,
+} from "@/app/lib/pedagogical-feedback-from-group"
 import OMRPreviewModal from "@/app/components/OMRPreviewModal"
 import AnswerKeyUploadModal from "../components/AnswerKeyUploadModal"
 import { RealtimeOMRModal } from "@/app/components/RealtimeOMRModal"
@@ -266,17 +271,24 @@ function renderForWeb(value: any): string {
   }
   try {
     if (typeof value === "object" && value !== null) {
-      // Manejar objetos con estructura conocida
-      if (value.cita_estudiante && value.justificacion) {
-        return `Puntaje: ${value.puntaje || "N/A"} - Respuesta: "${value.cita_estudiante}" - ${value.justificacion}`
+      // Manejar objetos con estructura conocida (desarrollo: misma prioridad de cita que normalizeRespuestasDesarrollo)
+      if (
+        value.justificacion &&
+        ("puntaje" in value || "texto_estudiante" in value || "cita_estudiante" in value)
+      ) {
+        const q = pickStudentDesarrolloVisibleText(value as Record<string, unknown>)
+        const pRaw = (value as { puntaje?: unknown }).puntaje
+        const pStr =
+          pRaw != null && String(renderForWeb(pRaw)).trim() !== "" ? renderForWeb(pRaw) : "N/A"
+        return `Puntaje: ${pStr} - Respuesta: "${q}" - ${renderForWeb((value as { justificacion: unknown }).justificacion)}`
       }
       if (value.area && value.detalles) {
         return `${value.area}: ${renderForWeb(value.detalles)}`
       }
-      if (value.descripcion) return String(value.descripcion)
-      if (value.detalle) return String(value.detalle)
-      if (value.detalles) return String(value.detalles)
-      if (value.texto) return String(value.texto)
+      if (value.descripcion != null && value.descripcion !== "") return renderForWeb(value.descripcion)
+      if (value.detalle != null && value.detalle !== "") return renderForWeb(value.detalle)
+      if (value.detalles != null && value.detalles !== "") return renderForWeb(value.detalles)
+      if (value.texto != null && value.texto !== "") return renderForWeb(value.texto)
       if (value.seccion) return `${value.seccion}: ${renderForWeb(value.detalle || value.detalles || "")}`
       if (value.mensaje) return String(value.mensaje)
       // Ultimo recurso: convertir entries a string
@@ -297,14 +309,27 @@ function pdfSafe(value: any): string {
     if (Array.isArray(value)) {
       const arr = value as any[]
       if (arr.length > 0 && typeof arr[0] === "object" && arr[0] !== null && ("aspecto" in arr[0] || "detalle" in arr[0])) {
-        return arr.map((x: any) => `• ${x.aspecto ?? x.seccion ?? "Item"}: ${x.detalle ?? x.detalles ?? ""}`).join("\n")
+        return arr
+          .map(
+            (x: any) =>
+              `• ${x.aspecto ?? x.seccion ?? "Item"}: ${pdfSafe(x.detalle ?? x.detalles ?? "")}`,
+          )
+          .join("\n")
       }
       return arr.map((v) => pdfSafe(v)).join(", ")
     }
-    if (typeof value === "object" && value !== null && value.cita_estudiante && value.justificacion) {
-      return `Puntaje: ${pdfSafe(value.puntaje)}
-Respuesta Estudiante: "${value.cita_estudiante}"
-Justificación: ${value.justificacion}`
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      value.justificacion &&
+      ("puntaje" in value || "texto_estudiante" in value || "cita_estudiante" in value)
+    ) {
+      const q = pickStudentDesarrolloVisibleText(value as Record<string, unknown>)
+      const pRaw = (value as { puntaje?: unknown }).puntaje
+      const pStr = pRaw != null && String(pdfSafe(pRaw)).trim() !== "" ? pdfSafe(pRaw) : "N/A"
+      return `Puntaje: ${pStr}
+Respuesta Estudiante: "${q}"
+Justificación: ${pdfSafe((value as { justificacion: unknown }).justificacion)}`
     }
     return JSON.stringify(value)
   } catch {
@@ -336,11 +361,10 @@ function formatDetalleDesarrolloPdf(raw: any): string {
     pVal != null && String(pVal).trim() !== ""
       ? `Puntaje: ${String(pVal).trim()}`
       : ""
-  const txtSource = (o.cita_estudiante ?? o.texto_estudiante ?? o.respuesta ?? o.respuesta_estudiante) as unknown
-  const txt = txtSource != null ? String(txtSource).trim() : ""
+  const txt = pickStudentDesarrolloVisibleText(o as Record<string, unknown>)
   const txtPart = txt ? `Respuesta: "${txt.replace(/"/g, "'")}"` : ""
   const jVal = o.justificacion
-  const j = jVal != null ? String(jVal).trim() : ""
+  const j = jVal != null ? renderForWeb(jVal).trim() : ""
   const jPart = j ? `Justificación: ${j}` : ""
   const main = [p, txtPart, jPart].filter(Boolean).join("\n")
   if (main) return main
@@ -351,126 +375,33 @@ function formatDetalleDesarrolloPdf(raw: any): string {
   return fallback || "(Sin detalle estructurado disponible)"
 }
 
-function normalizePdfMatchText(s: string): string {
-  return String(s || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{M}/gu, "")
-    .replace(/\s+/g, " ")
-    .trim()
-}
-
-function extractDevQuestionNumbersFromKeys(devKeys: string[]): Set<number> {
-  const nums = new Set<number>()
-  for (const key of devKeys) {
-    const m = /^P\s*(\d+)$/i.exec(key.trim())
-    if (m) nums.add(parseInt(m[1], 10))
-  }
-  return nums
-}
-
-function buildDetalleDesarrolloMatchCorpus(detalleDesarrollo: Record<string, any> | undefined): string {
-  if (!detalleDesarrollo || typeof detalleDesarrollo !== "object") return ""
-  const parts: string[] = []
-  for (const v of Object.values(detalleDesarrollo)) {
-    if (v == null) continue
-    if (typeof v === "object" && !Array.isArray(v)) {
-      parts.push(String((v as any).justificacion ?? ""))
-      parts.push(String((v as any).cita_estudiante ?? (v as any).texto_estudiante ?? (v as any).respuesta ?? ""))
-    } else {
-      parts.push(String(v))
-    }
-  }
-  return normalizePdfMatchText(parts.join("\n"))
-}
-
-function textoMencionaNumerosDesarrollo(texto: string, nums: Set<number>): boolean {
-  const t = normalizePdfMatchText(texto)
-  if (!t) return false
-  for (const n of nums) {
-    if (new RegExp(`\\bp\\s*${n}\\b`, "i").test(t)) return true
-    if (new RegExp(`pregunta\\s*[:-]?\\s*${n}\\b`, "i").test(t)) return true
-  }
-  return false
-}
-
-function seccionRelatesToDetalleDesarrolloKeys(seccion: string, devKeys: string[]): boolean {
-  if (!devKeys.length) return false
-  const s = String(seccion || "")
-  const upper = s.toUpperCase()
-  for (const key of devKeys) {
-    const k = key.trim()
-    if (!k) continue
-    const ku = k.toUpperCase()
-    const kSpaced = k.replace(/_/g, " ").toUpperCase()
-    if (upper.includes(ku) || upper.includes(kSpaced)) return true
-    const num = /^P(\d+)$/i.exec(k)?.[1]
-    if (num && new RegExp(`\\bP\\s*${num}\\b`, "i").test(s)) return true
-  }
-  return false
-}
-
 /**
- * PDF: si hay detalle_desarrollo, no mostrar en correccion_detallada ninguna fila del "mundo desarrollo"
- * (misma pregunta por número, subtítulos repetidos en justificación, cita solapada, etc.).
+ * Regla estructural (sin heurísticas de texto): si existe al menos una clave en
+ * detalle_desarrollo, el bloque de corrección detallada de desarrollo sale solo de ahí;
+ * correccion_detallada no se mezcla en preview ni PDF.
  */
-function excludeCorreccionDetalladaRowForPdfDesarrollo(
-  row: any,
-  devKeys: string[],
-  detalleDesarrollo: Record<string, any> | undefined,
-): boolean {
-  if (!devKeys.length) return false
-  const seccion = String(row?.seccion ?? "")
-  const detalleRow = String(row?.detalle ?? row?.detalles ?? "")
-  const nums = extractDevQuestionNumbersFromKeys(devKeys)
-  const corpus = buildDetalleDesarrolloMatchCorpus(detalleDesarrollo)
-  const secNorm = normalizePdfMatchText(seccion)
-  const detNorm = normalizePdfMatchText(detalleRow)
-
-  if (seccionRelatesToDetalleDesarrolloKeys(seccion, devKeys)) return true
-  if (/pregunta\s+desarrollo/i.test(seccion)) return true
-  if (/\bdesarrollo\b/i.test(seccion) && /\bpregunta\b/i.test(seccion)) return true
-
-  for (const n of nums) {
-    if (new RegExp(`pregunta\\s*[:-]?\\s*${n}\\b`, "i").test(seccion)) return true
-  }
-
-  if (secNorm.length >= 10 && corpus.length >= 24 && corpus.includes(secNorm)) return true
-  if (detNorm.length >= 28 && corpus.length >= 24 && corpus.includes(detNorm)) return true
-
-  if (textoMencionaNumerosDesarrollo(seccion, nums)) return true
-  if (textoMencionaNumerosDesarrollo(detalleRow, nums)) return true
-
-  if (detNorm.length >= 22 && detalleDesarrollo && typeof detalleDesarrollo === "object") {
-    for (const v of Object.values(detalleDesarrollo)) {
-      if (!v || typeof v !== "object") continue
-      const cite = normalizePdfMatchText(
-        String((v as any).cita_estudiante ?? (v as any).texto_estudiante ?? (v as any).respuesta ?? ""),
-      )
-      if (cite.length < 18) continue
-      const head = cite.slice(0, 44)
-      if (head.length >= 18 && detNorm.includes(head)) return true
-      const headRow = detNorm.slice(0, 44)
-      if (headRow.length >= 18 && cite.includes(headRow)) return true
-    }
-  }
-
-  return false
+function filterCorreccionDetalladaParaDesarrolloUnico(group: {
+  retroalimentacion?: { correccion_detallada?: any[] }
+  detalle_desarrollo?: Record<string, any>
+}): any[] {
+  const devKeys = Object.keys(group.detalle_desarrollo || {})
+  if (devKeys.length > 0) return []
+  return group.retroalimentacion?.correccion_detallada || []
 }
 
 const ReportDocument = ({ group, formData, logoPreview }: any) => {
-  const resumen = (group.retroalimentacion && group.retroalimentacion.resumen_general) || {
-    fortalezas: "N/A",
-    areas_mejora: "N/A",
-  }
+  const resumenPedagogico = buildPedagogicalResumenFromGroup({
+    alternativas_corregidas: group.alternativas_corregidas,
+    puntaje: group.puntaje,
+    puntosMaximos: group.puntosMaximos,
+    puntosAprobacion: group.puntosAprobacion,
+    detalle_desarrollo: group.detalle_desarrollo,
+  })
   const puntaje = group.puntaje || "N/A"
   const notaNum = Number(group.nota) || 0
   const notaFinal = (notaNum + (group.decimasAdicionales || 0)).toFixed(1)
-  const correccion = group.retroalimentacion?.correccion_detallada || []
   const devKeys = Object.keys(group.detalle_desarrollo || {})
-  const correccionSinDuplicarDesarrollo = correccion.filter(
-    (row: any) => !excludeCorreccionDetalladaRowForPdfDesarrollo(row, devKeys, group.detalle_desarrollo),
-  )
+  const correccionSinDuplicarDesarrollo = filterCorreccionDetalladaParaDesarrolloUnico(group)
   const correccionDesarrolloArray = devKeys.map((key) => {
     const raw = group.detalle_desarrollo![key]
     const detalle =
@@ -585,7 +516,7 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
             }}
           >
             <Text style={{ fontSize: 9, fontWeight: "bold", color: "#4B5563", marginBottom: 4 }}>
-              📊 Rendimiento vs. Exigencia ({formData.porcentajeExigencia}%)
+              Rendimiento vs. Exigencia ({String(formData.porcentajeExigencia ?? "")}%)
             </Text>
             <View
               style={{ height: 6, width: "100%", backgroundColor: "#E5E7EB", borderRadius: 3, position: "relative" }}
@@ -637,9 +568,12 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
               <Text>0 pts</Text>
               <Text>{puntajeMaximo} pts (100%)</Text>
             </View>
-            <Text style={{ fontSize: 8, fontWeight: "bold", color: "#4B5563", marginTop: 4 }}>
-              Puntos de Aprobación (4.0): <Text style={{ color: "#F59E0B" }}>{puntosAprobacion} pts</Text>
-            </Text>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 4, alignItems: "baseline" }}>
+              <Text style={{ fontSize: 8, fontWeight: "bold", color: "#4B5563" }}>
+                Puntos de Aprobación (4.0):{" "}
+              </Text>
+              <Text style={{ fontSize: 8, fontWeight: "bold", color: "#F59E0B" }}>{puntosAprobacion} pts</Text>
+            </View>
           </View>
         )}
         {/* FIN - BLOQUE DE VELOCÍMETRO EN PDF */}
@@ -656,9 +590,9 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
             }}
           >
             <Text style={{ fontSize: 9, fontWeight: "bold", color: "#166534", marginBottom: 3 }}>
-              ✅ <Text>Fortalezas</Text>
+              Fortalezas (según datos registrados)
             </Text>
-            <Text style={styles.feedbackText}>{pdfSafe(resumen.fortalezas)}</Text>
+            <Text style={styles.feedbackText}>{pdfSafe(resumenPedagogico.fortalezas)}</Text>
           </View>
           <View
             style={{
@@ -670,11 +604,8 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
               borderColor: "#FDE68A",
             }}
           >
-            <Text style={styles.feedbackImproveTitle}>
-              ✏️
-              <Text>Áreas de Mejora</Text>
-            </Text>
-            <Text style={styles.feedbackText}>{pdfSafe(resumen.areas_mejora)}</Text>
+            <Text style={styles.feedbackImproveTitle}>Áreas de mejora (según datos registrados)</Text>
+            <Text style={styles.feedbackText}>{pdfSafe(resumenPedagogico.areas_mejora)}</Text>
           </View>
         </View>
         {correccionP1.length > 0 && (
@@ -693,10 +624,12 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
               {correccionP1.map((item: any, index: number) => (
                 <View key={String(index)} style={styles.tableRow}>
                   <View style={styles.tableCol}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.seccion)}</Text>
+                    <Text style={styles.tableCell}>{pdfSafe(renderForWeb(item.seccion ?? ""))}</Text>
                   </View>
                   <View style={styles.tableColDetail}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.detalle)}</Text>
+                    <Text style={styles.tableCell}>
+                      {pdfSafe(renderForWeb(item.detalle ?? item.detalles ?? ""))}
+                    </Text>
                   </View>
                 </View>
               ))}
@@ -718,10 +651,12 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
               {correccionP2.map((item: any, index: number) => (
                 <View key={String(index)} style={styles.tableRow}>
                   <View style={styles.tableCol}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.seccion)}</Text>
+                    <Text style={styles.tableCell}>{pdfSafe(renderForWeb(item.seccion ?? ""))}</Text>
                   </View>
                   <View style={styles.tableColDetail}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.detalle)}</Text>
+                    <Text style={styles.tableCell}>
+                      {pdfSafe(renderForWeb(item.detalle ?? item.detalles ?? ""))}
+                    </Text>
                   </View>
                 </View>
               ))}
@@ -1162,26 +1097,6 @@ export default function EvaluatorClient() {
   >("odd_even_dual_column")
   // Progreso de evaluacion por lotes
 
-  /** Cuenta incorrectas y a revisar desde alternativas_corregidas (misma lógica que la tabla OMR; solo lectura). */
-  const countAlternativasSummary = (alts: Array<{ pregunta?: string; respuesta_estudiante?: string; respuesta_correcta?: string }> | undefined) => {
-    if (!alts?.length) return { incorrect: 0, revisar: 0 }
-    let incorrect = 0
-    let revisar = 0
-    for (const item of alts) {
-      const respuestaEst = (item.respuesta_estudiante ?? "").trim().toUpperCase()
-      const respuestaCorr = (item.respuesta_correcta ?? "").trim().toUpperCase()
-      const esIncorrecta = Boolean(respuestaEst && respuestaCorr && respuestaEst !== respuestaCorr)
-      const tieneBajaConfianza =
-        respuestaEst.length > 2 ||
-        (String(item.pregunta ?? "").includes("VF") && !["V", "F"].includes(respuestaEst)) ||
-        (String(item.pregunta ?? "").includes("TP") && isNaN(Number.parseInt(respuestaEst))) ||
-        (String(item.pregunta ?? "").includes("SM") && !["A", "B", "C", "D", "E"].includes(respuestaEst)) ||
-        respuestaEst === ""
-      if (esIncorrecta) incorrect++
-      if (esIncorrecta || tieneBajaConfianza) revisar++
-    }
-    return { incorrect, revisar }
-  }
   const batchInitial = { isActive: false, totalItems: 0, completedItems: 0, successCount: 0, errorCount: 0, currentBatch: 0, totalBatches: 0 }
   const [batchProgress, setBatchProgress] = useState(batchInitial)
   const isMobile = typeof window !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
@@ -2150,48 +2065,6 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     })
   }
 
-  const extractStudentNameFromText = (text: string, knownName?: string): string => {
-    if (knownName && knownName.trim() && knownName !== "Estudiante") {
-      return knownName
-    }
-
-    // Buscar patrones comunes de nombres en el texto
-    const namePatterns = [
-      /(?:el estudiante|la estudiante|alumno|alumna)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)*)/i,
-      /^([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){1,3})\s+(?:demuestra|muestra|presenta|tiene)/i,
-    ]
-
-    for (const pattern of namePatterns) {
-      const match = text.match(pattern)
-      if (match && match[1]) {
-        return match[1].trim()
-      }
-    }
-
-    return "El estudiante"
-  }
-
-  const formatFeedbackText = (text: string, studentName: string): string => {
-    // Validar que text sea string
-    if (!text || typeof text !== 'string') {
-      return text || ""
-    }
-    
-    const nameToUse = extractStudentNameFromText(text, studentName)
-
-    // Si el texto ya tiene un nombre o "el estudiante", no lo reemplazamos mal
-    if (text.toLowerCase().includes("el estudiante") || text.toLowerCase().includes("la estudiante")) {
-      return text
-    }
-
-    // Si no menciona al estudiante, agregamos el nombre al inicio
-    if (!text.match(/^(el|la)\s+estudiante/i)) {
-      return `${nameToUse} ${text.charAt(0).toLowerCase()}${text.slice(1)}`
-    }
-
-    return text
-  }
-
   // Función para manejar la evaluación de un solo grupo (usada para confirmación OMR individual)
   const handleEvaluateSingleGroup = async (groupId: string) => {
     const {
@@ -2722,20 +2595,32 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     }
 
     if (formatType === "doc") {
-      // Generar documento Word (.doc) básico con HTML
+      const escHtml = (s: string) =>
+        String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+      // Generar documento Word (.doc) básico con HTML (mismo criterio que preview/PDF: datos reales)
       const rows = evaluatedGroups
-        .map(
-          (g) =>
-            [
-              "<tr>",
-              "<td>" + (g.studentName || "N/A") + "</td>",
-              "<td>" + (g.puntaje || "N/A") + "</td>",
-              "<td>" + (g.nota || "N/A") + "</td>",
-              "<td>" + (g.retroalimentacion?.resumen_general?.fortalezas || "N/A").replace(/\n/g, "<br>") + "</td>",
-              "<td>" + (g.retroalimentacion?.resumen_general?.areas_mejora || "N/A").replace(/\n/g, "<br>") + "</td>",
-              "</tr>",
-            ].join(""),
-        )
+        .map((g) => {
+          const rp = buildPedagogicalResumenFromGroup({
+            alternativas_corregidas: g.alternativas_corregidas,
+            puntaje: g.puntaje,
+            puntosMaximos: g.puntosMaximos,
+            puntosAprobacion: g.puntosAprobacion,
+            detalle_desarrollo: g.detalle_desarrollo,
+          })
+          return [
+            "<tr>",
+            "<td>" + escHtml(g.studentName || "N/A") + "</td>",
+            "<td>" + escHtml(String(g.puntaje || "N/A")) + "</td>",
+            "<td>" + escHtml(String(g.nota ?? "N/A")) + "</td>",
+            "<td>" + escHtml(rp.fortalezas || "N/A").replace(/\n/g, "<br>") + "</td>",
+            "<td>" + escHtml(rp.areas_mejora || "N/A").replace(/\n/g, "<br>") + "</td>",
+            "</tr>",
+          ].join("")
+        })
         .join("")
       const htmlContent = [
         "<html><head><meta charset=\"utf-8\"><title>Notas - Libel-IA</title>",
@@ -4583,13 +4468,15 @@ h-4 w-4 animate-spin"
                                           </TableHeader>
 
                                           <TableBody>
-                                            {group.retroalimentacion?.correccion_detallada?.map((item, index) => (
+                                            {filterCorreccionDetalladaParaDesarrolloUnico(group).map((item, index) => (
                                               <TableRow key={index}>
                                                 <TableCell className="font-medium">
                                                   {renderForWeb(item.seccion)}
                                                 </TableCell>
 
-                                                <TableCell>{renderForWeb(item.detalle)}</TableCell>
+                                                <TableCell>
+                                                  {renderForWeb(item.detalle ?? item.detalles ?? "")}
+                                                </TableCell>
                                               </TableRow>
                                             ))}
                                             {Object.keys(group.detalle_desarrollo || {}).map((key) => {
@@ -4607,8 +4494,8 @@ h-4 w-4 animate-spin"
                                                   ? renderForWeb(item.puntaje)
                                                   : ""
                                               const citaStr =
-                                                isDevelopmentItem && (item.cita_estudiante ?? item.texto_estudiante) != null
-                                                  ? renderForWeb(item.cita_estudiante ?? item.texto_estudiante)
+                                                isDevelopmentItem
+                                                  ? renderForWeb(pickStudentDesarrolloVisibleText(item as Record<string, unknown>))
                                                   : ""
                                               const justifStr =
                                                 isDevelopmentItem && item.justificacion != null
@@ -4828,7 +4715,9 @@ h-4 w-4 animate-spin"
                                                         score_max = parts[1] ?? 0
                                                       }
                                                       return {
-                                                        student_answer: (item as { texto_estudiante?: string })?.texto_estudiante ?? "",
+                                                        student_answer: pickStudentDesarrolloVisibleText(
+                                                          item as Record<string, unknown>,
+                                                        ),
                                                         correct_answer: null as string | null,
                                                         is_correct: null as boolean | null,
                                                         score_obtained,
@@ -4896,33 +4785,40 @@ h-4 w-4 animate-spin"
                                     {/* FIN DE LA TABLA EDITABLE */}
 
                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-                                      <Card className="border-l-4 border-l-green-500">
-                                        <CardHeader className="pb-3">
-                                          <CardTitle className="text-green-700 text-base">✅ Fortalezas</CardTitle>
-                                        </CardHeader>
-<CardContent>
-                                          <p className="text-sm leading-relaxed">
-                                            {formatFeedbackText(
-                                              renderForWeb(group.retroalimentacion?.resumen_general?.fortalezas) || "No disponible",
-                                              group.studentName,
-                                            )}
-                                          </p>
-                                        </CardContent>
-                                      </Card>
+                                      {(() => {
+                                        const rp = buildPedagogicalResumenFromGroup({
+                                          alternativas_corregidas: group.alternativas_corregidas,
+                                          puntaje: group.puntaje,
+                                          puntosMaximos: group.puntosMaximos,
+                                          puntosAprobacion: group.puntosAprobacion,
+                                          detalle_desarrollo: group.detalle_desarrollo,
+                                        })
+                                        return (
+                                          <>
+                                            <Card className="border-l-4 border-l-green-500">
+                                              <CardHeader className="pb-3">
+                                                <CardTitle className="text-green-700 text-base">
+                                                  Fortalezas (datos de la evaluación)
+                                                </CardTitle>
+                                              </CardHeader>
+                                              <CardContent>
+                                                <p className="text-sm leading-relaxed whitespace-pre-line">{rp.fortalezas}</p>
+                                              </CardContent>
+                                            </Card>
 
-                                      <Card className="border-l-4 border-l-yellow-500">
-                                        <CardHeader className="pb-3">
-                                          <CardTitle className="text-yellow-700 text-base">Áreas de Mejora</CardTitle>
-                                        </CardHeader>
-                                        <CardContent>
-                                          <p className="text-sm leading-relaxed">
-                                            {formatFeedbackText(
-                                              renderForWeb(group.retroalimentacion?.resumen_general?.areas_mejora) || "No disponible",
-                                              group.studentName,
-                                            )}
-                                          </p>
-                                        </CardContent>
-                                      </Card>
+                                            <Card className="border-l-4 border-l-yellow-500">
+                                              <CardHeader className="pb-3">
+                                                <CardTitle className="text-yellow-700 text-base">
+                                                  Áreas de mejora (datos de la evaluación)
+                                                </CardTitle>
+                                              </CardHeader>
+                                              <CardContent>
+                                                <p className="text-sm leading-relaxed whitespace-pre-line">{rp.areas_mejora}</p>
+                                              </CardContent>
+                                            </Card>
+                                          </>
+                                        )
+                                      })()}
                                     </div>
                                   </>
                                 )}
