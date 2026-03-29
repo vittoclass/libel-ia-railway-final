@@ -4226,27 +4226,10 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         const finalNota = notaNumber + (group.decimasAdicionales || 0)
                         const isReadyToValidate = group.isValidationStep && group.alternativas_corregidas?.length
                         const debug = group.omrDebug
-                        const expectedClosedCount = Math.max(
-                          0,
-                          Number(debug?.expectedQuestionCountUsed ?? 0) || 0
-                        )
                         const currentAlternativas = Array.isArray(group.alternativas_corregidas)
                           ? group.alternativas_corregidas
                           : []
-                        const tableAlternativas =
-                          expectedClosedCount > currentAlternativas.length
-                            ? [
-                                ...currentAlternativas,
-                                ...Array.from(
-                                  { length: expectedClosedCount - currentAlternativas.length },
-                                  (_, idx) => ({
-                                    pregunta: `SM${currentAlternativas.length + idx + 1}`,
-                                    respuesta_estudiante: "",
-                                    respuesta_correcta: "",
-                                  }),
-                                ),
-                              ]
-                            : currentAlternativas
+                        const tableAlternativas = currentAlternativas
 
                         // 🔥 EXTRACCIÓN DE VALORES PARA EL VELOCÍMETRO
                         const puntajeObtenido = Number.parseInt(group.puntaje?.split("/")[0] || "0", 10)

@@ -11,6 +11,12 @@ import { persistEvaluation } from "@/app/lib/persist-evaluation"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { runAzureLayoutOmrPipeline } from "@/app/lib/omr/experimental/azure-layout-omr-pipeline"
+import {
+  buildEvaluationBase,
+  getFormItemCorrectAnswer,
+  isEvaluationBaseItemClosedForOmr,
+  isFormStructuredRowClosedForOmr,
+} from "@/app/lib/evaluation-base"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -95,6 +101,90 @@ function normalizeRespuestaCerrada(texto: string): string {
   if (numMatch) return numMatch[1]
   if (/^[A-EVF]$/.test(t)) return t
   return "BLANK"
+}
+
+type CerradaNormRow = { pregunta: string; respuesta_detectada: string; confianza: number }
+
+/** Índice de detecciones por clave en mayúsculas (sin inventar ítems). */
+function buildCerradaDetectionLookup(rows: CerradaNormRow[]): Map<string, CerradaNormRow> {
+  const m = new Map<string, CerradaNormRow>()
+  for (const r of rows) {
+    const p = String(r.pregunta ?? "").trim()
+    if (!p) continue
+    const u = p.toUpperCase()
+    if (!m.has(u)) {
+      m.set(u, {
+        pregunta: p,
+        respuesta_detectada: r.respuesta_detectada,
+        confianza: Number(r.confianza) || 0.8,
+      })
+    }
+    if (/^\d+$/.test(u)) {
+      const sm = `SM${u}`
+      if (!m.has(sm)) m.set(sm, m.get(u)!)
+    }
+  }
+  return m
+}
+
+/**
+ * Cruza una detección con un id oficial de evaluation base sin confundir prefijos (p. ej. VF12 vs SM12).
+ */
+function lookupCerradaForOfficialId(lookup: Map<string, CerradaNormRow>, officialId: string): CerradaNormRow | undefined {
+  const o = officialId.trim()
+  if (!o) return undefined
+  const u = o.toUpperCase()
+  if (lookup.has(u)) return lookup.get(u)
+  const digits = u.replace(/\D/g, "")
+  if (!digits) return undefined
+  if (/^\d+$/.test(u)) {
+    return lookup.get(u) || lookup.get(`SM${u}`) || lookup.get(`VF${u}`) || lookup.get(`TP${u}`)
+  }
+  if (u.startsWith("SM")) return lookup.get(`SM${digits}`) || lookup.get(digits)
+  if (u.startsWith("VF")) return lookup.get(`VF${digits}`) || lookup.get(digits)
+  if (u.startsWith("TP")) return lookup.get(`TP${digits}`) || lookup.get(digits)
+  return lookup.get(digits) || lookup.get(`SM${digits}`)
+}
+
+function dedupeCerradasDetectedOnly(rows: CerradaNormRow[]): CerradaNormRow[] {
+  const seen = new Set<string>()
+  const out: CerradaNormRow[] = []
+  let n = 0
+  for (const r of rows) {
+    const p = String(r.pregunta ?? "").trim()
+    const id = p || `Q${++n}`
+    const k = id.toUpperCase()
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push({
+      pregunta: id,
+      respuesta_detectada: normalizeRespuestaCerrada(String(r.respuesta_detectada ?? "")),
+      confianza: Number(r.confianza) || 0.8,
+    })
+  }
+  return out
+}
+
+/**
+ * Inventario oficial (evaluation base, ítems cerrados) + detecciones OMR/IA; sin inflar más allá del inventario.
+ */
+function alignCerradasToOfficialInventory(
+  detected: CerradaNormRow[],
+  officialClosed: { id: string; order: number }[],
+): CerradaNormRow[] {
+  if (!officialClosed.length) return dedupeCerradasDetectedOnly(detected)
+  const lookup = buildCerradaDetectionLookup(detected)
+  const sorted = [...officialClosed].sort((a, b) => a.order - b.order)
+  const out: CerradaNormRow[] = []
+  for (const it of sorted) {
+    const hit = lookupCerradaForOfficialId(lookup, it.id)
+    out.push({
+      pregunta: it.id,
+      respuesta_detectada: hit ? normalizeRespuestaCerrada(hit.respuesta_detectada) : "BLANK",
+      confianza: hit ? hit.confianza : 0,
+    })
+  }
+  return out
 }
 
 // Calcular nota en escala chilena (1.0 - 7.0)
@@ -1036,6 +1126,50 @@ export async function POST(req: NextRequest) {
     const tieneAlternativas = tipoPruebaReal !== "solo_desarrollo"
     let respuestasCerradasDesdeOMR: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
 
+    const evaluationBaseFormBuilt = buildEvaluationBase({
+      form: {
+        pautaEstructurada: String(pautaEstructurada ?? ""),
+        pautaCorrectaAlternativas: pautaAlternativasFinal,
+        rubrica: String(rubrica ?? ""),
+        tipoPrueba: tipoPruebaReal,
+        title: typeof evaluationTitleBody === "string" ? evaluationTitleBody.trim() || null : null,
+      },
+    })
+    const officialClosedItemsEvaluationBase = evaluationBaseFormBuilt.items
+      .filter((it) => isEvaluationBaseItemClosedForOmr(it))
+      .sort((a, b) => a.order - b.order)
+    /** Filas de pauta no marcadas como desarrollo por id heurístico; la entrada a OMR exige cierre estructural. */
+    const pautaRowsNotDevelopment = parsePautaEstructurada(pautaEstructurada).filter((i) => !i.isDevelopment)
+    const ebByPreguntaUpper = new Map(
+      evaluationBaseFormBuilt.items.map((it) => [it.id.trim().toUpperCase(), it]),
+    )
+    let officialClosedItems: { id: string; order: number }[] = []
+    if (pautaRowsNotDevelopment.length > 0) {
+      let ord = 0
+      for (const row of pautaRowsNotDevelopment) {
+        const id = row.id.trim()
+        const eb = ebByPreguntaUpper.get(id.toUpperCase())
+        if (eb && !isEvaluationBaseItemClosedForOmr(eb)) continue
+        const corr = getFormItemCorrectAnswer(pautaAlternativasFinal, id)
+        if (
+          !isFormStructuredRowClosedForOmr({
+            maxScore: row.maxScore,
+            correctAnswer: corr ?? null,
+            tipoPrueba: tipoPruebaReal,
+          })
+        ) {
+          continue
+        }
+        ord++
+        officialClosedItems.push({
+          id: eb?.id ?? id,
+          order: eb?.order ?? ord,
+        })
+      }
+    } else {
+      officialClosedItems = officialClosedItemsEvaluationBase.map((it) => ({ id: it.id, order: it.order }))
+    }
+
     if (useAzurePath) {
       if (!azureEndpoint || !azureKey) {
         return NextResponse.json(
@@ -1111,15 +1245,15 @@ export async function POST(req: NextRequest) {
         ? answerKeyFromTemplate.respuestas
         : []
       const templateKeyUsed = "template_38_4"
-      const expectedByTemplateKey = templateKeyUsed === "template_38_4" ? 38 : 0
       const closedQuestionsFromPauta = parsePautaEstructurada(pautaEstructurada).filter(
         (i) => !i.isDevelopment
       ).length
+      const closedFromEvaluationBase = officialClosedItems.length
       const totalPreg =
         Number(answerKeyFromTemplate?.totalPreguntas) ||
         teacherAnswerKeyBase.length ||
+        closedFromEvaluationBase ||
         closedQuestionsFromPauta ||
-        expectedByTemplateKey ||
         1
       officialOmrTotalPregResolved = totalPreg
       officialOmrTeacherAnswerKeyLength = teacherAnswerKeyBase.length
@@ -1159,7 +1293,7 @@ export async function POST(req: NextRequest) {
                 pregunta: String(r?.pregunta ?? ""),
                 respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
               }))
-              const expectedQuestionCountUsed = Math.max(1, totalPreg, expectedByTemplateKey)
+              const expectedQuestionCountUsed = Math.max(1, totalPreg)
               officialOmrExpectedQuestionCountUsed = expectedQuestionCountUsed
               officialOmrTemplateKeyUsed = templateKeyUsed
               officialOmrTemplateVariantUsed = omrTemplateVariant
@@ -1393,34 +1527,31 @@ export async function POST(req: NextRequest) {
     if (!(tieneAlternativas && answerKeyFromTemplate?.respuestas?.length) || combinedAnalysis.respuestas_cerradas.length === 0) {
       if (respuestasAlternativas && respuestasAlternativas.length > 0 && !answerKeyFromTemplate?.respuestas?.length) {
         const respMap = new Map<string, any>()
-      for (const r of respuestasAlternativas) {
-        const preguntaRaw = String(r.pregunta).toUpperCase()
-        const numMatch = preguntaRaw.match(/(\d+)/)
-        const num = numMatch ? numMatch[1] : preguntaRaw
-        const preguntaId = `SM${num}`
-
-        // Solo usar campos que son claramente respuesta DEL ESTUDIANTE (lo que marcó). NUNCA usar respuestaCorrecta aquí.
-        const respuestaEstudiante = (r.respuesta_estudiante ?? r.respuesta ?? "").toString().trim()
-        if (!respMap.has(preguntaId)) {
-          respMap.set(preguntaId, {
-            pregunta: preguntaId,
-            respuesta_detectada: respuestaEstudiante,
-            confianza: r.confianza ?? 1.0,
-          })
+        for (let idx = 0; idx < respuestasAlternativas.length; idx++) {
+          const r = respuestasAlternativas[idx]
+          const preguntaSrc = String(r.pregunta ?? "").trim()
+          const preguntaId = preguntaSrc || `Q${idx + 1}`
+          const mapKey = preguntaId.toUpperCase()
+          const respuestaEstudiante = (r.respuesta_estudiante ?? r.respuesta ?? "").toString().trim()
+          if (!respMap.has(mapKey)) {
+            respMap.set(mapKey, {
+              pregunta: preguntaId,
+              respuesta_detectada: respuestaEstudiante,
+              confianza: r.confianza ?? 1.0,
+            })
+          }
         }
+        combinedAnalysis.respuestas_cerradas = Array.from(respMap.values())
       }
-      combinedAnalysis.respuestas_cerradas = Array.from(respMap.values())
     } else {
-      // Normalizar respuestas de Mistral (formato consistente)
       const respMap = new Map<string, any>()
-      for (const r of combinedAnalysis.respuestas_cerradas) {
-        const preguntaRaw = String(r.pregunta).toUpperCase()
-        const numMatch = preguntaRaw.match(/(\d+)/)
-        const num = numMatch ? numMatch[1] : preguntaRaw
-        const preguntaId = `SM${num}`
-        
-        if (!respMap.has(preguntaId)) {
-          respMap.set(preguntaId, {
+      for (let idx = 0; idx < combinedAnalysis.respuestas_cerradas.length; idx++) {
+        const r = combinedAnalysis.respuestas_cerradas[idx]
+        const preguntaSrc = String(r.pregunta ?? "").trim()
+        const preguntaId = preguntaSrc || `Q${idx + 1}`
+        const mapKey = preguntaId.toUpperCase()
+        if (!respMap.has(mapKey)) {
+          respMap.set(mapKey, {
             pregunta: preguntaId,
             respuesta_detectada: r.respuesta_detectada || "",
             confianza: r.confianza || 1.0,
@@ -1429,41 +1560,15 @@ export async function POST(req: NextRequest) {
       }
       combinedAnalysis.respuestas_cerradas = Array.from(respMap.values())
     }
-    }
 
-    // Normalización final: una entrada por ítem de alternativas de la pauta, respuesta_detectada solo letra/número
-    const itemScoresForNorm = parsePautaEstructurada(pautaEstructurada)
-    const expectedAltIds = itemScoresForNorm.filter((i) => !i.isDevelopment).map((i) => i.id)
-    const respMapByPregunta = new Map<string, { respuesta_detectada: string; confianza: number }>()
-    for (const r of combinedAnalysis.respuestas_cerradas) {
-      const rawId = String(r.pregunta ?? "").trim().toUpperCase()
-      const num = rawId.replace(/\D/g, "")
-      const detectada = normalizeRespuestaCerrada(String(r.respuesta_detectada ?? r.respuesta ?? ""))
-      respMapByPregunta.set(rawId, { respuesta_detectada: detectada, confianza: Number(r.confianza) || 0.8 })
-      if (num) {
-        respMapByPregunta.set(num, { respuesta_detectada: detectada, confianza: Number(r.confianza) || 0.8 })
-        respMapByPregunta.set(`SM${num}`, { respuesta_detectada: detectada, confianza: Number(r.confianza) || 0.8 })
-      }
-    }
-    const normalizadas: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
-    for (const expectedId of expectedAltIds) {
-      const idUpper = expectedId.toUpperCase()
-      const existing = respMapByPregunta.get(idUpper) || respMapByPregunta.get(expectedId) || (idUpper.replace(/\D/g, "") ? respMapByPregunta.get(idUpper.replace(/\D/g, "")) : undefined)
-      normalizadas.push({
-        pregunta: expectedId,
-        respuesta_detectada: existing ? existing.respuesta_detectada : "BLANK",
-        confianza: existing ? existing.confianza : 0,
-      })
-    }
-    if (normalizadas.length === 0 && combinedAnalysis.respuestas_cerradas.length > 0) {
-      combinedAnalysis.respuestas_cerradas = combinedAnalysis.respuestas_cerradas.map((r: any, idx: number) => ({
-        pregunta: String(r.pregunta || "").trim() || `SM${idx + 1}`,
-        respuesta_detectada: normalizeRespuestaCerrada(String(r.respuesta_detectada ?? r.respuesta ?? "")),
-        confianza: Number(r.confianza) || 0.8,
-      }))
-    } else {
-      combinedAnalysis.respuestas_cerradas = normalizadas
-    }
+    const cerradasParaAlinear: CerradaNormRow[] = (combinedAnalysis.respuestas_cerradas || []).map((r: any) => ({
+      pregunta: String(r.pregunta ?? ""),
+      respuesta_detectada: String(r.respuesta_detectada ?? r.respuesta ?? ""),
+      confianza: Number(r.confianza) || 0.8,
+    }))
+    const cerradasAlineadas = alignCerradasToOfficialInventory(cerradasParaAlinear, officialClosedItems)
+    combinedAnalysis.respuestas_cerradas = cerradasAlineadas
+    officialOmrExpectedQuestionCountUsed = cerradasAlineadas.length
     console.info("[trace][omr_official][combined_before_scoring]", {
       combinedRespuestasCerradasCount: Array.isArray(combinedAnalysis.respuestas_cerradas)
         ? combinedAnalysis.respuestas_cerradas.length
