@@ -1,16 +1,37 @@
 /**
  * POST /api/source-exams/[id]/items/extract-pdf-text
- * Extrae texto de un PDF subido. No inserta ítems; solo devuelve texto para previsualizar e importar después.
- * Valida teacher_id igual que el resto de rutas de ítems.
+ * Extrae contenido de PDF o DOCX para previsualizar/importar ítems de prueba base.
+ *
+ * Flujo E2E importación: este endpoint → texto en UI → Previsualizar → parser → tabla (opcional).
+ *
+ * Pipeline documental:
+ * - Azure Document Intelligence prebuilt-layout (tablas, párrafos, líneas, words) con fallback prebuilt-read.
+ * - PDF sin Azure: pdf-parse (solo texto incrustado).
+ * - DOCX sin Azure: mammoth (raw + HTML/tablas); con Azure se fusiona mammoth si aporta texto faltante.
+ *
+ * Respuesta: text, raw_text, structured_lines, blocks, extraction, forensic (métricas y diagnóstico).
  */
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
-import { extractTextFromPdf } from "@/app/lib/extract-text-from-pdf"
+import { extractSourceDocumentStructured } from "@/app/lib/extract-document-structured"
+import { inferSuggestedInstrumentTitle } from "@/app/lib/normalize-source-exam-text"
 
 export const dynamic = "force-dynamic"
 
-const MAX_PDF_BYTES = 10 * 1024 * 1024 // 10 MB
+const MAX_FILE_BYTES = 10 * 1024 * 1024 // 10 MB
+
+const DOCX_MIME =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document" as const
+
+function isAllowedFile(name: string, mime: string): "pdf" | "docx" | null {
+  const n = name.toLowerCase()
+  const m = mime.toLowerCase()
+  if (m === "application/pdf" || n.endsWith(".pdf")) return "pdf"
+  if (m === DOCX_MIME || n.endsWith(".docx")) return "docx"
+  if (m === "application/msword" && n.endsWith(".doc")) return null
+  return null
+}
 
 async function checkSourceExamAccess(
   supabase: NonNullable<ReturnType<typeof getSupabaseServer>>,
@@ -54,49 +75,95 @@ export async function POST(
   } catch {
     return NextResponse.json({ error: "Formato de petición inválido" }, { status: 400 })
   }
-  const file = formData.get("file") ?? formData.get("pdf")
+  const file = formData.get("file") ?? formData.get("pdf") ?? formData.get("document")
   if (!file || !(file instanceof Blob)) {
-    return NextResponse.json({ error: "Envíe un archivo PDF en el campo 'file' o 'pdf'" }, { status: 400 })
+    return NextResponse.json({ error: "Envíe un archivo en el campo 'file' (PDF o DOCX)" }, { status: 400 })
   }
-  const name = typeof (file as File).name === "string" ? (file as File).name : ""
-  const isPdfType = file.type === "application/pdf"
-  const isPdfName = name.toLowerCase().endsWith(".pdf")
-  if (!isPdfType && !isPdfName) {
+  const name = typeof (file as File).name === "string" ? (file as File).name : "document"
+  const mime = file.type || ""
+  const kind = isAllowedFile(name, mime)
+  if (!kind) {
     return NextResponse.json(
-      { error: "El archivo debe ser PDF (application/pdf o extensión .pdf)" },
+      { error: "Formato no soportado. Use PDF o DOCX (.docx). Los .doc antiguos no están soportados." },
       { status: 400 }
     )
   }
+
   const arrayBuffer = await file.arrayBuffer()
   const buffer = Buffer.from(arrayBuffer)
-  if (process.env.NODE_ENV !== "production") {
-    console.log("[extract-pdf-text] file received:", { name, size: buffer.length, type: file.type })
-  }
-  if (buffer.length > MAX_PDF_BYTES) {
+
+  console.log("[extract-document-text] entrada:", {
+    name,
+    mime: mime || "(vacío)",
+    kind,
+    bytes: buffer.length,
+  })
+
+  if (buffer.length > MAX_FILE_BYTES) {
     return NextResponse.json(
-      { error: `El PDF no puede superar ${MAX_PDF_BYTES / 1024 / 1024} MB` },
+      { error: `El archivo no puede superar ${MAX_FILE_BYTES / 1024 / 1024} MB` },
       { status: 400 }
     )
   }
+
   try {
-    const result = await extractTextFromPdf(buffer)
-    if (process.env.NODE_ENV !== "production") {
-      console.log("[extract-pdf-text] extraction ok:", {
-        textLength: result.text?.length ?? 0,
-        pageCount: result.pageCount,
-        hasWarning: !!result.warning,
-      })
+    const result = await extractSourceDocumentStructured(buffer, {
+      filename: name,
+      mimeType: mime || (kind === "pdf" ? "application/pdf" : DOCX_MIME),
+    })
+    const text = result.raw_text ?? ""
+
+    console.log("[extract-document-text] salida forense:", {
+      kind,
+      method: result.extraction.method,
+      pages: result.pageCount,
+      lines: result.extraction.lines_total,
+      blocks: result.extraction.blocks_total,
+      tables: result.forensic.tables_detected,
+      paragraphs: result.forensic.paragraphs_detected,
+      wordsApprox: result.forensic.words_approx_total,
+      char_final: text.length,
+      char_content_vs_lines: {
+        api_or_embed: result.forensic.char_api_content,
+        ordered_lines: result.forensic.char_from_ordered_lines,
+      },
+      pdf_scanned_hint: result.forensic.pdf_scanned_heuristic ?? false,
+    })
+
+    let warning = result.warning
+    if (
+      result.extraction.method === "pdf_parse_fallback" &&
+      text.trim().length < 80 &&
+      !process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
+    ) {
+      warning =
+        (warning ? warning + " " : "") +
+        "Para PDF escaneados o con diagramación compleja, configure AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT y AZURE_DOCUMENT_INTELLIGENCE_KEY."
     }
+    if (result.forensic.pdf_scanned_heuristic) {
+      warning =
+        (warning ? warning + " " : "") +
+        "Posible PDF escaneado o sin capa de texto: el resultado puede estar incompleto sin Azure OCR."
+    }
+
+    const suggested_title = inferSuggestedInstrumentTitle(text)
     return NextResponse.json({
-      text: result.text,
+      text,
+      raw_text: text,
       pageCount: result.pageCount,
-      warning: result.warning ?? undefined,
+      file_kind: kind,
+      warning: warning ?? undefined,
+      suggested_title: suggested_title ?? undefined,
+      structured_lines: result.structured_lines,
+      blocks: result.blocks,
+      extraction: result.extraction,
+      forensic: result.forensic,
     })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
-    console.error("[extract-pdf-text] extraction failed:", message)
+    console.error("[extract-document-text] fallo:", message)
     return NextResponse.json(
-      { error: "No se pudo extraer texto del PDF", details: message },
+      { error: "No se pudo extraer el documento", details: message },
       { status: 422 }
     )
   }

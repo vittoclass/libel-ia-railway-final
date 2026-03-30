@@ -5,7 +5,7 @@
  * - Inicio clásico "39." o "39)" con enunciado y rúbrica.
  * Solo lectura estructural; no usa IA. No toca evaluación, scoring ni OCR.
  */
-import type { ParsedLine } from "@/app/lib/parse-bulk-items"
+import { dedupeParsedLinesByItemNumber, type ParsedLine } from "@/app/lib/parse-bulk-items"
 
 export interface ParseDevelopmentBlocksResult {
   items: ParsedLine[]
@@ -14,17 +14,20 @@ export interface ParseDevelopmentBlocksResult {
   consumedLines: string[]
 }
 
-const MIN_ENUNCIADO_LENGTH = 10
+const MIN_ENUNCIADO_LENGTH = 8
 const MAX_ITEM_NUMBER = 999
 const MIN_AXIS_LENGTH = 2
+const MIN_RUBRIC_CHARS = 3
 
 const DEBUG_DEV_BLOCKS =
   typeof process !== "undefined" && process.env.NODE_ENV !== "production"
 
-/** Patrón: inicio de ítem (número seguido de punto o paréntesis). */
-const RE_ITEM_START = /^\s*(\d+)[\.\)]\s*(.*)$/
+/** Patrón: inicio de ítem (número + . ) ) - – —). PDFs suelen usar guión tras el número. */
+const RE_ITEM_START = /^\s*(\d+)\s*[\.\)\-–—]\s*(.*)$/
 /** Patrón: cabecera desarrollo "39 2 Números y Operaciones" → item_number, max_score, axis_label. */
 const RE_DEV_HEADER = /^\s*(\d+)\s+(\d+)\s+(.+)$/
+/** Patrón laxo: "39 Explica ..." (sin "." ni ")"). */
+const RE_ITEM_START_LOOSE = /^\s*(\d+)\s+(.+)$/
 /** Patrón: puntaje explícito (N puntos o Puntaje: N). */
 const RE_MAX_SCORE = /(?:^|\s)(\d+)\s*puntos?\s*$/i
 const RE_PUNTAJE_LABEL = /puntaje\s*:\s*(\d+)/i
@@ -40,6 +43,16 @@ function matchItemStart(line: string): { num: number; rest: string } | null {
   const num = parseInt(m[1], 10)
   if (Number.isNaN(num) || num < 1 || num > MAX_ITEM_NUMBER) return null
   return { num, rest: (m[2] ?? "").trim() }
+}
+
+function matchItemStartLoose(line: string): { num: number; rest: string } | null {
+  const m = line.match(RE_ITEM_START_LOOSE)
+  if (!m) return null
+  const num = parseInt(m[1], 10)
+  if (Number.isNaN(num) || num < 1 || num > MAX_ITEM_NUMBER) return null
+  const rest = (m[2] ?? "").trim()
+  if (!rest) return null
+  return { num, rest }
 }
 
 /**
@@ -85,16 +98,105 @@ function extractAxis(lines: string[]): string | null {
   return null
 }
 
+/** Clave explícita de ítem cerrado en enunciado o rúbrica (pauta docente). */
+function extractDeclaredClosedKey(
+  itemText: string,
+  rubricText: string | null,
+): { key: string; kind: "sm" | "vf" } | null {
+  const blob = [itemText, rubricText ?? ""].join("\n").replace(/\s+/g, " ")
+  const vf = blob.match(/(?:clave|respuesta)\s*(?:correcta)?\s*[:\.]\s*\b([VF])\b/i)
+  if (vf?.[1]) {
+    const k = vf[1].toUpperCase()
+    if (k === "V" || k === "F") return { key: k, kind: "vf" }
+  }
+  const patterns = [
+    /respuesta\s+correcta\s*[:\.]\s*([A-E])\b/i,
+    /alternativa\s+correcta\s*[:\.]\s*([A-E])\b/i,
+    /clave\s*(?:de\s*correcci[oó]n|docente|profesor)?\s*[:\.]\s*([A-E])\b/i,
+    /opci[oó]n\s+correcta\s*[:\.]\s*([A-E])\b/i,
+    /letra\s+correcta\s*[:\.]\s*([A-E])\b/i,
+  ]
+  for (const re of patterns) {
+    const m = blob.match(re)
+    if (m?.[1]) return { key: m[1].toUpperCase(), kind: "sm" }
+  }
+  return null
+}
+
+function stemShowsAlternativeOptions(itemText: string): boolean {
+  const t = itemText.replace(/\s+/g, " ")
+  if (/\b[A-E]\)\s/.test(t)) return true
+  if (/\b[A-E]\.\s+\S/.test(t) && (t.match(/\b[A-E]\./g) ?? []).length >= 2) return true
+  if ((t.match(/\b[A-E]\)/g) ?? []).length >= 3) return true
+  if (/alternativa|marque\s+la|opciones\s+[A-E]|seleccione/i.test(t)) return true
+  return false
+}
+
+function looksLikeOpenQuestionPrompt(text: string): boolean {
+  const t = (text ?? "").trim()
+  if (t.length < 10) return false
+  if (stemShowsAlternativeOptions(t)) return false
+  return /^(explica|analiza|describe|desarrolla|justifica|fundamenta|argumenta|compara|interpreta|elabora|resuelve)\b/i.test(t)
+}
+
+/**
+ * Si el bloque trae pauta de alternativa (A–E / V–F) y puntaje típico de cerrada, no forzar essay.
+ */
+function upgradeParsedLineIfDocClosed(base: ParsedLine): ParsedLine {
+  const max = base.max_score ?? 1
+  if (max > 1) return base
+  const declared = extractDeclaredClosedKey(base.item_text, base.rubric_text)
+  if (!declared) return base
+  if (declared.kind === "vf") {
+    return { ...base, question_type: "true_false", correct_answer: declared.key }
+  }
+  if (!/^[A-E]$/.test(declared.key)) return base
+  const blob = `${base.item_text}\n${base.rubric_text ?? ""}`.toLowerCase()
+  const explicitMc =
+    /alternativa\s+correcta|opci[oó]n\s+correcta|letra\s+correcta|respuesta\s+correcta|clave\s*(?:de\s*correcci[oó]n|docente)/.test(
+      blob,
+    )
+  if (!stemShowsAlternativeOptions(base.item_text) && !explicitMc) return base
+  return { ...base, question_type: "multiple_choice", correct_answer: declared.key }
+}
+
 function looksLikeRubricLine(line: string): boolean {
   const t = line.trim()
   if (t.length < 2) return false
   if (/^(criterio|rúbrica|pauta)\s*[:\.]?\s*$/i.test(t)) return true
   if (/^(criterio|rúbrica|pauta)\s*[:\.]\s*.+/i.test(t)) return true
+  if (/^respuesta\s+esperada\s*[:\.]/i.test(t)) return true
+  if (/^orientaci[oó]n\s*(docente\s*)?[:\.]/i.test(t)) return true
+  if (/^clave\s*(de\s*correcci[oó]n|docente)?\s*[:\.]/i.test(t)) return true
   if (RE_RUBRIC_LINE.test(t)) return true
   if (/^\d+\s*puntos?\s*[:\.]/i.test(t)) return true
   if (/^[•·\-*]?\s*\d+\s*puntos?\s*[:\.]/i.test(t)) return true
   if (/\d+\s*ptos?\.?\s*[:\.]/i.test(t)) return true
+  // Línea solo con criterio entre paréntesis (común en pruebas impresas).
+  if (/^\([^)]{6,400}\)\s*$/.test(t) && /criterio|rúbrica|pauta|respuesta|puntos|evalúe|justif|explic|defin|analiz/i.test(t)) {
+    return true
+  }
+  // Criterio compacto al final de línea ya tratado en splitInline; aquí líneas sueltas tipo "(2 pts si…)"
+  if (/^\([^)]{6,200}\)/.test(t) && /pts?|puntos|criterio|esperad/i.test(t)) return true
   return false
+}
+
+/**
+ * Separa enunciado y criterio breve entre paréntesis al final (formato docente habitual).
+ */
+function splitInlineParentheticalCriterion(rest: string): { enunciado: string; inlineRubric: string | null } {
+  const t = rest.trim()
+  const m = t.match(/^(.+?)\s*(\([^)]{8,500}\))\s*$/)
+  if (!m) return { enunciado: t, inlineRubric: null }
+  const paren = m[2]
+  if (
+    /criterio|rúbrica|pauta|respuesta|esperad|orientaci|ejempl|puntos|evalúe|evalua|analiz|justif|defin|explic|clave|docente/i.test(
+      paren
+    )
+  ) {
+    return { enunciado: m[1].trim(), inlineRubric: paren }
+  }
+  return { enunciado: t, inlineRubric: null }
 }
 
 /** Verdadero si la línea es ancla "Pregunta N:" (cualquier N). Devuelve el número o 0. */
@@ -221,6 +323,39 @@ type BlockStart =
   | { type: "header"; lineIndex: number; itemNumber: number; maxScore: number; axisLabel: string }
 
 /**
+ * Líneas que parecen incisos de rúbrica/criterio (p. ej. "1. Si menciona…") y NO deben abrir un ítem nuevo.
+ * Evita fragmentar una pregunta abierta en P1, P2, P3 artificiales por numeración interna del docente.
+ */
+function looksLikeNumberedRubricOrSubcriterionLine(line: string): boolean {
+  const t = line.trim()
+  if (!t) return false
+  // No usar looksLikeRubricLine aquí: palabras como "parcial" o "correcta" en el enunciado
+  // harían perder un inicio de ítem real (falso positivo).
+  if (/^\d{1,2}\.\s+\d+\s*puntos?\s*[:\.]/i.test(t)) return true
+  if (/^\d{1,2}\)\s+\d+\s*puntos?\s*[:\.]/i.test(t)) return true
+  if (/^\d{1,2}\.\d+[\.\)]?\s/.test(t)) return true
+  if (/^\d{1,2}\s*[-–—]\s*\d{1,2}\s*puntos?\b/i.test(t)) return true
+  if (/^\d{1,2}\.\s+(si\b|sí\b|cuando\b|cuándo\b|cuando\s+el\b|si\s+el\b|si\s+la\b|si\s+lo\b|si\s+los\b|si\s+las\b)/i.test(t)) {
+    return true
+  }
+  if (/^\d{1,2}\)\s+(si\b|cuando\b|sí\b)/i.test(t)) return true
+  if (/^\d{1,2}\.\s+(se\s+otorg|se\s+asign|se\s+eval|punt[uú]a|asigna\s+|otorga\s+des|descuenta\b)/i.test(t)) {
+    return true
+  }
+  if (/^\d{1,2}\.\s+/.test(t) && t.length < 140 && !/\?/.test(t)) {
+    const rest = t.replace(/^\d{1,2}\.\s+/, "")
+    if (
+      /^(criterio|indicador|nivel\s+de|logro|no\s+logra|logra\s+parcial|puntaje\s+parcial|puntuaci[oó]n|desempeño)/i.test(
+        rest,
+      )
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * Encuentra todos los inicios de bloque (clásico "N." / "N)" o cabecera "N M Eje").
  */
 function findBlockStarts(lines: string[]): BlockStart[] {
@@ -229,12 +364,14 @@ function findBlockStarts(lines: string[]): BlockStart[] {
     const line = lines[i] ?? ""
     const classic = matchItemStart(line)
     if (classic) {
-      starts.push({
-        type: "classic",
-        lineIndex: i,
-        itemNumber: classic.num,
-        rest: classic.rest,
-      })
+      if (!looksLikeNumberedRubricOrSubcriterionLine(line)) {
+        starts.push({
+          type: "classic",
+          lineIndex: i,
+          itemNumber: classic.num,
+          rest: classic.rest,
+        })
+      }
       continue
     }
     const header = matchDevHeader(line)
@@ -246,9 +383,72 @@ function findBlockStarts(lines: string[]): BlockStart[] {
         maxScore: header.maxScore,
         axisLabel: header.axisLabel,
       })
+      continue
+    }
+
+    // Laxo y universal: "N texto..." para abiertas, evitando tablas cerradas.
+    const loose = matchItemStartLoose(line)
+    if (loose) {
+      const isLikelyClosed =
+        stemShowsAlternativeOptions(loose.rest) ||
+        /(?:respuesta|alternativa|opci[oó]n|clave)\s+correcta\s*[:\.]\s*[A-EVF]/i.test(loose.rest)
+      if (!isLikelyClosed && looksLikeOpenQuestionPrompt(loose.rest)) {
+        starts.push({
+          type: "classic",
+          lineIndex: i,
+          itemNumber: loose.num,
+          rest: loose.rest,
+        })
+      }
     }
   }
   return starts
+}
+
+function parseFallbackOpenBlocks(lines: string[]): ParseDevelopmentBlocksResult {
+  const items: ParsedLine[] = []
+  const warnings: string[] = []
+  const consumedLines: string[] = []
+
+  const nonEmpty = lines.map((l) => l.trim()).filter(Boolean)
+  if (nonEmpty.length === 0) return { items, warnings, consumedLines }
+
+  // Segmentación por párrafos para no depender de "Pregunta N" ni cabeceras rígidas.
+  const paragraphs = String(lines.join("\n"))
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter((p) => p.length >= MIN_ENUNCIADO_LENGTH)
+
+  for (const p of paragraphs) {
+    if (stemShowsAlternativeOptions(p)) continue
+    const hasRubric = looksLikeRubricLine(p) || /\b\d+\s*puntos?\b/i.test(p)
+    const looksOpen = looksLikeOpenQuestionPrompt(p) || hasRubric || p.length > 180
+    if (!looksOpen) continue
+
+    const idxHint = p.match(/^\s*(\d{1,3})[\.\)\-–—:]?\s+/)
+    const itemNumber = idxHint ? parseInt(idxHint[1], 10) : items.length + 1
+    const cleanPrompt = p.replace(/^\s*\d{1,3}[\.\)\-–—:]?\s+/, "").trim()
+    const rub = hasRubric ? p : null
+
+    items.push({
+      item_number: itemNumber,
+      item_text: cleanPrompt || `Pregunta ${itemNumber}`,
+      axis_label: null,
+      skill_label: null,
+      competence: null,
+      difficulty: null,
+      question_type: cleanPrompt.length <= 120 ? "short_answer" : "essay",
+      correct_answer: null,
+      max_score: null,
+      rubric_text: rub,
+    })
+    consumedLines.push(...p.split(/\n/).map((x) => x.trim()).filter(Boolean))
+  }
+
+  if (items.length > 0) {
+    warnings.push("Detección de desarrollo por fallback universal (sin anclas rígidas).")
+  }
+  return { items: dedupeParsedLinesByItemNumber(items), warnings, consumedLines }
 }
 
 /**
@@ -333,7 +533,7 @@ function buildItemFromBlock(
       })
     }
 
-    return {
+    return upgradeParsedLineIfDocClosed({
       item_number: start.itemNumber,
       item_text,
       axis_label: start.axisLabel,
@@ -344,7 +544,7 @@ function buildItemFromBlock(
       correct_answer: null,
       max_score: start.maxScore,
       rubric_text,
-    }
+    })
   }
 
   // Bloque clásico: "N. enunciado" + rúbrica.
@@ -353,13 +553,15 @@ function buildItemFromBlock(
   if (!itemStart) return null
 
   const { num: itemNumber, rest: firstLineRest } = itemStart
-  const maxScore = extractMaxScore(blockLines) ?? extractMaxScore([firstLineRest])
+  const { enunciado: stem, inlineRubric } = splitInlineParentheticalCriterion(firstLineRest)
+  const maxScore = extractMaxScore(blockLines) ?? extractMaxScore([stem])
   const axis_label = extractAxis(blockLines)
-  const { enunciado, rubricLines } = extractEnunciadoAndRubric(lines, lineIndices, firstLineRest)
-  const rubric_text = rubricLines.length > 0 ? rubricLines.join("\n").trim() : null
+  const { enunciado, rubricLines } = extractEnunciadoAndRubric(lines, lineIndices, stem)
+  const rubricParts = [...(inlineRubric ? [inlineRubric] : []), ...rubricLines]
+  const rubric_text = rubricParts.length > 0 ? rubricParts.join("\n").trim() : null
 
   const hasEnoughEnunciado = enunciado.length >= MIN_ENUNCIADO_LENGTH
-  const hasRubric = rubric_text && rubric_text.length >= 5
+  const hasRubric = rubric_text != null && rubric_text.trim().length >= MIN_RUBRIC_CHARS
   if (!hasEnoughEnunciado && !hasRubric) return null
 
   const item_text = hasEnoughEnunciado ? enunciado : `Pregunta ${itemNumber}`
@@ -368,8 +570,8 @@ function buildItemFromBlock(
   }
 
   let finalMaxScore = maxScore
-  if (finalMaxScore == null && hasRubric) {
-    const fromRubric = rubricLines.join(" ").match(/(\d+)\s*puntos?/i)
+  if (finalMaxScore == null && hasRubric && rubric_text) {
+    const fromRubric = rubric_text.match(/(\d+)\s*puntos?/i)
     if (fromRubric) {
       const inferred = parseInt(fromRubric[1], 10)
       if (!Number.isNaN(inferred) && inferred <= 20) {
@@ -379,7 +581,7 @@ function buildItemFromBlock(
     }
   }
 
-  return {
+  return upgradeParsedLineIfDocClosed({
     item_number: itemNumber,
     item_text,
     axis_label,
@@ -390,7 +592,7 @@ function buildItemFromBlock(
     correct_answer: null,
     max_score: finalMaxScore,
     rubric_text,
-  }
+  })
 }
 
 function extractEnunciadoAndRubric(
@@ -430,7 +632,9 @@ export function parseDevelopmentBlocksFromText(normalizedText: string): ParseDev
   const lines = text.split(/\r?\n/).map((l) => l.trimEnd())
 
   const starts = findBlockStarts(lines)
-  if (starts.length === 0) return { items, warnings, consumedLines }
+  if (starts.length === 0) {
+    return parseFallbackOpenBlocks(lines)
+  }
 
   const headerLineIndices = new Set(
     starts.filter((s): s is typeof s & { type: "header" } => s.type === "header").map((s) => s.lineIndex)
@@ -518,18 +722,20 @@ export function parseDevelopmentBlocksFromText(normalizedText: string): ParseDev
         })
       }
 
-      items.push({
-        item_number: start.itemNumber,
-        item_text,
-        axis_label: start.axisLabel,
-        skill_label: null,
-        competence: null,
-        difficulty: null,
-        question_type: item_text.length <= 120 ? "short_answer" : "essay",
-        correct_answer: null,
-        max_score: start.maxScore,
-        rubric_text,
-      })
+      items.push(
+        upgradeParsedLineIfDocClosed({
+          item_number: start.itemNumber,
+          item_text,
+          axis_label: start.axisLabel,
+          skill_label: null,
+          competence: null,
+          difficulty: null,
+          question_type: item_text.length <= 120 ? "short_answer" : "essay",
+          correct_answer: null,
+          max_score: start.maxScore,
+          rubric_text,
+        }),
+      )
       continue
     }
 
@@ -540,5 +746,5 @@ export function parseDevelopmentBlocksFromText(normalizedText: string): ParseDev
     }
   }
 
-  return { items, warnings, consumedLines }
+  return { items: dedupeParsedLinesByItemNumber(items), warnings, consumedLines }
 }

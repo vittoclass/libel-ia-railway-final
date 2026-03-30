@@ -16,6 +16,8 @@ export interface NormalizeSourceExamTextResult {
   normalized_text: string
   detected_blocks: DetectedBlock[]
   warnings: string[]
+  /** Título o encabezado del instrumento si las primeras líneas lo permiten (sin depender de un PDF concreto). */
+  suggested_title: string | null
 }
 
 /**
@@ -59,6 +61,34 @@ function looksLikeHeaderOrInstruction(line: string): boolean {
   return false
 }
 
+/**
+ * Primera línea con aspecto de título de instrumento (no ítem numerado ni tabla SIMCE).
+ */
+export function inferSuggestedInstrumentTitle(text: string): string | null {
+  const lines = (typeof text === "string" ? text : "")
+    .split(/\r?\n/)
+    .map((l) => l.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean)
+  for (let i = 0; i < Math.min(lines.length, 35); i++) {
+    const t = lines[i]
+    if (!t || t.length < 5 || t.length > 160) continue
+    if (looksLikeSimceLine(t)) continue
+    if (/^\d+\s*[\.\)\-–—]\s/.test(t)) continue
+    if (/^ítem\s*\d+/i.test(t)) continue
+    if (/^n[º°]?\s*\d+/i.test(t)) continue
+    if (looksLikeHeaderOrInstruction(t) && t.length > 90) continue
+    if (/^n[º°]?\s*correcta\s+ptje/i.test(t.replace(/\s+/g, " "))) continue
+    if (/^página\s+\d+/i.test(t)) continue
+    const letterish = (t.match(/[a-záéíóúñ]/gi) ?? []).length
+    if (letterish < 5) continue
+    const upperRatio = (t.match(/[A-ZÁÉÍÓÚÑ]/g)?.length ?? 0) / Math.max(t.replace(/\s/g, "").length, 1)
+    if (upperRatio > 0.92 && t.length <= 55) return t.slice(0, 200)
+    if (upperRatio < 0.35 && t.length >= 8) return t.slice(0, 200)
+    if (t.length >= 10 && t.length <= 120) return t.slice(0, 200)
+  }
+  return null
+}
+
 export function normalizeSourceExamText(raw_text: string): NormalizeSourceExamTextResult {
   const warnings: string[] = []
   const raw = typeof raw_text === "string" ? raw_text : ""
@@ -99,5 +129,6 @@ export function normalizeSourceExamText(raw_text: string): NormalizeSourceExamTe
     normalized_text: normalized,
     detected_blocks,
     warnings,
+    suggested_title: inferSuggestedInstrumentTitle(normalized),
   }
 }

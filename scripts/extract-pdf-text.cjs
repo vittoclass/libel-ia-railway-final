@@ -5,6 +5,7 @@
  * Escribe en stdout JSON: { text, pageCount, warning? }
  * En error escribe en stderr JSON: { error, details? } y sale con código 1.
  * Solo para importación de ítems de prueba base. No toca evaluación ni OCR.
+ * La ruta HTTP extract-pdf-text prioriza Azure Document Intelligence si hay variables de entorno.
  */
 "use strict";
 
