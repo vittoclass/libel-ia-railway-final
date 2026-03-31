@@ -170,23 +170,30 @@ const isDev = process.env.NODE_ENV !== "production"
   let itemsInserted = 0
 
   const altItems = result.alternativas_corregidas || []
-  for (const a of altItems) {
-    const isCorrect = String(a.respuesta_estudiante).trim().toUpperCase() === String(a.respuesta_correcta).trim().toUpperCase()
-    const { error: itemErr } = await supabase.from("evaluation_items").insert({
-      evaluation_id: evaluationId,
-      question_number: questionNumber++,
-      student_answer: a.respuesta_estudiante ?? null,
-      correct_answer: a.respuesta_correcta ?? null,
-      is_correct: isCorrect,
-      score_obtained: isCorrect ? 1 : 0,
-      score_max: 1,
-    })
-    if (itemErr) {
-      registerChildError("insert_evaluation_items_alternativas", itemErr.message)
-    } else {
-      itemsInserted++
-    }
+  // SNAPSHOT_NATIONAL_ANALYTICS_V1: inserts paralelos para reducir latencia en serverless
+  const altInsertPromises = altItems.map((a, idx) => {
+    const isCorrect =
+      String(a.respuesta_estudiante).trim().toUpperCase() ===
+      String(a.respuesta_correcta).trim().toUpperCase()
+    return supabase
+      .from("evaluation_items")
+      .insert({
+        evaluation_id: evaluationId,
+        question_number: idx + 1,
+        student_answer: a.respuesta_estudiante ?? null,
+        correct_answer: a.respuesta_correcta ?? null,
+        is_correct: isCorrect,
+        score_obtained: isCorrect ? 1 : 0,
+        score_max: 1,
+      })
+      .then(({ error }) => ({ error }))
+  })
+  const altInsertResults = await Promise.all(altInsertPromises)
+  for (const r of altInsertResults) {
+    if (r.error) registerChildError("insert_evaluation_items_alternativas", r.error.message)
+    else itemsInserted++
   }
+  questionNumber = altItems.length + 1
 
   const desarrollo = result.detalle_desarrollo || {}
   /** Extrae número de pregunta desde clave de desarrollo (P39 → 39, "39" → 39) para que evaluation_items.question_number coincida con source_exam_items.item_number y entre al análisis pedagógico. */
@@ -200,6 +207,8 @@ const isDev = process.env.NODE_ENV !== "production"
     return null
   }
   const desarrolloKeys = Object.keys(desarrollo).sort()
+  const desarrolloRows: Array<Record<string, unknown>> = []
+  let nextQuestionNumber = questionNumber
   for (const key of desarrolloKeys) {
     const item = desarrollo[key]
     if (!item || typeof item !== "object") continue
@@ -211,8 +220,8 @@ const isDev = process.env.NODE_ENV !== "production"
       scoreMax = max
     }
     const parsedQ = parseDevelopmentQuestionNumber(key)
-    const qNum = parsedQ != null ? parsedQ : questionNumber++
-    const { error: itemErr } = await supabase.from("evaluation_items").insert({
+    const qNum = parsedQ != null ? parsedQ : nextQuestionNumber++
+    desarrolloRows.push({
       evaluation_id: evaluationId,
       question_number: qNum,
       student_answer: item.texto_estudiante ?? null,
@@ -221,11 +230,14 @@ const isDev = process.env.NODE_ENV !== "production"
       score_obtained: scoreObtained,
       score_max: scoreMax,
     })
-    if (itemErr) {
-      registerChildError("insert_evaluation_items_desarrollo", itemErr.message)
-    } else {
-      itemsInserted++
-    }
+  }
+  const desarrolloInsertPromises = desarrolloRows.map((row) =>
+    supabase.from("evaluation_items").insert(row).then(({ error }) => ({ error }))
+  )
+  const desarrolloInsertResults = await Promise.all(desarrolloInsertPromises)
+  for (const r of desarrolloInsertResults) {
+    if (r.error) registerChildError("insert_evaluation_items_desarrollo", r.error.message)
+    else itemsInserted++
   }
 
   if (isDev) console.info("[persist] items inserted", itemsInserted)
@@ -306,19 +318,25 @@ const isDev = process.env.NODE_ENV !== "production"
   try {
     const skillRows = await evaluateSkillsFromEvaluation(result, safeSubject)
     if (skillRows.length > 0 && profileIdsCollected.length > 0) {
-      for (const profileId of profileIdsCollected) {
-        for (const row of skillRows) {
-          const { error: skillErr } = await supabase.from("evaluation_skill_results").insert({
-            evaluation_id: evaluationId,
-            student_profile_id: profileId,
-            axis_id: row.axis_id,
-            skill_id: row.skill_id,
-            score_obtained: row.score_obtained,
-            score_max: row.score_max,
-            accuracy: row.accuracy,
-          })
-          if (skillErr) registerChildError("insert_evaluation_skill_results", skillErr.message)
-        }
+      const skillInsertPromises = profileIdsCollected.flatMap((profileId) =>
+        skillRows.map((row) =>
+          supabase
+            .from("evaluation_skill_results")
+            .insert({
+              evaluation_id: evaluationId,
+              student_profile_id: profileId,
+              axis_id: row.axis_id,
+              skill_id: row.skill_id,
+              score_obtained: row.score_obtained,
+              score_max: row.score_max,
+              accuracy: row.accuracy,
+            })
+            .then(({ error }) => ({ error }))
+        )
+      )
+      const skillInsertResults = await Promise.all(skillInsertPromises)
+      for (const r of skillInsertResults) {
+        if (r.error) registerChildError("insert_evaluation_skill_results", r.error.message)
       }
       if (isDev) console.info("[skill_results] inserted for", profileIdsCollected.length, "profiles,", skillRows.length, "skills each")
     }

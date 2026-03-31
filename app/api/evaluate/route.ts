@@ -29,7 +29,8 @@ import {
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
-export const maxDuration = 60
+// SNAPSHOT_NATIONAL_ANALYTICS_V1: timeout ampliado para evitar corte en ramas serverless con persistencia completa
+export const maxDuration = 300
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY
 // SNAPSHOT_ESTABLE_OMR_MARCH_31
