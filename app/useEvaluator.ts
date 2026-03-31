@@ -245,25 +245,43 @@ export const useEvaluator = () => {
         body: JSON.stringify(payloadFinal),
       });
 
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Error en la evaluación.');
+      const rawBody = await response.text();
+      let data: any = {};
+      try {
+        data = rawBody ? JSON.parse(rawBody) : {};
+      } catch {
+        throw new Error(
+          `Error parseando JSON de /api/evaluate (status ${response.status}).`
+        );
+      }
+      // SNAPSHOT_NATIONAL_ANALYTICS_V1: trazabilidad para inspeccionar payload real en navegador
+      console.log("DEBUG - Respuesta completa:", data);
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.error || `Error en la evaluación (status ${response.status}).`);
       }
 
       // Si hay pauta y respuestas extraídas, corrige autom��ticamente (tu lógica actual)
-      if (payloadFinal.pauta && data.respuestasExtraidas) {
+      if (payloadFinal?.pauta && data?.respuestasExtraidas && typeof data.respuestasExtraidas === "object") {
         const pauta = parsePauta(payloadFinal.pauta);
-        const correccion = corregirObjetivas(pauta, data.respuestasExtraidas);
+        const respuestasExtraidasSeguras = {
+          sm: Array.isArray((data as any)?.respuestasExtraidas?.sm) ? (data as any).respuestasExtraidas.sm : [],
+          vf: Array.isArray((data as any)?.respuestasExtraidas?.vf) ? (data as any).respuestasExtraidas.vf : [],
+        };
+        const correccion = corregirObjetivas(pauta, respuestasExtraidasSeguras);
 
         data.retroalimentacion = {
-          ...data.retroalimentacion,
+          ...(data?.retroalimentacion ?? {}),
           correccion_objetiva: correccion
         };
       }
 
       return data;
     } catch (err: any) {
-      return { success: false, error: err.message };
+      const msg =
+        err instanceof Error
+          ? err.message
+          : "Fallo de red o parsing en cliente al procesar /api/evaluate";
+      return { success: false, error: msg };
     } finally {
       setIsLoading(false);
     }
@@ -287,10 +305,26 @@ export const useEvaluator = () => {
         }),
       });
 
-      const data = await response.json();
+      const rawBody = await response.text();
+      let data: any = {};
+      try {
+        data = rawBody ? JSON.parse(rawBody) : {};
+      } catch {
+        return {
+          success: false,
+          error: `Error parseando JSON de /api/omr/compare (status ${response.status}).`,
+        };
+      }
+      console.log("DEBUG - Respuesta completa:", data);
       return data;
     } catch (err: any) {
-      return { success: false, error: err.message };
+      return {
+        success: false,
+        error:
+          err instanceof Error
+            ? err.message
+            : "Fallo de red o parsing en cliente al procesar /api/omr/compare",
+      };
     }
   }, [loadAnswerKey]);
 
