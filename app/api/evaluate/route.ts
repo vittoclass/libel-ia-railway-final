@@ -1470,8 +1470,8 @@ export async function POST(req: NextRequest) {
                 2,
                 new Set(
                   teacherAnswerKey
-                    .map((r) => String(r?.respuestaCorrecta ?? "").trim().toUpperCase())
-                    .filter((v) => /^[A-Z]$/.test(v))
+                    .map((r: any) => String(r?.respuestaCorrecta ?? "").trim().toUpperCase())
+                    .filter((v: any) => /^[A-Z]$/.test(v))
                 ).size || 4
               )
               const expectedQuestionCountUsed = Math.max(1, totalPreg)
@@ -1734,7 +1734,7 @@ export async function POST(req: NextRequest) {
 
     // Conservar siempre las respuestas cerradas detectadas por OMR del estudiante, aun sin pauta cargada.
     if (respuestasCerradasDesdeOMR.length > 0) {
-      combinedAnalysis.respuestas_cerradas = respuestasCerradasDesdeOMR.map((r) => ({
+      combinedAnalysis.respuestas_cerradas = respuestasCerradasDesdeOMR.map((r: any) => ({
         pregunta: r.pregunta,
         respuesta_detectada: r.respuesta_detectada || "",
         confianza: r.confianza ?? 0.9,
