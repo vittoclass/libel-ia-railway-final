@@ -3,6 +3,8 @@
  * No toca backend ni APIs; persiste en localStorage.
  */
 
+export type OMRTemplateVariant = "odd_even_dual_column" | "sequential_dual_column"
+
 export interface OMRTemplate {
   templateId: string
   name: string
@@ -11,6 +13,8 @@ export interface OMRTemplate {
   answerKey: { [question: number]: string }
   createdAt: number
   sheetSpec: "libelia_standard_v1" | "libelia_standard_v2"
+  /** Orden de numeración usado al generar la hoja (pares/impares o continuo/secuencial). */
+  omrTemplateVariant?: OMRTemplateVariant
   /** Plantilla Aspose .omr en base64 (generada automáticamente desde la hoja LibelIA). */
   asposeOmrBase64?: string
 }

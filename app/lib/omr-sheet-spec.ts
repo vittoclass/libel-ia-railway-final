@@ -28,6 +28,7 @@ export const HEADER_HEIGHT_MM = 28
 export const QUESTION_NUMBER_WIDTH_MM = 8
 
 export type BubblePosition = { q: number; optionIndex: number; cx: number; cy: number }
+export type OmrTemplateVariant = "odd_even_dual_column" | "sequential_dual_column"
 
 /**
  * Devuelve las posiciones (centro en mm) de cada burbuja para el grid de preguntas.
@@ -36,7 +37,8 @@ export type BubblePosition = { q: number; optionIndex: number; cx: number; cy: n
  */
 export function getBubblePositions(
   numQuestions: number,
-  numOptions: number
+  numOptions: number,
+  templateVariant: OmrTemplateVariant = "odd_even_dual_column"
 ): BubblePosition[] {
   const positions: BubblePosition[] = []
   const rowsPerColumn = Math.ceil(numQuestions / COLUMNS)
@@ -44,8 +46,13 @@ export function getBubblePositions(
   const startY = INNER_TOP_MM + HEADER_HEIGHT_MM
 
   for (let q = 1; q <= numQuestions; q++) {
-    const col = (q - 1) % COLUMNS
-    const row = Math.floor((q - 1) / COLUMNS)
+    const isSequential = templateVariant === "sequential_dual_column"
+    const col = isSequential ? (q > rowsPerColumn ? 1 : 0) : (q - 1) % COLUMNS
+    const row = isSequential
+      ? q > rowsPerColumn
+        ? q - rowsPerColumn - 1
+        : q - 1
+      : Math.floor((q - 1) / COLUMNS)
     const xBase = INNER_LEFT_MM + col * colWidth + QUESTION_NUMBER_WIDTH_MM
     const yRow = startY + row * ROW_HEIGHT_MM + ROW_HEIGHT_MM / 2
     for (let o = 0; o < numOptions; o++) {

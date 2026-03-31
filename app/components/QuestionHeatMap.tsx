@@ -32,6 +32,26 @@ type Props = {
   items: QuestionHeatMapItem[]
 }
 
+function safeHeatMapLabel(value: unknown, fallback = "—"): string {
+  if (value == null) return fallback
+  if (typeof value === "string") return value.trim() || fallback
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>
+    const candidate =
+      (typeof obj.descripcion === "string" && obj.descripcion) ||
+      (typeof obj.label === "string" && obj.label) ||
+      (typeof obj.nombre === "string" && obj.nombre) ||
+      (typeof obj.name === "string" && obj.name) ||
+      (typeof obj.titulo === "string" && obj.titulo) ||
+      (typeof obj.title === "string" && obj.title) ||
+      (typeof obj.ejemplo === "string" && obj.ejemplo) ||
+      ""
+    return candidate.trim() || fallback
+  }
+  return fallback
+}
+
 function HeatMapLegend() {
   return (
     <div className="flex flex-wrap items-center gap-4 text-xs text-[var(--text-muted)] mb-3">
@@ -67,8 +87,8 @@ export function QuestionHeatMap({ items }: Props) {
           {sorted.map((q) => {
             const level = getHeatMapLevel(q.logro_pct)
             const style = LEVEL_STYLES[level]
-            const axis = q.axis?.trim() || "—"
-            const skill = q.skill?.trim() || "—"
+            const axis = safeHeatMapLabel(q.axis, "—")
+            const skill = safeHeatMapLabel(q.skill, "—")
             return (
               <Tooltip key={q.item_number}>
                 <TooltipTrigger asChild>

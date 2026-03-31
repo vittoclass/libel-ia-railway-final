@@ -17,6 +17,7 @@ import {
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Button } from "@/components/ui/button"
 import { Loader2, FolderOpen, FileDown } from "lucide-react"
+import { Switch } from "@/components/ui/switch"
 import {
   BarChart,
   Bar,
@@ -37,6 +38,7 @@ import { exportElementToPdf } from "@/app/lib/export-report-pdf"
 import { useToast } from "@/hooks/use-toast"
 import { buildPedagogicalDiagnosis } from "@/app/lib/pedagogical-diagnosis-text"
 import { QuestionHeatMap } from "@/app/components/QuestionHeatMap"
+import { downloadCsvFile } from "@/app/lib/csv-export"
 
 type SummaryData = {
   course: string
@@ -62,6 +64,31 @@ type SummaryData = {
     student_count: number
   }>
   question_heat_map?: Array<{ item_number: number; logro_pct: number; axis?: string; skill?: string }>
+  national_analytics?: {
+    enabled: boolean
+    by_evaluation: Array<{
+      evaluation_id: string
+      student_name: string
+      note_7: number | null
+      score_obtained: number
+      score_max: number
+      logro_pct: number
+      paes_score: number
+      simce_score: number
+      simce_level: "Adecuado" | "Elemental" | "Insatisfactorio"
+    }>
+    course_summary: {
+      average_note_7: number | null
+      average_logro_pct: number
+      average_paes: number
+      average_simce: number
+      simce_distribution: {
+        Adecuado: number
+        Elemental: number
+        Insatisfactorio: number
+      }
+    }
+  }
 }
 
 type Props = {
@@ -69,6 +96,80 @@ type Props = {
   courseLabel?: string | null
   open: boolean
   onOpenChange: (open: boolean) => void
+}
+
+function toSafeText(value: unknown, fallback = "N/A"): string {
+  if (value === null || value === undefined) return fallback
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return fallback
+  }
+}
+
+// SNAPSHOT_NATIONAL_ANALYTICS_V1: extractor semantico para labels pedagogicos
+function pickPedagogicalLabel(value: unknown, fallback = "N/A"): string {
+  if (value === null || value === undefined) return fallback
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value)
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>
+    if (typeof obj.descripcion === "string" && obj.descripcion.trim()) return obj.descripcion
+    if (typeof obj.label === "string" && obj.label.trim()) return obj.label
+    if (typeof obj.nombre === "string" && obj.nombre.trim()) return obj.nombre
+    if (typeof obj.name === "string" && obj.name.trim()) return obj.name
+    if (typeof obj.titulo === "string" && obj.titulo.trim()) return obj.titulo
+    if (typeof obj.title === "string" && obj.title.trim()) return obj.title
+    if (typeof obj.ejemplo === "string" && obj.ejemplo.trim()) return obj.ejemplo
+  }
+  return toSafeText(value, fallback)
+}
+
+function normalizeSummaryData(raw: SummaryData): SummaryData {
+  // SNAPSHOT_NATIONAL_ANALYTICS_V1: normalizacion de entrada para impedir objetos en render
+  const mapDimensionRows = (rows: Array<{ dimension_value: string; logro_pct: number; question_count: number }>) =>
+    (rows ?? []).map((r) => ({
+      ...r,
+      dimension_value: pickPedagogicalLabel(r.dimension_value),
+    }))
+
+  return {
+    ...raw,
+    course: toSafeText(raw.course, "Curso"),
+    by_axis: mapDimensionRows(raw.by_axis),
+    by_skill: mapDimensionRows(raw.by_skill),
+    by_cognitive_level: mapDimensionRows(raw.by_cognitive_level),
+    weakest_skills: (raw.weakest_skills ?? []).map((s) => ({
+      ...s,
+      skill: pickPedagogicalLabel(s.skill),
+    })),
+    weakest_axes: (raw.weakest_axes ?? []).map((a) => ({
+      ...a,
+      axis: pickPedagogicalLabel(a.axis),
+    })),
+    most_failed_questions: (raw.most_failed_questions ?? []).map((q) => ({
+      ...q,
+      axis: pickPedagogicalLabel(q.axis),
+      skill: pickPedagogicalLabel(q.skill),
+    })),
+    question_heat_map: (raw.question_heat_map ?? []).map((q) => ({
+      ...q,
+      axis: pickPedagogicalLabel(q.axis ?? "—"),
+      skill: pickPedagogicalLabel(q.skill ?? "—"),
+    })),
+    national_analytics: raw.national_analytics
+      ? {
+          ...raw.national_analytics,
+          by_evaluation: (raw.national_analytics.by_evaluation ?? []).map((r) => ({
+            ...r,
+            student_name: toSafeText(r.student_name, "Estudiante"),
+          })),
+        }
+      : raw.national_analytics,
+  }
 }
 
 function SummaryBlock({ data }: { data: SummaryData }) {
@@ -80,7 +181,7 @@ function SummaryBlock({ data }: { data: SummaryData }) {
     <div className="rounded-md border bg-[var(--bg-muted)] p-3 space-y-2">
       <div className="font-medium text-[var(--text-accent)]">Resumen del curso</div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-sm">
-        <span><strong>Curso:</strong> {data.course}</span>
+        <span><strong>Curso:</strong> {toSafeText(data.course, "Curso")}</span>
         <span><strong>Evaluaciones encontradas:</strong> {total}</span>
         <span><strong>Con prueba base:</strong> {hasNewFields && withSource !== undefined ? withSource : "—"}</span>
         <span><strong>Analizables:</strong> {hasNewFields && analyzable !== undefined ? analyzable : "—"}</span>
@@ -131,12 +232,39 @@ export default function CoursePedagogicalSummaryModal({
   open,
   onOpenChange,
 }: Props) {
+  // SNAPSHOT_NATIONAL_ANALYTICS_V1: utilitario defensivo de render para evitar "Objects are not valid as a React child"
+  const safeText = toSafeText
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<SummaryData | null>(null)
   const reportRef = useRef<HTMLDivElement>(null)
   const [exportPdfLoading, setExportPdfLoading] = useState(false)
+  const [showNationalAnalytics, setShowNationalAnalytics] = useState(true)
   const { toast } = useToast()
+
+  useEffect(() => {
+    // SNAPSHOT_NATIONAL_ANALYTICS_V1: persistencia local del switch de proyecciones
+    if (typeof window === "undefined") return
+    try {
+      const stored = window.localStorage.getItem("libelia_show_national_analytics")
+      if (stored === null) {
+        setShowNationalAnalytics(true)
+        return
+      }
+      setShowNationalAnalytics(stored !== "false")
+    } catch {
+      setShowNationalAnalytics(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    try {
+      window.localStorage.setItem("libelia_show_national_analytics", showNationalAnalytics ? "true" : "false")
+    } catch {
+      // ignore storage failures
+    }
+  }, [showNationalAnalytics])
 
   useEffect(() => {
     if (!open || !courseId) {
@@ -157,7 +285,7 @@ export default function CoursePedagogicalSummaryModal({
           setData(null)
           return
         }
-        setData(j)
+        setData(normalizeSummaryData(j as SummaryData))
       })
       .catch(() => {
         setError("No se pudo cargar el resumen pedagógico.")
@@ -186,20 +314,47 @@ export default function CoursePedagogicalSummaryModal({
   }, [data])
 
   const courseDisplayName = courseLabel ?? data?.course ?? (courseId ? String(courseId) : null) ?? "Curso"
+  const national = data?.national_analytics
+  // SNAPSHOT_NATIONAL_ANALYTICS_V1: vista desacoplada del flag backend para no ocultar controles del modal
+  const hasNational = Boolean(Array.isArray(national?.by_evaluation) && national.by_evaluation.length > 0)
+  // SNAPSHOT_NATIONAL_ANALYTICS_V1: normalizacion defensiva para evitar renderizar objetos en <td>
+  const nationalRows = hasNational
+    ? national!.by_evaluation.map((row) => {
+        const safeNote = typeof row.note_7 === "number" && Number.isFinite(row.note_7) ? row.note_7.toFixed(1) : "N/A"
+        const safePaes = typeof row.paes_score === "number" && Number.isFinite(row.paes_score) ? row.paes_score : "N/A"
+        const safeSimce = typeof row.simce_score === "number" && Number.isFinite(row.simce_score) ? row.simce_score : "N/A"
+        const safeLevel =
+          row.simce_level === "Adecuado" || row.simce_level === "Elemental" || row.simce_level === "Insatisfactorio"
+            ? row.simce_level
+            : "N/A"
+        const safeLogro = typeof row.logro_pct === "number" && Number.isFinite(row.logro_pct) ? `${row.logro_pct}%` : "N/A"
+        return {
+          id: String(row.evaluation_id ?? ""),
+          student: safeText(row.student_name, "Estudiante"),
+          note: safeNote,
+          logro: safeLogro,
+          paes: safePaes,
+          simce: safeSimce,
+          level: safeLevel,
+          scoreObtained: typeof row.score_obtained === "number" && Number.isFinite(row.score_obtained) ? row.score_obtained : "N/A",
+          scoreMax: typeof row.score_max === "number" && Number.isFinite(row.score_max) ? row.score_max : "N/A",
+        }
+      })
+    : []
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <FolderOpen className="h-5 w-5" /> Resumen pedagógico del curso: {courseDisplayName}
+            <FolderOpen className="h-5 w-5" /> Resumen pedagógico del curso: {safeText(courseDisplayName, "Curso")}
           </DialogTitle>
         </DialogHeader>
         <div ref={reportRef} className="space-y-4 text-sm">
           {!loading && !error && data && (
             <div className="rounded-md border border-[var(--border-color)] bg-[var(--bg-muted)] p-3 text-xs">
               <div className="font-semibold text-[var(--text-accent)]">Contexto</div>
-              <div>Curso: {courseDisplayName}</div>
+              <div>Curso: {safeText(courseDisplayName, "Curso")}</div>
             </div>
           )}
           {loading && (
@@ -218,6 +373,11 @@ export default function CoursePedagogicalSummaryModal({
           {!loading && !error && data && (
             <>
               <SummaryBlock data={data} />
+              {(data.evaluation_count_without_items ?? 0) > 0 && (
+                <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
+                  Datos incompletos detectados
+                </p>
+              )}
               {!data.summary_available && (data.evaluation_count_analyzable ?? data.evaluation_count) === 0 && (
                 <NoSummaryMessage data={data} />
               )}
@@ -237,7 +397,7 @@ export default function CoursePedagogicalSummaryModal({
                     <TableBody>
                       {data.by_axis.map((r, i) => (
                         <TableRow key={i}>
-                          <TableCell>{r.dimension_value}</TableCell>
+                          <TableCell>{pickPedagogicalLabel(r.dimension_value)}</TableCell>
                           <TableCell>
                             <span className={r.logro_pct >= 70 ? "text-green-600" : r.logro_pct < 50 ? "text-amber-600" : ""}>
                               {r.logro_pct}%
@@ -264,7 +424,7 @@ export default function CoursePedagogicalSummaryModal({
                     <TableBody>
                       {data.by_skill.map((r, i) => (
                         <TableRow key={i}>
-                          <TableCell>{r.dimension_value}</TableCell>
+                          <TableCell>{pickPedagogicalLabel(r.dimension_value)}</TableCell>
                           <TableCell>
                             <span className={r.logro_pct >= 70 ? "text-green-600" : r.logro_pct < 50 ? "text-amber-600" : ""}>
                               {r.logro_pct}%
@@ -291,7 +451,7 @@ export default function CoursePedagogicalSummaryModal({
                     <TableBody>
                       {data.by_cognitive_level.map((r, i) => (
                         <TableRow key={i}>
-                          <TableCell>{r.dimension_value}</TableCell>
+                          <TableCell>{pickPedagogicalLabel(r.dimension_value)}</TableCell>
                           <TableCell>{r.logro_pct}%</TableCell>
                           <TableCell>{r.question_count}</TableCell>
                         </TableRow>
@@ -305,7 +465,7 @@ export default function CoursePedagogicalSummaryModal({
                   <h4 className="font-semibold text-[var(--text-accent)] mb-2">Habilidades más débiles</h4>
                   <ul className="list-disc list-inside space-y-1">
                     {data.weakest_skills.slice(0, 10).map((s, i) => (
-                      <li key={i}>{s.skill}: {s.average_logro_pct}%</li>
+                      <li key={i}>{pickPedagogicalLabel(s.skill)}: {s.average_logro_pct}%</li>
                     ))}
                   </ul>
                 </div>
@@ -315,7 +475,7 @@ export default function CoursePedagogicalSummaryModal({
                   <h4 className="font-semibold text-[var(--text-accent)] mb-2">Ejes más débiles</h4>
                   <ul className="list-disc list-inside space-y-1">
                     {data.weakest_axes.slice(0, 10).map((a, i) => (
-                      <li key={i}>{a.axis}: {a.average_logro_pct}%</li>
+                      <li key={i}>{pickPedagogicalLabel(a.axis)}: {a.average_logro_pct}%</li>
                     ))}
                   </ul>
                 </div>
@@ -337,8 +497,8 @@ export default function CoursePedagogicalSummaryModal({
                       {data.most_failed_questions.map((q, i) => (
                         <TableRow key={i}>
                           <TableCell>{q.item_number}</TableCell>
-                          <TableCell className="max-w-[120px] truncate">{q.axis}</TableCell>
-                          <TableCell className="max-w-[120px] truncate">{q.skill}</TableCell>
+                          <TableCell className="max-w-[120px] truncate">{pickPedagogicalLabel(q.axis)}</TableCell>
+                          <TableCell className="max-w-[120px] truncate">{pickPedagogicalLabel(q.skill)}</TableCell>
                           <TableCell>{q.error_pct}%</TableCell>
                           <TableCell>{q.student_count}</TableCell>
                         </TableRow>
@@ -356,7 +516,7 @@ export default function CoursePedagogicalSummaryModal({
                     <div className="w-full h-[240px]">
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart
-                          data={data.by_axis.map((r) => ({ name: r.dimension_value, logro: r.logro_pct }))}
+                          data={data.by_axis.map((r) => ({ name: pickPedagogicalLabel(r.dimension_value), logro: r.logro_pct }))}
                           margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
                         >
                           <CartesianGrid strokeDasharray="3 3" className="opacity-50" />
@@ -379,7 +539,7 @@ export default function CoursePedagogicalSummaryModal({
                     <div className="w-full h-[240px]">
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart
-                          data={data.by_skill.map((r) => ({ name: r.dimension_value, logro: r.logro_pct }))}
+                          data={data.by_skill.map((r) => ({ name: pickPedagogicalLabel(r.dimension_value), logro: r.logro_pct }))}
                           margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
                         >
                           <CartesianGrid strokeDasharray="3 3" className="opacity-50" />
@@ -404,8 +564,8 @@ export default function CoursePedagogicalSummaryModal({
                         <RadarChart
                           data={
                             data.by_axis.length >= data.by_skill.length
-                              ? data.by_axis.map((r) => ({ dimension: r.dimension_value, logro: r.logro_pct, fullMark: 100 }))
-                              : data.by_skill.map((r) => ({ dimension: r.dimension_value, logro: r.logro_pct, fullMark: 100 }))
+                              ? data.by_axis.map((r) => ({ dimension: pickPedagogicalLabel(r.dimension_value), logro: r.logro_pct, fullMark: 100 }))
+                              : data.by_skill.map((r) => ({ dimension: pickPedagogicalLabel(r.dimension_value), logro: r.logro_pct, fullMark: 100 }))
                           }
                           margin={{ top: 16, right: 16, left: 16, bottom: 16 }}
                         >
@@ -421,13 +581,66 @@ export default function CoursePedagogicalSummaryModal({
                   </div>
                 )}
               </div>
+              {/* SNAPSHOT_NATIONAL_ANALYTICS_V1 */}
+              {hasNational && (
+                <div className="space-y-4 pt-4 border-t border-[var(--border-color)]">
+                  <div className="flex items-center justify-between gap-2">
+                    <h4 className="font-semibold text-[var(--text-accent)]">Analítica Nacional (PAES/SIMCE)</h4>
+                  </div>
+                  <div className="rounded-md border bg-[var(--bg-muted)] p-3 text-sm grid grid-cols-1 md:grid-cols-5 gap-2">
+                    <div><strong>Nota 7.0 prom.</strong>: {national?.course_summary.average_note_7 ?? "—"}</div>
+                    <div><strong>Logro prom.</strong>: {national?.course_summary.average_logro_pct ?? 0}%</div>
+                    <div><strong>PAES prom.</strong>: {national?.course_summary.average_paes ?? 100}</div>
+                    <div><strong>SIMCE prom.</strong>: {national?.course_summary.average_simce ?? 0}</div>
+                    <div>
+                      <strong>Distribución SIMCE</strong>: A {national?.course_summary.simce_distribution.Adecuado ?? 0}% ·
+                      E {national?.course_summary.simce_distribution.Elemental ?? 0}% ·
+                      I {national?.course_summary.simce_distribution.Insatisfactorio ?? 0}%
+                    </div>
+                  </div>
+                  {/* SNAPSHOT_NATIONAL_ANALYTICS_V1: columnas nacionales forzadas en detalle */}
+                  <div className="w-full overflow-x-auto">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Estudiante</TableHead>
+                          <TableHead className="w-20">Nota 7.0</TableHead>
+                          <TableHead className="w-20">PAES</TableHead>
+                          <TableHead className="w-20">SIMCE</TableHead>
+                          <TableHead className="w-24">Nivel SIMCE</TableHead>
+                          <TableHead className="w-20">Logro %</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {nationalRows.map((alumno) => (
+                          <TableRow key={alumno.id}>
+                            <TableCell>{safeText(alumno.student, "Estudiante")}</TableCell>
+                            <TableCell>{alumno.note || "-"}</TableCell>
+                            <TableCell>{alumno.paes === "N/A" || alumno.paes == null ? "-" : alumno.paes}</TableCell>
+                            <TableCell>{alumno.simce === "N/A" || alumno.simce == null ? "-" : alumno.simce}</TableCell>
+                            <TableCell>{alumno.level === "N/A" || alumno.level == null ? "-" : alumno.level}</TableCell>
+                            <TableCell>{alumno.logro || "-"}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+              )}
               {/* Diagnóstico pedagógico, evidencia y mapa de calor (después de los gráficos) */}
               {(data.by_axis.length > 0 || data.by_skill.length > 0 || data.most_failed_questions.length > 0) && (() => {
                 const diagnosis = buildPedagogicalDiagnosis({
-                  by_axis: data.by_axis,
-                  by_skill: data.by_skill,
-                  by_cognitive_level: data.by_cognitive_level ?? [],
-                  most_failed_questions: data.most_failed_questions,
+                  by_axis: data.by_axis.map((x) => ({ ...x, dimension_value: pickPedagogicalLabel(x.dimension_value) })),
+                  by_skill: data.by_skill.map((x) => ({ ...x, dimension_value: pickPedagogicalLabel(x.dimension_value) })),
+                  by_cognitive_level: (data.by_cognitive_level ?? []).map((x) => ({
+                    ...x,
+                    dimension_value: pickPedagogicalLabel(x.dimension_value),
+                  })),
+                  most_failed_questions: data.most_failed_questions.map((x) => ({
+                    ...x,
+                    axis: pickPedagogicalLabel(x.axis),
+                    skill: pickPedagogicalLabel(x.skill),
+                  })),
                 })
                 const heatMap = (data.question_heat_map ?? []).slice().sort((a, b) => a.item_number - b.item_number)
                 return (
@@ -436,7 +649,7 @@ export default function CoursePedagogicalSummaryModal({
                     <div className="rounded-md border bg-[var(--bg-muted)] p-4 space-y-3 text-sm">
                       <p className="font-medium text-[var(--text-accent)]">Diagnóstico pedagógico del curso</p>
                       {diagnosis.diagnosisParagraphs.map((p, i) => (
-                        <p key={i} className="text-[var(--text)]">{p}</p>
+                        <p key={i} className="text-[var(--text)]">{safeText(p, "")}</p>
                       ))}
                     </div>
 
@@ -446,10 +659,10 @@ export default function CoursePedagogicalSummaryModal({
                         <div className="rounded-md border bg-[var(--bg-muted)] p-4 space-y-2 text-sm">
                           <p className="font-medium text-[var(--text-accent)]">Evidencia de dificultad</p>
                           {diagnosis.evidenceLines.map((line, i) => (
-                            <p key={i} className="text-[var(--text)] whitespace-pre-wrap">{line}</p>
+                            <p key={i} className="text-[var(--text)] whitespace-pre-wrap">{safeText(line, "")}</p>
                           ))}
                           {diagnosis.triangulationMessage && (
-                            <p className="pt-2 font-medium text-[var(--text-accent)]">{diagnosis.triangulationMessage}</p>
+                            <p className="pt-2 font-medium text-[var(--text-accent)]">{safeText(diagnosis.triangulationMessage, "")}</p>
                           )}
                         </div>
                       </>
@@ -469,7 +682,54 @@ export default function CoursePedagogicalSummaryModal({
             </>
           )}
         </div>
-        <DialogFooter>
+        <DialogFooter className="sticky bottom-0 z-20 border-t border-[var(--border-color)] bg-background pt-3">
+          <div className="flex flex-col gap-2 w-full sm:w-auto">
+            <div className="flex items-center gap-2 text-xs">
+              <span>Mostrar columnas nacionales</span>
+              <Switch checked={showNationalAnalytics} onCheckedChange={(checked) => setShowNationalAnalytics(Boolean(checked))} />
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!hasNational}
+              onClick={() => {
+                if (!national) return
+                const headers = [
+                  "Estudiante",
+                  "Nota 7.0",
+                  "Puntaje Obtenido",
+                  "Puntaje Maximo",
+                  "Logro %",
+                  "PAES",
+                  "SIMCE",
+                  "Nivel SIMCE",
+                ]
+                const rows = nationalRows.map((alumno) => [
+                  alumno.student,
+                  alumno.note === "N/A" ? "" : alumno.note,
+                  alumno.scoreObtained === "N/A" ? "" : alumno.scoreObtained,
+                  alumno.scoreMax === "N/A" ? "" : alumno.scoreMax,
+                  alumno.logro === "N/A" ? "" : alumno.logro.replace("%", ""),
+                  alumno.paes === "N/A" ? "" : alumno.paes,
+                  alumno.simce === "N/A" ? "" : alumno.simce,
+                  alumno.level === "N/A" ? "" : alumno.level,
+                ])
+                const safeName = (courseDisplayName || "curso")
+                  .replace(/[^\w\u00C0-\u024F\s\-]/g, "")
+                  .replace(/\s+/g, "_")
+                  .slice(0, 60)
+                downloadCsvFile({
+                  filename: `libelia_analitica_nacional_${safeName}.csv`,
+                  headers,
+                  rows,
+                  delimiter: ",",
+                })
+              }}
+            >
+              <FileDown className="h-4 w-4 mr-2" />
+              Exportar CSV gestión
+            </Button>
+          </div>
           <Button
             variant="outline"
             size="sm"

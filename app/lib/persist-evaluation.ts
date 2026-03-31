@@ -159,6 +159,13 @@ const isDev = process.env.NODE_ENV !== "production"
   const evaluationId = typeof evaluation.id === "string" ? evaluation.id : String(evaluation.id)
   if (isDev) console.info("[persist] evaluation created", evaluationId)
 
+  // SNAPSHOT_NATIONAL_ANALYTICS_V1: evitar falso "saved: true" en persistencia parcial
+  let childPersistError: { step: string; message: string } | null = null
+  const registerChildError = (step: string, message: string) => {
+    if (!childPersistError) childPersistError = { step, message }
+    if (isDev) console.error(`[save] child persistence fail (${step})`, message)
+  }
+
   let questionNumber = 1
   let itemsInserted = 0
 
@@ -175,7 +182,7 @@ const isDev = process.env.NODE_ENV !== "production"
       score_max: 1,
     })
     if (itemErr) {
-      if (isDev) console.error("[save] insert evaluation_items (alternativa) FAIL", itemErr.message)
+      registerChildError("insert_evaluation_items_alternativas", itemErr.message)
     } else {
       itemsInserted++
     }
@@ -215,7 +222,7 @@ const isDev = process.env.NODE_ENV !== "production"
       score_max: scoreMax,
     })
     if (itemErr) {
-      if (isDev) console.error("[save] insert evaluation_items (desarrollo) FAIL", itemErr.message)
+      registerChildError("insert_evaluation_items_desarrollo", itemErr.message)
     } else {
       itemsInserted++
     }
@@ -241,7 +248,7 @@ const isDev = process.env.NODE_ENV !== "production"
     improvements: resumen?.areas_mejora ?? null,
     raw: rawSafe,
   })
-  if (sumErr && isDev) console.error("[save] insert evaluation_summaries FAIL", sumErr.message)
+  if (sumErr) registerChildError("insert_evaluation_summaries", sumErr.message)
   if (!sumErr && isDev) console.info("[persist] summary inserted")
 
   const savedStudentNames: string[] = []
@@ -261,7 +268,7 @@ const isDev = process.env.NODE_ENV !== "production"
       const { error: esErr } = await supabase
         .from("evaluation_students")
         .upsert(row, { onConflict: "evaluation_id,student_normalized" })
-      if (esErr && isDev) console.warn("[save] evaluation_students upsert", esErr.message)
+      if (esErr) registerChildError("upsert_evaluation_students", esErr.message)
       if (!esErr) savedStudentNames.push(confirmedName)
 
       try {
@@ -278,14 +285,20 @@ const isDev = process.env.NODE_ENV !== "production"
             .update({ student_profile_id: profileId })
             .eq("evaluation_id", evaluationId)
             .eq("student_normalized", normalized)
-          if (upErr && isDev) console.warn("[student_profile] attach failed", upErr.message)
+          if (upErr) registerChildError("attach_student_profile", upErr.message)
           else if (isDev) console.info("[student_profile] attached evaluation_student ->", profileId)
         }
       } catch (linkErr) {
-        if (isDev) console.warn("[student_profile] link step failed", linkErr)
+        registerChildError(
+          "student_profile_link",
+          linkErr instanceof Error ? linkErr.message : String(linkErr)
+        )
       }
     } catch (e) {
-      if (isDev) console.warn("[save] evaluation_students upsert exception", e)
+      registerChildError(
+        "upsert_evaluation_students_exception",
+        e instanceof Error ? e.message : String(e)
+      )
     }
   }
   if (isDev) console.info("[student] saved_students =", JSON.stringify(savedStudentNames))
@@ -304,13 +317,27 @@ const isDev = process.env.NODE_ENV !== "production"
             score_max: row.score_max,
             accuracy: row.accuracy,
           })
-          if (skillErr && isDev) console.warn("[skill_results] insert failed", skillErr.message)
+          if (skillErr) registerChildError("insert_evaluation_skill_results", skillErr.message)
         }
       }
       if (isDev) console.info("[skill_results] inserted for", profileIdsCollected.length, "profiles,", skillRows.length, "skills each")
     }
   } catch (e) {
-    if (isDev) console.warn("[skill_results] evaluateSkillsFromEvaluation or insert failed", e)
+    registerChildError(
+      "skill_results_pipeline",
+      e instanceof Error ? e.message : String(e)
+    )
+  }
+
+  if (childPersistError) {
+    return {
+      saved: false,
+      success: false,
+      error: {
+        step: childPersistError.step,
+        message: `${childPersistError.message} (evaluation_id=${evaluationId})`,
+      },
+    }
   }
 
   return { saved: true, success: true, evaluation_id: evaluationId, status: "draft" }

@@ -17,12 +17,28 @@ import {
   isEvaluationBaseItemClosedForOmr,
   isFormStructuredRowClosedForOmr,
 } from "@/app/lib/evaluation-base"
+import {
+  accumulateDesarrolloAcrossPages,
+  collapseDevelopmentKeysToCanonical,
+  filterDesarrolloExcludingClosedPautaSlots,
+  mergeVisionAndDedicatedDesarrollo,
+  orderCanonicalDesarrolloRecord,
+  pruneCorreccionDetalladaForCanonicalDesarrollo,
+  removeCorreccionEntriesForClosedPautaSlots,
+} from "@/app/lib/desarrollo-pipeline"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 export const maxDuration = 60
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY
+// SNAPSHOT_ESTABLE_OMR_MARCH_31
+// Ajuste reversible de rigor/fidelidad en desarrollo:
+// - Piso de generosidad para intento identificable: 0.5 (antes 1.0)
+// - Marcador obligatorio [ilegible] para palabras no legibles
+const DESARROLLO_MIN_ATTEMPT_SCORE = 0.5
+// HUMAN_CONTEXT_TRANSCRIPTION_V1
+// Regla reversible: usar contexto local solo para descifrar trazos, nunca para inventar/reemplazar evidencia.
 
 /** Reintentos para 502/503/429 (overload/servicio no disponible). */
 async function fetchMistralWithRetry(url: string, init: RequestInit): Promise<Response> {
@@ -344,7 +360,7 @@ REGLAS DE ORO:
 
 2) PUNTUACIÓN DE DESARROLLO (generosidad calibrada):
    - Ítems de desarrollo y sus máximos: ${desarrolloPuntajes || "No especificados"}
-   - **CRITERIO DE GENEROSIDAD:** Si el concepto principal de la respuesta (según la pauta) es identificable AUNQUE SEA BREVE O MAL ESCRITO, el puntaje debe ser MÍNIMO 1 PUNTO (si el máximo del ítem > 1). Solo asigna 0 cuando la respuesta es totalmente incomprensible o en blanco.
+   - **CRITERIO DE GENEROSIDAD (AJUSTE SEGURO):** Si el concepto principal es identificable pero la respuesta es incompleta o con errores de redacción, el puntaje mínimo es ${DESARROLLO_MIN_ATTEMPT_SCORE} puntos (si el máximo del ítem > ${DESARROLLO_MIN_ATTEMPT_SCORE}). Si la respuesta es totalmente irrelevante o ilegible, el puntaje debe ser 0.
    - **FORMATO:** "puntaje" = "OBTENIDO/MAX_ITEM" (ej. "2/2", "1/3").
    - Considera flexibilidad ${flexibilidad}/5 (1=estricto, 5=flexible) al asignar puntaje.
 
@@ -353,6 +369,9 @@ REGLAS DE ORO:
 4) ÁREAS DE MEJORA: Orienta el crecimiento citando lo que escribió e indicando qué puede mejorar y cómo. Tono de apoyo, sin desvalorizar.
 
 5) En respuestas_desarrollo: "texto_estudiante" = CITA LITERAL de la respuesta del estudiante. "justificacion" = por qué tiene ese puntaje según la rúbrica (incluye cita).
+   - **MARCADOR DE INCERTIDUMBRE OBLIGATORIO:** Si una palabra es ilegible por caligrafía, NO la inventes ni la completes por contexto; reemplázala por [ilegible]. La transcripción debe ser un espejo de lo escrito.
+   - **CONTEXTO COMO APOYO DE DESCIFRADO (NO DE REEMPLAZO):** Usa las palabras legibles alrededor para ayudar a identificar caracteres manuscritos dudosos. Si el trazo sugiere una palabra concreta que encaja en la oración, transcríbela LITERAL (incluyendo errores ortográficos del estudiante). Ejemplo: si parece "extricta", escribe "extricta"; NO la cambies por "estricta" ni por otra palabra más "correcta".
+   - Si tras usar contexto local el trazo sigue ambiguo o no coincide en absoluto, usa [ilegible]. Es preferible [ilegible] antes que resumir o suponer texto no escrito.
 
 6) LENGUAJE RESPONSABLE: Nunca escribas frases que afirmen que el estudiante "no respondió", "no contestó" o "no escribió nada". Si en la TRANSCRIPCIÓN OCR no ves respuesta para una pregunta, describe la LIMITACIÓN de la transcripción, por ejemplo: "En la transcripción OCR no se observa una respuesta legible para esta pregunta", sin culpar al estudiante.
 
@@ -444,10 +463,17 @@ async function extractStudentClosedAnswersOnly(
   totalPreguntas: number,
   alternativas: string[],
   columnas: number = 2,
-  templateImageBase64?: string
+  templateImageBase64?: string,
+  templateVariant: "odd_even_dual_column" | "sequential_dual_column" = "odd_even_dual_column"
 ): Promise<{ pregunta: string; respuesta_detectada: string; confianza: number }[]> {
   const half = Math.ceil(totalPreguntas / 2)
   const alts = alternativas.length ? alternativas : ["A", "B", "C", "D"]
+  const layoutText =
+    templateVariant === "sequential_dual_column"
+      ? `- COLUMNA IZQUIERDA: Preguntas 1 a ${half}
+- COLUMNA DERECHA: Preguntas ${half + 1} a ${totalPreguntas}`
+      : `- COLUMNA IZQUIERDA: Preguntas impares (1, 3, 5, ...)
+- COLUMNA DERECHA: Preguntas pares (2, 4, 6, ...)`
 
   const conPlantilla = !!templateImageBase64 && templateImageBase64.length > 50
   const prompt = conPlantilla
@@ -458,7 +484,9 @@ IMAGEN 2 = HOJA DEL ESTUDIANTE. Aquí debes leer QUÉ LETRA está marcada en cad
 
 TU TAREA: Extraer ÚNICAMENTE lo que está marcado en la IMAGEN 2 (hoja del estudiante). NO copies las respuestas de la imagen 1. El estudiante puede marcar distinto al profesor.
 
-Estructura: ${columnas} columnas. Preguntas 1 a ${half}, luego ${half + 1} a ${totalPreguntas}. Opciones: ${alts.join(", ")}.
+Estructura: ${columnas} columnas.
+${layoutText}
+Opciones: ${alts.join(", ")}.
 
 Para cada pregunta (1 a ${totalPreguntas}) indica SOLO la letra que VES MARCADA EN LA IMAGEN 2. Si en la imagen 2 no hay marca, escribe "SIN_RESPUESTA".
 
@@ -470,7 +498,9 @@ Exactamente ${totalPreguntas} elementos en "r".`
 
 NO tienes acceso a las respuestas correctas. Indica QUÉ LETRA está marcada (con X o relleno) en cada pregunta.
 
-ESTRUCTURA: ${columnas} columnas. Preguntas 1 a ${half}, luego ${half + 1} a ${totalPreguntas}. Opciones: ${alts.join(", ")}.
+ESTRUCTURA: ${columnas} columnas.
+${layoutText}
+Opciones: ${alts.join(", ")}.
 
 Para cada pregunta (1 a ${totalPreguntas}) indica SOLO la letra que VES marcada. Si no hay marca, "SIN_RESPUESTA". NO inventes. El estudiante puede marcar mal; refleja exactamente lo marcado.
 
@@ -513,17 +543,22 @@ Responde SOLO este JSON:
     const num = Number(r?.p)
     if (num >= 1 && num <= totalPreguntas && !respMap.has(num)) {
       const ans = String(r?.a || "").trim().toUpperCase()
-      respMap.set(num, alts.includes(ans) ? ans : ans || "SIN_RESPUESTA")
+      if (ans === "BLANK" || ans === "SIN_RESPUESTA" || ans === "") {
+        respMap.set(num, "SIN_RESPUESTA")
+      } else {
+        respMap.set(num, alts.includes(ans) ? ans : "SIN_RESPUESTA")
+      }
     }
   }
 
   const out: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
   for (let i = 1; i <= totalPreguntas; i++) {
     const a = respMap.get(i) || "SIN_RESPUESTA"
+    const isBlankLike = a === "SIN_RESPUESTA" || a === "BLANK" || a === ""
     out.push({
       pregunta: `SM${i}`,
       respuesta_detectada: a,
-      confianza: a && a !== "SIN_RESPUESTA" ? 0.9 : 0.4,
+      confianza: isBlankLike ? 0.4 : 0.9,
     })
   }
   return out
@@ -532,6 +567,8 @@ Responde SOLO este JSON:
 async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
   studentImageBase64: string
   teacherAnswerKey: Array<{ pregunta: string; respuestaCorrecta: string }>
+  closedQuestionIds?: string[]
+  expectedOptionCount?: number
   /** Si se pasa >0, el pipeline completa huecos con BLANK inferido (completedByExpectation). Omitir para solo lectura sensorial. */
   expectedQuestionCount?: number
   templateKey: string
@@ -556,6 +593,7 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
     imageBuffer,
     templateKey: params.templateKey,
     ...(expectation !== undefined ? { expectedQuestionCount: expectation } : {}),
+    ...(typeof params.expectedOptionCount === "number" ? { expectedOptionCount: params.expectedOptionCount } : {}),
     canonicalWidth: 1200,
     canonicalHeight: 1700,
     omrTemplateVariant: params.templateVariant ?? "odd_even_dual_column",
@@ -572,6 +610,18 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
   }
 
   const perQuestion = Array.isArray((azure as any).perQuestion) ? (azure as any).perQuestion : []
+  if (perQuestion.length === 0) {
+    throw new Error("[official_azure_layout_family] pipeline devolvió 0 preguntas detectadas")
+  }
+  const expectedClosedCount =
+    Array.isArray(params.closedQuestionIds) && params.closedQuestionIds.length > 0
+      ? params.closedQuestionIds.length
+      : params.teacherAnswerKey.length
+  if (expectedClosedCount > 0 && perQuestion.length !== expectedClosedCount) {
+    throw new Error(
+      `[official_azure_layout_family] Layout Mismatch pipeline=${perQuestion.length} esperado=${expectedClosedCount}`
+    )
+  }
   const sorted = [...perQuestion].sort(
     (a, b) => Number(a?.questionNumber ?? 0) - Number(b?.questionNumber ?? 0),
   )
@@ -580,17 +630,36 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
   for (const row of sorted) {
     const qn = Number(row?.questionNumber ?? 0)
     if (qn < 1) continue
-    const keyIdRaw = String(params.teacherAnswerKey[qn - 1]?.pregunta ?? `SM${qn}`).trim()
+    const keyIdRaw = String(
+      params.closedQuestionIds?.[qn - 1] ?? params.teacherAnswerKey[qn - 1]?.pregunta ?? `SM${qn}`
+    ).trim()
     const keyId = keyIdRaw || `SM${qn}`
-    // Passthrough desde el pipeline: vacío / BLANK / SIN_RESPUESTA → BLANK (no confundir "BLANK" con letra B en normalización).
+    // Passthrough directo desde Azure; si reporta MULTIPLE elegimos la alternativa de mayor confianza.
     const ansRaw = String(row?.selectedAnswer ?? "").trim().toUpperCase()
+    const confidenceMapRaw =
+      row && typeof row === "object" && row.confidencesByColumn && typeof row.confidencesByColumn === "object"
+        ? (row.confidencesByColumn as Record<string, unknown>)
+        : {}
+    const confidenceEntries = Object.entries(confidenceMapRaw)
+      .map(([k, v]) => [String(k).toUpperCase(), Number(v)] as const)
+      .filter(([k, v]) => /^[A-Z]$/.test(k) && Number.isFinite(v))
+      .sort((a, b) => b[1] - a[1])
+    const bestByConfidence = confidenceEntries[0]?.[0] ?? ""
     const ans =
-      ansRaw === "" || ansRaw === "SIN_RESPUESTA" || ansRaw === "BLANK" ? "BLANK" : ansRaw
+      ansRaw === "MULTIPLE"
+        ? bestByConfidence || "BLANK"
+        : ansRaw === "" || ansRaw === "SIN_RESPUESTA" || ansRaw === "BLANK"
+          ? "BLANK"
+          : ansRaw
+    const isBlankLike = ans === "BLANK" || ans === "SIN_RESPUESTA" || ans === ""
     out.push({
       pregunta: keyId,
       respuesta_detectada: ans,
-      confianza: ans !== "BLANK" && ans !== "SIN_RESPUESTA" ? 0.92 : 0.4,
+      confianza: isBlankLike ? 0.4 : 0.92,
     })
+  }
+  if (out.length === 0) {
+    throw new Error("[official_azure_layout_family] adapter devolvió 0 respuestas detectadas")
   }
   console.info("[official_azure_layout_family] pipeline_success", {
     pipelineExpectationPassed: expectation ?? null,
@@ -653,6 +722,8 @@ TAREA:
 ${soloDesarrollo ? "" : `2. EXTRAE ÚNICAMENTE lo que el estudiante marcó en esta hoja. Para cada pregunta de alternativas (SM, V/F, términos pareados): lee la letra o número que está marcado con X o relleno en la imagen. Responde SOLO con lo que VES marcado (A, B, C, D, E, V, F, o número). Si no hay marca clara, escribe "SIN_RESPUESTA". NO inventes ni uses ninguna lista de respuestas correctas: extrae solo lo que muestra la imagen.`}
 ${soloAlternativas ? "" : `3. PREGUNTAS DE DESARROLLO (OBLIGATORIO):
    - En "texto_estudiante" DEBES copiar LITERALMENTE lo que el estudiante escribió. Si hay texto manuscrito visible, CÍTALO aquí.
+   - Si una palabra no se puede leer, escribe [ilegible] exactamente en esa posición. NO inventes ni completes por contexto.
+   - Puedes usar el contexto de palabras vecinas solo para descifrar caracteres dudosos; si el trazo apunta a una palabra específica, transcríbela tal cual (con sus errores del estudiante). NO reemplaces por una palabra "mejor".
    - En "justificacion" explica POR QUÉ tiene ese puntaje citando partes concretas de su respuesta.
    - PROHIBIDO escribir "no contestó", "sin respuesta" o "no respondió" si en la imagen hay CUALQUIER texto manuscrito en la pregunta. Solo "Sin respuesta" cuando la zona de respuesta está realmente en blanco.
    - El puntaje debe reflejar lo que se ve; si hay texto, debe haber cita en texto_estudiante.`}
@@ -685,6 +756,8 @@ REGLA CRÍTICA PARA ALTERNATIVAS: En "respuesta_detectada" debes poner ÚNICAMEN
 INSTRUCCIONES PARA PREGUNTAS DE DESARROLLO (si la prueba tiene desarrollo):
 1. BUSCA en la imagen el número de la pregunta y el texto manuscrito debajo.
 2. En "texto_estudiante" COPIA EXACTAMENTE lo que escribió el estudiante (cita literal). Si hay texto visible, DEBE aparecer aquí; no resumas.
+   Si una palabra es ilegible, usa [ilegible] y no la completes por contexto.
+   Puedes usar contexto local para descifrar trazos; si identificas una palabra probable por trazo+contexto, escríbela literal como aparece (incluidos errores ortográficos del estudiante), sin corregirla.
 3. En "justificacion" explica POR QUÉ tiene ese puntaje e INCLUYE al menos una cita entre comillas de lo que escribió el estudiante.
 4. En "correccion_detallada" cada elemento en "detalle" DEBE contener al menos una cita entre comillas del texto del estudiante.
 5. PROHIBIDO: No escribas "Sin respuesta", "no contestó", "no respondió" ni "no hay texto escrito por el estudiante" en desarrollo si hay CUALQUIER texto manuscrito en la zona de esa pregunta. Solo usa "Sin respuesta" cuando la zona está realmente en blanco.`
@@ -738,6 +811,8 @@ async function analyzeDevelopmentOnly(
 
 CITAS OBLIGATORIAS EN DESARROLLO (no omitas ninguna):
 - En CADA "texto_estudiante" debes poner la CITA LITERAL de lo que el estudiante escribió. Si hay texto visible, copia el texto exacto; no resumas. Si la zona está en blanco, escribe "Sin respuesta".
+- Si una palabra es ilegible por caligrafía, reemplázala por [ilegible]. NO inventes ni completes por contexto.
+- Puedes usar palabras vecinas como ayuda para descifrar trazos. Si el trazo sugiere una palabra específica, transcríbela exactamente como el estudiante la escribió (aunque tenga faltas). Si sigue ambiguo, deja [ilegible].
 - En CADA "justificacion" debes incluir al menos UNA cita entre comillas del texto del estudiante y explicar por qué tiene ese puntaje.
 - En "correccion_detallada" CADA ítem en "detalle" debe contener al menos UNA cita entre comillas de lo que escribió el estudiante y por qué tuvo ese puntaje.
 
@@ -1250,10 +1325,10 @@ export async function POST(req: NextRequest) {
       ).length
       const closedFromEvaluationBase = officialClosedItems.length
       const totalPreg =
-        Number(answerKeyFromTemplate?.totalPreguntas) ||
         teacherAnswerKeyBase.length ||
         closedFromEvaluationBase ||
         closedQuestionsFromPauta ||
+        Number(answerKeyFromTemplate?.totalPreguntas) ||
         1
       officialOmrTotalPregResolved = totalPreg
       officialOmrTeacherAnswerKeyLength = teacherAnswerKeyBase.length
@@ -1265,6 +1340,80 @@ export async function POST(req: NextRequest) {
       }
       const alternativasArray = altsSet.size > 0 ? Array.from(altsSet) : ["A", "B", "C", "D"]
       const columnas = 2
+      const officialClosedSorted = [...officialClosedItems].sort((a, b) => a.order - b.order)
+      const officialClosedOrderIds = officialClosedSorted
+        .map((it) => String(it.id ?? "").trim())
+        .filter((id) => id.length > 0)
+      const extractClosedOrdinal = (id: string): number | null => {
+        const m = String(id).toUpperCase().match(/(\d+)/)
+        if (!m) return null
+        const n = Number(m[1])
+        return Number.isFinite(n) && n > 0 ? n : null
+      }
+      const hasClosedInventoryMismatch =
+        officialClosedOrderIds.length > 0 &&
+        teacherAnswerKeyBase.length > 0 &&
+        officialClosedOrderIds.length !== teacherAnswerKeyBase.length
+      const officialClosedQuestionNumbers = officialClosedSorted.map((it, idx) => {
+        const fromId = extractClosedOrdinal(String(it.id ?? ""))
+        if (fromId != null) return fromId
+        const teacherQ = Number(teacherAnswerKeyBase[idx]?.pregunta)
+        return Number.isFinite(teacherQ) && teacherQ > 0 ? teacherQ : idx + 1
+      })
+      const teacherQuestionNumbers = teacherAnswerKeyBase
+        .map((r: any) => Number(r?.pregunta))
+        .filter((n: number) => Number.isFinite(n) && n > 0)
+      const hasClosedNumberSequenceMismatch =
+        teacherQuestionNumbers.length > 0 &&
+        officialClosedQuestionNumbers.length === teacherQuestionNumbers.length &&
+        officialClosedQuestionNumbers.some((n, idx) => n !== teacherQuestionNumbers[idx])
+      const legacyQuestionSpan = Math.max(
+        1,
+        ...officialClosedQuestionNumbers,
+        ...teacherQuestionNumbers,
+        totalPreg
+      )
+      const remapLegacyRawToOfficialOrder = (
+        legacyRaw: { pregunta: string; respuesta_detectada: string; confianza: number }[]
+      ): { pregunta: string; respuesta_detectada: string; confianza: number }[] =>
+        officialClosedOrderIds.map((officialId, idx) => {
+          const expectedQn = officialClosedQuestionNumbers[idx] ?? idx + 1
+          const rawMatch = legacyRaw.find((item) => {
+            const m = String(item?.pregunta ?? "").toUpperCase().match(/(\d+)/)
+            if (!m) return false
+            const qn = Number(m[1])
+            return Number.isFinite(qn) && qn === expectedQn
+          })
+          const fallbackId = `C${expectedQn}`
+          return {
+            pregunta: officialId || fallbackId,
+            respuesta_detectada: String(rawMatch?.respuesta_detectada ?? "BLANK"),
+            confianza: Number(rawMatch?.confianza) || 0.4,
+          }
+        })
+      const isBlankLikeDetectedAnswer = (value: string): boolean => {
+        const norm = String(value ?? "").trim().toUpperCase()
+        return norm === "" || norm === "BLANK" || norm === "SIN_RESPUESTA"
+      }
+      const shouldReplaceDetectedAnswer = (
+        current: { respuesta_detectada: string; confianza: number },
+        incoming: { respuesta_detectada: string; confianza: number },
+      ): boolean => {
+        const currentBlank = isBlankLikeDetectedAnswer(current.respuesta_detectada)
+        const incomingBlank = isBlankLikeDetectedAnswer(incoming.respuesta_detectada)
+        // Regla de oro: BLANK/SIN_RESPUESTA nunca pisa una alternativa válida.
+        if (!currentBlank && incomingBlank) return false
+        if (currentBlank && !incomingBlank) return true
+        const currentConfidence = Number(current.confianza) || 0
+        const incomingConfidence = Number(incoming.confianza) || 0
+        return incomingConfidence > currentConfidence
+      }
+      const detectedByPregunta = new Map<
+        string,
+        { pregunta: string; respuesta_detectada: string; confianza: number }
+      >()
+      let azureSuccessfulPages = 0
+      let azureFailedPages = 0
 
       for (let i = 0; i < imageBase64List.length; i++) {
         try {
@@ -1279,20 +1428,52 @@ export async function POST(req: NextRequest) {
           let extraidas: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
           const tryOfficialAzure =
             officialOmrIntegrationEnabled === true && officialOmrEngineSelected === "azure_layout_family"
+          const forceLegacyStableRouteForStructure =
+            hasClosedInventoryMismatch || hasClosedNumberSequenceMismatch
           console.info("[trace][omr_official][engine_selector]", {
             tryOfficialAzure,
+            forceLegacyStableRouteForStructure,
+            hasClosedInventoryMismatch,
+            hasClosedNumberSequenceMismatch,
             officialOmrIntegrationEnabled,
             officialOmrEngineSelected,
             officialOmrAllowFallbackToLegacy,
             hasTemplateAnswerKey: Boolean(answerKeyFromTemplate?.respuestas?.length),
             totalPreg,
           })
-          if (tryOfficialAzure) {
+          if (forceLegacyStableRouteForStructure) {
+            officialOmrFallbackUsed = true
+            officialOmrFallbackReason =
+              "FORCED_LEGACY_STRUCTURAL_MISMATCH_STABLE_ROUTE"
+            const legacyRaw = await extractStudentClosedAnswersOnly(
+              studentBase64,
+              legacyQuestionSpan,
+              alternativasArray,
+              columnas,
+              templateBase64,
+              omrTemplateVariant
+            )
+            extraidas = remapLegacyRawToOfficialOrder(legacyRaw)
+            console.info("[trace][omr_official][extraidas_forced_legacy_structural_gaps]", {
+              extraidasFirst10: extraidas.slice(0, 10),
+              extraidasCount: extraidas.length,
+            })
+            officialOmrAdapterMode = "legacy_extract_student_only"
+            officialOmrEngineUsed = "legacy"
+          } else if (tryOfficialAzure) {
             try {
               const teacherAnswerKey = teacherAnswerKeyBase.map((r: any) => ({
                 pregunta: String(r?.pregunta ?? ""),
                 respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
               }))
+              const expectedOptionCount = Math.max(
+                2,
+                new Set(
+                  teacherAnswerKey
+                    .map((r) => String(r?.respuestaCorrecta ?? "").trim().toUpperCase())
+                    .filter((v) => /^[A-Z]$/.test(v))
+                ).size || 4
+              )
               const expectedQuestionCountUsed = Math.max(1, totalPreg)
               officialOmrExpectedQuestionCountUsed = expectedQuestionCountUsed
               officialOmrTemplateKeyUsed = templateKeyUsed
@@ -1300,7 +1481,9 @@ export async function POST(req: NextRequest) {
               const azureOfficial = await extractStudentClosedAnswersAzureLayoutOfficial({
                 studentImageBase64: studentBase64,
                 teacherAnswerKey,
-                // No pasar expectedQuestionCount: evita completedByExpectation masivo en el pipeline cuando hay pocos rows observados.
+                closedQuestionIds: officialClosedOrderIds,
+                expectedOptionCount,
+                expectedQuestionCount: expectedQuestionCountUsed,
                 templateKey: templateKeyUsed,
                 templateVariant: omrTemplateVariant,
               })
@@ -1324,21 +1507,22 @@ export async function POST(req: NextRequest) {
               officialOmrDetectedVsPipelineMismatch = azureOfficial.officialOmrDetectedVsPipelineMismatch
               officialOmrAdapterMode = azureOfficial.officialOmrAdapterMode
               officialOmrEngineUsed = "azure_layout_family"
+              azureSuccessfulPages++
             } catch (engineErr) {
               if (!officialOmrAllowFallbackToLegacy) {
                 throw engineErr
               }
-              officialOmrFallbackUsed = true
-              officialOmrFallbackReason =
-                engineErr instanceof Error ? engineErr.message : String(engineErr)
+              azureFailedPages++
               console.warn("[Evaluate] official azure_layout_family falló, fallback legacy:", engineErr)
-              extraidas = await extractStudentClosedAnswersOnly(
+              const legacyRaw = await extractStudentClosedAnswersOnly(
                 studentBase64,
-                totalPreg,
+                legacyQuestionSpan,
                 alternativasArray,
                 columnas,
-                templateBase64
+                templateBase64,
+                omrTemplateVariant
               )
+              extraidas = remapLegacyRawToOfficialOrder(legacyRaw)
               console.info("[trace][omr_official][extraidas_after_fallback_legacy]", {
                 extraidasFirst10: extraidas.slice(0, 10),
                 extraidasCount: extraidas.length,
@@ -1347,27 +1531,33 @@ export async function POST(req: NextRequest) {
                   engineErr instanceof Error ? engineErr.message : String(engineErr),
               })
               officialOmrAdapterMode = "legacy_extract_student_only"
-              officialOmrEngineUsed = "legacy"
             }
           } else {
-            extraidas = await extractStudentClosedAnswersOnly(
+            const legacyRaw = await extractStudentClosedAnswersOnly(
               studentBase64,
-              totalPreg,
+              legacyQuestionSpan,
               alternativasArray,
               columnas,
-              templateBase64
+              templateBase64,
+              omrTemplateVariant
             )
+            extraidas = remapLegacyRawToOfficialOrder(legacyRaw)
             console.info("[trace][omr_official][extraidas_after_legacy_direct]", {
               extraidasFirst10: extraidas.slice(0, 10),
               extraidasCount: extraidas.length,
             })
             officialOmrAdapterMode = "legacy_extract_student_only"
-            officialOmrEngineUsed = "legacy"
           }
           for (const item of extraidas) {
             const pid = item.pregunta.toUpperCase()
-            if (!respuestasCerradasDesdeOMR.some((r: any) => String(r.pregunta).toUpperCase() === pid)) {
-              respuestasCerradasDesdeOMR.push(item)
+            const incoming = {
+              pregunta: item.pregunta,
+              respuesta_detectada: String(item.respuesta_detectada ?? ""),
+              confianza: Number(item.confianza) || 0.4,
+            }
+            const current = detectedByPregunta.get(pid)
+            if (!current || shouldReplaceDetectedAnswer(current, incoming)) {
+              detectedByPregunta.set(pid, incoming)
             }
           }
         } catch (e) {
@@ -1405,6 +1595,28 @@ export async function POST(req: NextRequest) {
             )
           }
           console.warn("[Evaluate] OMR dedicado falló para imagen", i, e)
+        }
+      }
+      const officialClosedOrderUpper = officialClosedOrderIds.map((id) => id.toUpperCase())
+      respuestasCerradasDesdeOMR = Array.from(detectedByPregunta.values()).sort((a, b) => {
+        const ia = officialClosedOrderUpper.indexOf(String(a.pregunta ?? "").toUpperCase())
+        const ib = officialClosedOrderUpper.indexOf(String(b.pregunta ?? "").toUpperCase())
+        const ra = ia >= 0 ? ia : Number.MAX_SAFE_INTEGER
+        const rb = ib >= 0 ? ib : Number.MAX_SAFE_INTEGER
+        return ra - rb
+      })
+      if (azureSuccessfulPages > 0) {
+        officialOmrEngineUsed = "azure_layout_family"
+        officialOmrFallbackUsed = false
+        officialOmrFallbackReason = null
+        if (officialOmrAdapterMode !== "direct_passthrough_from_experimental") {
+          officialOmrAdapterMode = "direct_passthrough_from_experimental"
+        }
+      } else if (azureFailedPages > 0) {
+        officialOmrEngineUsed = "legacy"
+        officialOmrFallbackUsed = true
+        if (!officialOmrFallbackReason) {
+          officialOmrFallbackReason = "[official_azure_layout_family] fallback total por fallas en todas las páginas"
         }
       }
     }
@@ -1455,13 +1667,6 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      if (analysis.respuestas_desarrollo) {
-        combinedAnalysis.respuestas_desarrollo = {
-          ...combinedAnalysis.respuestas_desarrollo,
-          ...analysis.respuestas_desarrollo,
-        }
-      }
-
       if (analysis.retroalimentacion) {
         if (i === 0) {
           combinedAnalysis.retroalimentacion = analysis.retroalimentacion
@@ -1473,10 +1678,12 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // Llamada dedicada a desarrollo: citas obligatorias y retroalimentación profunda (mixta o solo_desarrollo)
-      // Para "solo_desarrollo" siempre se ejecuta; para "mixta" solo si hay pauta o pautaEstructurada
+      // FASE 3.5: desarrollo — una sola clave canónica P{n} por ítem; fusión Vision + dedicada con criterio estable.
       const tieneDesarrollo = tipoPrueba !== "solo_alternativas"
-      const ejecutarDesarrolloDedicado = tieneDesarrollo && (tipoPrueba === "solo_desarrollo" || !!pauta || !!pautaEstructurada)
+      const ejecutarDesarrolloDedicado =
+        tieneDesarrollo && (tipoPrueba === "solo_desarrollo" || !!pauta || !!pautaEstructurada)
+
+      let pageMergedDev: Record<string, unknown>
       if (ejecutarDesarrolloDedicado) {
         try {
           const devResult = await analyzeDevelopmentOnly(
@@ -1487,12 +1694,10 @@ export async function POST(req: NextRequest) {
             nivelEducativo,
             areaConocimiento
           )
-          if (Object.keys(devResult.respuestas_desarrollo || {}).length > 0) {
-            combinedAnalysis.respuestas_desarrollo = {
-              ...combinedAnalysis.respuestas_desarrollo,
-              ...devResult.respuestas_desarrollo,
-            }
-          }
+          pageMergedDev = mergeVisionAndDedicatedDesarrollo(
+            (analysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+            (devResult.respuestas_desarrollo || {}) as Record<string, unknown>
+          )
           if (devResult.retroalimentacion && (devResult.retroalimentacion.fortalezas || devResult.retroalimentacion.areas_mejora || (Array.isArray(devResult.retroalimentacion.correccion_detallada) && devResult.retroalimentacion.correccion_detallada.length > 0))) {
             if (i === 0) {
               combinedAnalysis.retroalimentacion = {
@@ -1509,8 +1714,20 @@ export async function POST(req: NextRequest) {
           }
         } catch (e) {
           console.warn("[Evaluate] Análisis desarrollo dedicado falló", e)
+          pageMergedDev = collapseDevelopmentKeysToCanonical(
+            (analysis.respuestas_desarrollo || {}) as Record<string, unknown>
+          )
         }
+      } else {
+        pageMergedDev = collapseDevelopmentKeysToCanonical(
+          (analysis.respuestas_desarrollo || {}) as Record<string, unknown>
+        )
       }
+
+      combinedAnalysis.respuestas_desarrollo = accumulateDesarrolloAcrossPages(
+        combinedAnalysis.respuestas_desarrollo as Record<string, unknown>,
+        pageMergedDev
+      ) as typeof combinedAnalysis.respuestas_desarrollo
     }
 
     }  // fin else (rama imágenes: Mistral Vision)
@@ -1581,8 +1798,29 @@ export async function POST(req: NextRequest) {
       officialOmrFallbackReason,
     })
 
+    // FASE 3.5: claves canónicas P{n} + orden estable (PDF/Word e imagen convergen aquí antes de normalizar).
+    combinedAnalysis.respuestas_desarrollo = orderCanonicalDesarrolloRecord(
+      collapseDevelopmentKeysToCanonical((combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>)
+    ) as typeof combinedAnalysis.respuestas_desarrollo
+
     // Normalizar respuestas_desarrollo para que puntaje sea siempre string "X/Y" (evita [object Object] y permite calcular nota)
     combinedAnalysis.respuestas_desarrollo = normalizeRespuestasDesarrollo(combinedAnalysis.respuestas_desarrollo)
+
+    // Excluir del detalle de desarrollo los ordinales que en pauta estructurada son solo cerrados (p. ej. SM1 → 1 vs P1 mal colapsado).
+    const pautaRowsForDesarrolloFilter = parsePautaEstructurada(pautaEstructurada)
+    combinedAnalysis.respuestas_desarrollo = filterDesarrolloExcludingClosedPautaSlots(
+      (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      pautaRowsForDesarrolloFilter,
+      tipoPruebaReal,
+    ) as typeof combinedAnalysis.respuestas_desarrollo
+
+    removeCorreccionEntriesForClosedPautaSlots(combinedAnalysis.retroalimentacion, pautaRowsForDesarrolloFilter)
+
+    // No duplicar por ítem en correccion_detallada lo que ya está cubierto en detalle_desarrollo (por Pn).
+    pruneCorreccionDetalladaForCanonicalDesarrollo(
+      combinedAnalysis.retroalimentacion,
+      (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>
+    )
 
     // Sanitizar retroalimentación para no culpar al estudiante cuando es problema de lectura/OCR
     combinedAnalysis.retroalimentacion = sanitizeRetroalimentacion(combinedAnalysis.retroalimentacion)
@@ -1730,6 +1968,7 @@ export async function POST(req: NextRequest) {
           engineSelected: officialOmrEngineSelected,
           engineUsed: officialOmrEngineUsed,
           fallbackUsed: officialOmrFallbackUsed,
+          fallbackReason: officialOmrFallbackReason,
           integrationEnabled: officialOmrIntegrationEnabled,
           studentAnswersSource,
           teacherAnswersSource,
@@ -1745,9 +1984,12 @@ export async function POST(req: NextRequest) {
           officialOmrPerQuestionRawPreview: Array.isArray(officialOmrPerQuestionRaw)
             ? officialOmrPerQuestionRaw.slice(0, 10)
             : [],
-          detectedAnswersPreview: Array.isArray(studentClosedAnswersDetected)
-            ? studentClosedAnswersDetected.slice(0, 10)
-            : [],
+          detectedAnswersPreview:
+            Array.isArray(officialOmrDetectedAnswersPreview) && officialOmrDetectedAnswersPreview.length > 0
+              ? officialOmrDetectedAnswersPreview.slice(0, 10)
+              : Array.isArray(studentClosedAnswersDetected)
+                ? studentClosedAnswersDetected.slice(0, 10)
+                : [],
           totalDetectedAnswers: Array.isArray(studentClosedAnswersDetected)
             ? studentClosedAnswersDetected.length
             : 0,

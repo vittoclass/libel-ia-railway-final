@@ -2,6 +2,7 @@
 'use client';
 
 import { useState, useCallback } from 'react';
+import { buildTeacherAnswerKeyFromFormPauta } from '@/app/lib/evaluation-base';
 
 // Tipo para la plantilla de respuestas del profesor
 export interface AnswerKeyItem {
@@ -168,6 +169,23 @@ export const useEvaluator = () => {
         }
         if (currentAnswerKey.templateId) {
           payloadFinal.templateId = currentAnswerKey.templateId;
+        }
+      } else {
+        const bodyLen = Array.isArray(payloadFinal.answerKeyFromTemplate?.respuestas)
+          ? payloadFinal.answerKeyFromTemplate.respuestas.length
+          : 0;
+        if (bodyLen === 0) {
+          const syn = buildTeacherAnswerKeyFromFormPauta(
+            String(payloadFinal.pautaEstructurada ?? ''),
+            String(payloadFinal.pautaCorrectaAlternativas ?? ''),
+            payloadFinal.tipoPrueba,
+          );
+          if (syn?.respuestas?.length) {
+            payloadFinal.answerKeyFromTemplate = syn;
+            payloadFinal.pautaPlantilla = syn.respuestas
+              .map((r) => `SM${r.pregunta}:${r.respuestaCorrecta}`)
+              .join('; ');
+          }
         }
       }
 

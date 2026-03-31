@@ -13,6 +13,7 @@ import {
   BUBBLE_RADIUS_MM,
   getBubblePositions,
   LIBELIA_OMR_ASPECT_RATIO,
+  type OmrTemplateVariant,
 } from "./omr-sheet-spec"
 import { getLibelIAArUcoMarkerDataUrls } from "./omr-sheet-aruco"
 
@@ -26,6 +27,8 @@ export type OMRSheetOptions = {
   title?: string
   /** Si es "libelia_standard_v2", se dibujan fiduciales ArUco en lugar de cuadrados. */
   sheetSpec?: "libelia_standard_v1" | "libelia_standard_v2"
+  /** Orden de numeración en 2 columnas: pares/impares o continuo/secuencial. */
+  omrTemplateVariant?: OmrTemplateVariant
 }
 
 // eslint-disable-next-line
@@ -71,9 +74,10 @@ function drawBubbles(
   doc: any,
   numQuestions: number,
   numOptions: number,
-  keyAnswers?: string[]
+  keyAnswers?: string[],
+  omrTemplateVariant: OmrTemplateVariant = "odd_even_dual_column"
 ): void {
-  const positions = getBubblePositions(numQuestions, numOptions)
+  const positions = getBubblePositions(numQuestions, numOptions, omrTemplateVariant)
   const optionLabels = "ABCDEFGH".slice(0, numOptions).split("")
 
   positions.forEach(({ q, optionIndex, cx, cy }) => {
@@ -113,7 +117,7 @@ export async function generateOMRSheetPDF(opts: OMRSheetOptions): Promise<Blob> 
     format: "a4",
   })
 
-  const { numQuestions, options, variant, keyAnswers, title, sheetSpec } = opts
+  const { numQuestions, options, variant, keyAnswers, title, sheetSpec, omrTemplateVariant } = opts
   const numOptions = options.length
 
   if (sheetSpec === "libelia_standard_v2") {
@@ -148,7 +152,13 @@ export async function generateOMRSheetPDF(opts: OMRSheetOptions): Promise<Blob> 
   const sheetTitle =
     title || (variant === "key" ? "LibelIA OMR — Clave correcta" : "LibelIA OMR — Hoja de respuestas")
   drawHeader(doc, variant, sheetTitle)
-  drawBubbles(doc, numQuestions, numOptions, variant === "key" ? keyAnswers : undefined)
+  drawBubbles(
+    doc,
+    numQuestions,
+    numOptions,
+    variant === "key" ? keyAnswers : undefined,
+    omrTemplateVariant ?? "odd_even_dual_column"
+  )
 
   return doc.output("blob")
 }

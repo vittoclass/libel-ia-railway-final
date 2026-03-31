@@ -54,6 +54,14 @@ import { cn } from "@/lib/utils"
 import { useToast } from "@/hooks/use-toast"
 import NotesDashboard from "@/app/components/NotesDashboard"
 import SourceExamsSection from "@/app/components/SourceExamsSection"
+import {
+  buildEvaluationBase,
+  sourceExamInputToFormHints,
+  buildTeacherAnswerKeyFromFormPauta,
+  toCanonicalPautaFromEvaluationBaseItems,
+  type EvaluationBase,
+  type EvaluationBaseSourceExamItemInput,
+} from "@/app/lib/evaluation-base"
 import PedagogicalAnalysisModal from "@/app/components/PedagogicalAnalysisModal"
 import CoursePedagogicalSummaryModal from "@/app/components/CoursePedagogicalSummaryModal"
 // PDF
@@ -96,6 +104,30 @@ const FEATURE_PEDAGOGY_UI = false
 const PEDAGOGY_UI_ENABLED =
   FEATURE_PEDAGOGY_UI ||
   (typeof process !== "undefined" && process.env.NEXT_PUBLIC_PEDAGOGY_FEATURES === "true")
+
+/**
+ * Panel temporal de trazabilidad visible dentro de la app.
+ * Ajusta a `false` cuando termines el diagnóstico del caso real.
+ */
+const SHOW_EVALUATION_TRACE_PANEL = true
+
+function tryCanonicalDevelopmentKeyForTrace(rawKey: string): string | null {
+  const k = String(rawKey ?? "").trim().toUpperCase()
+  if (!k) return null
+  // Evitar claves de cerradas/alternativas si por algún motivo llegan.
+  if (/^(SM|VF|TP|C)\s*\d+/.test(k)) return null
+
+  // Normalizar separadores comunes alrededor del número.
+  const compact = k.replace(/[\.\:\)\(]/g, " ").replace(/\s+/g, " ").trim()
+
+  const p = /^P\s*(\d{1,3})$/.exec(compact.replace(/\s/g, ""))
+  if (p) return `P${p[1]}`
+
+  const n = /^(\d{1,3})$/.exec(compact.replace(/\s/g, ""))
+  if (n) return `P${n[1]}`
+
+  return null
+}
 
 function EvaluatorRootDiv({
   className,
@@ -943,6 +975,24 @@ interface StudentGroup {
   // 🔥 AÑADIDO: Puntos clave para la visualización
   puntosAprobacion?: number
   puntosMaximos?: number
+  /**
+   * Panel temporal de diagnóstico (sin depender de consola/F12).
+   * Se rellena en runtime para una evaluación concreta.
+   */
+  evaluationTrace?: {
+    payload: {
+      tipoPrueba: string
+      evaluatorInstrumentSource: string
+      selectedEvaluatorSourceExamId: string
+      pautaEstructuradaFinal: string
+      pautaCorrectaAlternativasFinal: string
+      answerKeyFromTemplateSummary: {
+        totalPreguntas: number
+        respuestasLength: number
+        primeras10: Array<{ pregunta: number; respuestaCorrecta: string }>
+      } | null
+    }
+  }
   /** Id de la evaluación en BD cuando ya fue guardada; permite aplicar cambios de la tabla al resto de la app */
   evaluation_id?: string | null
   shouldUseOfficialAzureOmr?: boolean
@@ -1058,6 +1108,47 @@ const ImageMagnifier = ({ src, alt }: { src: string; alt: string }) => {
       )}
     </>
   )
+}
+
+/** FASE 3: mapeo API → buildEvaluationBase (sin tocar servidor). */
+type SourceExamItemApiRow = {
+  id: string
+  item_number?: number | null
+  item_text?: string | null
+  axis_id?: string | null
+  skill_id?: string | null
+  question_type?: string | null
+  correct_answer?: string | null
+  max_score?: number | null
+  rubric_text?: string | null
+}
+
+function mapSourceExamApiRowsToInputs(rows: unknown[]): EvaluationBaseSourceExamItemInput[] {
+  if (!Array.isArray(rows)) return []
+  const out: EvaluationBaseSourceExamItemInput[] = []
+  for (const row of rows) {
+    const r = row as SourceExamItemApiRow
+    const id = typeof r.id === "string" ? r.id : ""
+    if (!id) continue
+    const num = r.item_number
+    out.push({
+      rowId: id,
+      item_number: typeof num === "number" ? num : typeof num === "string" ? parseInt(String(num), 10) || null : null,
+      item_text: typeof r.item_text === "string" ? r.item_text : null,
+      axis_id: typeof r.axis_id === "string" ? r.axis_id : null,
+      skill_id: typeof r.skill_id === "string" ? r.skill_id : null,
+      question_type: typeof r.question_type === "string" ? r.question_type : null,
+      correct_answer:
+        typeof r.correct_answer === "string"
+          ? r.correct_answer.trim() || null
+          : r.correct_answer != null && (typeof r.correct_answer === "number" || typeof r.correct_answer === "boolean")
+            ? String(r.correct_answer).trim().toUpperCase() || null
+            : null,
+      max_score: typeof r.max_score === "number" ? r.max_score : typeof r.max_score === "string" ? parseInt(String(r.max_score), 10) || null : null,
+      rubric_text: typeof r.rubric_text === "string" ? r.rubric_text : null,
+    })
+  }
+  return out
 }
 
 export default function EvaluatorClient() {
@@ -1211,6 +1302,17 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
   const [selectedCourseIdForBulk, setSelectedCourseIdForBulk] = useState<string>("")
   const [bulkAssociateConfirmOpen, setBulkAssociateConfirmOpen] = useState(false)
   const [bulkAssociateLoading, setBulkAssociateLoading] = useState(false)
+  /** FASE 3 / FREEZE_EVALUATION_BASE_CERRADAS: prueba base opcional en el evaluador (no sustituye el formulario). */
+  const [evaluatorSourceExamOptions, setEvaluatorSourceExamOptions] = useState<Array<{ id: string; title: string | null }>>([])
+  const [evaluatorSourceExamListLoading, setEvaluatorSourceExamListLoading] = useState(false)
+  const [selectedEvaluatorSourceExamId, setSelectedEvaluatorSourceExamId] = useState<string>("")
+  const [evaluatorEvaluationBaseSnapshot, setEvaluatorEvaluationBaseSnapshot] = useState<EvaluationBase | null>(null)
+  const [evaluatorLastSourceExamPayload, setEvaluatorLastSourceExamPayload] = useState<{
+    title: string | null
+    items: EvaluationBaseSourceExamItemInput[]
+  } | null>(null)
+  const [evaluatorSourceExamItemsLoading, setEvaluatorSourceExamItemsLoading] = useState(false)
+  const [evaluatorInstrumentSource, setEvaluatorInstrumentSource] = useState<"manual" | "source_exam" | "both">("manual")
   /** Solo development: diagnóstico flujo Ver informe */
   const [verDebug, setVerDebug] = useState<{ evaluationId: string; status: number; error: string | null; payload: unknown } | null>(null)
   /** Solo development: diagnóstico flujo Archivar */
@@ -1458,6 +1560,93 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
       tipoPrueba: "mixta",
     },
   })
+
+  const applyEvaluatorSourceExamHintsToEmptyFields = useCallback(() => {
+    if (!evaluatorLastSourceExamPayload) return
+    const hints = sourceExamInputToFormHints({
+      title: evaluatorLastSourceExamPayload.title,
+      items: evaluatorLastSourceExamPayload.items,
+    })
+    const v = form.getValues()
+    if (!(typeof v.pautaEstructurada === "string" && v.pautaEstructurada.trim())) {
+      form.setValue("pautaEstructurada", hints.pautaEstructurada)
+    }
+    if (!(typeof v.pautaCorrectaAlternativas === "string" && v.pautaCorrectaAlternativas.trim())) {
+      form.setValue("pautaCorrectaAlternativas", hints.pautaCorrectaAlternativas)
+    }
+    if (!(typeof v.rubrica === "string" && v.rubrica.trim())) {
+      form.setValue("rubrica", hints.rubricaNotes)
+    }
+    if (!(typeof v.nombrePrueba === "string" && v.nombrePrueba.trim()) && evaluatorLastSourceExamPayload.title) {
+      form.setValue("nombrePrueba", evaluatorLastSourceExamPayload.title.slice(0, 300))
+    }
+    setEvaluatorInstrumentSource("both")
+    toast({ title: "Campos vacíos rellenados desde la prueba base" })
+  }, [evaluatorLastSourceExamPayload, form, toast])
+
+  const applySuggestedTipoPruebaFromSourceExam = useCallback(() => {
+    if (!evaluatorLastSourceExamPayload) return
+    const hints = sourceExamInputToFormHints({
+      title: evaluatorLastSourceExamPayload.title,
+      items: evaluatorLastSourceExamPayload.items,
+    })
+    form.setValue("tipoPrueba", hints.suggestedTipoPrueba)
+    toast({ title: "Tipo de prueba actualizado (sugerencia desde prueba base)" })
+  }, [evaluatorLastSourceExamPayload, form, toast])
+
+  const handleEvaluatorSourceExamSelect = useCallback(
+    async (value: string) => {
+      const id = value === "__none__" ? "" : value
+      setSelectedEvaluatorSourceExamId(id)
+      if (!id) {
+        setEvaluatorEvaluationBaseSnapshot(null)
+        setEvaluatorLastSourceExamPayload(null)
+        setEvaluatorInstrumentSource("manual")
+        return
+      }
+      setEvaluatorSourceExamItemsLoading(true)
+      try {
+        const r = await fetch(`/api/source-exams/${id}/items`, { credentials: "include" })
+        const j = await r.json()
+        const raw = Array.isArray(j.items) ? j.items : []
+        const items = mapSourceExamApiRowsToInputs(raw)
+        const title = evaluatorSourceExamOptions.find((o) => o.id === id)?.title ?? null
+        const payload = { title, items }
+        setEvaluatorLastSourceExamPayload(payload)
+        const eb = buildEvaluationBase({ sourceExam: { title, items } })
+        setEvaluatorEvaluationBaseSnapshot(eb)
+        setEvaluatorInstrumentSource("source_exam")
+      } catch {
+        setEvaluatorEvaluationBaseSnapshot(null)
+        setEvaluatorLastSourceExamPayload(null)
+        toast({ title: "No se pudieron cargar los ítems de la prueba base", variant: "destructive" })
+      } finally {
+        setEvaluatorSourceExamItemsLoading(false)
+      }
+    },
+    [evaluatorSourceExamOptions, toast],
+  )
+
+  /** Lista de pruebas base para el selector del Evaluador: debe refrescarse al volver desde el banco, no solo al cargar la página. */
+  const loadEvaluatorSourceExamOptions = useCallback(() => {
+    setEvaluatorSourceExamListLoading(true)
+    fetch("/api/source-exams", { credentials: "include", cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => {
+        if (Array.isArray(j.source_exams)) {
+          setEvaluatorSourceExamOptions(
+            j.source_exams.map((e: { id: string; title?: string | null }) => ({ id: e.id, title: e.title ?? null })),
+          )
+        }
+      })
+      .catch(() => {})
+      .finally(() => setEvaluatorSourceExamListLoading(false))
+  }, [])
+
+  useEffect(() => {
+    if (activeTab !== "evaluator") return
+    loadEvaluatorSourceExamOptions()
+  }, [activeTab, loadEvaluatorSourceExamOptions])
 
   /** Nombre final visible del estudiante para sync-student. Fuente: group.studentName (single/batch) o payload.opts.student_name (retry). */
   function getFinalStudentNameForSync(
@@ -2084,6 +2273,44 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     const puntajeTotalNum = Number(puntajeTotal)
     const porcentajeExigenciaNum = Number(porcentajeExigencia)
 
+    // canonicalize-on-payload: si hay Prueba Base seleccionada y cargada en memoria,
+    // forzamos el payload a usar la pauta derivada de esa fuente canónica.
+    let pautaEstructuradaFinal = pautaEstructurada || ""
+    let pautaCorrectaAlternativasFinal = pautaCorrectaAlternativas || ""
+    const hasSourceExamSelected = typeof selectedEvaluatorSourceExamId === "string" && selectedEvaluatorSourceExamId.trim().length > 0
+    if ((evaluatorInstrumentSource === "source_exam" || hasSourceExamSelected) && evaluatorEvaluationBaseSnapshot?.items?.length) {
+      const canonical = toCanonicalPautaFromEvaluationBaseItems(evaluatorEvaluationBaseSnapshot.items)
+      console.log("CANONICAL PAYLOAD", {
+        pautaEstructurada: canonical.pautaEstructurada,
+        pautaCorrectaAlternativas: canonical.pautaCorrectaAlternativas,
+      })
+      if (canonical.pautaEstructurada.trim()) pautaEstructuradaFinal = canonical.pautaEstructurada
+      if (canonical.pautaCorrectaAlternativas.trim()) pautaCorrectaAlternativasFinal = canonical.pautaCorrectaAlternativas
+    }
+
+    const traceAnswerKey = buildTeacherAnswerKeyFromFormPauta(
+      String(pautaEstructuradaFinal),
+      String(pautaCorrectaAlternativasFinal),
+      (tipoPrueba || "mixta") as any,
+    )
+    const evaluationTracePayload = {
+      tipoPrueba: tipoPrueba || "mixta",
+      evaluatorInstrumentSource: evaluatorInstrumentSource,
+      selectedEvaluatorSourceExamId: selectedEvaluatorSourceExamId || "",
+      pautaEstructuradaFinal: String(pautaEstructuradaFinal),
+      pautaCorrectaAlternativasFinal: String(pautaCorrectaAlternativasFinal),
+      answerKeyFromTemplateSummary: traceAnswerKey
+        ? {
+            totalPreguntas: traceAnswerKey.totalPreguntas,
+            respuestasLength: traceAnswerKey.respuestas.length,
+            primeras10: traceAnswerKey.respuestas.slice(0, 10).map((r) => ({
+              pregunta: r.pregunta,
+              respuestaCorrecta: r.respuestaCorrecta,
+            })),
+          }
+        : null,
+    }
+
     const group = studentGroups.find((g) => g.id === groupId)
     if (!group || group.files.length === 0) return
 
@@ -2115,8 +2342,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       nivelEducativo,
       nombresGrupales,
       porcentajeExigencia: porcentajeExigenciaNum,
-      pautaEstructurada,
-      pautaCorrectaAlternativas,
+      pautaEstructurada: pautaEstructuradaFinal,
+      pautaCorrectaAlternativas: pautaCorrectaAlternativasFinal,
       tipoPrueba: tipoPrueba || "mixta",
       respuestasAlternativas: answerKey ? undefined : group.alternativas_corregidas,
       captureMode: captureMode,
@@ -2259,6 +2486,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             officialOmrFallbackUsed: result.officialOmrFallbackUsed,
             officialOmrFallbackReason: result.officialOmrFallbackReason ?? null,
             omrDebug: result.omrDebug,
+              evaluationTrace: { payload: evaluationTracePayload },
             error: undefined,
             evaluation_id: (result as { evaluation_id?: string }).evaluation_id ?? undefined,
           }
@@ -2274,6 +2502,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             officialOmrFallbackUsed: result.officialOmrFallbackUsed,
             officialOmrFallbackReason: result.officialOmrFallbackReason ?? null,
             omrDebug: result.omrDebug,
+              evaluationTrace: { payload: evaluationTracePayload },
             error: result.error,
           }
         }
@@ -2355,6 +2584,54 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     const teacherIdForPayload = profileIds?.teacher_id ?? null
     const schoolIdForPayload = profileIds?.school_id ?? null
 
+    // canonicalize-on-payload (BATCH): aplicar la misma pauta canónica que SINGLE
+    // para que /api/evaluate use la misma verdad (especialmente para answerKeyFromTemplate).
+    const hasSourceExamSelected =
+      typeof selectedEvaluatorSourceExamId === "string" && selectedEvaluatorSourceExamId.trim().length > 0
+
+    let pautaEstructuradaFinal = pautaEstructurada
+    let pautaCorrectaAlternativasFinal = pautaCorrectaAlternativas
+
+    if (
+      (evaluatorInstrumentSource === "source_exam" || hasSourceExamSelected) &&
+      evaluatorEvaluationBaseSnapshot?.items?.length
+    ) {
+      const canonical = toCanonicalPautaFromEvaluationBaseItems(evaluatorEvaluationBaseSnapshot.items)
+
+      console.log("CANONICAL PAYLOAD BATCH", canonical)
+
+      if (canonical.pautaEstructurada.trim()) {
+        pautaEstructuradaFinal = canonical.pautaEstructurada
+      }
+
+      if (canonical.pautaCorrectaAlternativas.trim()) {
+        pautaCorrectaAlternativasFinal = canonical.pautaCorrectaAlternativas
+      }
+    }
+
+    const traceAnswerKey = buildTeacherAnswerKeyFromFormPauta(
+      String(pautaEstructuradaFinal),
+      String(pautaCorrectaAlternativasFinal),
+      (tipoPrueba || "mixta") as any,
+    )
+    const evaluationTracePayloadCommon = {
+      tipoPrueba: tipoPrueba || "mixta",
+      evaluatorInstrumentSource: evaluatorInstrumentSource,
+      selectedEvaluatorSourceExamId: selectedEvaluatorSourceExamId || "",
+      pautaEstructuradaFinal: String(pautaEstructuradaFinal),
+      pautaCorrectaAlternativasFinal: String(pautaCorrectaAlternativasFinal),
+      answerKeyFromTemplateSummary: traceAnswerKey
+        ? {
+            totalPreguntas: traceAnswerKey.totalPreguntas,
+            respuestasLength: traceAnswerKey.respuestas.length,
+            primeras10: traceAnswerKey.respuestas.slice(0, 10).map((r) => ({
+              pregunta: r.pregunta,
+              respuestaCorrecta: r.respuestaCorrecta,
+            })),
+          }
+        : null,
+    }
+
     // Construir items para el batch endpoint
     const batchItems = validGroups.map((group) => ({
       groupId: group.id,
@@ -2371,8 +2648,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         nivelEducativo,
         nombresGrupales,
         porcentajeExigencia: porcentajeExigenciaNum,
-        pautaEstructurada,
-        pautaCorrectaAlternativas,
+        pautaEstructurada: pautaEstructuradaFinal,
+        pautaCorrectaAlternativas: pautaCorrectaAlternativasFinal,
         tipoPrueba: tipoPrueba || "mixta",
         respuestasAlternativas: answerKey ? undefined : group.alternativas_corregidas,
         captureMode: captureMode,
@@ -2383,6 +2660,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         course_id: curso ?? "",
         nombreEstudiante: group.studentName && String(group.studentName).trim() !== "" ? String(group.studentName).trim() : undefined,
         omrTemplateVariant: selectedOmrTemplateVariant,
+        answerKeyFromTemplate: buildTeacherAnswerKeyFromFormPauta(
+          String(pautaEstructuradaFinal),
+          String(pautaCorrectaAlternativasFinal),
+          (tipoPrueba || "mixta") as any,
+        ),
       },
     }))
 
@@ -2470,6 +2752,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                         msg.data.alternativas_corregidas ||
                         msg.data.retroalimentacion?.retroalimentacion_alternativas,
                       omrDebug: msg.data.omrDebug,
+                      evaluationTrace: { payload: evaluationTracePayloadCommon },
                       error: undefined,
                       evaluation_id: (msg.data as { evaluation_id?: string }).evaluation_id ?? undefined,
                     }
@@ -3263,6 +3546,130 @@ w-8"
                         </FormItem>
                       )}
                     />
+                    <div className="p-4 border rounded-lg border-dashed border-[var(--border-color)] bg-[var(--bg-card)] space-y-3">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <BookOpen className="h-5 w-5 text-[var(--text-accent)] shrink-0" />
+                        <h3 className="text-base font-semibold text-[var(--text-accent)]">
+                          Prueba base (opcional) — FASE 3 / FREEZE_EVALUATION_BASE_CERRADAS
+                        </h3>
+                      </div>
+                      <p className="text-sm text-[var(--text-secondary)]">
+                        El evaluador funciona igual en modo <span className="font-medium">solo formulario manual</span>.
+                        Si ya tienes una prueba base en el banco, el selector de abajo la enlaza a <span className="font-medium">esta</span>{" "}
+                        configuración (pauta estructurada, alternativas, tipo sugerido) sin sustituir el formulario.
+                      </p>
+                      <ul className="text-xs text-[var(--text-secondary)] space-y-1 list-disc pl-5">
+                        <li>
+                          <span className="font-medium text-[var(--text-primary)]">Crear, listar o importar PDF/Word</span>{" "}
+                          está en la pestaña superior <span className="font-medium">Pruebas base</span>.
+                        </li>
+                        <li>
+                          <span className="font-medium text-[var(--text-primary)]">Reutilizar aquí</span>: elige una prueba en el
+                          desplegable; se cargan sus ítems en memoria para los botones de abajo.
+                        </li>
+                      </ul>
+                      <p className="text-[11px] text-[var(--text-secondary)] m-0">
+                        Tras crear o importar en «Pruebas base», la lista se actualiza al volver a esta pestaña. Si no ves la nueva
+                        prueba, pulsa <span className="font-medium text-[var(--text-primary)]">Actualizar lista</span>.
+                      </p>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-auto py-1 px-2 text-xs text-[var(--text-accent)] underline-offset-2 hover:underline"
+                        onClick={() => setActiveTab("pruebas-base")}
+                      >
+                        Ir al banco «Pruebas base» (subir archivos / ver listado)
+                      </Button>
+                      <div className="flex flex-col sm:flex-row gap-2 sm:items-center flex-wrap">
+                        <Select
+                          value={selectedEvaluatorSourceExamId || "__none__"}
+                          onValueChange={handleEvaluatorSourceExamSelect}
+                          disabled={evaluatorSourceExamListLoading}
+                        >
+                          <SelectTrigger className="w-full sm:max-w-md">
+                            <SelectValue
+                              placeholder={
+                                evaluatorSourceExamListLoading ? "Cargando pruebas base…" : "Sin prueba base seleccionada"
+                              }
+                            />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="__none__">Solo formulario manual</SelectItem>
+                            {evaluatorSourceExamOptions.map((o) => (
+                              <SelectItem key={o.id} value={o.id}>
+                                {o.title?.trim() || o.id.slice(0, 8)}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="shrink-0"
+                          title="Volver a cargar pruebas base desde el servidor"
+                          onClick={loadEvaluatorSourceExamOptions}
+                          disabled={evaluatorSourceExamListLoading}
+                        >
+                          <RefreshCw className={cn("h-4 w-4", evaluatorSourceExamListLoading && "animate-spin")} />
+                          <span className="ml-2">Actualizar lista</span>
+                        </Button>
+                        {evaluatorSourceExamItemsLoading ? (
+                          <span className="text-sm text-[var(--text-secondary)] inline-flex items-center gap-1">
+                            <Loader2 className="h-4 w-4 animate-spin" /> Cargando ítems…
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="text-xs font-mono rounded-md px-2 py-1.5 bg-[var(--bg-muted)] border border-[var(--border-color)]">
+                        Fuente instrumento:{" "}
+                        <span className="font-semibold">
+                          {evaluatorInstrumentSource === "manual"
+                            ? "solo formulario manual"
+                            : evaluatorInstrumentSource === "source_exam"
+                              ? "prueba base cargada (EvaluationBase en memoria)"
+                              : "formulario + datos aplicados desde prueba base"}
+                        </span>
+                      </div>
+                      {evaluatorEvaluationBaseSnapshot ? (
+                        <p className="text-sm text-[var(--text-primary)]">
+                          Resumen estructural: {evaluatorEvaluationBaseSnapshot.totalItems} ítems totales;{" "}
+                          {evaluatorEvaluationBaseSnapshot.closedItems} cerrados; {evaluatorEvaluationBaseSnapshot.developmentItems}{" "}
+                          desarrollo. Origen: {evaluatorEvaluationBaseSnapshot.source}.
+                        </p>
+                      ) : null}
+                      <div className="flex flex-col gap-2">
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            size="sm"
+                            disabled={!evaluatorLastSourceExamPayload}
+                            onClick={applyEvaluatorSourceExamHintsToEmptyFields}
+                          >
+                            Rellenar solo campos vacíos desde prueba base
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={!evaluatorLastSourceExamPayload}
+                            onClick={applySuggestedTipoPruebaFromSourceExam}
+                          >
+                            Aplicar tipo de prueba sugerido
+                          </Button>
+                        </div>
+                        <p className="text-[11px] text-[var(--text-secondary)] leading-snug">
+                          <span className="font-medium text-[var(--text-primary)]">Rellenar vacíos:</span> copia a los campos del
+                          formulario solo si están vacíos (pauta estructurada, alternativas correctas, rúbrica, nombre de
+                          prueba). No borra lo que ya escribiste.
+                          <span className="mx-1 text-[var(--border-color)]">·</span>
+                          <span className="font-medium text-[var(--text-primary)]">Tipo sugerido:</span> ajusta únicamente el
+                          selector «Tipo de prueba» (mixta / solo alternativas / solo desarrollo) según los ítems de la prueba
+                          base; no modifica textos de pauta ni respuestas.
+                        </p>
+                      </div>
+                    </div>
                     <div className="p-4 border rounded-lg border-[var(--border-color)] bg-[var(--bg-muted)]">
                       <h3 className="text-lg font-semibold mb-4 text-[var(--text-accent)]">
                         Configuración Avanzada (Nota y Puntajes)
@@ -4231,6 +4638,71 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           : []
                         const tableAlternativas = currentAlternativas
 
+                        const tracePayload = group.evaluationTrace?.payload ?? null
+                        const teacherAnswerKeyLength =
+                          debug && typeof debug.teacherAnswerKeyLength === "number" ? debug.teacherAnswerKeyLength : null
+                        const expectedQuestionCountUsed =
+                          debug && typeof debug.expectedQuestionCountUsed === "number" ? debug.expectedQuestionCountUsed : null
+                        const officialOmrQuestionCountFromPipeline =
+                          debug && typeof debug.officialOmrQuestionCountFromPipeline === "number"
+                            ? debug.officialOmrQuestionCountFromPipeline
+                            : null
+
+                        const traceAlerts: string[] = []
+                        if (teacherAnswerKeyLength === 0) {
+                          traceAlerts.push("teacherAnswerKeyLength = 0 (clave docente usada por OMR vacía)")
+                        }
+                        if (
+                          expectedQuestionCountUsed != null &&
+                          officialOmrQuestionCountFromPipeline != null &&
+                          expectedQuestionCountUsed !== officialOmrQuestionCountFromPipeline
+                        ) {
+                          traceAlerts.push(
+                            `expectedQuestionCountUsed (${expectedQuestionCountUsed}) != officialOmrQuestionCountFromPipeline (${officialOmrQuestionCountFromPipeline})`,
+                          )
+                        }
+                        if (
+                          teacherAnswerKeyLength === 0 &&
+                          tracePayload?.answerKeyFromTemplateSummary?.respuestasLength &&
+                          tracePayload.answerKeyFromTemplateSummary.respuestasLength > 0
+                        ) {
+                          traceAlerts.push("Frontend sintetiza clave, pero el backend reporta teacherAnswerKeyLength = 0")
+                        }
+
+                        if (teacherAnswerKeyLength === 0 && tableAlternativas.some((x) => String(x.respuesta_correcta ?? "").trim().length > 0)) {
+                          traceAlerts.push("Se observan respuestas correctas en la tabla (R. Correcta) pero teacherAnswerKeyLength = 0")
+                        }
+
+                        const desarrolloKeys = Object.keys(group.detalle_desarrollo || {})
+                        const canonicalDevPairs = desarrolloKeys.map((k) => ({
+                          original: k,
+                          canonical: tryCanonicalDevelopmentKeyForTrace(k),
+                        }))
+                        const canonicalDevCounts = new Map<string, number>()
+                        for (const p of canonicalDevPairs) {
+                          if (!p.canonical) continue
+                          canonicalDevCounts.set(p.canonical, (canonicalDevCounts.get(p.canonical) ?? 0) + 1)
+                        }
+                        const devCanonicalDuplicate = Array.from(canonicalDevCounts.values()).some((count) => count > 1)
+                        if (devCanonicalDuplicate) {
+                          traceAlerts.push("Duplicación canónica de desarrollo detectada (posibles colisiones Pn)")
+                        }
+
+                        const snapshotItems = evaluatorEvaluationBaseSnapshot?.items ?? []
+                        const snapshotSource = evaluatorEvaluationBaseSnapshot?.source ?? "—"
+                        const snapshotBuildFn =
+                          snapshotSource === "source_exam"
+                            ? "buildEvaluationBase -> buildFromSourceExam"
+                            : snapshotSource === "structured_form"
+                              ? "buildEvaluationBase -> buildFromForm"
+                              : snapshotSource === "text_form"
+                                ? "buildEvaluationBase -> buildFromForm(text_form-fallback)"
+                                : "buildEvaluationBase (other)"
+
+                        const typeInferenceSources = snapshotItems.map((it) => String((it.metadata as any)?.typeInferenceSource ?? "—"))
+                        const inferTypeFromFormItemV2Used = typeInferenceSources.some((s) => s.includes("inferTypeFromFormItem:v2_altEvidence"))
+                        const inferTypeFromFormItemUsed = typeInferenceSources.some((s) => s.includes("inferTypeFromFormItem:"))
+
                         // 🔥 EXTRACCIÓN DE VALORES PARA EL VELOCÍMETRO
                         const puntajeObtenido = Number.parseInt(group.puntaje?.split("/")[0] || "0", 10)
                         const puntajeMaximo =
@@ -4357,6 +4829,7 @@ h-4 w-4 animate-spin"
                                         <div>engineSelected: {String(debug.engineSelected)}</div>
                                         <div>engineUsed: {String(debug.engineUsed)}</div>
                                         <div>fallbackUsed: {String(debug.fallbackUsed)}</div>
+                                        <div>fallbackReason: {String(debug.fallbackReason ?? "—")}</div>
                                         <div>integrationEnabled: {String(debug.integrationEnabled)}</div>
 
                                         <div>studentAnswersSource: {String(debug.studentAnswersSource)}</div>
@@ -4382,6 +4855,194 @@ h-4 w-4 animate-spin"
                                           {JSON.stringify(debug.officialOmrPerQuestionRawPreview, null, 2)}
                                         </pre>
                                       </div>
+                                    )}
+                                    {SHOW_EVALUATION_TRACE_PANEL && tracePayload && (
+                                      <details
+                                        open
+                                        className="mt-4 rounded-lg border border-blue-300 bg-blue-50/30 p-3"
+                                      >
+                                        <summary className="cursor-pointer font-semibold text-blue-900 dark:text-blue-100">
+                                          Diagnóstico técnico temporal
+                                        </summary>
+                                        <div className="mt-3 space-y-4">
+                                          <div className="rounded-md border border-border bg-background/60 p-3">
+                                            <div className="font-semibold mb-2">PAYLOAD FINAL ENVIADO</div>
+                                            <div className="text-xs text-muted-foreground space-y-1">
+                                              <div>tipoPrueba: <span className="font-mono">{tracePayload.tipoPrueba}</span></div>
+                                              <div>evaluatorInstrumentSource: <span className="font-mono">{tracePayload.evaluatorInstrumentSource}</span></div>
+                                              <div>selectedEvaluatorSourceExamId: <span className="font-mono">{tracePayload.selectedEvaluatorSourceExamId || "—"}</span></div>
+                                              <div className="pt-2">pautaEstructuradaFinal:</div>
+                                              <pre className="text-[11px] font-mono overflow-x-auto">{tracePayload.pautaEstructuradaFinal}</pre>
+                                              <div className="pt-2">pautaCorrectaAlternativasFinal:</div>
+                                              <pre className="text-[11px] font-mono overflow-x-auto">{tracePayload.pautaCorrectaAlternativasFinal}</pre>
+                                              <div className="pt-2">answerKeyFromTemplate (resumen):</div>
+                                              {tracePayload.answerKeyFromTemplateSummary ? (
+                                                <>
+                                                  <div>
+                                                    totalPreguntas: <span className="font-mono">{tracePayload.answerKeyFromTemplateSummary.totalPreguntas}</span>
+                                                  </div>
+                                                  <div>
+                                                    respuestas.length: <span className="font-mono">{tracePayload.answerKeyFromTemplateSummary.respuestasLength}</span>
+                                                  </div>
+                                                  <pre className="text-[11px] font-mono overflow-x-auto">
+                                                    {JSON.stringify(tracePayload.answerKeyFromTemplateSummary.primeras10, null, 2)}
+                                                  </pre>
+                                                </>
+                                              ) : (
+                                                <div className="text-[11px] font-mono">null (no se pudo sintetizar clave desde la pauta)</div>
+                                              )}
+                                            </div>
+                                          </div>
+
+                                          <div className="rounded-md border border-border bg-background/60 p-3">
+                                            <div className="font-semibold mb-2">DEBUG OMR REAL</div>
+                                            <div className="text-xs text-muted-foreground space-y-1 font-mono">
+                                              <div>studentAnswersSource: {debug?.studentAnswersSource ?? "—"}</div>
+                                              <div>teacherAnswersSource: {debug?.teacherAnswersSource ?? "—"}</div>
+                                              <div>expectedQuestionCountUsed: {debug?.expectedQuestionCountUsed ?? "—"}</div>
+                                              <div>teacherAnswerKeyLength: {debug?.teacherAnswerKeyLength ?? "—"}</div>
+                                              <div>totalDetectedAnswers: {debug?.totalDetectedAnswers ?? "—"}</div>
+                                              <div>officialOmrQuestionCountFromPipeline: {debug?.officialOmrQuestionCountFromPipeline ?? "—"}</div>
+                                              <div>officialOmrDetectedAnswersCount: {debug?.officialOmrDetectedAnswersCount ?? "—"}</div>
+                                              <div>officialOmrDetectedVsPipelineMismatch: {debug?.officialOmrDetectedVsPipelineMismatch ?? "—"}</div>
+                                              <div>templateKeyUsed: {debug?.templateKeyUsed ?? "—"}</div>
+                                              <div>omrTemplateVariantUsed: {debug?.omrTemplateVariantUsed ?? "—"}</div>
+                                            </div>
+                                          </div>
+
+                                          <div className="rounded-md border border-border bg-background/60 p-3">
+                                            <div className="font-semibold mb-2">TRACE DE ORIGEN REAL DE TIPOS</div>
+                                            <div className="text-xs text-muted-foreground space-y-1">
+                                              <div>evaluatorEvaluationBaseSnapshot.source: <span className="font-mono">{String(snapshotSource)}</span></div>
+                                              <div>Construido por: <span className="font-mono">{snapshotBuildFn}</span></div>
+                                              <div>
+                                                inferTypeFromFormItem (versión modificada) usada:{" "}
+                                                <span className="font-mono">{inferTypeFromFormItemV2Used ? "sí" : "no"}</span>
+                                              </div>
+                                            </div>
+                                            <div className="mt-3 max-h-64 overflow-auto">
+                                              <Table>
+                                                <TableHeader>
+                                                  <TableRow>
+                                                    <TableHead>item_number</TableHead>
+                                                    <TableHead>type</TableHead>
+                                                    <TableHead>correctAnswer</TableHead>
+                                                    <TableHead>fuente</TableHead>
+                                                      <TableHead>altEvidence</TableHead>
+                                                      <TableHead>texto evaluado (alt)</TableHead>
+                                                  </TableRow>
+                                                </TableHeader>
+                                                <TableBody>
+                                                  {snapshotItems.map((it, idx) => {
+                                                    const meta = it.metadata as any
+                                                      const altText =
+                                                        typeof meta?.altEvidenceEvaluatedText === "string" ? meta.altEvidenceEvaluatedText : null
+                                                      const altRes = typeof meta?.altEvidenceResult === "boolean" ? meta.altEvidenceResult : null
+                                                    return (
+                                                      <TableRow key={it.id || idx}>
+                                                        <TableCell className="font-mono">{String(meta?.item_number ?? "—")}</TableCell>
+                                                        <TableCell className="font-mono">{it.type}</TableCell>
+                                                        <TableCell className="font-mono">{String(it.correctAnswer ?? "—")}</TableCell>
+                                                        <TableCell className="font-mono">{String(meta?.typeInferenceSource ?? "—")}</TableCell>
+                                                          <TableCell className="font-mono">{altRes == null ? "—" : altRes ? "true" : "false"}</TableCell>
+                                                          <TableCell>
+                                                            <div className="max-h-24 overflow-auto whitespace-pre-wrap font-mono text-[11px]">
+                                                              {altText ?? "—"}
+                                                            </div>
+                                                          </TableCell>
+                                                      </TableRow>
+                                                    )
+                                                  })}
+                                                </TableBody>
+                                              </Table>
+                                            </div>
+                                          </div>
+
+                                          <div className="rounded-md border border-border bg-background/60 p-3">
+                                            <div className="font-semibold mb-2">COMPARACIÓN CERRADAS REALES</div>
+                                            {Array.isArray(tableAlternativas) && tableAlternativas.length > 0 ? (
+                                              <div className="overflow-x-auto">
+                                                <Table>
+                                                  <TableHeader>
+                                                    <TableRow>
+                                                      <TableHead>Pregunta</TableHead>
+                                                      <TableHead>Respuesta detectada</TableHead>
+                                                      <TableHead>Respuesta correcta usada</TableHead>
+                                                      <TableHead>Estado real</TableHead>
+                                                      <TableHead>Fuente correct</TableHead>
+                                                      <TableHead>Fallback</TableHead>
+                                                      <TableHead>Slot/canonical</TableHead>
+                                                    </TableRow>
+                                                  </TableHeader>
+                                                  <TableBody>
+                                                    {tableAlternativas.slice(0, 30).map((item, idx) => {
+                                                      const est = (item.respuesta_estudiante ?? "").trim().toUpperCase()
+                                                      const corr = (item.respuesta_correcta ?? "").trim().toUpperCase()
+                                                      const ok = est && corr ? est === corr : false
+                                                      const preg = (item.pregunta ?? "").trim().toUpperCase()
+                                                      const slot = /^([CP])\d+$/.test(preg) ? preg : preg.match(/^\d+$/) ? `C${preg}` : "—"
+                                                      return (
+                                                        <TableRow key={idx}>
+                                                          <TableCell className="font-mono">{item.pregunta}</TableCell>
+                                                          <TableCell className="font-mono">{item.respuesta_estudiante}</TableCell>
+                                                          <TableCell className="font-mono text-green-700">{item.respuesta_correcta}</TableCell>
+                                                          <TableCell className="font-bold">{ok ? "OK" : "INCORRECTA"}</TableCell>
+                                                          <TableCell className="font-mono">{debug?.teacherAnswersSource ?? "—"}</TableCell>
+                                                          <TableCell className="font-mono">{debug?.fallbackUsed ? "sí" : "no"}</TableCell>
+                                                          <TableCell className="font-mono">{slot}</TableCell>
+                                                        </TableRow>
+                                                      )
+                                                    })}
+                                                  </TableBody>
+                                                </Table>
+                                              </div>
+                                            ) : (
+                                              <div className="text-xs text-muted-foreground">No hay alternativas corregidas para mostrar</div>
+                                            )}
+                                          </div>
+
+                                          <div className="rounded-md border border-border bg-background/60 p-3">
+                                            <div className="font-semibold mb-2">DESARROLLO REAL</div>
+                                            <div className="text-xs text-muted-foreground space-y-2">
+                                              <div>
+                                                total claves desarrollo detectadas: <span className="font-mono">{desarrolloKeys.length}</span>
+                                              </div>
+                                              <div>
+                                                colapso/evidencia de normalización (por claves canónicas):{" "}
+                                                <span className="font-mono">
+                                                  {canonicalDevPairs.some((p) => p.canonical && p.canonical !== p.original) ? "sí" : "no"}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                duplicación canónica detectada: <span className="font-mono">{devCanonicalDuplicate ? "sí" : "no"}</span>
+                                              </div>
+                                              <pre className="text-[11px] font-mono overflow-x-auto">
+                                                {JSON.stringify(
+                                                  canonicalDevPairs.slice(0, 60).map((p) => ({
+                                                    original: p.original,
+                                                    canonical: p.canonical ?? null,
+                                                  })),
+                                                  null,
+                                                  2,
+                                                )}
+                                              </pre>
+                                            </div>
+                                          </div>
+
+                                          <div className="rounded-md border border-border bg-background/60 p-3">
+                                            <div className="font-semibold mb-2">CONTRADICCIONES DETECTADAS</div>
+                                            {traceAlerts.length > 0 ? (
+                                              <ul className="list-disc pl-5 text-xs text-destructive space-y-1">
+                                                {traceAlerts.map((a, i) => (
+                                                  <li key={i}>{a}</li>
+                                                ))}
+                                              </ul>
+                                            ) : (
+                                              <div className="text-xs text-muted-foreground">Sin contradicciones detectadas para este caso.</div>
+                                            )}
+                                          </div>
+                                        </div>
+                                      </details>
                                     )}
                                     {/* REEMPLAZO DE PUNTAJE Y NOTA PARA INCLUIR VELOCÍMETRO */}
                                     <div className="flex justify-between items-start bg-[var(--bg-muted-subtle)] p-4 rounded-lg">

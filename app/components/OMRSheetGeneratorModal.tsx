@@ -18,7 +18,12 @@ import { Label } from "@/components/ui/label"
 import { Loader2, FileDown } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { generateOMRSheetPDF, getOMRSheetFilename } from "@/app/lib/omr-sheet-pdf"
-import { OMRTemplate, saveOMRTemplate, getOMRTemplate } from "@/app/lib/omr-template-store"
+import {
+  OMRTemplate,
+  type OMRTemplateVariant,
+  saveOMRTemplate,
+  getOMRTemplate,
+} from "@/app/lib/omr-template-store"
 import { LIBELIA_OMR_ASPECT_RATIO } from "@/app/lib/omr-sheet-spec"
 
 type Props = {
@@ -35,6 +40,7 @@ export function OMRSheetGeneratorModal({ open, onClose }: Props) {
   const [numOptions, setNumOptions] = useState<4 | 5>(4)
   const [variant, setVariant] = useState<"student" | "key">("student")
   const [sheetVersion, setSheetVersion] = useState<"v1" | "v2">("v1")
+  const [omrTemplateVariant, setOmrTemplateVariant] = useState<OMRTemplateVariant>("odd_even_dual_column")
   const [keyInput, setKeyInput] = useState("")
   const [loading, setLoading] = useState(false)
 
@@ -83,6 +89,7 @@ export function OMRSheetGeneratorModal({ open, onClose }: Props) {
         answerKey,
         createdAt: Date.now(),
         sheetSpec: sheetVersion === "v2" ? "libelia_standard_v2" : "libelia_standard_v1",
+        omrTemplateVariant,
       }
       saveOMRTemplate(template)
       toast({
@@ -206,6 +213,7 @@ export function OMRSheetGeneratorModal({ open, onClose }: Props) {
         keyAnswers,
         title: variant === "key" ? "LibelIA OMR — Clave correcta" : "LibelIA OMR — Hoja de respuestas",
         sheetSpec: sheetVersion === "v2" ? "libelia_standard_v2" : "libelia_standard_v1",
+        omrTemplateVariant,
       })
       const filename = getOMRSheetFilename(variant, numQuestions)
       const url = URL.createObjectURL(blob)
@@ -293,6 +301,29 @@ export function OMRSheetGeneratorModal({ open, onClose }: Props) {
           </div>
 
           <div>
+            <Label>Orden de numeración</Label>
+            <div className="flex gap-2 mt-1">
+              <Button
+                variant={omrTemplateVariant === "odd_even_dual_column" ? "default" : "outline"}
+                size="sm"
+                onClick={() => setOmrTemplateVariant("odd_even_dual_column")}
+              >
+                Pares e impares
+              </Button>
+              <Button
+                variant={omrTemplateVariant === "sequential_dual_column" ? "default" : "outline"}
+                size="sm"
+                onClick={() => setOmrTemplateVariant("sequential_dual_column")}
+              >
+                Continuo / secuencial
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Pares/impares = 1,3,5... izquierda y 2,4,6... derecha. Secuencial = 1..N izquierda y luego derecha.
+            </p>
+          </div>
+
+          <div>
             <Label>Tipo de hoja</Label>
             <div className="flex gap-2 mt-1">
               <Button
@@ -330,6 +361,10 @@ export function OMRSheetGeneratorModal({ open, onClose }: Props) {
           <div className="rounded-md border bg-muted/50 p-3 text-xs text-muted-foreground">
             <p className="font-medium text-foreground mb-1">Vista previa del formato</p>
             <p>Marcadores en las 4 esquinas · 2 columnas · {numQuestions} preguntas · Opciones {options.join(", ")}.</p>
+            <p>
+              Orden:{" "}
+              {omrTemplateVariant === "odd_even_dual_column" ? "pares/impares" : "continuo/secuencial"}.
+            </p>
             <p>Aspect ratio interior: {LIBELIA_OMR_ASPECT_RATIO.toFixed(3)} (alineado con cámara y sistema).</p>
           </div>
 
