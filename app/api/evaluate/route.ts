@@ -4,19 +4,20 @@
 // Soporta imágenes, PDF y Word: si hay PDF/Word se usa Azure OCR + Mistral texto; si solo imágenes, Mistral Vision.
 import { NextRequest, NextResponse } from "next/server"
 import { AzureKeyCredential, DocumentAnalysisClient } from "@azure/ai-form-recognizer"
-import { getTemplate, getTemplateImage } from "@/app/lib/omrTemplateCache"
-import { fileToImageBase64List, isPdfBase64 } from "@/app/lib/pdfToImages"
+// FIX_BUILD_PATH_REVERSIBLE: usar rutas relativas robustas (Railway case-sensitive + build context)
+import { getTemplate, getTemplateImage } from "../../lib/omrTemplateCache"
+import { fileToImageBase64List, isPdfBase64 } from "../../lib/pdfToImages"
 import { extractTextFromFiles } from "./utils"
-import { persistEvaluation } from "@/app/lib/persist-evaluation"
-import { getAuthUser } from "@/app/lib/supabase-route"
-import { getSupabaseServer } from "@/app/lib/supabase-server"
-import { runAzureLayoutOmrPipeline } from "@/app/lib/omr/experimental/azure-layout-omr-pipeline"
+import { persistEvaluation } from "../../lib/persist-evaluation"
+import { getAuthUser } from "../../lib/supabase-route"
+import { getSupabaseServer } from "../../lib/supabase-server"
+import { runAzureLayoutOmrPipeline } from "../../lib/omr/experimental/azure-layout-omr-pipeline"
 import {
   buildEvaluationBase,
   getFormItemCorrectAnswer,
   isEvaluationBaseItemClosedForOmr,
   isFormStructuredRowClosedForOmr,
-} from "@/app/lib/evaluation-base"
+} from "../../lib/evaluation-base"
 import {
   accumulateDesarrolloAcrossPages,
   collapseDevelopmentKeysToCanonical,
@@ -25,7 +26,7 @@ import {
   orderCanonicalDesarrolloRecord,
   pruneCorreccionDetalladaForCanonicalDesarrollo,
   removeCorreccionEntriesForClosedPautaSlots,
-} from "@/app/lib/desarrollo-pipeline"
+} from "../../lib/desarrollo-pipeline"
 
 export const runtime = "nodejs"
 // REFIX_404_RAILWAY: mantener respuesta dinámica en producción Railway
