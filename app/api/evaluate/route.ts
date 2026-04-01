@@ -28,8 +28,9 @@ import {
 } from "@/app/lib/desarrollo-pipeline"
 
 export const runtime = "nodejs"
+// REFIX_404_RAILWAY: mantener respuesta dinámica en producción Railway
 export const dynamic = "force-dynamic"
-// SNAPSHOT_NATIONAL_ANALYTICS_V1: timeout ampliado para evitar corte en ramas serverless con persistencia completa
+// REFIX_404_RAILWAY: timeout ampliado para evitar corte en rama serverless
 export const maxDuration = 300
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY

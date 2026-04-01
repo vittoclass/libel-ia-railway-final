@@ -3,7 +3,9 @@
 import { NextRequest } from "next/server"
 
 export const runtime = "nodejs"
+// REFIX_404_RAILWAY: mantener respuesta dinámica en producción Railway
 export const dynamic = "force-dynamic"
+// REFIX_404_RAILWAY: timeout ampliado para evitar corte en rama serverless
 export const maxDuration = 300
 
 const BATCH_SIZE = 45 // Procesar 45 evaluaciones en paralelo
