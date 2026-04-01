@@ -11,6 +11,8 @@ import {
   INNER_TOP_MM,
   HEADER_HEIGHT_MM,
   BUBBLE_RADIUS_MM,
+  BUBBLE_SPACING_MM,
+  ROW_HEIGHT_MM,
   getBubblePositions,
   LIBELIA_OMR_ASPECT_RATIO,
   type OmrTemplateVariant,
@@ -79,6 +81,39 @@ function drawBubbles(
 ): void {
   const positions = getBubblePositions(numQuestions, numOptions, omrTemplateVariant)
   const optionLabels = "ABCDEFGH".slice(0, numOptions).split("")
+
+  // SNAPSHOT_NATIONAL_ANALYTICS_V1:
+  // Encabezados A/B/C/D/E sobre la primera fila de cada panel sin mover grilla ni marcadores.
+  const panelAnchors = Array.from(
+    new Set(
+      positions
+        .filter((p) => p.optionIndex === 0)
+        .map((p) => Number(p.cx.toFixed(3)))
+    )
+  ).sort((a, b) => a - b)
+  const minCyByPanel = new Map<number, number>()
+  for (const anchor of panelAnchors) {
+    const firstRowCy = positions
+      .filter((p) => p.optionIndex === 0 && Number(p.cx.toFixed(3)) === anchor)
+      .reduce((min, p) => Math.min(min, p.cy), Number.POSITIVE_INFINITY)
+    if (Number.isFinite(firstRowCy)) minCyByPanel.set(anchor, firstRowCy)
+  }
+  doc.setFont("helvetica", "normal")
+  doc.setFontSize(10)
+  doc.setTextColor(40, 40, 40)
+  for (const anchor of panelAnchors) {
+    const firstCy = minCyByPanel.get(anchor)
+    if (!firstCy) continue
+    // Mantener texto dentro del espacio ya existente encima de la primera fila.
+    const labelY = firstCy - (ROW_HEIGHT_MM / 2) + 1.2
+    for (let o = 0; o < numOptions; o++) {
+      const x = anchor + o * BUBBLE_SPACING_MM
+      const letter = optionLabels[o] || ""
+      if (!letter) continue
+      doc.text(letter, x, labelY, { align: "center" })
+    }
+  }
+  doc.setTextColor(0, 0, 0)
 
   positions.forEach(({ q, optionIndex, cx, cy }) => {
     const label = optionLabels[optionIndex]

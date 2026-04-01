@@ -14,7 +14,8 @@ interface Payload {
 
 export async function evaluate(payload: Payload) {
     try {
-        const res = await fetch('http://localhost:3000/api/evaluate', {
+        // SNAPSHOT_NATIONAL_ANALYTICS_V1: ruta relativa para evitar dependencia de host hardcodeado
+        const res = await fetch('/api/evaluate', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',

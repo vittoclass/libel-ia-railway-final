@@ -2,7 +2,9 @@
 const nextConfig = {
   transpilePackages: ['@react-pdf/renderer'],
   output: 'standalone',
-  serverExternalPackages: ['pdf-parse', 'pdfjs-dist'],
+  experimental: {
+    serverExternalPackages: ['pdf-parse', 'pdfjs-dist'],
+  },
 };
 
 module.exports = nextConfig;

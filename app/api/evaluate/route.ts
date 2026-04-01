@@ -33,6 +33,7 @@ export const dynamic = "force-dynamic"
 export const maxDuration = 300
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY
+const DEFAULT_STUDENT_NAME = "Estudiante No Identificado"
 // SNAPSHOT_ESTABLE_OMR_MARCH_31
 // Ajuste reversible de rigor/fidelidad en desarrollo:
 // - Piso de generosidad para intento identificable: 0.5 (antes 1.0)
@@ -1059,6 +1060,19 @@ function sanitizeRetroalimentacion(retro: any): any {
   return cleaned
 }
 
+function normalizeDetectedStudentName(raw: unknown): string {
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return DEFAULT_STUDENT_NAME
+    for (const v of raw) {
+      const s = String(v ?? "").trim()
+      if (s) return s
+    }
+    return DEFAULT_STUDENT_NAME
+  }
+  const s = String(raw ?? "").trim()
+  return s ? s : DEFAULT_STUDENT_NAME
+}
+
 export async function POST(req: NextRequest) {
   try {
     if (!MISTRAL_API_KEY) {
@@ -1880,7 +1894,9 @@ export async function POST(req: NextRequest) {
       puntosMaximos: scores.puntosMaximos,
       detalle_desarrollo: combinedAnalysis.respuestas_desarrollo,
       alternativas_corregidas: scores.alternativas_corregidas,
-      nombreEstudianteDetectado: combinedAnalysis.nombreEstudiante,
+      // SNAPSHOT_NATIONAL_ANALYTICS_V1:
+      // Original: nombreEstudianteDetectado: combinedAnalysis.nombreEstudiante,
+      nombreEstudianteDetectado: normalizeDetectedStudentName(combinedAnalysis.nombreEstudiante),
       officialOmrIntegrationEnabled,
       officialOmrEngineSelected,
       officialOmrAllowFallbackToLegacy,
@@ -1927,11 +1943,19 @@ export async function POST(req: NextRequest) {
       saveResult = { saved: false, success: false, error: { step: "auth", message: reason === "NO_SESSION" ? "Inicia sesión para guardar" : "Completa tu perfil para guardar" }, reason }
     } else {
       try {
-        const nombreFromBody = typeof nombreEstudianteBody === "string" ? nombreEstudianteBody.trim() || null : null
-        const nombreFromResult = result.nombreEstudianteDetectado != null && String(result.nombreEstudianteDetectado).trim() !== ""
-          ? String(result.nombreEstudianteDetectado).trim()
-          : null
-        const confirmedStudentName = nombreFromBody ?? nombreFromResult ?? null
+        // SNAPSHOT_NATIONAL_ANALYTICS_V1:
+        // Original:
+        // const nombreFromBody = typeof nombreEstudianteBody === "string" ? nombreEstudianteBody.trim() || null : null
+        // const nombreFromResult = result.nombreEstudianteDetectado != null && String(result.nombreEstudianteDetectado).trim() !== ""
+        //   ? String(result.nombreEstudianteDetectado).trim()
+        //   : null
+        // const confirmedStudentName = nombreFromBody ?? nombreFromResult ?? null
+        const nombreFromBody =
+          typeof nombreEstudianteBody === "string" && nombreEstudianteBody.trim() !== ""
+            ? nombreEstudianteBody.trim()
+            : null
+        const nombreFromResult = normalizeDetectedStudentName(result.nombreEstudianteDetectado)
+        const confirmedStudentName = nombreFromBody ?? nombreFromResult
         if (process.env.NODE_ENV !== "production") {
           console.info("[student] detected_students_raw =", JSON.stringify([result.nombreEstudianteDetectado].filter(Boolean)))
           console.info("[student] confirmed_students_before_save =", JSON.stringify(confirmedStudentName ? [confirmedStudentName] : []))
