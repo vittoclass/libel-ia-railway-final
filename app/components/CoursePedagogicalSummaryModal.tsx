@@ -51,11 +51,11 @@ type SummaryData = {
   summary_available?: boolean
   status_reason?: string
   student_count: number
-  by_axis: Array<{ dimension_value: string; logro_pct: number; question_count: number }>
-  by_skill: Array<{ dimension_value: string; logro_pct: number; question_count: number }>
-  by_cognitive_level: Array<{ dimension_value: string; logro_pct: number; question_count: number }>
-  weakest_skills: Array<{ skill: string; average_logro_pct: number }>
-  weakest_axes: Array<{ axis: string; average_logro_pct: number; question_count: number }>
+  by_axis: Array<{ dimension_value: string; logro_pct: number | null; question_count: number }>
+  by_skill: Array<{ dimension_value: string; logro_pct: number | null; question_count: number }>
+  by_cognitive_level: Array<{ dimension_value: string; logro_pct: number | null; question_count: number }>
+  weakest_skills: Array<{ skill: string; average_logro_pct: number | null }>
+  weakest_axes: Array<{ axis: string; average_logro_pct: number | null; question_count: number }>
   most_failed_questions: Array<{
     item_number: number
     axis: string
@@ -63,7 +63,7 @@ type SummaryData = {
     error_pct: number
     student_count: number
   }>
-  question_heat_map?: Array<{ item_number: number; logro_pct: number; axis?: string; skill?: string }>
+  question_heat_map?: Array<{ item_number: number; logro_pct: number | null; axis?: string; skill?: string }>
   national_analytics?: {
     enabled: boolean
     by_evaluation: Array<{
@@ -72,14 +72,14 @@ type SummaryData = {
       note_7: number | null
       score_obtained: number
       score_max: number
-      logro_pct: number
+      logro_pct: number | null
       paes_score: number
       simce_score: number
       simce_level: "Adecuado" | "Elemental" | "Insatisfactorio"
     }>
     course_summary: {
       average_note_7: number | null
-      average_logro_pct: number
+      average_logro_pct: number | null
       average_paes: number
       average_simce: number
       simce_distribution: {
@@ -130,7 +130,7 @@ function pickPedagogicalLabel(value: unknown, fallback = "N/A"): string {
 
 function normalizeSummaryData(raw: SummaryData): SummaryData {
   // SNAPSHOT_NATIONAL_ANALYTICS_V1: normalizacion de entrada para impedir objetos en render
-  const mapDimensionRows = (rows: Array<{ dimension_value: string; logro_pct: number; question_count: number }>) =>
+  const mapDimensionRows = (rows: Array<{ dimension_value: string; logro_pct: number | null; question_count: number }>) =>
     (rows ?? []).map((r) => ({
       ...r,
       dimension_value: pickPedagogicalLabel(r.dimension_value),
@@ -170,6 +170,27 @@ function normalizeSummaryData(raw: SummaryData): SummaryData {
         }
       : raw.national_analytics,
   }
+}
+
+function formatPct(value: number | null | undefined): string {
+  // DATA_NORMALIZATION_V2: no evaluado se representa con guion.
+  if (value == null || !Number.isFinite(Number(value))) return "—"
+  return `${Math.round(Number(value))}%`
+}
+
+function chartPct(value: number | null | undefined): number {
+  return value == null || !Number.isFinite(Number(value)) ? 0 : Math.round(Number(value))
+}
+
+function isMissingPedagogyLabel(value: unknown): boolean {
+  const normalized = pickPedagogicalLabel(value, "N/A").trim().toLowerCase()
+  return (
+    normalized === "n/a" ||
+    normalized === "sin eje" ||
+    normalized === "sin habilidad" ||
+    normalized === "sin metadata" ||
+    normalized === "—"
+  )
 }
 
 function SummaryBlock({ data }: { data: SummaryData }) {
@@ -315,6 +336,14 @@ export default function CoursePedagogicalSummaryModal({
 
   const courseDisplayName = courseLabel ?? data?.course ?? (courseId ? String(courseId) : null) ?? "Curso"
   const national = data?.national_analytics
+  // DATA_SCIENCE_FIX_V1: detectar metadata incompleta antes de graficos.
+  const hasMissingAxisMetadata = Boolean(data?.by_axis.some((r) => isMissingPedagogyLabel(r.dimension_value)))
+  const hasMissingSkillMetadata = Boolean(data?.by_skill.some((r) => isMissingPedagogyLabel(r.dimension_value)))
+  const shouldShowMetadataWarning =
+    Boolean(data) &&
+    (((data?.by_axis?.length ?? 0) === 0 || (data?.by_skill?.length ?? 0) === 0) ||
+      hasMissingAxisMetadata ||
+      hasMissingSkillMetadata)
   // SNAPSHOT_NATIONAL_ANALYTICS_V1: vista desacoplada del flag backend para no ocultar controles del modal
   const hasNational = Boolean(Array.isArray(national?.by_evaluation) && national.by_evaluation.length > 0)
   // SNAPSHOT_NATIONAL_ANALYTICS_V1: normalizacion defensiva para evitar renderizar objetos en <td>
@@ -327,7 +356,7 @@ export default function CoursePedagogicalSummaryModal({
           row.simce_level === "Adecuado" || row.simce_level === "Elemental" || row.simce_level === "Insatisfactorio"
             ? row.simce_level
             : "N/A"
-        const safeLogro = typeof row.logro_pct === "number" && Number.isFinite(row.logro_pct) ? `${row.logro_pct}%` : "N/A"
+        const safeLogro = row.logro_pct == null ? "N/A" : `${Math.round(Number(row.logro_pct))}%`
         return {
           id: String(row.evaluation_id ?? ""),
           student: safeText(row.student_name, "Estudiante"),
@@ -381,6 +410,13 @@ export default function CoursePedagogicalSummaryModal({
               {!data.summary_available && (data.evaluation_count_analyzable ?? data.evaluation_count) === 0 && (
                 <NoSummaryMessage data={data} />
               )}
+              {shouldShowMetadataWarning && (
+                <p className="rounded-md border border-orange-500/60 bg-orange-500/10 px-3 py-2 text-orange-800 dark:text-orange-200">
+                  {/* LOGICA_ANTERIOR_LOCAL: no se advertia explicitamente por metadatos faltantes de ejes/habilidades */}
+                  {/* DATA_SCIENCE_FIX_V1: alerta preventiva de integridad para lectura de graficos */}
+                  Faltan metadatos pedagógicos (Ejes/Habilidades) en parte de la data. Los gráficos pueden verse incompletos.
+                </p>
+              )}
               {((data.summary_available === true) || ((data.evaluation_count_analyzable ?? data.evaluation_count) > 0)) && (
             <>
               {data.by_axis.length > 0 && (
@@ -399,8 +435,8 @@ export default function CoursePedagogicalSummaryModal({
                         <TableRow key={i}>
                           <TableCell>{pickPedagogicalLabel(r.dimension_value)}</TableCell>
                           <TableCell>
-                            <span className={r.logro_pct >= 70 ? "text-green-600" : r.logro_pct < 50 ? "text-amber-600" : ""}>
-                              {r.logro_pct}%
+                            <span className={(r.logro_pct ?? -1) >= 70 ? "text-green-600" : (r.logro_pct ?? 999) < 50 ? "text-amber-600" : ""}>
+                              {formatPct(r.logro_pct)}
                             </span>
                           </TableCell>
                           <TableCell>{r.question_count}</TableCell>
@@ -426,8 +462,8 @@ export default function CoursePedagogicalSummaryModal({
                         <TableRow key={i}>
                           <TableCell>{pickPedagogicalLabel(r.dimension_value)}</TableCell>
                           <TableCell>
-                            <span className={r.logro_pct >= 70 ? "text-green-600" : r.logro_pct < 50 ? "text-amber-600" : ""}>
-                              {r.logro_pct}%
+                            <span className={(r.logro_pct ?? -1) >= 70 ? "text-green-600" : (r.logro_pct ?? 999) < 50 ? "text-amber-600" : ""}>
+                              {formatPct(r.logro_pct)}
                             </span>
                           </TableCell>
                           <TableCell>{r.question_count}</TableCell>
@@ -452,7 +488,7 @@ export default function CoursePedagogicalSummaryModal({
                       {data.by_cognitive_level.map((r, i) => (
                         <TableRow key={i}>
                           <TableCell>{pickPedagogicalLabel(r.dimension_value)}</TableCell>
-                          <TableCell>{r.logro_pct}%</TableCell>
+                          <TableCell>{formatPct(r.logro_pct)}</TableCell>
                           <TableCell>{r.question_count}</TableCell>
                         </TableRow>
                       ))}
@@ -465,7 +501,7 @@ export default function CoursePedagogicalSummaryModal({
                   <h4 className="font-semibold text-[var(--text-accent)] mb-2">Habilidades más débiles</h4>
                   <ul className="list-disc list-inside space-y-1">
                     {data.weakest_skills.slice(0, 10).map((s, i) => (
-                      <li key={i}>{pickPedagogicalLabel(s.skill)}: {s.average_logro_pct}%</li>
+                      <li key={i}>{pickPedagogicalLabel(s.skill)}: {formatPct(s.average_logro_pct)}</li>
                     ))}
                   </ul>
                 </div>
@@ -475,7 +511,7 @@ export default function CoursePedagogicalSummaryModal({
                   <h4 className="font-semibold text-[var(--text-accent)] mb-2">Ejes más débiles</h4>
                   <ul className="list-disc list-inside space-y-1">
                     {data.weakest_axes.slice(0, 10).map((a, i) => (
-                      <li key={i}>{pickPedagogicalLabel(a.axis)}: {a.average_logro_pct}%</li>
+                      <li key={i}>{pickPedagogicalLabel(a.axis)}: {formatPct(a.average_logro_pct)}</li>
                     ))}
                   </ul>
                 </div>
@@ -516,7 +552,7 @@ export default function CoursePedagogicalSummaryModal({
                     <div className="w-full h-[240px]">
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart
-                          data={data.by_axis.map((r) => ({ name: pickPedagogicalLabel(r.dimension_value), logro: r.logro_pct }))}
+                          data={data.by_axis.map((r) => ({ name: pickPedagogicalLabel(r.dimension_value), logro: chartPct(r.logro_pct) }))}
                           margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
                         >
                           <CartesianGrid strokeDasharray="3 3" className="opacity-50" />
@@ -525,7 +561,7 @@ export default function CoursePedagogicalSummaryModal({
                           <Tooltip formatter={(v: number | undefined) => [`${v ?? 0}%`, "Logro"]} labelFormatter={(l) => l} />
                           <Bar dataKey="logro" name="Logro %" radius={[4, 4, 0, 0]}>
                             {data.by_axis.map((r, i) => (
-                              <Cell key={i} fill={r.logro_pct >= 70 ? "hsl(var(--chart-2))" : r.logro_pct < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
+                              <Cell key={i} fill={(r.logro_pct ?? -1) >= 70 ? "hsl(var(--chart-2))" : (r.logro_pct ?? 999) < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
                             ))}
                           </Bar>
                         </BarChart>
@@ -539,7 +575,7 @@ export default function CoursePedagogicalSummaryModal({
                     <div className="w-full h-[240px]">
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart
-                          data={data.by_skill.map((r) => ({ name: pickPedagogicalLabel(r.dimension_value), logro: r.logro_pct }))}
+                          data={data.by_skill.map((r) => ({ name: pickPedagogicalLabel(r.dimension_value), logro: chartPct(r.logro_pct) }))}
                           margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
                         >
                           <CartesianGrid strokeDasharray="3 3" className="opacity-50" />
@@ -548,7 +584,7 @@ export default function CoursePedagogicalSummaryModal({
                           <Tooltip formatter={(v: number | undefined) => [`${v ?? 0}%`, "Logro"]} labelFormatter={(l) => l} />
                           <Bar dataKey="logro" name="Logro %" radius={[4, 4, 0, 0]}>
                             {data.by_skill.map((r, i) => (
-                              <Cell key={i} fill={r.logro_pct >= 70 ? "hsl(var(--chart-2))" : r.logro_pct < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
+                              <Cell key={i} fill={(r.logro_pct ?? -1) >= 70 ? "hsl(var(--chart-2))" : (r.logro_pct ?? 999) < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
                             ))}
                           </Bar>
                         </BarChart>
@@ -564,8 +600,8 @@ export default function CoursePedagogicalSummaryModal({
                         <RadarChart
                           data={
                             data.by_axis.length >= data.by_skill.length
-                              ? data.by_axis.map((r) => ({ dimension: pickPedagogicalLabel(r.dimension_value), logro: r.logro_pct, fullMark: 100 }))
-                              : data.by_skill.map((r) => ({ dimension: pickPedagogicalLabel(r.dimension_value), logro: r.logro_pct, fullMark: 100 }))
+                              ? data.by_axis.map((r) => ({ dimension: pickPedagogicalLabel(r.dimension_value), logro: chartPct(r.logro_pct), fullMark: 100 }))
+                              : data.by_skill.map((r) => ({ dimension: pickPedagogicalLabel(r.dimension_value), logro: chartPct(r.logro_pct), fullMark: 100 }))
                           }
                           margin={{ top: 16, right: 16, left: 16, bottom: 16 }}
                         >
@@ -630,11 +666,20 @@ export default function CoursePedagogicalSummaryModal({
               {/* Diagnóstico pedagógico, evidencia y mapa de calor (después de los gráficos) */}
               {(data.by_axis.length > 0 || data.by_skill.length > 0 || data.most_failed_questions.length > 0) && (() => {
                 const diagnosis = buildPedagogicalDiagnosis({
-                  by_axis: data.by_axis.map((x) => ({ ...x, dimension_value: pickPedagogicalLabel(x.dimension_value) })),
-                  by_skill: data.by_skill.map((x) => ({ ...x, dimension_value: pickPedagogicalLabel(x.dimension_value) })),
+                  by_axis: data.by_axis.map((x) => ({
+                    ...x,
+                    dimension_value: pickPedagogicalLabel(x.dimension_value),
+                    logro_pct: Number(x.logro_pct ?? 0),
+                  })),
+                  by_skill: data.by_skill.map((x) => ({
+                    ...x,
+                    dimension_value: pickPedagogicalLabel(x.dimension_value),
+                    logro_pct: Number(x.logro_pct ?? 0),
+                  })),
                   by_cognitive_level: (data.by_cognitive_level ?? []).map((x) => ({
                     ...x,
                     dimension_value: pickPedagogicalLabel(x.dimension_value),
+                    logro_pct: Number(x.logro_pct ?? 0),
                   })),
                   most_failed_questions: data.most_failed_questions.map((x) => ({
                     ...x,
@@ -642,7 +687,9 @@ export default function CoursePedagogicalSummaryModal({
                     skill: pickPedagogicalLabel(x.skill),
                   })),
                 })
-                const heatMap = (data.question_heat_map ?? []).slice().sort((a, b) => a.item_number - b.item_number)
+                const heatMap = (data.question_heat_map ?? [])
+                  .map((a) => ({ ...a, logro_pct: Number(a.logro_pct ?? 0) }))
+                  .sort((a, b) => a.item_number - b.item_number)
                 return (
                   <div className="space-y-6 pt-4 border-t border-[var(--border-color)]">
                     <h4 className="font-semibold text-[var(--text-accent)]">Diagnóstico pedagógico</h4>

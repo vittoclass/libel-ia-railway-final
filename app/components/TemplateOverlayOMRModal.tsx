@@ -1,4 +1,5 @@
 "use client"
+/* eslint-disable @next/next/no-img-element -- Overlay y capturas en modal OMR. */
 
 /**
  * OMR guiado por plantilla real superpuesta.

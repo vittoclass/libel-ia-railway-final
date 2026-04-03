@@ -13,6 +13,8 @@ import { enrichItemsWithPedagogy } from "@/app/lib/analyze-pedagogical-structure
 import {
   analyzeLearningResults,
   aggregateCourseSummary,
+  normalizePedagogicalText,
+  formatPedagogicalDisplayText,
   type EvaluationItemRow,
   type SourceExamItemWithPedagogy,
   type LearningResultsAnalysis,
@@ -25,6 +27,8 @@ import {
   simceLevelFromLogroPct,
   type SimceLevel,
 } from "@/app/lib/standard-scale-converters"
+import { buildCourseQualityMetrics } from "@/app/lib/pedagogical-intelligence/metrics"
+import type { CourseStudentMetricInput } from "@/app/lib/pedagogical-intelligence/types"
 import type { SupabaseClient } from "@supabase/supabase-js"
 
 export const dynamic = "force-dynamic"
@@ -46,7 +50,7 @@ type NationalAnalyticsRow = {
   note_7: number | null
   score_obtained: number
   score_max: number
-  logro_pct: number
+  logro_pct: number | null
   paes_score: number
   simce_score: number
   simce_level: SimceLevel
@@ -73,14 +77,6 @@ function pickLabel(value: unknown, fallback: string): string {
   return fallback
 }
 
-function normalizeGroupKey(label: string): string {
-  return label
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-}
-
 function buildAggregatesFromByQuestion(
   byQuestion: LogroByQuestion[],
   dimension: DimensionKey
@@ -89,11 +85,14 @@ function buildAggregatesFromByQuestion(
   for (const q of byQuestion) {
     const fallback =
       dimension === "axis" ? "Sin eje" : dimension === "skill" ? "Sin habilidad" : "aplicar"
-    const raw = pickLabel(q[dimension], fallback)
-    const key = normalizeGroupKey(raw)
+    const raw = formatPedagogicalDisplayText(pickLabel(q[dimension], fallback))
+    // DATA_NORMALIZATION_V2: llave normalizada para fusionar textos equivalentes.
+    const key = normalizePedagogicalText(raw)
     const cur = acc.get(key) ?? { display: raw, obtained: 0, max: 0, count: 0 }
+    const shouldReplaceDisplay = cur.display === key && /[ÁÉÍÓÚÜÑ]/.test(raw)
     acc.set(key, {
-      display: cur.display || raw,
+      // DATA_NORMALIZATION_V2: prioriza variante con acento si aparece.
+      display: shouldReplaceDisplay ? raw : (cur.display || raw),
       obtained: cur.obtained + (Number(q.score_obtained) || 0),
       max: cur.max + (Number(q.score_max) || 0),
       count: cur.count + 1,
@@ -103,7 +102,9 @@ function buildAggregatesFromByQuestion(
     dimension_value: v.display,
     score_obtained: v.obtained,
     score_max: v.max,
-    logro_pct: v.max > 0 ? Math.round((v.obtained / v.max) * 100) : 0,
+    // LOGICA_ANTERIOR_LOCAL: ... : 0
+    // DATA_NORMALIZATION_V2: no evaluado => null
+    logro_pct: v.max > 0 ? Math.round((v.obtained / v.max) * 100) : null,
     question_count: v.count,
   }))
 }
@@ -127,7 +128,7 @@ function buildFallbackByQuestionFromEvaluationItems(items: EvaluationItemRow[]):
       cognitive_level: "aplicar",
       score_obtained: safeObtained,
       score_max: safeMax,
-      logro_pct: Math.round((safeObtained / safeMax) * 100),
+      logro_pct: safeMax > 0 ? Math.round((safeObtained / safeMax) * 100) : null,
     }
   })
 }
@@ -221,7 +222,7 @@ function toNationalAnalyticsRows(params: {
     // SNAPSHOT_NATIONAL_ANALYTICS_V1: escala dinamica universal por prioridad pauta->items
     const score_max_fallback = params.maxFallbackByEvaluation.get(evaluationId) ?? 0
     const score_max = score_max_raw > 0 ? score_max_raw : score_max_fallback
-    const logro_pct = Math.round(clampLogroPctFromScores(score_obtained, score_max))
+    const logro_pct = score_max > 0 ? Math.round(clampLogroPctFromScores(score_obtained, score_max)) : null
     rows.push({
       evaluation_id: evaluationId,
       student_name: params.studentByEvaluation.get(evaluationId) ?? "Estudiante",
@@ -229,12 +230,34 @@ function toNationalAnalyticsRows(params: {
       score_obtained,
       score_max,
       logro_pct,
-      paes_score: projectPaesFromLogroPct(logro_pct),
-      simce_score: projectSimceFromLogroPct(logro_pct),
-      simce_level: simceLevelFromLogroPct(logro_pct),
+      paes_score: projectPaesFromLogroPct(Number(logro_pct ?? 0)),
+      simce_score: projectSimceFromLogroPct(Number(logro_pct ?? 0)),
+      simce_level: simceLevelFromLogroPct(Number(logro_pct ?? 0)),
     })
   }
   return rows
+}
+
+function toCourseStudentMetricInputs(analyses: LearningResultsAnalysis[]): CourseStudentMetricInput[] {
+  return analyses.map((a) => {
+    const totalScore = a.by_question.reduce((sum, q) => sum + (Number(q.score_obtained) || 0), 0)
+    const maxScore = a.by_question.reduce((sum, q) => sum + (Number(q.score_max) || 0), 0)
+    const totalLogroPct = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : null
+    return {
+      // PHASE_1_METRICS_V1: cada evaluacion representa una observacion de alumno en este flujo.
+      student_id: a.evaluation_id,
+      total_score: totalScore,
+      max_score: maxScore,
+      total_logro_pct: totalLogroPct,
+      by_item: a.by_question.map((q) => ({
+        item_number: q.item_number,
+        is_correct:
+          Number(q.score_max) > 0
+            ? (Number(q.score_obtained) || 0) >= (Number(q.score_max) || 0)
+            : null,
+      })),
+    }
+  })
 }
 
 export async function GET(
@@ -398,6 +421,8 @@ export async function GET(
     const analysis = await fetchAnalysisForEvaluation(supabase, evaluationId)
     analyses.push(analysis)
   }
+  // PHASE_1_METRICS_V1: integración silenciosa de métricas de calidad (sin cambios de UI en esta fase).
+  const phase1Metrics = buildCourseQualityMetrics(toCourseStudentMetricInputs(analyses))
 
   const evaluation_count_with_source_exam = evalsMeta.filter((m) => m.has_source_exam).length
   const evaluation_count_analyzable = analyses.filter((a) => a.by_question.length > 0).length
@@ -450,6 +475,10 @@ export async function GET(
       summary_available,
       status_reason,
     })
+    console.info("[pedagogical-summary][PHASE_1_METRICS_V1]", {
+      student_stats_count: phase1Metrics.student_stats.length,
+      item_discrimination_count: phase1Metrics.item_discrimination.length,
+    })
     evalsMetaWithIncluded.forEach((m) => {
       console.info("[pedagogical-summary] eval", {
         evaluation_id: m.id,
@@ -491,12 +520,12 @@ export async function GET(
   }
 
   const weakest_axes = [...courseSummary.average_by_axis]
-    .filter((a) => a.question_count >= 1)
-    .sort((a, b) => a.logro_pct - b.logro_pct)
+    .filter((a) => a.question_count >= 1 && typeof a.logro_pct === "number")
+    .sort((a, b) => Number(a.logro_pct) - Number(b.logro_pct))
     .slice(0, 10)
     .map((a) => ({
       axis: a.dimension_value,
-      average_logro_pct: a.logro_pct,
+      average_logro_pct: Number(a.logro_pct),
       question_count: a.question_count,
     }))
 
@@ -524,10 +553,10 @@ export async function GET(
       const axis = q.axis || "—"
       const skill = q.skill || "—"
       if (cur) {
-        cur.sum += q.logro_pct
+        cur.sum += Number(q.logro_pct ?? 0)
         cur.count += 1
       } else {
-        questionLogroAcc.set(q.item_number, { sum: q.logro_pct, count: 1, axis, skill })
+        questionLogroAcc.set(q.item_number, { sum: Number(q.logro_pct ?? 0), count: 1, axis, skill })
       }
     }
   }
@@ -566,11 +595,17 @@ export async function GET(
           })()
         : null
     const average_logro_pct =
-      count > 0 ? Math.round(byEvaluation.reduce((s, r) => s + r.logro_pct, 0) / count) : 0
+      count > 0
+        ? Math.round(byEvaluation.reduce((s, r) => s + Number(r.logro_pct ?? 0), 0) / count)
+        : 0
     const average_paes =
-      count > 0 ? Math.round(byEvaluation.reduce((s, r) => s + r.paes_score, 0) / count) : 100
+      count > 0
+        ? Math.round(byEvaluation.reduce((s, r) => s + Number(r.paes_score ?? 0), 0) / count)
+        : 100
     const average_simce =
-      count > 0 ? Math.round(byEvaluation.reduce((s, r) => s + r.simce_score, 0) / count) : 0
+      count > 0
+        ? Math.round(byEvaluation.reduce((s, r) => s + Number(r.simce_score ?? 0), 0) / count)
+        : 0
     const distCount: Record<SimceLevel, number> = {
       Adecuado: 0,
       Elemental: 0,

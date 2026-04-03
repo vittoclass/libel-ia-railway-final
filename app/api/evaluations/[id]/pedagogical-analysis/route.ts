@@ -9,8 +9,12 @@ import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { getSourceExamForEvaluation } from "@/app/lib/source-exam-db"
 import { enrichItemsWithPedagogy } from "@/app/lib/analyze-pedagogical-structure"
+import { convertToNationalScore, nationalLevelLabel } from "@/app/lib/standard-scale/converters"
+import { mean, sampleStdDev, zScore } from "@/app/lib/pedagogical-intelligence/metrics"
+import { generateStrategicAnalysis } from "@/app/lib/pedagogical-intelligence/inference-engine"
 import {
   analyzeLearningResults,
+  normalizePedagogicalText,
   type EvaluationItemRow,
   type SourceExamItemWithPedagogy,
 } from "@/app/lib/analyze-learning-results"
@@ -27,7 +31,7 @@ type StatusReason =
   | "error"
 
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id: evaluationId } = await params
@@ -43,7 +47,7 @@ export async function GET(
 
   const { data: evaluation, error: evErr } = await supabase
     .from("evaluations")
-    .select("id, teacher_id, user_id")
+    .select("id, teacher_id, user_id, course_id, evaluated_at")
     .eq("id", evaluationId)
     .maybeSingle()
 
@@ -99,6 +103,193 @@ export async function GET(
   else if (!has_source_exam_items) status_reason = "missing_source_exam_items"
   else if (!analysis.by_question.length) status_reason = "missing_source_exam_items"
 
+  // PHASE_2_SCALES_V1: proyecciones nacionales para modal/pfd sin recalculo en frontend.
+  const requestedYear = Number(req.nextUrl.searchParams.get("year") || 2026)
+  const scaleYear = Number.isFinite(requestedYear) && requestedYear > 0 ? Math.floor(requestedYear) : 2026
+  const totalObtained = analysis.by_question.reduce((sum, q) => sum + (Number(q.score_obtained) || 0), 0)
+  const totalMax = analysis.by_question.reduce((sum, q) => sum + (Number(q.score_max) || 0), 0)
+  const logroPct = totalMax > 0 ? Math.round((totalObtained / totalMax) * 100) : null
+  const projections = {
+    simce_estimated: convertToNationalScore(logroPct, "simce", scaleYear),
+    paes_estimated: convertToNationalScore(logroPct, "paes", scaleYear),
+    level_label: nationalLevelLabel(logroPct),
+    year: scaleYear,
+  }
+  // PHASE_4_MEMORY_IDENTITY_V1
+  let delta_analysis: {
+    previous_evaluation_id: string | null
+    delta_overall_pct: number | null
+    by_axis: Array<{ axis: string; delta_pct: number | null }>
+    by_skill: Array<{ skill: string; delta_pct: number | null }>
+  } | null = null
+  // PHASE_4_MEMORY_IDENTITY_V1
+  try {
+    const { data: currentStudent } = await supabase
+      .from("evaluation_students")
+      .select("student_id")
+      .eq("evaluation_id", evaluationId)
+      .not("student_id", "is", null)
+      .limit(1)
+      .maybeSingle()
+    const studentId = (currentStudent as { student_id?: string | null } | null)?.student_id ?? null
+    if (studentId) {
+      const currentEvaluatedAt =
+        (evaluation as { evaluated_at?: string | null }).evaluated_at ?? new Date().toISOString()
+      const { data: prevLink } = await supabase
+        .from("student_evaluations")
+        .select("evaluation_id, evaluated_at")
+        .eq("student_id", studentId)
+        .lt("evaluated_at", currentEvaluatedAt)
+        .order("evaluated_at", { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      const prevEvaluationId = (prevLink as { evaluation_id?: string | null } | null)?.evaluation_id ?? null
+      if (prevEvaluationId) {
+        const prevSourceExamId = await getSourceExamForEvaluation(supabase, prevEvaluationId)
+        const [prevItemsRes, prevSourceItemsRes] = await Promise.all([
+          supabase
+            .from("evaluation_items")
+            .select("question_number, score_obtained, score_max, is_correct, student_answer, correct_answer")
+            .eq("evaluation_id", prevEvaluationId)
+            .order("question_number", { ascending: true }),
+          prevSourceExamId
+            ? supabase
+                .from("source_exam_items")
+                .select("id, item_number, item_text, axis_label, skill_label, max_score, rubric_text, question_type")
+                .eq("source_exam_id", prevSourceExamId)
+                .order("item_number", { ascending: true })
+            : Promise.resolve({ data: [] as unknown[], error: null }),
+        ])
+        const prevEvaluationItems = (prevItemsRes.data ?? []) as EvaluationItemRow[]
+        const prevSourceItemsRaw = (prevSourceItemsRes.data ?? []) as SourceExamItemWithPedagogy[]
+        const prevSourceExamItemsEnriched =
+          prevSourceItemsRaw.length > 0 ? enrichItemsWithPedagogy(prevSourceItemsRaw) : ([] as SourceExamItemWithPedagogy[])
+        const prevAnalysis = analyzeLearningResults(prevEvaluationId, prevEvaluationItems, prevSourceExamItemsEnriched)
+
+        const prevObt = prevAnalysis.by_question.reduce((s, q) => s + (Number(q.score_obtained) || 0), 0)
+        const prevMax = prevAnalysis.by_question.reduce((s, q) => s + (Number(q.score_max) || 0), 0)
+        const prevLogro = prevMax > 0 ? Math.round((prevObt / prevMax) * 100) : null
+        const deltaOverall =
+          logroPct != null && prevLogro != null ? Math.round((logroPct - prevLogro) * 10) / 10 : null
+
+        const byAxisCurrent = new Map(
+          analysis.by_axis.map((x) => [normalizePedagogicalText(x.dimension_value), typeof x.logro_pct === "number" ? x.logro_pct : null])
+        )
+        const byAxisPrev = new Map(
+          prevAnalysis.by_axis.map((x) => [normalizePedagogicalText(x.dimension_value), typeof x.logro_pct === "number" ? x.logro_pct : null])
+        )
+        const axisKeys = new Set([...byAxisCurrent.keys(), ...byAxisPrev.keys()])
+        const byAxisDelta = Array.from(axisKeys).map((k) => {
+          const c = byAxisCurrent.get(k)
+          const p = byAxisPrev.get(k)
+          return {
+            axis: k,
+            delta_pct: c != null && p != null ? Math.round((c - p) * 10) / 10 : null,
+          }
+        })
+
+        const bySkillCurrent = new Map(
+          analysis.by_skill.map((x) => [normalizePedagogicalText(x.dimension_value), typeof x.logro_pct === "number" ? x.logro_pct : null])
+        )
+        const bySkillPrev = new Map(
+          prevAnalysis.by_skill.map((x) => [normalizePedagogicalText(x.dimension_value), typeof x.logro_pct === "number" ? x.logro_pct : null])
+        )
+        const skillKeys = new Set([...bySkillCurrent.keys(), ...bySkillPrev.keys()])
+        const bySkillDelta = Array.from(skillKeys).map((k) => {
+          const c = bySkillCurrent.get(k)
+          const p = bySkillPrev.get(k)
+          return {
+            skill: k,
+            delta_pct: c != null && p != null ? Math.round((c - p) * 10) / 10 : null,
+          }
+        })
+
+        delta_analysis = {
+          previous_evaluation_id: prevEvaluationId,
+          delta_overall_pct: deltaOverall,
+          by_axis: byAxisDelta,
+          by_skill: bySkillDelta,
+        }
+      }
+    }
+  } catch (deltaErr) {
+    if (isDev) console.warn("[pedagogical-analysis][delta] fallback", deltaErr)
+    delta_analysis = null
+  }
+  // PHASE_3_INFERENCE_SECURITY_V1
+  let strategic_analysis: {
+    paragraph: string
+    key_gap: {
+      numbers_pct: number | null
+      modelacion_pct: number | null
+      overall_pct: number | null
+      z_score_course: number | null
+      simce_level: "Insuficiente" | "Elemental" | "Adecuado" | null
+    }
+  } | null = null
+  // PHASE_3_INFERENCE_SECURITY_V1
+  try {
+    const courseId = (evaluation as { course_id?: string | null }).course_id ?? null
+    let zCourse: number | null = null
+    if (courseId) {
+      const { data: courseEvaluations } = await supabase
+        .from("evaluations")
+        .select("id")
+        .eq("teacher_id", teacherId)
+        .eq("course_id", courseId)
+      const courseEvalIds = (courseEvaluations ?? []).map((r) => String((r as { id: string }).id))
+      if (courseEvalIds.length > 0) {
+        const { data: courseItems } = await supabase
+          .from("evaluation_items")
+          .select("evaluation_id, score_obtained, score_max")
+          .in("evaluation_id", courseEvalIds)
+        const grouped = new Map<string, Array<{ score_obtained: number | null; score_max: number | null }>>()
+        for (const row of courseItems ?? []) {
+          const evId = String((row as { evaluation_id?: string | null }).evaluation_id ?? "")
+          if (!evId) continue
+          const arr = grouped.get(evId) ?? []
+          arr.push({
+            score_obtained: (row as { score_obtained?: number | null }).score_obtained ?? null,
+            score_max: (row as { score_max?: number | null }).score_max ?? null,
+          })
+          grouped.set(evId, arr)
+        }
+        const logroList: number[] = []
+        for (const evId of courseEvalIds) {
+          const rows = grouped.get(evId) ?? []
+          const totalObt = rows.reduce((s, r) => s + (Number(r.score_obtained) || 0), 0)
+          const totalMx = rows.reduce((s, r) => s + (Number(r.score_max) || 0), 0)
+          if (totalMx > 0) logroList.push(Math.round((totalObt / totalMx) * 100))
+        }
+        const m = mean(logroList)
+        const sd = sampleStdDev(logroList)
+        zCourse = logroPct != null ? zScore(logroPct, m, sd) : null
+      }
+    }
+    strategic_analysis = generateStrategicAnalysis({
+      // PHASE_3_INFERENCE_SECURITY_V1
+      by_axis: analysis.by_axis.map((x) => ({ dimension_value: x.dimension_value, logro_pct: x.logro_pct })),
+      // PHASE_3_INFERENCE_SECURITY_V1
+      by_skill: analysis.by_skill.map((x) => ({ dimension_value: x.dimension_value, logro_pct: x.logro_pct })),
+      // PHASE_3_INFERENCE_SECURITY_V1
+      overall_logro_pct: logroPct,
+      // PHASE_3_INFERENCE_SECURITY_V1
+      z_score_course: zCourse,
+      // PHASE_3_INFERENCE_SECURITY_V1
+      simce_level: projections.level_label,
+      // PHASE_4_MEMORY_IDENTITY_V1
+      delta_overall_pct: delta_analysis?.delta_overall_pct ?? null,
+      // PHASE_4_MEMORY_IDENTITY_V1
+      delta_by_axis: delta_analysis?.by_axis ?? [],
+      // PHASE_4_MEMORY_IDENTITY_V1
+      delta_by_skill: delta_analysis?.by_skill ?? [],
+    })
+  } catch (e) {
+    // PHASE_3_INFERENCE_SECURITY_V1
+    if (isDev) console.warn("[pedagogical-analysis][strategic_analysis] fallback", e)
+    strategic_analysis = null
+  }
+
   if (isDev) {
     console.info("[pedagogical-analysis]", {
       evaluationId,
@@ -121,6 +312,9 @@ export async function GET(
       has_source_exam_items,
       analysis_available,
       status_reason,
+      projections,
+      delta_analysis,
+      strategic_analysis,
     },
     {
       status: 200,

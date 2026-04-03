@@ -1,4 +1,6 @@
 "use client"
+/* eslint-disable @next/next/no-img-element -- Preview de plantilla desde URL/archivo local. */
+
 import { useState, useCallback, useRef, useEffect } from "react"
 import {
   X,

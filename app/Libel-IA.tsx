@@ -1,4 +1,5 @@
 "use client"
+/* eslint-disable @next/next/no-img-element -- Data URL de captura; preview dinámica. */
 
 import { useState } from "react"
 import { useEvaluator } from "./useEvaluator"

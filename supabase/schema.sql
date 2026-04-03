@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS evaluations (
   title text,
   subject text,
   evaluated_at timestamptz,
+  assessment_category text,
+  batch_id uuid,
   created_at timestamptz DEFAULT now()
 );
 
@@ -69,6 +71,7 @@ CREATE TABLE IF NOT EXISTS evaluation_summaries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   evaluation_id uuid REFERENCES evaluations(id) ON DELETE CASCADE,
   grade_chile numeric,
+  student_name_raw text,
   strengths text,
   improvements text,
   raw jsonb,

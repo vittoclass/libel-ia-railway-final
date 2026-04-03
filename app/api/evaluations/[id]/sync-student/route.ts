@@ -8,6 +8,10 @@ import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { ensureStudentProfile } from "@/app/lib/student-profile-link"
+import {
+  attachStudentIdToEvaluationArtifacts,
+  upsertStudentIdentity,
+} from "@/app/lib/student-identity/repository"
 
 export const dynamic = "force-dynamic"
 
@@ -106,7 +110,7 @@ export async function POST(
     console.info("[sync-student] teacher_id", teacherId)
   }
 
-  let body: { student_name?: string; course_label?: string | null }
+  let body: { student_name?: string; course_label?: string | null; student_rut?: string | null }
   try {
     body = await req.json()
   } catch {
@@ -142,6 +146,10 @@ export async function POST(
       ? String(body.course_label).trim()
       : null
   const course_label = received_course_label
+  const student_rut =
+    body.student_rut != null && String(body.student_rut).trim() !== ""
+      ? String(body.student_rut).trim()
+      : null
 
   const normalized_student_name = student_name.toLowerCase()
 
@@ -260,6 +268,28 @@ export async function POST(
     }
   } catch {
     created_or_existing = null
+  }
+
+  // PHASE_4_MEMORY_IDENTITY_V1
+  try {
+    const identity = await upsertStudentIdentity(supabase, {
+      rut: student_rut,
+      student_name,
+      course_label,
+      institution: null,
+      evaluation_id: evaluationId,
+      evaluated_at: new Date().toISOString(),
+    })
+    if (identity.student_id) {
+      await attachStudentIdToEvaluationArtifacts(supabase, {
+        evaluation_id: evaluationId,
+        student_name,
+        student_normalized: normalized_student_name,
+        student_id: identity.student_id,
+      })
+    }
+  } catch (identityErr) {
+    if (isDev) console.warn("[sync-student] student identity fallback", identityErr)
   }
 
   return NextResponse.json(

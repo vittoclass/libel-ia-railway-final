@@ -29,6 +29,7 @@ import {
 } from "recharts"
 import { exportElementToPdf } from "@/app/lib/export-report-pdf"
 import { useToast } from "@/hooks/use-toast"
+import { formatPedagogicalDisplayText } from "@/app/lib/analyze-learning-results"
 
 type AnalysisData = {
   evaluation_id: string
@@ -44,11 +45,11 @@ type AnalysisData = {
     cognitive_level: string
     score_obtained: number
     score_max: number
-    logro_pct: number
+    logro_pct: number | null
   }>
-  by_skill: Array<{ dimension_value: string; score_obtained: number; score_max: number; logro_pct: number; question_count: number }>
-  by_axis: Array<{ dimension_value: string; score_obtained: number; score_max: number; logro_pct: number; question_count: number }>
-  by_cognitive_level: Array<{ dimension_value: string; score_obtained: number; score_max: number; logro_pct: number; question_count: number }>
+  by_skill: Array<{ dimension_value: string; score_obtained: number; score_max: number; logro_pct: number | null; question_count: number }>
+  by_axis: Array<{ dimension_value: string; score_obtained: number; score_max: number; logro_pct: number | null; question_count: number }>
+  by_cognitive_level: Array<{ dimension_value: string; score_obtained: number; score_max: number; logro_pct: number | null; question_count: number }>
   student_summary: {
     strong_axes: string[]
     weak_axes: string[]
@@ -56,6 +57,24 @@ type AnalysisData = {
     weak_skills: string[]
     lowest_cognitive_level: string | null
     highest_cognitive_level: string | null
+  } | null
+  // PHASE_2_SCALES_V1
+  projections?: {
+    simce_estimated: number | null
+    paes_estimated: number | null
+    level_label: "Insuficiente" | "Elemental" | "Adecuado" | null
+    year?: number
+  }
+  // PHASE_3_INFERENCE_SECURITY_V1
+  strategic_analysis?: {
+    paragraph: string
+    key_gap?: {
+      numbers_pct?: number | null
+      modelacion_pct?: number | null
+      overall_pct?: number | null
+      z_score_course?: number | null
+      simce_level?: "Insuficiente" | "Elemental" | "Adecuado" | null
+    }
   } | null
 }
 
@@ -105,16 +124,38 @@ function StatusMessage({ data }: { data: AnalysisData }) {
   )
 }
 
+function formatPct(value: number | null | undefined): string {
+  // DATA_NORMALIZATION_V2: no evaluado se muestra con guion.
+  if (value == null || !Number.isFinite(Number(value))) return "—"
+  return `${Math.round(Number(value))}%`
+}
+
+function chartPct(value: number | null | undefined): number {
+  return value == null || !Number.isFinite(Number(value)) ? 0 : Math.round(Number(value))
+}
+
+function safeScore(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return "—"
+  return String(Math.round(Number(value)))
+}
+
+function levelBadgeClass(level: string | null | undefined): string {
+  // PHASE_2_SCALES_V1: badges vibrantes para mejor legibilidad en modal y PDF.
+  if (level === "Adecuado") return "border-emerald-700 bg-emerald-500 text-white"
+  if (level === "Elemental") return "border-amber-700 bg-amber-500 text-white"
+  return "border-rose-700 bg-rose-600 text-white"
+}
+
 /** Reglas: <50% debilidad, 50-69% desarrollo medio, ≥70% fortaleza. Solo interpreta datos ya calculados. */
 function buildStudentDiagnosis(data: AnalysisData) {
   const byAxis = data.by_axis ?? []
   const bySkill = data.by_skill ?? []
   const byCog = data.by_cognitive_level ?? []
-  const strengthsAxis = byAxis.filter((r) => r.logro_pct >= 70).map((r) => ({ name: r.dimension_value, pct: r.logro_pct }))
-  const strengthsSkill = bySkill.filter((r) => r.logro_pct >= 70).map((r) => ({ name: r.dimension_value, pct: r.logro_pct }))
-  const weakAxis = byAxis.filter((r) => r.logro_pct < 50).map((r) => ({ name: r.dimension_value, pct: r.logro_pct }))
-  const weakSkill = bySkill.filter((r) => r.logro_pct < 50).map((r) => ({ name: r.dimension_value, pct: r.logro_pct }))
-  const weakCog = byCog.filter((r) => r.logro_pct < 50).map((r) => ({ name: r.dimension_value, pct: r.logro_pct }))
+  const strengthsAxis = byAxis.filter((r) => typeof r.logro_pct === "number" && r.logro_pct >= 70).map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
+  const strengthsSkill = bySkill.filter((r) => typeof r.logro_pct === "number" && r.logro_pct >= 70).map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
+  const weakAxis = byAxis.filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50).map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
+  const weakSkill = bySkill.filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50).map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
+  const weakCog = byCog.filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50).map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
   const recommendations = [
     ...weakSkill.map((s) => s.name),
     ...weakAxis.map((a) => a.name),
@@ -231,6 +272,29 @@ export default function PedagogicalAnalysisModal({
           )}
           {!loading && !error && data && showAnalysis && (
             <>
+              {data.projections && (
+                <div className="space-y-3 rounded-md border border-[var(--border-color)] bg-[var(--bg-muted)] p-4">
+                  <h4 className="font-semibold text-[var(--text-accent)]">PROYECCIÓN DE ESTÁNDARES NACIONALES</h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
+                      <p className="text-xs font-medium text-[var(--text-muted)]">SIMCE (ESTIMADO)</p>
+                      <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.simce_estimated)}</p>
+                    </div>
+                    <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
+                      <p className="text-xs font-medium text-[var(--text-muted)]">PAES (ESTIMADO)</p>
+                      <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.paes_estimated)}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="font-medium text-[var(--text-muted)]">NIVEL DE DESEMPEÑO:</span>
+                    <span
+                      className={`inline-flex items-center rounded-full border px-3 py-1 font-semibold ${levelBadgeClass(data.projections.level_label)}`}
+                    >
+                      {data.projections.level_label ? data.projections.level_label.toUpperCase() : "—"}
+                    </span>
+                  </div>
+                </div>
+              )}
               {summary && (
                 <div className="rounded-md border bg-[var(--bg-muted)] p-3 space-y-2">
                   <h4 className="font-semibold text-[var(--text-accent)]">Resumen del alumno</h4>
@@ -277,12 +341,12 @@ export default function PedagogicalAnalysisModal({
                     <TableBody>
                       {data.by_axis.map((r, i) => (
                         <TableRow key={i}>
-                          <TableCell>{r.dimension_value}</TableCell>
+                          <TableCell>{formatPedagogicalDisplayText(r.dimension_value)}</TableCell>
                           <TableCell>{r.score_obtained}</TableCell>
                           <TableCell>{r.score_max}</TableCell>
                           <TableCell>
-                            <span className={r.logro_pct >= 70 ? "text-green-600" : r.logro_pct < 50 ? "text-amber-600" : ""}>
-                              {r.logro_pct}%
+                            <span className={(r.logro_pct ?? -1) >= 70 ? "text-green-600" : (r.logro_pct ?? 999) < 50 ? "text-amber-600" : ""}>
+                              {formatPct(r.logro_pct)}
                             </span>
                           </TableCell>
                         </TableRow>
@@ -306,12 +370,12 @@ export default function PedagogicalAnalysisModal({
                     <TableBody>
                       {data.by_skill.map((r, i) => (
                         <TableRow key={i}>
-                          <TableCell>{r.dimension_value}</TableCell>
+                          <TableCell>{formatPedagogicalDisplayText(r.dimension_value)}</TableCell>
                           <TableCell>{r.score_obtained}</TableCell>
                           <TableCell>{r.score_max}</TableCell>
                           <TableCell>
-                            <span className={r.logro_pct >= 70 ? "text-green-600" : r.logro_pct < 50 ? "text-amber-600" : ""}>
-                              {r.logro_pct}%
+                            <span className={(r.logro_pct ?? -1) >= 70 ? "text-green-600" : (r.logro_pct ?? 999) < 50 ? "text-amber-600" : ""}>
+                              {formatPct(r.logro_pct)}
                             </span>
                           </TableCell>
                         </TableRow>
@@ -335,10 +399,10 @@ export default function PedagogicalAnalysisModal({
                     <TableBody>
                       {data.by_cognitive_level.map((r, i) => (
                         <TableRow key={i}>
-                          <TableCell>{r.dimension_value}</TableCell>
+                          <TableCell>{formatPedagogicalDisplayText(r.dimension_value)}</TableCell>
                           <TableCell>{r.score_obtained}</TableCell>
                           <TableCell>{r.score_max}</TableCell>
-                          <TableCell>{r.logro_pct}%</TableCell>
+                          <TableCell>{formatPct(r.logro_pct)}</TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
@@ -365,12 +429,12 @@ export default function PedagogicalAnalysisModal({
                         {data.by_question.map((q, i) => (
                           <TableRow key={i}>
                             <TableCell>{q.item_number}</TableCell>
-                            <TableCell className="max-w-[120px] truncate">{q.axis}</TableCell>
-                            <TableCell className="max-w-[120px] truncate">{q.skill}</TableCell>
+                            <TableCell className="max-w-[120px] truncate">{formatPedagogicalDisplayText(q.axis)}</TableCell>
+                            <TableCell className="max-w-[120px] truncate">{formatPedagogicalDisplayText(q.skill)}</TableCell>
                             <TableCell>{q.cognitive_level}</TableCell>
                             <TableCell>{q.score_obtained}</TableCell>
                             <TableCell>{q.score_max}</TableCell>
-                            <TableCell>{q.logro_pct}%</TableCell>
+                            <TableCell>{formatPct(q.logro_pct)}</TableCell>
                           </TableRow>
                         ))}
                       </TableBody>
@@ -387,7 +451,7 @@ export default function PedagogicalAnalysisModal({
                     <div className="w-full h-[240px]">
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart
-                          data={data.by_axis.map((r) => ({ name: r.dimension_value, logro: r.logro_pct }))}
+                          data={data.by_axis.map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), logro: chartPct(r.logro_pct) }))}
                           margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
                         >
                           <CartesianGrid strokeDasharray="3 3" className="opacity-50" />
@@ -396,7 +460,7 @@ export default function PedagogicalAnalysisModal({
                           <Tooltip formatter={(v: number | undefined) => [`${v ?? 0}%`, "Logro"]} labelFormatter={(l) => l} />
                           <Bar dataKey="logro" name="Logro %" radius={[4, 4, 0, 0]}>
                             {data.by_axis.map((r, i) => (
-                              <Cell key={i} fill={r.logro_pct >= 70 ? "hsl(var(--chart-2))" : r.logro_pct < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
+                              <Cell key={i} fill={(r.logro_pct ?? -1) >= 70 ? "hsl(var(--chart-2))" : (r.logro_pct ?? 999) < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
                             ))}
                           </Bar>
                         </BarChart>
@@ -410,7 +474,7 @@ export default function PedagogicalAnalysisModal({
                     <div className="w-full h-[240px]">
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart
-                          data={data.by_skill.map((r) => ({ name: r.dimension_value, logro: r.logro_pct }))}
+                          data={data.by_skill.map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), logro: chartPct(r.logro_pct) }))}
                           margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
                         >
                           <CartesianGrid strokeDasharray="3 3" className="opacity-50" />
@@ -419,7 +483,7 @@ export default function PedagogicalAnalysisModal({
                           <Tooltip formatter={(v: number | undefined) => [`${v ?? 0}%`, "Logro"]} labelFormatter={(l) => l} />
                           <Bar dataKey="logro" name="Logro %" radius={[4, 4, 0, 0]}>
                             {data.by_skill.map((r, i) => (
-                              <Cell key={i} fill={r.logro_pct >= 70 ? "hsl(var(--chart-2))" : r.logro_pct < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
+                              <Cell key={i} fill={(r.logro_pct ?? -1) >= 70 ? "hsl(var(--chart-2))" : (r.logro_pct ?? 999) < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
                             ))}
                           </Bar>
                         </BarChart>
@@ -433,7 +497,7 @@ export default function PedagogicalAnalysisModal({
                     <div className="w-full h-[240px]">
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart
-                          data={data.by_cognitive_level.map((r) => ({ name: r.dimension_value, logro: r.logro_pct }))}
+                          data={data.by_cognitive_level.map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), logro: chartPct(r.logro_pct) }))}
                           margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
                         >
                           <CartesianGrid strokeDasharray="3 3" className="opacity-50" />
@@ -442,7 +506,7 @@ export default function PedagogicalAnalysisModal({
                           <Tooltip formatter={(v: number | undefined) => [`${v ?? 0}%`, "Logro"]} labelFormatter={(l) => l} />
                           <Bar dataKey="logro" name="Logro %" radius={[4, 4, 0, 0]}>
                             {data.by_cognitive_level.map((r, i) => (
-                              <Cell key={i} fill={r.logro_pct >= 70 ? "hsl(var(--chart-2))" : r.logro_pct < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
+                              <Cell key={i} fill={(r.logro_pct ?? -1) >= 70 ? "hsl(var(--chart-2))" : (r.logro_pct ?? 999) < 50 ? "hsl(var(--chart-4))" : "hsl(var(--chart-1))"} />
                             ))}
                           </Bar>
                         </BarChart>
@@ -464,10 +528,10 @@ export default function PedagogicalAnalysisModal({
                           <p className="font-medium text-[var(--text-accent)] mb-1">El estudiante muestra fortalezas en:</p>
                           <ul className="list-disc list-inside space-y-0.5 text-[var(--text)]">
                             {d.strengthsAxis.map((x, i) => (
-                              <li key={`ax-${i}`}>{x.name} ({x.pct}%)</li>
+                              <li key={`ax-${i}`}>{x.name} ({formatPct(x.pct)})</li>
                             ))}
                             {d.strengthsSkill.map((x, i) => (
-                              <li key={`sk-${i}`}>{x.name} ({x.pct}%)</li>
+                              <li key={`sk-${i}`}>{x.name} ({formatPct(x.pct)})</li>
                             ))}
                           </ul>
                         </div>
@@ -477,13 +541,13 @@ export default function PedagogicalAnalysisModal({
                           <p className="font-medium text-[var(--text-accent)] mb-1">Presenta dificultades en:</p>
                           <ul className="list-disc list-inside space-y-0.5 text-[var(--text)]">
                             {d.weakAxis.map((x, i) => (
-                              <li key={`wax-${i}`}>{x.name} ({x.pct}%)</li>
+                              <li key={`wax-${i}`}>{x.name} ({formatPct(x.pct)})</li>
                             ))}
                             {d.weakSkill.map((x, i) => (
-                              <li key={`wsk-${i}`}>{x.name} ({x.pct}%)</li>
+                              <li key={`wsk-${i}`}>{x.name} ({formatPct(x.pct)})</li>
                             ))}
                             {d.weakCog.map((x, i) => (
-                              <li key={`wcog-${i}`}>Nivel cognitivo: {x.name} ({x.pct}%)</li>
+                              <li key={`wcog-${i}`}>Nivel cognitivo: {x.name} ({formatPct(x.pct)})</li>
                             ))}
                           </ul>
                         </div>
@@ -502,6 +566,15 @@ export default function PedagogicalAnalysisModal({
                   </div>
                 )
               })()}
+              {data.strategic_analysis?.paragraph && (
+                <div className="space-y-3 pt-4 border-t border-[var(--border-color)]">
+                  <h4 className="font-semibold text-[var(--text-accent)]">ANÁLISIS ESTRATÉGICO DEL ESPECIALISTA</h4>
+                  <div className="rounded-md border border-slate-300 bg-white p-4 text-sm leading-6 text-slate-900">
+                    {/* PHASE_3_INFERENCE_SECURITY_V1 */}
+                    {data.strategic_analysis.paragraph}
+                  </div>
+                </div>
+              )}
             </>
           )}
         </div>

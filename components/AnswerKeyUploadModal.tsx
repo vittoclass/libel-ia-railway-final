@@ -1,5 +1,6 @@
 // components/AnswerKeyUploadModal.tsx
 "use client"
+/* eslint-disable @next/next/no-img-element -- Preview de plantilla desde URL/archivo local. */
 import { useState, useCallback, useRef } from "react"
 import {
   X,

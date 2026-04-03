@@ -1,4 +1,5 @@
 "use client"
+/* eslint-disable @next/next/no-img-element -- Preview de hoja en modal OMR. */
 
 /**
  * OMR robusto por archivo (imagen de hoja estándar LibelIA).

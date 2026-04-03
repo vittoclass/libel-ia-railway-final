@@ -1,5 +1,7 @@
 // components/ClosedAnswerOMRModal.tsx
 "use client"
+/* eslint-disable @next/next/no-img-element -- Preview OMR desde imagen. */
+
 import { useState, useEffect, useCallback } from "react"
 import {
   X,

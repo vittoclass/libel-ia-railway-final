@@ -1,5 +1,6 @@
 // EvaluatorClient.tsx - Cliente principal del evaluador (porcentajes, pautas, OMR)
 "use client"
+/* eslint-disable @next/next/no-img-element -- Vistas previas dinámicas (blob/data URL); Next/Image no encaja sin dimensiones estables. */
 import * as React from "react"
 import { useState, useRef, type ChangeEvent, useEffect, useCallback } from "react"
 import { useForm } from "react-hook-form"
@@ -89,6 +90,8 @@ import { TemplateOverlayOMRModal } from "@/app/components/TemplateOverlayOMRModa
 import { OMRSheetGeneratorModal } from "@/app/components/OMRSheetGeneratorModal"
 import { RobustLibeliaOMRModal } from "@/app/components/RobustLibeliaOMRModal"
 import ClosedAnswerOMRModal from "@/app/components/ClosedAnswerOMRModal"
+import DevAdminPanel from "@/app/components/DevAdminPanel"
+import { normalizeRutCanonical } from "@/app/lib/student-identity/rut"
 type ClosedAnswerOMRResult = any
 const SmartCameraModal = dynamic(() => import("@/components/smart-camera-modal"), {
   loading: () => <p>Cargando...</p>,
@@ -961,6 +964,7 @@ const calculateFinalScore = (
 interface StudentGroup {
   id: string
   studentName: string
+  studentRut?: string
   files: FilePreview[]
   retroalimentacion?: RetroalimentacionEstructurada
   puntaje?: string
@@ -1156,7 +1160,49 @@ export default function EvaluatorClient() {
   const [activeTab, setActiveTab] = useState("presentacion")
   const [userEmail, setUserEmail] = useState<string>("")
   const [unassignedFiles, setUnassignedFiles] = useState<FilePreview[]>([])
+  /** Sellado de lote (UUID); persiste en evaluations.batch_id. No interfiere con OMR. */
+  const evaluationBatchIdRef = useRef<string | null>(null)
+  const [evaluationBatchIdUi, setEvaluationBatchIdUi] = useState<string | null>(null)
+  /** Embudo UTP → Dirección: pending_utp | validated | rejected | null si sin fila. */
+  const [batchInstitutionalStatus, setBatchInstitutionalStatus] = useState<string | null>(null)
+  const [batchUtpObservations, setBatchUtpObservations] = useState<string | null>(null)
+  const [submitBatchUtpLoading, setSubmitBatchUtpLoading] = useState(false)
   const [studentGroups, setStudentGroups] = useState<StudentGroup[]>([])
+
+  useEffect(() => {
+    const bid = evaluationBatchIdUi
+    if (!bid) {
+      setBatchInstitutionalStatus(null)
+      setBatchUtpObservations(null)
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const r = await fetch(`/api/evaluation-batches/release-status?batch_id=${encodeURIComponent(bid)}`)
+        const j = (await r.json().catch(() => ({}))) as {
+          status?: string | null
+          utp_observations?: string | null
+        }
+        if (cancelled) return
+        if (r.ok) {
+          setBatchInstitutionalStatus(typeof j.status === "string" ? j.status : null)
+          setBatchUtpObservations(typeof j.utp_observations === "string" ? j.utp_observations : null)
+        } else {
+          setBatchInstitutionalStatus(null)
+          setBatchUtpObservations(null)
+        }
+      } catch {
+        if (!cancelled) {
+          setBatchInstitutionalStatus(null)
+          setBatchUtpObservations(null)
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [evaluationBatchIdUi])
   const [isCameraOpen, setIsCameraOpen] = useState(false)
   // 🚨 NUEVOS ESTADOS PARA CAPTURA GUIADA
   const [isCaptureModeSelectionOpen, setIsCaptureModeSelectionOpen] = useState(false)
@@ -1200,7 +1246,7 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
   // Estado para el modal de plantilla de respuestas del profesor
   const [isAnswerKeyModalOpen, setIsAnswerKeyModalOpen] = useState(false)
   // Sesión MVP: persistencia Supabase (solo perfil desde API; sin localStorage para teacher_id)
-  const [mainProfile, setMainProfile] = useState<{ profile: { teacher_id: string | null; school_id: string | null } | null; user: { id: string; email: string | null } | null } | null>(null)
+  const [mainProfile, setMainProfile] = useState<{ profile: { teacher_id: string | null; school_id: string | null; role?: string | null } | null; user: { id: string; email: string | null } | null } | null>(null)
   const [showOnboardingModal, setShowOnboardingModal] = useState(false)
   const [onboardingForm, setOnboardingForm] = useState({ teacher_name: "", school_name: "", department: "" })
   const [onboardingSaving, setOnboardingSaving] = useState(false)
@@ -1208,7 +1254,7 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
   const [onboardRefreshFailed, setOnboardRefreshFailed] = useState(false)
   const [hasSessionTeacher, setHasSessionTeacher] = useState(false)
   // Historial (Fase 2A): perfil y evaluaciones del usuario logueado
-  const [historialProfile, setHistorialProfile] = useState<{ profile: { teacher_id: string } | null; user: { id: string; email: string | null } | null } | null>(null)
+  const [historialProfile, setHistorialProfile] = useState<{ profile: { teacher_id: string; role?: string | null } | null; user: { id: string; email: string | null } | null } | null>(null)
   const [historialEvaluations, setHistorialEvaluations] = useState<Array<{ id: string; title: string | null; subject: string | null; evaluated_at: string | null; grade_chile: number | null }>>([])
   const [historialDetailId, setHistorialDetailId] = useState<string | null>(null)
   const [historialDetail, setHistorialDetail] = useState<{ evaluation: unknown; items: unknown[]; summary: unknown } | null>(null)
@@ -1317,6 +1363,13 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
   const [verDebug, setVerDebug] = useState<{ evaluationId: string; status: number; error: string | null; payload: unknown } | null>(null)
   /** Solo development: diagnóstico flujo Archivar */
   const [archiveDebug, setArchiveDebug] = useState<{ total: number; rows: Array<{ id: string; status: string | null; canShowArchive: boolean }>; lastClick?: string; lastResponse?: { status: number; json: unknown } } | null>(null)
+  // DATA_SCIENCE_FIX_V1: confirmacion modal para borrado fisico.
+  const [deleteEvaluationDialog, setDeleteEvaluationDialog] = useState<{ open: boolean; id: string | null; title: string | null }>({
+    open: false,
+    id: null,
+    title: null,
+  })
+  const [deleteEvaluationLoading, setDeleteEvaluationLoading] = useState(false)
   /** Solo development: panel Debug UI colapsable */
   const [debugPanelOpen, setDebugPanelOpen] = useState(false)
   const [studentsModalEvalId, setStudentsModalEvalId] = useState<string | null>(null)
@@ -1333,7 +1386,7 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
     source_exam_id: "",
   })
   const [showRetrySaveButton, setShowRetrySaveButton] = useState(false)
-  const lastFailedSaveRef = React.useRef<{ result: Record<string, unknown>; opts: { teacher_id?: string; school_id?: string; title?: string; subject?: string; course_id?: string; student_name?: string } } | null>(null)
+  const lastFailedSaveRef = React.useRef<{ result: Record<string, unknown>; opts: { teacher_id?: string; school_id?: string; title?: string; subject?: string; course_id?: string; student_name?: string; student_rut?: string } } | null>(null)
 
   const [studentsList, setStudentsList] = useState<Array<{ id: string; student_name: string; course_label: string | null; evaluations_count: number; avg_score: number | null }>>([])
   const [studentsListLoading, setStudentsListLoading] = useState(false)
@@ -1535,6 +1588,44 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
     }
   }, [courseDiagnosisOpen, courseDiagnosisLabel])
 
+  const openDeleteEvaluationDialog = useCallback((evaluationId: string, title?: string | null) => {
+    setDeleteEvaluationDialog({ open: true, id: evaluationId, title: title ?? null })
+  }, [])
+
+  const handleConfirmDeleteEvaluation = useCallback(async () => {
+    if (!deleteEvaluationDialog.id) return
+    setDeleteEvaluationLoading(true)
+    try {
+      // LOGICA_ANTERIOR_LOCAL: solo existia archivado, no borrado fisico.
+      // DATA_SCIENCE_FIX_V1: borrado fisico via endpoint DELETE.
+      const r = await fetch(`/api/evaluations/${deleteEvaluationDialog.id}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+      })
+      const j = await r.json().catch(() => ({}))
+      if (r.ok) {
+        setEvaluacionesList((prev) => prev.filter((item) => item.id !== deleteEvaluationDialog.id))
+        if (evaluacionesDetailId === deleteEvaluationDialog.id) {
+          setEvaluacionesDetailId(null)
+          setEvaluacionesDetail(null)
+          setEvaluacionesDetailError(null)
+          setEvaluacionesDetailItemsDraft(null)
+        }
+        toast({ title: "Evaluación eliminada definitivamente." })
+        setDeleteEvaluationDialog({ open: false, id: null, title: null })
+        loadEvaluationsList().catch(() => {})
+        loadStudentsList().catch(() => {})
+      } else {
+        toast({ title: j?.message || j?.error || "Error al eliminar evaluación", variant: "destructive" })
+      }
+    } catch {
+      toast({ title: "Error al eliminar evaluación", variant: "destructive" })
+    } finally {
+      setDeleteEvaluationLoading(false)
+    }
+  }, [deleteEvaluationDialog.id, evaluacionesDetailId, loadEvaluationsList, loadStudentsList, toast])
+
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: {
@@ -1656,6 +1747,32 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
     const fromGroup = group?.studentName != null ? String(group.studentName).trim() : ""
     const fromPayload = payload?.opts?.student_name != null ? String(payload.opts.student_name).trim() : ""
     return fromGroup || fromPayload || ""
+  }
+
+  function getFinalStudentRutForSync(
+    group: { studentRut?: string } | null | undefined,
+    payload?: { opts?: { student_rut?: string } } | null
+  ): string | null {
+    const fromGroup = group?.studentRut != null ? String(group.studentRut).trim() : ""
+    const fromPayload = payload?.opts?.student_rut != null ? String(payload.opts.student_rut).trim() : ""
+    return normalizeRutCanonical(fromGroup || fromPayload)
+  }
+
+  async function registerAuditAction(action: string, targetId: string, studentOrCourse: string) {
+    try {
+      await fetch("/api/dashboard/audit/log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          targetId,
+          targetType: "evaluation",
+          metadata: { student_or_course: studentOrCourse },
+        }),
+      })
+    } catch {
+      // Silencioso para no bloquear el flujo operativo del docente.
+    }
   }
 
   /** Curso final visible para sync-student. Fuente: form.curso o payload.opts.course_id (retry). */
@@ -1803,6 +1920,7 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
       Array.from({ length: count }, (_, i) => ({
         id: `student-${Date.now()}-${i}`,
         studentName: `Alumno ${i + 1}`,
+        studentRut: "",
         files: [],
         isEvaluated: false,
         isEvaluating: false,
@@ -1827,6 +1945,10 @@ const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKey
       return false
     })
     if (validFiles.length === 0) return
+    if (!evaluationBatchIdRef.current) {
+      evaluationBatchIdRef.current = crypto.randomUUID()
+      setEvaluationBatchIdUi(evaluationBatchIdRef.current)
+    }
     validFiles.forEach((file) => {
       const reader = new FileReader()
       reader.onload = (e) => {
@@ -1871,6 +1993,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           file,
           previewUrl: URL.createObjectURL(file),
           dataUrl,
+        }
+        if (!evaluationBatchIdRef.current) {
+          evaluationBatchIdRef.current = crypto.randomUUID()
+          setEvaluationBatchIdUi(evaluationBatchIdRef.current)
         }
         setUnassignedFiles((prev) => [...prev, filePreview])
         handleOpenClosedAnswerOMR(dataUrl)
@@ -1989,6 +2115,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   }
   const updateStudentName = (groupId: string, newName: string) =>
     setStudentGroups((groups) => groups.map((g) => (g.id === groupId ? { ...g, studentName: newName } : g)))
+  const updateStudentRut = (groupId: string, newRut: string) =>
+    setStudentGroups((groups) => groups.map((g) => (g.id === groupId ? { ...g, studentRut: newRut } : g)))
   const assignFileToGroup = (fileId: string, groupId: string) => {
     const fileToMove = unassignedFiles.find((f) => f.id === fileId)
     if (!fileToMove) return
@@ -2256,6 +2384,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   // Función para manejar la evaluación de un solo grupo (usada para confirmación OMR individual)
   const handleEvaluateSingleGroup = async (groupId: string) => {
+    if (!evaluationBatchIdRef.current) {
+      evaluationBatchIdRef.current = crypto.randomUUID()
+      setEvaluationBatchIdUi(evaluationBatchIdRef.current)
+    }
     const {
       rubrica,
       pauta,
@@ -2353,7 +2485,9 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       evaluation_subject: form.getValues("asignatura") ?? "",
       course_id: form.getValues("curso") ?? "",
       nombreEstudiante: group.studentName && String(group.studentName).trim() !== "" ? String(group.studentName).trim() : undefined,
+      student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
       omrTemplateVariant: selectedOmrTemplateVariant,
+      evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
     }
 
     const result = await evaluate(payload)
@@ -2376,6 +2510,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               lastFailedSaveRef.current = null
               ;(async () => {
                 const finalStudentName = getFinalStudentNameForSync(group, null)
+                const finalStudentRut = getFinalStudentRutForSync(group, null)
                 const finalCourseLabel = getFinalCourseLabel(null)
                 if (!finalStudentName) {
                   setLastStudentSyncResult({
@@ -2398,6 +2533,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                     body: JSON.stringify({
                       student_name: finalStudentName,
                       course_label: finalCourseLabel,
+                      student_rut: finalStudentRut,
                     }),
                   })
                   const j = await r.json()
@@ -2415,6 +2551,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                     loadStudentsList()
                     loadEvaluationsList()
                     setStudentsListFetchKey((k) => k + 1)
+                    await registerAuditAction(
+                      "ALUMNO_EDITADO",
+                      evalId,
+                      `${finalStudentName}${finalCourseLabel ? ` · ${finalCourseLabel}` : ""}`,
+                    )
                   } else {
                     toast({ title: "La evaluación se guardó, pero no se pudo sincronizar el estudiante", variant: "default" })
                   }
@@ -2461,6 +2602,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                 subject: form.getValues("asignatura") || undefined,
                 course_id: form.getValues("curso") || undefined,
                 student_name: group.studentName && String(group.studentName).trim() !== "" ? String(group.studentName).trim() : undefined,
+                student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
               },
             }
             setShowRetrySaveButton(true)
@@ -2512,6 +2654,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   // Función para manejar evaluación masiva en lotes paralelos (3 lotes x 45 simultáneos)
   const handleEvaluateGroups = async (groupIDsToEvaluate: string[]) => {
+    if (!evaluationBatchIdRef.current) {
+      evaluationBatchIdRef.current = crypto.randomUUID()
+      setEvaluationBatchIdUi(evaluationBatchIdRef.current)
+    }
     const {
       rubrica,
       pauta,
@@ -2659,12 +2805,14 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         evaluation_subject: asignatura ?? "",
         course_id: curso ?? "",
         nombreEstudiante: group.studentName && String(group.studentName).trim() !== "" ? String(group.studentName).trim() : undefined,
+        student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
         omrTemplateVariant: selectedOmrTemplateVariant,
         answerKeyFromTemplate: buildTeacherAnswerKeyFromFormPauta(
           String(pautaEstructuradaFinal),
           String(pautaCorrectaAlternativasFinal),
           (tipoPrueba || "mixta") as any,
         ),
+        evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
       },
     }))
 
@@ -2765,6 +2913,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                 const evalId = (msg.data as { evaluation_id: string }).evaluation_id
                 const group = studentGroups.find((g) => g.id === msg.groupId)
                 const finalStudentName = getFinalStudentNameForSync(group ?? undefined, null)
+                const finalStudentRut = getFinalStudentRutForSync(group ?? undefined, null)
                 const finalCourseLabel = getFinalCourseLabel(null)
                 if (finalStudentName) {
                   fetch(`/api/evaluations/${evalId}/sync-student`, {
@@ -2773,6 +2922,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                     body: JSON.stringify({
                       student_name: finalStudentName,
                       course_label: finalCourseLabel,
+                      student_rut: finalStudentRut,
                     }),
                   })
                     .then(async (res) => {
@@ -2791,6 +2941,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                         loadStudentsList()
                         loadEvaluationsList()
                         setStudentsListFetchKey((k) => k + 1)
+                        await registerAuditAction(
+                          "ALUMNO_EDITADO",
+                          evalId,
+                          `${finalStudentName}${finalCourseLabel ? ` · ${finalCourseLabel}` : ""}`,
+                        )
                       } else {
                         toast({ title: "La evaluación se guardó, pero no se pudo sincronizar el estudiante", variant: "default" })
                       }
@@ -2950,6 +3105,16 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   const cursoLabel = isSuperior ? "Sección" : "Curso"
   const departamentoLabel = isSuperior ? "Escuela/Carrera" : "Departamento"
   const rootThemeClass = activeTab === "inicio" ? "theme-ocaso" : theme
+  const currentEmail = String(mainProfile?.user?.email ?? "").toLowerCase()
+  const currentRole = String(mainProfile?.profile?.role ?? "").toUpperCase()
+  const isIvan =
+    currentEmail.includes("ivan") ||
+    (typeof process !== "undefined" &&
+      process.env.NEXT_PUBLIC_DEV_MASTER_EMAIL != null &&
+      currentEmail === String(process.env.NEXT_PUBLIC_DEV_MASTER_EMAIL).toLowerCase())
+  const isAdminRole =
+    currentRole === "DIRECCION" || currentRole === "UTP" || currentRole === "ADMIN_INSTITUCION"
+  const canSeePanelColegio = isIvan || isAdminRole
 
   return (
     <EvaluatorRootDiv className={rootThemeClass}>
@@ -3407,6 +3572,15 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               <BookOpen className="mr-2 h-4 w-4 inline" />
               Pruebas base
             </TabsTrigger>
+            {canSeePanelColegio && (
+              <a
+                href="/dashboard/institucion"
+                className="shrink-0 whitespace-nowrap px-3 py-1.5 text-sm inline-flex items-center rounded-md border border-[var(--border-color)] bg-white hover:bg-[var(--bg-muted-subtle)]"
+              >
+                <Sparkles className="mr-2 h-4 w-4 inline" />
+                Panel Colegio
+              </a>
+            )}
           </TabsList>
           <TabsContent value="evaluator" className="space-y-8 mt-4">
             <div className="flex items-center gap-3">
@@ -4148,6 +4322,102 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                     </div>
                   </div>
 
+                  <div className="p-3 rounded-lg border border-slate-200 bg-slate-50/80 dark:bg-slate-900/40 flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs text-[var(--text-secondary)] max-w-[min(100%,42rem)]">
+                      <span className="font-semibold text-[var(--text-primary)]">Lote de carga</span>
+                      {evaluationBatchIdUi ? (
+                        <span className="ml-2 font-mono text-[11px] break-all">{evaluationBatchIdUi}</span>
+                      ) : (
+                        <span className="ml-2 italic">Se asigna al subir la primera hoja o al iniciar evaluación.</span>
+                      )}
+                      {evaluationBatchIdUi && batchInstitutionalStatus && (
+                        <span className="ml-2 block mt-1 text-[11px] text-slate-600 dark:text-slate-400">
+                          Estado institucional:{" "}
+                          <strong>
+                            {batchInstitutionalStatus === "pending_utp"
+                              ? "En revisión UTP"
+                              : batchInstitutionalStatus === "validated"
+                                ? "Validado UTP (visible Dirección)"
+                                : batchInstitutionalStatus === "rejected"
+                                  ? "Devuelto por UTP"
+                                  : batchInstitutionalStatus}
+                          </strong>
+                          {batchInstitutionalStatus === "rejected" && batchUtpObservations ? (
+                            <span className="block mt-0.5 opacity-90">Obs.: {batchUtpObservations}</span>
+                          ) : null}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        className="text-xs"
+                        disabled={
+                          !evaluationBatchIdUi ||
+                          submitBatchUtpLoading ||
+                          batchInstitutionalStatus === "pending_utp" ||
+                          batchInstitutionalStatus === "validated"
+                        }
+                        onClick={async () => {
+                          if (!evaluationBatchIdUi) return
+                          setSubmitBatchUtpLoading(true)
+                          try {
+                            const r = await fetch("/api/evaluation-batches/submit-utp-review", {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ batch_id: evaluationBatchIdUi }),
+                            })
+                            const j = (await r.json().catch(() => ({}))) as { error?: string; message?: string }
+                            if (!r.ok) {
+                              toast({
+                                title: "No se pudo enviar",
+                                description: j?.error ?? "Error",
+                                variant: "destructive",
+                              })
+                              return
+                            }
+                            toast({
+                              title: "Enviado a UTP",
+                              description: j?.message ?? "El lote quedó en revisión.",
+                            })
+                            setBatchInstitutionalStatus("pending_utp")
+                            setBatchUtpObservations(null)
+                          } catch {
+                            toast({
+                              title: "Error de red",
+                              variant: "destructive",
+                            })
+                          } finally {
+                            setSubmitBatchUtpLoading(false)
+                          }
+                        }}
+                      >
+                        {submitBatchUtpLoading ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin mr-1 inline" aria-hidden />
+                        ) : (
+                          <Send className="h-3.5 w-3.5 mr-1 inline" aria-hidden />
+                        )}
+                        Enviar a Revisión UTP
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="text-xs shrink-0"
+                        onClick={() => {
+                          evaluationBatchIdRef.current = null
+                          setEvaluationBatchIdUi(null)
+                          setBatchInstitutionalStatus(null)
+                          setBatchUtpObservations(null)
+                        }}
+                      >
+                        Nuevo lote
+                      </Button>
+                    </div>
+                  </div>
+
                   {/* Agrupación automática por reglas (solo UI; no toca evaluación ni contratos). */}
                   {studentGroups.length > 0 ? (
                     <div className="p-4 rounded-xl border-2 border-indigo-200 dark:border-indigo-800 bg-indigo-50/30 dark:bg-indigo-950/20 space-y-3">
@@ -4345,6 +4615,15 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                             <span className="text-xs font-medium px-2 py-1 rounded-full border bg-white/80 dark:bg-gray-900/80">
                               {stateLabel}
                             </span>
+                          </div>
+                          <div className="mb-3">
+                            <Label className="text-xs text-[var(--text-muted)]">RUT (secundario, ancla técnica)</Label>
+                            <Input
+                              className="mt-1 max-w-xs"
+                              placeholder="12.345.678-9"
+                              value={group.studentRut ?? ""}
+                              onChange={(e) => updateStudentRut(group.id, e.target.value)}
+                            />
                           </div>
 
                           <Button
@@ -6031,12 +6310,13 @@ h-4 w-4 animate-spin"
                             loadEvaluationsList()
                             const evalId = j.evaluation_id
                             const finalStudentName = getFinalStudentNameForSync(null, payload)
+                            const finalStudentRut = getFinalStudentRutForSync(null, payload)
                             const finalCourseLabel = getFinalCourseLabel(payload)
                             if (evalId && finalStudentName) {
                               fetch(`/api/evaluations/${evalId}/sync-student`, {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ student_name: finalStudentName, course_label: finalCourseLabel }),
+                                body: JSON.stringify({ student_name: finalStudentName, course_label: finalCourseLabel, student_rut: finalStudentRut }),
                               })
                                 .then(async (res) => {
                                   const data = await res.json()
@@ -6054,6 +6334,11 @@ h-4 w-4 animate-spin"
                                     loadStudentsList()
                                     loadEvaluationsList()
                                     setStudentsListFetchKey((k) => k + 1)
+                                    await registerAuditAction(
+                                      "ALUMNO_EDITADO",
+                                      evalId,
+                                      `${finalStudentName}${finalCourseLabel ? ` · ${finalCourseLabel}` : ""}`,
+                                    )
                                   } else {
                                     toast({ title: "La evaluación se guardó, pero no se pudo sincronizar el estudiante", variant: "default" })
                                   }
@@ -6265,6 +6550,17 @@ h-4 w-4 animate-spin"
                                   <Archive className="h-4 w-4" />
                                 </Button>
                               )}
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  title="Eliminar"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    openDeleteEvaluationDialog(ev.id, ev.title ?? null)
+                                  }}
+                                >
+                                  <Trash2 className="h-4 w-4 text-red-600" />
+                                </Button>
                             </TableCell>
                           </TableRow>
                         )
@@ -6827,6 +7123,14 @@ h-4 w-4 animate-spin"
                                     >
                                       <Archive className="h-4 w-4" />
                                     </Button>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      title="Eliminar"
+                                      onClick={() => openDeleteEvaluationDialog(e.id, e.title ?? null)}
+                                    >
+                                      <Trash2 className="h-4 w-4 text-red-600" />
+                                    </Button>
                                   </TableCell>
                                 </TableRow>
                               ))}
@@ -6911,6 +7215,14 @@ h-4 w-4 animate-spin"
                                       >
                                         Ver estudiantes
                                       </Button>
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        title="Eliminar"
+                                        onClick={() => openDeleteEvaluationDialog(e.id, e.title ?? null)}
+                                      >
+                                        <Trash2 className="h-4 w-4 text-red-600" />
+                                      </Button>
                                     </TableCell>
                                   </TableRow>
                                 ))
@@ -6924,6 +7236,47 @@ h-4 w-4 animate-spin"
                 )}
               </CardContent>
             </Card>
+            <Dialog
+              open={deleteEvaluationDialog.open}
+              onOpenChange={(open) => {
+                if (!open) {
+                  setDeleteEvaluationDialog({ open: false, id: null, title: null })
+                } else {
+                  setDeleteEvaluationDialog((prev) => ({ ...prev, open: true }))
+                }
+              }}
+            >
+              <DialogContent className="max-w-md">
+                <DialogHeader>
+                  <DialogTitle>Eliminar evaluación</DialogTitle>
+                </DialogHeader>
+                <div className="text-sm text-[var(--text-muted)] space-y-2">
+                  <p>
+                    Esta acción eliminará definitivamente la evaluación y sus datos asociados.
+                  </p>
+                  <p>
+                    <strong>Título:</strong> {deleteEvaluationDialog.title || "(Sin título)"}
+                  </p>
+                </div>
+                <DialogFooter>
+                  <Button
+                    variant="outline"
+                    onClick={() => setDeleteEvaluationDialog({ open: false, id: null, title: null })}
+                    disabled={deleteEvaluationLoading}
+                  >
+                    Cancelar
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    onClick={handleConfirmDeleteEvaluation}
+                    disabled={deleteEvaluationLoading || !deleteEvaluationDialog.id}
+                  >
+                    {deleteEvaluationLoading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+                    Eliminar
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
             <Dialog open={courseDiagnosisOpen} onOpenChange={(open) => { if (!open) { setCourseDiagnosisOpen(false); setCourseDiagnosisLabel(null); setCourseDiagnosisData(null); setCourseDiagnosisRaw(null); setShowDiagnosticoCrudo(false) } }}>
               <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
                 <DialogHeader>
@@ -8023,6 +8376,7 @@ h-4 w-4 animate-spin"
           setIsAnswerKeyModalOpen(false)
         }}
       />
+      <DevAdminPanel />
     </EvaluatorRootDiv>
   )
 }

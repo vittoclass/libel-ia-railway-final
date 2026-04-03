@@ -1,4 +1,5 @@
 "use client"
+/* eslint-disable @next/next/no-img-element -- Secuencia de capturas (data URL). */
 
 import { useState, useRef, useCallback, useEffect } from "react"
 import { X, Camera, RotateCw, Zap, CheckCircle2 } from "lucide-react"

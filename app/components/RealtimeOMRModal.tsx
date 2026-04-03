@@ -1,4 +1,5 @@
 "use client"
+/* eslint-disable @next/next/no-img-element -- Capturas en vivo / data URL en modal OMR. */
 
 /**
  * Flujo nuevo: OMR en tiempo real con cámara.

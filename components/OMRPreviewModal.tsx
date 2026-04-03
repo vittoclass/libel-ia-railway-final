@@ -1,5 +1,6 @@
 // components/OMRPreviewModal.tsx
 'use client';
+/* eslint-disable @next/next/no-img-element -- Zoom/preview de ítems OMR. */
 import { useState, useEffect } from 'react';
 import { X, RotateCcw, AlertCircle, Eye, ZoomIn } from 'lucide-react'; 
 import { Button } from '@/components/ui/button';

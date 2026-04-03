@@ -1,4 +1,5 @@
 // app/presentacion/page.tsx
+/* eslint-disable @next/next/no-img-element -- Logo como data URL SVG embebida. */
 import Link from "next/link";
 import { Metadata } from "next";
 import { Button } from "@/components/ui/button";

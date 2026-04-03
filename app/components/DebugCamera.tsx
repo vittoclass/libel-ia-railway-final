@@ -1,5 +1,6 @@
 // components/DebugCamera.tsx
 'use client';
+/* eslint-disable @next/next/no-img-element -- Data URL desde canvas (debug). */
 import { useState, useRef, useEffect } from 'react';
 
 export default function DebugCamera({ onClose }: { onClose: () => void }) {

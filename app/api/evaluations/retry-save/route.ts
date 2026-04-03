@@ -45,6 +45,10 @@ export async function POST(req: NextRequest) {
       subject: body.subject != null ? String(body.subject).trim() || undefined : undefined,
       course_id: body.course_id != null ? String(body.course_id).trim() || undefined : undefined,
       student_name: body.student_name != null && String(body.student_name).trim() !== "" ? String(body.student_name).trim() : undefined,
+      batch_id:
+        body.evaluation_batch_id != null && String(body.evaluation_batch_id).trim() !== ""
+          ? String(body.evaluation_batch_id).trim()
+          : undefined,
     }
 
     const saveResult = await persistEvaluation(result, opts)

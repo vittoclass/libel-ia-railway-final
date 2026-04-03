@@ -6,6 +6,10 @@
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { ensureStudentProfile } from "@/app/lib/student-profile-link"
 import { evaluateSkillsFromEvaluation } from "@/app/lib/skill-evaluator"
+import {
+  attachStudentIdToEvaluationArtifacts,
+  upsertStudentIdentity,
+} from "@/app/lib/student-identity/repository"
 import type { SupabaseClient } from "@supabase/supabase-js"
 
 export interface PersistEvaluationOpts {
@@ -17,10 +21,14 @@ export interface PersistEvaluationOpts {
   subject?: string | null
   /** Un nombre confirmado (frontend o detectado). Se guarda exactamente. */
   student_name?: string | null
+  /** RUT opcional del estudiante para identidad histórica (si no viene, fallback por nombre). */
+  student_rut?: string | null
   /** Varios nombres confirmados; cada uno se guarda como fila independiente. Si se usa, tiene prioridad sobre student_name. */
   student_names?: string[] | null
   teacher_name?: string | null
   course?: string | null
+  /** UUID de lote (EvaluatorClient); opcional, reversible si se ignora en BD. */
+  batch_id?: string | null
 }
 
 export interface EvaluationResultForPersist {
@@ -139,6 +147,8 @@ const isDev = process.env.NODE_ENV !== "production"
     course_label: safeCourseLabel,
   }
   if (evaluationCourseId) evaluationInsert.course_id = evaluationCourseId
+  const batchIdOpt = opts.batch_id != null && String(opts.batch_id).trim() !== "" ? String(opts.batch_id).trim() : null
+  if (batchIdOpt && isValidUUID(batchIdOpt)) evaluationInsert.batch_id = batchIdOpt
 
   const { data: evaluation, error: evalError } = await supabase
     .from("evaluations")
@@ -243,6 +253,12 @@ const isDev = process.env.NODE_ENV !== "production"
   if (isDev) console.info("[persist] items inserted", itemsInserted)
 
   const resumen = result.retroalimentacion?.resumen_general
+  const studentNameRawForSummary =
+    confirmedStudents[0] ??
+    (opts.student_name != null && String(opts.student_name).trim() !== "" ? String(opts.student_name).trim() : null) ??
+    (result.nombreEstudianteDetectado != null && String(result.nombreEstudianteDetectado).trim() !== ""
+      ? String(result.nombreEstudianteDetectado).trim()
+      : null)
   let rawSafe: Record<string, unknown> | null = null
   try {
     rawSafe = result as unknown as Record<string, unknown>
@@ -256,6 +272,7 @@ const isDev = process.env.NODE_ENV !== "production"
   const { error: sumErr } = await supabase.from("evaluation_summaries").insert({
     evaluation_id: evaluationId,
     grade_chile: result.nota ?? null,
+    student_name_raw: studentNameRawForSummary,
     strengths: resumen?.fortalezas ?? null,
     improvements: resumen?.areas_mejora ?? null,
     raw: rawSafe,
@@ -304,6 +321,29 @@ const isDev = process.env.NODE_ENV !== "production"
         registerChildError(
           "student_profile_link",
           linkErr instanceof Error ? linkErr.message : String(linkErr)
+        )
+      }
+      // PHASE_4_MEMORY_IDENTITY_V1
+      try {
+        const identity = await upsertStudentIdentity(supabase, {
+          rut: opts.student_rut ?? null,
+          student_name: confirmedName,
+          course_label: safeCourseLabel,
+          institution: null,
+          evaluation_id: evaluationId,
+          evaluated_at: new Date().toISOString(),
+        })
+        if (identity.student_id) {
+          await attachStudentIdToEvaluationArtifacts(supabase, {
+            evaluation_id: evaluationId,
+            student_name: confirmedName,
+            student_id: identity.student_id,
+          })
+        }
+      } catch (identityErr) {
+        registerChildError(
+          "student_identity_upsert",
+          identityErr instanceof Error ? identityErr.message : String(identityErr)
         )
       }
     } catch (e) {

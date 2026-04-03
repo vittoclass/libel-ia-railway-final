@@ -1109,6 +1109,7 @@ export async function POST(req: NextRequest) {
       course_id: courseIdBody,
       evaluation_title: evaluationTitleBody,
       evaluation_subject: evaluationSubjectBody,
+      evaluation_batch_id: evaluationBatchIdBody,
       officialOmrIntegrationEnabled: officialOmrIntegrationEnabledIn,
       officialOmrEngineSelected: officialOmrEngineSelectedIn,
       omrTemplateVariant: omrTemplateVariantIn,
@@ -1970,6 +1971,10 @@ export async function POST(req: NextRequest) {
           title: typeof evaluationTitleBody === "string" ? evaluationTitleBody.trim() || null : null,
           subject: typeof evaluationSubjectBody === "string" ? evaluationSubjectBody.trim() || null : null,
           student_name: confirmedStudentName,
+          batch_id:
+            typeof evaluationBatchIdBody === "string" && evaluationBatchIdBody.trim() !== ""
+              ? evaluationBatchIdBody.trim()
+              : null,
         })
       } catch (e) {
         if (process.env.NODE_ENV !== "production") console.error("[Evaluate] persistEvaluation threw:", e)

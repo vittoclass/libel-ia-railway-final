@@ -144,3 +144,73 @@ export async function GET(
     { status: 200, headers: { "Cache-Control": "no-store" } }
   )
 }
+
+export async function DELETE(
+  _req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params
+  if (!id) {
+    return NextResponse.json(
+      isDev ? { step: "params", message: "id requerido", debug: { id } } : { error: "id requerido" },
+      { status: 400 }
+    )
+  }
+
+  const { user, profile } = await getOrCreateProfile()
+  const teacherId = profile?.teacher_id ?? null
+  if (!user) {
+    return NextResponse.json(
+      isDev ? { step: "auth", message: "No autorizado", debug: { hasUser: false } } : { error: "No autorizado" },
+      { status: 401 }
+    )
+  }
+
+  const supabase = getSupabaseServer()
+  if (!supabase) {
+    return NextResponse.json(
+      isDev ? { step: "config", message: "Supabase no configurado", debug: {} } : { error: "Supabase no configurado" },
+      { status: 503 }
+    )
+  }
+
+  const { data: evaluation, error: evalErr } = await supabase
+    .from("evaluations")
+    .select("id, teacher_id, user_id")
+    .eq("id", id)
+    .maybeSingle()
+
+  if (evalErr || !evaluation) {
+    return NextResponse.json(
+      isDev ? { step: "fetch_evaluation", message: evalErr?.message ?? "Evaluación no encontrada", debug: { id } } : { error: "Evaluación no encontrada" },
+      { status: 404 }
+    )
+  }
+
+  const isOwnerByTeacher = teacherId && evaluation.teacher_id === teacherId
+  const isOwnerByUser = evaluation.user_id && evaluation.user_id === user.id
+  if (!isOwnerByTeacher && !isOwnerByUser) {
+    return NextResponse.json(
+      isDev
+        ? {
+            step: "ownership",
+            message: "No autorizado para esta evaluación",
+            debug: { evaluationTeacherId: evaluation.teacher_id, evaluationUserId: evaluation.user_id, profileTeacherId: teacherId, userId: user.id },
+          }
+        : { error: "No autorizado para esta evaluación" },
+      { status: 403 }
+    )
+  }
+
+  // LOGICA_ANTERIOR_LOCAL: no existia borrado fisico en este endpoint.
+  // DATA_SCIENCE_FIX_V1: eliminacion por fila padre; dependencias se limpian por ON DELETE CASCADE en DB.
+  const { error: deleteErr } = await supabase.from("evaluations").delete().eq("id", id)
+  if (deleteErr) {
+    return NextResponse.json(
+      isDev ? { step: "delete_evaluation", message: deleteErr.message, debug: { id } } : { error: "No se pudo eliminar la evaluación" },
+      { status: 500 }
+    )
+  }
+
+  return NextResponse.json({ ok: true, deleted_evaluation_id: id }, { status: 200 })
+}
