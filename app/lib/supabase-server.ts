@@ -6,7 +6,8 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js"
 
 const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+/** Solo esta variable (no alternativas): clave service_role del proyecto Supabase. */
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()
 
 let _serverClient: SupabaseClient | null = null
 
@@ -15,7 +16,7 @@ let _serverClient: SupabaseClient | null = null
  * Solo usar en servidor (getServerSession, API routes, etc.).
  */
 export function getSupabaseServer(): SupabaseClient | null {
-  if (!supabaseUrl || !supabaseServiceRoleKey) return null
+  if (!supabaseUrl || !supabaseServiceRoleKey?.length) return null
   if (!_serverClient) {
     _serverClient = createClient(supabaseUrl, supabaseServiceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false },
