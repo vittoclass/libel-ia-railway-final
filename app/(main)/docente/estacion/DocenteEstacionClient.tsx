@@ -22,6 +22,7 @@ export function DocenteEstacionClient() {
   const [assignmentId, setAssignmentId] = useState<string | null>(null)
   const [contextRow, setContextRow] = useState<TeacherAssignmentOption | null>(null)
   const [sourceExam, setSourceExam] = useState<SourceExamPick | null>(null)
+  const [batchSessionError, setBatchSessionError] = useState<string | null>(null)
 
   const loadAssignments = useCallback(async () => {
     try {
@@ -65,17 +66,41 @@ export function DocenteEstacionClient() {
 
   useEffect(() => {
     if (!batchId) return
-    void fetch("/api/docente/batch-session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ batch_id: batchId }),
-    }).catch(() => {})
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await fetch("/api/docente/batch-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ batch_id: batchId }),
+        })
+        const j = await res.json().catch(() => ({}))
+        if (cancelled) return
+        if (res.ok && j?.ok) {
+          console.log("Lote registrado con éxito:", batchId)
+          setBatchSessionError(null)
+        } else {
+          const msg = typeof j?.error === "string" ? j.error : `Error HTTP ${res.status}`
+          console.warn("[DocenteEstacion] Registro de lote falló:", batchId, msg)
+          setBatchSessionError(msg)
+        }
+      } catch (e) {
+        if (!cancelled) {
+          console.warn("[DocenteEstacion] batch-session (red):", batchId, e)
+          setBatchSessionError("No se pudo contactar al servidor para registrar el lote.")
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
   }, [batchId])
 
   const onRegenerateBatch = useCallback(() => {
     setBatchId(crypto.randomUUID())
     setSourceExam(null)
+    setBatchSessionError(null)
   }, [])
 
   return (
@@ -122,6 +147,11 @@ export function DocenteEstacionClient() {
 
       <section className="space-y-4">
         <h2 className="text-lg font-semibold text-slate-900 px-1">2. Sincronización móvil</h2>
+        {batchSessionError ? (
+          <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+            <strong>QR no válido en el celular hasta corregir esto:</strong> {batchSessionError}
+          </p>
+        ) : null}
         <BatchMobileSyncPanel batchId={batchId} onRegenerateBatch={onRegenerateBatch} />
       </section>
 

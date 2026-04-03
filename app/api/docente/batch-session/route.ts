@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser, getSupabaseRouteClient } from "@/app/lib/supabase-route"
+import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
 
@@ -50,7 +51,13 @@ export async function POST(req: NextRequest) {
   const expiresAt = new Date()
   expiresAt.setHours(expiresAt.getHours() + TTL_HOURS)
 
-  const { error: upErr } = await routeClient.from("batch_scan_sessions").upsert(
+  /** Service role evita fallos silenciosos por RLS en upsert; ya validamos usuario y perfil arriba. */
+  const server = getSupabaseServer()
+  if (!server) {
+    return NextResponse.json({ error: "Servidor sin service role (SUPABASE_SERVICE_ROLE_KEY)." }, { status: 503 })
+  }
+
+  const { error: upErr } = await server.from("batch_scan_sessions").upsert(
     {
       batch_id: batchId,
       teacher_id: teacherId,
@@ -62,6 +69,7 @@ export async function POST(req: NextRequest) {
   )
 
   if (upErr) {
+    console.error("[batch-session] Error upsert batch_scan_sessions", batchId, upErr.message)
     if (upErr.message.includes("does not exist") || upErr.code === "42P01") {
       return NextResponse.json(
         {
@@ -73,6 +81,8 @@ export async function POST(req: NextRequest) {
     }
     return NextResponse.json({ error: upErr.message }, { status: 500 })
   }
+
+  console.log("[batch-session] Lote registrado con éxito:", batchId)
 
   return NextResponse.json({ ok: true, expires_at: expiresAt.toISOString() })
 }

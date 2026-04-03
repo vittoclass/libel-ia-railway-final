@@ -47,6 +47,34 @@ export function BatchMobileSyncPanel({ batchId, onRegenerateBatch }: Props) {
     setQrLoadFailed(false)
   }, [qrSrc])
 
+  /** Registra el lote en batch_scan_sessions al tener URL de QR lista (mismo ID que en /escaneo/[batchId]). */
+  useEffect(() => {
+    if (!ready || !batchId) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await fetch("/api/docente/batch-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ batch_id: batchId }),
+        })
+        const j = await res.json().catch(() => ({}))
+        if (cancelled) return
+        if (res.ok && j?.ok) {
+          console.log("Lote registrado con éxito:", batchId)
+        } else {
+          console.warn("[BatchMobileSyncPanel] No se pudo registrar lote", batchId, res.status, j)
+        }
+      } catch (e) {
+        if (!cancelled) console.warn("[BatchMobileSyncPanel] batch-session", batchId, e)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [ready, batchId])
+
   async function copyLink() {
     if (!mobileUrl || !navigator.clipboard) return
     try {
@@ -129,7 +157,7 @@ export function BatchMobileSyncPanel({ batchId, onRegenerateBatch }: Props) {
           </Button>
           <p className="text-[11px] text-slate-600 max-w-sm">
             Ruta Storage: <code className="text-[10px]">{"{teacher_id}/{batch_id}/archivo.jpg"}</code>
-            <span className="block mt-1">En el celular debe iniciar sesión con la misma cuenta para subir fotos (Paso C).</span>
+            <span className="block mt-1">El celular abre /escaneo sin login; las fotos suben por la API del servidor.</span>
           </p>
         </div>
       </div>

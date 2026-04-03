@@ -15,6 +15,8 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "batch_id inválido" }, { status: 400 })
   }
 
+  console.log("[batch-session/public] Buscando Lote:", batchId)
+
   const supabase = getSupabaseServer()
   if (!supabase) {
     return NextResponse.json({ ok: false, error: "Servidor no configurado" }, { status: 503 })
@@ -34,6 +36,7 @@ export async function GET(req: NextRequest) {
   }
 
   if (!data) {
+    console.warn("[batch-session/public] Lote no encontrado en BD:", batchId)
     return NextResponse.json({ ok: false, error: "Lote no registrado. Actualice el QR desde la estación PC." }, { status: 404 })
   }
 
