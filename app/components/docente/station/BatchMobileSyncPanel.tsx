@@ -11,6 +11,8 @@ const QR_SIZE_PX = 256
 type Props = {
   batchId: string | null
   onRegenerateBatch: () => void
+  /** Si falla POST batch-session, envía el objeto crudo a la página (mismo debug que DocenteEstacion). */
+  onBatchSessionDebug?: (payload: unknown) => void
 }
 
 /** Origen público para el enlace móvil: mismo host que la barra de direcciones; fuerza https fuera de localhost. */
@@ -27,7 +29,7 @@ function resolveClientPublicOrigin(): string {
   return o
 }
 
-export function BatchMobileSyncPanel({ batchId, onRegenerateBatch }: Props) {
+export function BatchMobileSyncPanel({ batchId, onRegenerateBatch, onBatchSessionDebug }: Props) {
   const [isMounted, setIsMounted] = useState(false)
   const [origin, setOrigin] = useState("")
   const [copied, setCopied] = useState(false)
@@ -65,15 +67,31 @@ export function BatchMobileSyncPanel({ batchId, onRegenerateBatch }: Props) {
           console.log("Lote registrado con éxito:", batchId)
         } else {
           console.warn("[BatchMobileSyncPanel] No se pudo registrar lote", batchId, res.status, j)
+          onBatchSessionDebug?.({
+            source: "BatchMobileSyncPanel",
+            endpoint: "POST /api/docente/batch-session",
+            httpStatus: res.status,
+            batchId,
+            body: j,
+          })
         }
       } catch (e) {
-        if (!cancelled) console.warn("[BatchMobileSyncPanel] batch-session", batchId, e)
+        if (!cancelled) {
+          console.warn("[BatchMobileSyncPanel] batch-session", batchId, e)
+          onBatchSessionDebug?.({
+            source: "BatchMobileSyncPanel",
+            endpoint: "POST /api/docente/batch-session",
+            networkOrParse: true,
+            batchId,
+            exception: e instanceof Error ? { name: e.name, message: e.message, stack: e.stack } : String(e),
+          })
+        }
       }
     })()
     return () => {
       cancelled = true
     }
-  }, [ready, batchId])
+  }, [ready, batchId, onBatchSessionDebug])
 
   async function copyLink() {
     if (!mobileUrl || !navigator.clipboard) return

@@ -40,6 +40,8 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   const [batchGateOk, setBatchGateOk] = useState<boolean | null>(null)
   const [batchGateError, setBatchGateError] = useState<string | null>(null)
+  /** Respuesta cruda de GET /public para depuración en pantalla. */
+  const [publicApiDebug, setPublicApiDebug] = useState<unknown>(null)
   const [uploading, setUploading] = useState(false)
   const [lastOk, setLastOk] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -69,23 +71,53 @@ export function EstacionMovilClient({ batchId }: Props) {
     if (!batchOk) {
       setBatchGateOk(false)
       setBatchGateError("Enlace no válido.")
+      setPublicApiDebug({
+        source: "EstacionMovilClient",
+        step: "uuid_regex",
+        batchId,
+        message: "El batchId de la URL no pasó la validación UUID en el cliente.",
+      })
       return
     }
     setBatchGateError(null)
+    setPublicApiDebug(null)
+    const url = `/api/docente/batch-session/public?batch_id=${encodeURIComponent(batchId)}`
     try {
-      const res = await fetch(`/api/docente/batch-session/public?batch_id=${encodeURIComponent(batchId)}`, {
-        cache: "no-store",
-      })
-      const j = await res.json().catch(() => ({}))
-      if (!res.ok || !j?.ok) {
+      const res = await fetch(url, { cache: "no-store" })
+      const text = await res.text()
+      let parsed: unknown
+      try {
+        parsed = text ? JSON.parse(text) : {}
+      } catch {
+        parsed = { _parseError: true, rawBody: text }
+      }
+      const body = parsed as { ok?: boolean; error?: string }
+      if (!res.ok || !body?.ok) {
         setBatchGateOk(false)
-        setBatchGateError(typeof j?.error === "string" ? j.error : "No se pudo validar el lote.")
+        setBatchGateError(typeof body?.error === "string" ? body.error : `HTTP ${res.status}`)
+        setPublicApiDebug({
+          source: "EstacionMovilClient",
+          endpoint: "GET /api/docente/batch-session/public",
+          httpStatus: res.status,
+          requestUrl: url,
+          batchId,
+          body: parsed,
+        })
         return
       }
       setBatchGateOk(true)
-    } catch {
+      setPublicApiDebug(null)
+    } catch (e) {
       setBatchGateOk(false)
       setBatchGateError("Sin conexión. Intente de nuevo.")
+      setPublicApiDebug({
+        source: "EstacionMovilClient",
+        endpoint: "GET /api/docente/batch-session/public",
+        networkOrFetch: true,
+        batchId,
+        requestUrl: url,
+        exception: e instanceof Error ? { name: e.name, message: e.message, stack: e.stack } : String(e),
+      })
     }
   }, [batchId, batchOk])
 
@@ -229,12 +261,25 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   if (batchGateOk === false) {
     return (
-      <main className="min-h-screen flex flex-col items-center justify-center bg-slate-950 p-6 text-slate-100 gap-3">
-        <AlertCircle className="h-10 w-10 text-amber-400" aria-hidden />
-        <p className="text-sm text-center text-amber-100 max-w-sm">{batchGateError ?? "Lote no disponible."}</p>
-        <Button type="button" variant="secondary" className="mt-2" onClick={() => void validateBatchGate()}>
-          Reintentar
-        </Button>
+      <main className="min-h-screen flex flex-col bg-slate-950 p-4 text-slate-100 gap-4">
+        {publicApiDebug != null ? (
+          <div
+            className="rounded-lg border-4 border-black bg-red-600 p-4 text-white shadow-2xl shrink-0"
+            style={{ fontFamily: "ui-monospace, monospace" }}
+          >
+            <div className="text-xl font-black uppercase tracking-wide mb-2">DEBUG GET /public — sin filtros</div>
+            <pre className="text-xs sm:text-sm whitespace-pre-wrap break-all overflow-x-auto max-h-[55vh] overflow-y-auto">
+              {JSON.stringify(publicApiDebug, null, 2)}
+            </pre>
+          </div>
+        ) : null}
+        <div className="flex flex-col items-center justify-center gap-3 flex-1 px-2">
+          <AlertCircle className="h-10 w-10 text-amber-400" aria-hidden />
+          <p className="text-sm text-center text-amber-100 max-w-sm font-medium">{batchGateError ?? "Lote no disponible."}</p>
+          <Button type="button" variant="secondary" className="mt-2" onClick={() => void validateBatchGate()}>
+            Reintentar
+          </Button>
+        </div>
       </main>
     )
   }

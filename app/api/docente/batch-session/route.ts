@@ -8,40 +8,74 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 
 const TTL_HOURS = 72
 
-/** Serializa error de PostgREST / Supabase para logs (sin datos sensibles). */
-function logSupabaseError(scope: string, batchId: string, err: { message?: string; code?: string; details?: string; hint?: string }) {
-  const payload = {
-    scope,
-    batchId,
-    message: err.message ?? "(sin mensaje)",
+type SupabaseErrShape = { message: string | null; code: string | null; details: string | null; hint: string | null }
+
+function supabasePayload(err: { message?: string; code?: string; details?: string; hint?: string } | null): SupabaseErrShape | null {
+  if (!err) return null
+  return {
+    message: err.message ?? null,
     code: err.code ?? null,
     details: err.details ?? null,
     hint: err.hint ?? null,
   }
-  console.error("[batch-session] Supabase:", JSON.stringify(payload))
+}
+
+function logSupabaseError(scope: string, batchId: string, err: { message?: string; code?: string; details?: string; hint?: string }) {
+  console.error("[batch-session] Supabase:", JSON.stringify({ scope, batchId, ...supabasePayload(err) }))
+}
+
+function exceptionPayload(e: unknown) {
+  if (e instanceof Error) {
+    return { name: e.name, message: e.message, stack: e.stack ?? null }
+  }
+  return { raw: String(e) }
 }
 
 /**
  * POST /api/docente/batch-session — Registra el lote desde la estación PC (autenticado).
- * Upsert en batch_scan_sessions con cliente service role (solo process.env.SUPABASE_SERVICE_ROLE_KEY).
+ * En errores, el JSON incluye siempre `supabase: { message, details, hint, code }` cuando aplica (o null).
  */
 export async function POST(req: NextRequest) {
   try {
     const user = await getAuthUser()
     if (!user) {
-      return NextResponse.json({ error: "No autorizado: sesión no válida o expirada en el PC." }, { status: 401 })
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "No autorizado: sesión no válida o expirada en el PC.",
+          supabase: null,
+          debug: { step: "getAuthUser", userPresent: false },
+        },
+        { status: 401 },
+      )
     }
 
     let body: { batch_id?: string }
     try {
       body = await req.json()
-    } catch {
-      return NextResponse.json({ error: "JSON inválido en el cuerpo de la petición." }, { status: 400 })
+    } catch (parseErr) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "JSON inválido en el cuerpo de la petición.",
+          supabase: null,
+          debug: { step: "parseBody", exception: exceptionPayload(parseErr) },
+        },
+        { status: 400 },
+      )
     }
 
     const batchId = String(body?.batch_id ?? "").trim()
     if (!UUID_REGEX.test(batchId)) {
-      return NextResponse.json({ error: "batch_id inválido: debe ser un UUID v4." }, { status: 400 })
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "batch_id inválido: debe ser un UUID v4.",
+          supabase: null,
+          debug: { step: "validateUuid", received: body?.batch_id ?? null, trimmed: batchId },
+        },
+        { status: 400 },
+      )
     }
 
     const serviceKeyRaw = process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -56,8 +90,15 @@ export async function POST(req: NextRequest) {
       )
       return NextResponse.json(
         {
+          ok: false,
           error:
             "Servidor mal configurado: falta SUPABASE_SERVICE_ROLE_KEY en Railway (o está vacía). No se usa ninguna otra variable para el rol de servicio.",
+          supabase: null,
+          debug: {
+            step: "env.SUPABASE_SERVICE_ROLE_KEY",
+            defined: serviceKeyRaw !== undefined,
+            lengthAfterTrim: serviceKey.length,
+          },
         },
         { status: 503 },
       )
@@ -72,10 +113,12 @@ export async function POST(req: NextRequest) {
       )
       return NextResponse.json(
         {
-          error:
-            urlOk
-              ? "Cliente servidor Supabase no inicializado (revisar SUPABASE_URL o NEXT_PUBLIC_SUPABASE_URL)."
-              : "Falta SUPABASE_URL o NEXT_PUBLIC_SUPABASE_URL además de SUPABASE_SERVICE_ROLE_KEY.",
+          ok: false,
+          error: urlOk
+            ? "Cliente servidor Supabase no inicializado (revisar SUPABASE_URL o NEXT_PUBLIC_SUPABASE_URL)."
+            : "Falta SUPABASE_URL o NEXT_PUBLIC_SUPABASE_URL además de SUPABASE_SERVICE_ROLE_KEY.",
+          supabase: null,
+          debug: { step: "getSupabaseServer", supabaseUrlConfigured: urlOk },
         },
         { status: 503 },
       )
@@ -87,7 +130,15 @@ export async function POST(req: NextRequest) {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       console.error("[batch-session] getSupabaseRouteClient falló:", msg)
-      return NextResponse.json({ error: `Error interno al crear cliente de sesión: ${msg}` }, { status: 500 })
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Error interno al crear cliente de sesión: ${msg}`,
+          supabase: null,
+          debug: { step: "getSupabaseRouteClient", exception: exceptionPayload(e) },
+        },
+        { status: 500 },
+      )
     }
 
     const { data: profile, error: pErr } = await routeClient
@@ -99,7 +150,12 @@ export async function POST(req: NextRequest) {
     if (pErr) {
       logSupabaseError("profiles.select", batchId, pErr)
       return NextResponse.json(
-        { error: `Error al leer perfil: ${pErr.message}${pErr.hint ? ` (${pErr.hint})` : ""}` },
+        {
+          ok: false,
+          error: pErr.message,
+          supabase: supabasePayload(pErr),
+          debug: { step: "profiles.select", batchId, userId: user.id },
+        },
         { status: 500 },
       )
     }
@@ -109,8 +165,17 @@ export async function POST(req: NextRequest) {
     if (!teacherId || !schoolId) {
       return NextResponse.json(
         {
+          ok: false,
           error:
             "Perfil incompleto: asigne teacher_id y school_id al usuario en Supabase (tabla profiles) antes de usar el QR móvil.",
+          supabase: null,
+          debug: {
+            step: "profile.teacher_school",
+            batchId,
+            teacherIdPresent: !!teacherId,
+            schoolIdPresent: !!schoolId,
+            profileRow: profile ?? null,
+          },
         },
         { status: 400 },
       )
@@ -136,42 +201,28 @@ export async function POST(req: NextRequest) {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       console.error("[batch-session] Excepción en upsert (no PostgREST):", batchId, msg, e)
-      return NextResponse.json({ error: `Fallo al registrar lote: ${msg}` }, { status: 500 })
+      return NextResponse.json(
+        {
+          ok: false,
+          error: msg,
+          supabase: null,
+          debug: { step: "batch_scan_sessions.upsert.throw", batchId, row, exception: exceptionPayload(e) },
+        },
+        { status: 500 },
+      )
     }
 
     if (upErr) {
       logSupabaseError("batch_scan_sessions.upsert", batchId, upErr)
-
-      if (upErr.message?.includes("does not exist") || upErr.code === "42P01") {
-        return NextResponse.json(
-          {
-            error:
-              "Tabla batch_scan_sessions no existe en la base de datos. Aplique la migración 20260421120000_batch_scan_sessions.sql en Supabase.",
-          },
-          { status: 503 },
-        )
-      }
-
-      if (upErr.code === "42703" || upErr.message?.toLowerCase().includes("column")) {
-        return NextResponse.json(
-          {
-            error: `Columna o esquema incompatible: ${upErr.message}${upErr.hint ? ` — ${upErr.hint}` : ""}`,
-          },
-          { status: 500 },
-        )
-      }
-
-      if (upErr.code === "42501" || upErr.message?.toLowerCase().includes("permission denied")) {
-        return NextResponse.json(
-          {
-            error: `Permiso denegado en Supabase: ${upErr.message}. Compruebe que SUPABASE_SERVICE_ROLE_KEY sea la clave «service_role» del proyecto.`,
-          },
-          { status: 503 },
-        )
-      }
-
-      const parts = [upErr.message, upErr.details, upErr.hint].filter(Boolean).join(" — ")
-      return NextResponse.json({ error: parts || "Error desconocido al guardar el lote en Supabase." }, { status: 500 })
+      return NextResponse.json(
+        {
+          ok: false,
+          error: upErr.message,
+          supabase: supabasePayload(upErr),
+          debug: { step: "batch_scan_sessions.upsert", batchId, row },
+        },
+        { status: upErr.code === "42P01" ? 503 : upErr.code === "42501" ? 503 : 500 },
+      )
     }
 
     console.log("[batch-session] Lote registrado con éxito:", batchId)
@@ -180,6 +231,14 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     console.error("[batch-session] Error no manejado:", msg, e)
-    return NextResponse.json({ error: `Error interno del servidor: ${msg}` }, { status: 500 })
+    return NextResponse.json(
+      {
+        ok: false,
+        error: msg,
+        supabase: null,
+        debug: { step: "POST.catch", exception: exceptionPayload(e), raw: String(e) },
+      },
+      { status: 500 },
+    )
   }
 }

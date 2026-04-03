@@ -23,6 +23,8 @@ export function DocenteEstacionClient() {
   const [contextRow, setContextRow] = useState<TeacherAssignmentOption | null>(null)
   const [sourceExam, setSourceExam] = useState<SourceExamPick | null>(null)
   const [batchSessionError, setBatchSessionError] = useState<string | null>(null)
+  /** Respuesta cruda de /api/docente/batch-session para depuración en pantalla. */
+  const [debugError, setDebugError] = useState<unknown>(null)
 
   const loadAssignments = useCallback(async () => {
     try {
@@ -80,15 +82,30 @@ export function DocenteEstacionClient() {
         if (res.ok && j?.ok) {
           console.log("Lote registrado con éxito:", batchId)
           setBatchSessionError(null)
+          setDebugError(null)
         } else {
-          const msg = typeof j?.error === "string" ? j.error : `Error HTTP ${res.status}`
-          console.warn("[DocenteEstacion] Registro de lote falló:", batchId, msg)
+          const msg = typeof (j as { error?: string })?.error === "string" ? (j as { error: string }).error : `Error HTTP ${res.status}`
+          console.warn("[DocenteEstacion] Registro de lote falló:", batchId, msg, j)
           setBatchSessionError(msg)
+          setDebugError({
+            source: "DocenteEstacionClient",
+            endpoint: "POST /api/docente/batch-session",
+            httpStatus: res.status,
+            batchId,
+            body: j,
+          })
         }
       } catch (e) {
         if (!cancelled) {
           console.warn("[DocenteEstacion] batch-session (red):", batchId, e)
           setBatchSessionError("No se pudo contactar al servidor para registrar el lote.")
+          setDebugError({
+            source: "DocenteEstacionClient",
+            endpoint: "POST /api/docente/batch-session",
+            networkOrParse: true,
+            exception: e instanceof Error ? { name: e.name, message: e.message, stack: e.stack } : String(e),
+            batchId,
+          })
         }
       }
     })()
@@ -101,10 +118,27 @@ export function DocenteEstacionClient() {
     setBatchId(crypto.randomUUID())
     setSourceExam(null)
     setBatchSessionError(null)
+    setDebugError(null)
+  }, [])
+
+  const reportBatchSessionDebug = useCallback((payload: unknown) => {
+    setDebugError(payload)
   }, [])
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 space-y-8">
+      {debugError != null ? (
+        <div
+          className="rounded-lg border-4 border-black bg-red-600 p-6 text-white shadow-2xl"
+          style={{ fontFamily: "ui-monospace, monospace" }}
+        >
+          <div className="text-2xl font-black uppercase tracking-wide mb-3">DEBUG batch-session — sin filtros</div>
+          <pre className="text-sm md:text-base whitespace-pre-wrap break-all overflow-x-auto max-h-[70vh] overflow-y-auto">
+            {JSON.stringify(debugError, null, 2)}
+          </pre>
+        </div>
+      ) : null}
+
       <header className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-6">
         <div>
           <p className="text-xs font-medium uppercase tracking-wide text-indigo-600">Paso B · Estación de control</p>
@@ -152,7 +186,11 @@ export function DocenteEstacionClient() {
             <strong>QR no válido en el celular hasta corregir esto:</strong> {batchSessionError}
           </p>
         ) : null}
-        <BatchMobileSyncPanel batchId={batchId} onRegenerateBatch={onRegenerateBatch} />
+        <BatchMobileSyncPanel
+          batchId={batchId}
+          onRegenerateBatch={onRegenerateBatch}
+          onBatchSessionDebug={reportBatchSessionDebug}
+        />
       </section>
 
       <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-4">
