@@ -6592,6 +6592,31 @@ h-4 w-4 animate-spin"
                           <p><span className="font-medium">Fortalezas:</span> {(evaluacionesDetail.evaluation_summaries as { strengths?: string })?.strengths ?? "—"}</p>
                           <p><span className="font-medium">Debilidades / Áreas de mejora:</span> {(evaluacionesDetail.evaluation_summaries as { improvements?: string })?.improvements ?? "—"}</p>
                         </div>
+                        {Array.isArray((evaluacionesDetail.evaluation as { scan_image_signed_urls?: string[] }).scan_image_signed_urls) &&
+                        (evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.length > 0 ? (
+                          <div className="rounded-lg border border-[var(--border-color)] bg-[var(--bg-muted)] p-3 space-y-2">
+                            <p className="text-sm font-medium text-[var(--text-accent)]">Imágenes del lote (escaneo móvil)</p>
+                            <p className="text-xs text-[var(--text-muted)]">
+                              Enlaces firmados (~1 h). Origen:{" "}
+                              <span className="font-mono">
+                                {(evaluacionesDetail.evaluation as { capture_source?: string }).capture_source ?? "batch_scan"}
+                              </span>
+                            </p>
+                            <div className="flex flex-wrap gap-2">
+                              {(evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.map((url, i) => (
+                                <a
+                                  key={`${url}-${i}`}
+                                  href={url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="block w-28 h-28 rounded-md border border-[var(--border-color)] overflow-hidden bg-black/5"
+                                >
+                                  <img src={url} alt={`Página ${i + 1}`} className="w-full h-full object-cover" />
+                                </a>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
                         <div>
                           <p className="text-sm font-medium mb-1">Estudiantes</p>
                           {evaluationStudents.length === 0 ? (
@@ -7535,6 +7560,19 @@ h-4 w-4 animate-spin"
                             : null}
                         </p>
                         <p className="text-xs text-[var(--text-muted)]">{(evaluacionesDetail.evaluation as { evaluated_at?: string }).evaluated_at ? format(new Date((evaluacionesDetail.evaluation as { evaluated_at: string }).evaluated_at), "dd/MM/yyyy HH:mm") : ""}</p>
+                        {Array.isArray((evaluacionesDetail.evaluation as { scan_image_signed_urls?: string[] }).scan_image_signed_urls) &&
+                        (evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.length > 0 ? (
+                          <div className="mt-3 rounded-md border border-[var(--border-color)] bg-[var(--bg-muted)] p-2 space-y-2">
+                            <p className="text-xs font-medium text-[var(--text-accent)]">Imágenes del escaneo móvil</p>
+                            <div className="flex flex-wrap gap-2">
+                              {(evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.map((url, i) => (
+                                <a key={`dlg-${url}-${i}`} href={url} target="_blank" rel="noreferrer" className="block w-24 h-24 rounded border overflow-hidden">
+                                  <img src={url} alt="" className="w-full h-full object-cover" />
+                                </a>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
                         <div className="mt-2 flex flex-wrap items-center gap-2">
                           <span className="text-xs text-[var(--text-muted)]">
                             Prueba base: {(evaluacionesDetail.evaluation as { source_exam_id?: string | null }).source_exam_id ? "asociada" : "pendiente"}

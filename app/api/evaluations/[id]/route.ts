@@ -1,6 +1,7 @@
 // app/api/evaluations/[id]/route.ts
 // GET: detalle de una evaluación (metadata, items, summary, estudiantes). Solo del usuario autenticado.
 import { NextRequest, NextResponse } from "next/server"
+import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
@@ -43,7 +44,9 @@ export async function GET(
 
   const { data: evaluation, error: evalErr } = await supabase
     .from("evaluations")
-    .select("id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id")
+    .select(
+      "id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id, batch_id, batch_student_index, scan_image_paths, capture_source",
+    )
     .eq("id", id)
     .maybeSingle()
 
@@ -108,6 +111,18 @@ export async function GET(
     ? String((students[0] as { student_name: string }).student_name).trim()
     : undefined
 
+  const rawPaths = (evaluation as { scan_image_paths?: unknown }).scan_image_paths
+  const scanPaths = Array.isArray(rawPaths)
+    ? rawPaths.filter((p): p is string => typeof p === "string" && p.length > 0)
+    : []
+  const scan_image_signed_urls: string[] = []
+  for (const path of scanPaths.slice(0, 20)) {
+    const { data: signed, error: signErr } = await supabase.storage
+      .from(BATCH_SCANS_BUCKET)
+      .createSignedUrl(path, 3600)
+    if (!signErr && signed?.signedUrl) scan_image_signed_urls.push(signed.signedUrl)
+  }
+
   return NextResponse.json(
     {
       evaluation: {
@@ -120,6 +135,13 @@ export async function GET(
         status: evaluation.status ?? "draft",
         student_name: firstStudentName,
         source_exam_id: (evaluation as { source_exam_id?: string | null }).source_exam_id ?? undefined,
+        batch_id: (evaluation as { batch_id?: string | null }).batch_id ?? undefined,
+        batch_student_index: (evaluation as { batch_student_index?: number | null }).batch_student_index ?? undefined,
+        capture_source: (evaluation as { capture_source?: string | null }).capture_source ?? undefined,
+        scan_image_paths: scanPaths.length > 0 ? scanPaths : undefined,
+        /** Primera ruta en Storage (bucket batch-scans); misma lista ordenada que scan_image_paths[0]. */
+        scan_primary_storage_path: scanPaths[0] ?? undefined,
+        scan_image_signed_urls: scan_image_signed_urls.length > 0 ? scan_image_signed_urls : undefined,
       },
       items,
       summary: summary

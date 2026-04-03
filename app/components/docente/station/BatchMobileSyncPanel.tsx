@@ -13,6 +13,10 @@ type Props = {
   onRegenerateBatch: () => void
   /** Si falla POST batch-session, envía el objeto crudo a la página (mismo debug que DocenteEstacion). */
   onBatchSessionDebug?: (payload: unknown) => void
+  /** Páginas por alumno (debe coincidir con la estación / móvil). */
+  expectedPagesPerStudent?: number
+  /** Pauta base elegida en el PC (opcional). */
+  sourceExamId?: string | null
 }
 
 /** Origen público para el enlace móvil: mismo host que la barra de direcciones; fuerza https fuera de localhost. */
@@ -29,7 +33,13 @@ function resolveClientPublicOrigin(): string {
   return o
 }
 
-export function BatchMobileSyncPanel({ batchId, onRegenerateBatch, onBatchSessionDebug }: Props) {
+export function BatchMobileSyncPanel({
+  batchId,
+  onRegenerateBatch,
+  onBatchSessionDebug,
+  expectedPagesPerStudent = 2,
+  sourceExamId = null,
+}: Props) {
   const [isMounted, setIsMounted] = useState(false)
   const [origin, setOrigin] = useState("")
   const [copied, setCopied] = useState(false)
@@ -59,7 +69,11 @@ export function BatchMobileSyncPanel({ batchId, onRegenerateBatch, onBatchSessio
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({ batch_id: batchId }),
+          body: JSON.stringify({
+            batch_id: batchId,
+            expected_pages_per_student: expectedPagesPerStudent,
+            source_exam_id: sourceExamId,
+          }),
         })
         const j = await res.json().catch(() => ({}))
         if (cancelled) return
@@ -91,7 +105,7 @@ export function BatchMobileSyncPanel({ batchId, onRegenerateBatch, onBatchSessio
     return () => {
       cancelled = true
     }
-  }, [ready, batchId, onBatchSessionDebug])
+  }, [ready, batchId, onBatchSessionDebug, expectedPagesPerStudent, sourceExamId])
 
   async function copyLink() {
     if (!mobileUrl || !navigator.clipboard) return

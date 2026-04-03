@@ -18,15 +18,26 @@ export async function GET(req: NextRequest) {
   }
 
   const supabase = await getSupabaseRouteClient()
-  const { data, error } = await supabase
-    .from("batch_photo_uploads")
-    .select("id, batch_id, storage_path, processed_at, created_at, content_type, student_index, page_index")
-    .eq("batch_id", batchId)
-    .order("student_index", { ascending: true })
-    .order("page_index", { ascending: true })
-    .order("created_at", { ascending: true })
-    .limit(200)
 
+  const [photosRes, sessionRes] = await Promise.all([
+    supabase
+      .from("batch_photo_uploads")
+      .select(
+        "id, batch_id, storage_path, processed_at, created_at, content_type, student_index, page_index, evaluation_id, status",
+      )
+      .eq("batch_id", batchId)
+      .order("student_index", { ascending: true })
+      .order("page_index", { ascending: true })
+      .order("created_at", { ascending: true })
+      .limit(200),
+    supabase
+      .from("batch_scan_sessions")
+      .select("expected_pages_per_student, source_exam_id")
+      .eq("batch_id", batchId)
+      .maybeSingle(),
+  ])
+
+  const { data, error } = photosRes
   if (error) {
     if (error.message.includes("does not exist") || error.code === "42P01") {
       return NextResponse.json({ photos: [], warning: "Tabla batch_photo_uploads no aplicada aún." })
@@ -34,5 +45,22 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  return NextResponse.json({ photos: data ?? [] })
+  let expected_pages_per_student: number | null = null
+  let source_exam_id: string | null = null
+  if (!sessionRes.error && sessionRes.data) {
+    const sess = sessionRes.data as { expected_pages_per_student?: number | null; source_exam_id?: string | null }
+    const rawEp = sess.expected_pages_per_student
+    if (rawEp != null && Number.isFinite(Number(rawEp))) {
+      expected_pages_per_student = Math.max(1, Math.min(50, Math.floor(Number(rawEp))))
+    }
+    source_exam_id = sess.source_exam_id ?? null
+  }
+
+  return NextResponse.json({
+    photos: data ?? [],
+    session: {
+      expected_pages_per_student,
+      source_exam_id,
+    },
+  })
 }

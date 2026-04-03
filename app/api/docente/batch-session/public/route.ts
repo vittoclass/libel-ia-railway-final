@@ -55,7 +55,7 @@ export async function GET(req: NextRequest) {
 
   const { data, error } = await supabase
     .from("batch_scan_sessions")
-    .select("batch_id, expires_at")
+    .select("batch_id, expires_at, expected_pages_per_student, source_exam_id")
     .eq("batch_id", batchId)
     .maybeSingle()
 
@@ -107,5 +107,18 @@ export async function GET(req: NextRequest) {
     )
   }
 
-  return NextResponse.json({ ok: true, batch_id: batchId })
+  const row = data as {
+    expected_pages_per_student?: number | null
+    source_exam_id?: string | null
+  }
+
+  return NextResponse.json({
+    ok: true,
+    batch_id: batchId,
+    expected_pages_per_student:
+      row.expected_pages_per_student != null && Number.isFinite(Number(row.expected_pages_per_student))
+        ? Math.max(1, Math.min(50, Math.floor(Number(row.expected_pages_per_student))))
+        : 2,
+    source_exam_id: row.source_exam_id ?? null,
+  })
 }

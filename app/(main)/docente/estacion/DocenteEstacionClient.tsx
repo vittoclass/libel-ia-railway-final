@@ -11,6 +11,8 @@ import {
   type TeacherAssignmentOption,
 } from "@/app/components/docente/station/TeacherAssignmentSelector"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 
 export function DocenteEstacionClient() {
   const supabase = useMemo(() => createClientComponentClient(), [])
@@ -25,6 +27,8 @@ export function DocenteEstacionClient() {
   const [batchSessionError, setBatchSessionError] = useState<string | null>(null)
   /** Respuesta cruda de /api/docente/batch-session para depuración en pantalla. */
   const [debugError, setDebugError] = useState<unknown>(null)
+  /** Debe coincidir con “páginas por estudiante” en el móvil (EstacionMovilClient). */
+  const [pagesPerStudent, setPagesPerStudent] = useState(2)
 
   const loadAssignments = useCallback(async () => {
     try {
@@ -75,7 +79,11 @@ export function DocenteEstacionClient() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({ batch_id: batchId }),
+          body: JSON.stringify({
+            batch_id: batchId,
+            expected_pages_per_student: pagesPerStudent,
+            source_exam_id: sourceExam?.id ?? null,
+          }),
         })
         const j = await res.json().catch(() => ({}))
         if (cancelled) return
@@ -112,7 +120,7 @@ export function DocenteEstacionClient() {
     return () => {
       cancelled = true
     }
-  }, [batchId])
+  }, [batchId, pagesPerStudent, sourceExam?.id])
 
   const onRegenerateBatch = useCallback(() => {
     setBatchId(crypto.randomUUID())
@@ -186,10 +194,33 @@ export function DocenteEstacionClient() {
             <strong>QR no válido en el celular hasta corregir esto:</strong> {batchSessionError}
           </p>
         ) : null}
+        <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 max-w-md">
+          <Label htmlFor="pages-per-student" className="text-sm font-medium text-slate-800">
+            Fotos por alumno (páginas distintas)
+          </Label>
+          <Input
+            id="pages-per-student"
+            type="number"
+            min={1}
+            max={50}
+            value={pagesPerStudent}
+            onChange={(e) => {
+              const n = Math.max(1, Math.min(50, Math.floor(Number(e.target.value)) || 1))
+              setPagesPerStudent(n)
+            }}
+            className="w-24"
+          />
+          <p className="text-[11px] text-slate-500">
+            Debe coincidir con el número configurado en el celular al escanear. Al llegar todas las páginas de un alumno,
+            se crea la evaluación automáticamente.
+          </p>
+        </div>
         <BatchMobileSyncPanel
           batchId={batchId}
           onRegenerateBatch={onRegenerateBatch}
           onBatchSessionDebug={reportBatchSessionDebug}
+          expectedPagesPerStudent={pagesPerStudent}
+          sourceExamId={sourceExam?.id ?? null}
         />
       </section>
 
@@ -207,7 +238,14 @@ export function DocenteEstacionClient() {
       <section className="space-y-4">
         <h2 className="text-lg font-semibold text-slate-900 px-1">4. Grilla de fotos</h2>
         {batchId ? (
-          <BatchPhotoRealtimeGrid key={batchId} batchId={batchId} supabase={supabase} />
+          <BatchPhotoRealtimeGrid
+            key={batchId}
+            batchId={batchId}
+            supabase={supabase}
+            expectedPagesPerStudent={pagesPerStudent}
+            courseLabel={contextRow?.course_label ?? null}
+            subject={contextRow?.subject ?? sourceExam?.subject ?? null}
+          />
         ) : (
           <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50/80 px-4 py-10 text-center text-sm text-slate-500">
             Preparando identificador de lote en el navegador…

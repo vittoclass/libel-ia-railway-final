@@ -50,7 +50,7 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    let body: { batch_id?: string }
+    let body: { batch_id?: string; expected_pages_per_student?: number; source_exam_id?: string | null }
     try {
       body = await req.json()
     } catch (parseErr) {
@@ -143,7 +143,7 @@ export async function POST(req: NextRequest) {
 
     const { data: profile, error: pErr } = await routeClient
       .from("profiles")
-      .select("teacher_id, school_id")
+      .select("teacher_id, school_id, department, role")
       .eq("user_id", user.id)
       .maybeSingle()
 
@@ -184,12 +184,24 @@ export async function POST(req: NextRequest) {
     const expiresAt = new Date()
     expiresAt.setHours(expiresAt.getHours() + TTL_HOURS)
 
-    const row = {
+    const rawPages = Number(body?.expected_pages_per_student)
+    const expectedPages =
+      Number.isFinite(rawPages) && rawPages >= 1 ? Math.min(50, Math.floor(rawPages)) : 2
+
+    let sourceExamId: string | null = null
+    const sex = body?.source_exam_id
+    if (typeof sex === "string" && UUID_REGEX.test(sex.trim())) {
+      sourceExamId = sex.trim()
+    }
+
+    const row: Record<string, unknown> = {
       batch_id: batchId,
       teacher_id: teacherId,
       school_id: schoolId,
       created_by: user.id,
       expires_at: expiresAt.toISOString(),
+      expected_pages_per_student: expectedPages,
+      source_exam_id: sourceExamId,
     }
 
     let upErr: { message: string; code?: string; details?: string; hint?: string } | null = null
