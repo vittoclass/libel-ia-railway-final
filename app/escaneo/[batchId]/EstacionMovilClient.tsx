@@ -46,11 +46,16 @@ export function EstacionMovilClient({ batchId }: Props) {
   const [lastOk, setLastOk] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [cameraActivationError, setCameraActivationError] = useState<string | null>(null)
+  /** Nombre DOM del error (NotAllowedError, OverconstrainedError, …) en rojo grande. */
+  const [cameraErrorName, setCameraErrorName] = useState<string | null>(null)
   const [activatingCamera, setActivatingCamera] = useState(false)
+  /** Stream activo: estado para enlazar <video> tras montar (el ref es null antes de scannerActive). */
+  const [boundStream, setBoundStream] = useState<MediaStream | null>(null)
 
   const batchOk = UUID_REGEX.test(batchId.trim())
 
   const stopStream = useCallback(() => {
+    setBoundStream(null)
     streamRef.current?.getTracks().forEach((t) => t.stop())
     streamRef.current = null
     const v = videoRef.current
@@ -66,6 +71,32 @@ export function EstacionMovilClient({ batchId }: Props) {
       streamRef.current = null
     }
   }, [])
+
+  /** El <video> solo existe con scannerActive=true; aquí enlazamos boundStream cuando ya está en el DOM. */
+  useEffect(() => {
+    if (!scannerActive || !boundStream) return
+    const el = videoRef.current
+    if (!el) return
+
+    el.srcObject = boundStream
+    el.muted = true
+    el.setAttribute("playsinline", "")
+    el.setAttribute("webkit-playsinline", "true")
+
+    const tryPlay = () => {
+      void el.play().catch(() => {})
+    }
+
+    if (el.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      tryPlay()
+    } else {
+      el.addEventListener("loadedmetadata", tryPlay, { once: true })
+    }
+
+    return () => {
+      el.removeEventListener("loadedmetadata", tryPlay)
+    }
+  }, [scannerActive, boundStream])
 
   const validateBatchGate = useCallback(async () => {
     if (!batchOk) {
@@ -135,37 +166,53 @@ export function EstacionMovilClient({ batchId }: Props) {
       setError(null)
       setLastOk(null)
       setCameraActivationError(null)
+      setCameraErrorName(null)
     },
     [stopStream],
   )
 
   const activateScanner = useCallback(async () => {
     setCameraActivationError(null)
+    setCameraErrorName(null)
+    stopStream()
+
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-      setCameraActivationError("Error: Este navegador no permite acceso a la cámara desde aquí.")
+      setCameraErrorName("getUserMediaMissing")
+      setCameraActivationError("Este navegador no expone getUserMedia (requiere HTTPS o localhost).")
       return
     }
+
     setActivatingCamera(true)
+    let stream: MediaStream | null = null
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" } },
-        audio: false,
-      })
-      streamRef.current = stream
-      const video = videoRef.current
-      if (video) {
-        video.srcObject = stream
-        video.playsInline = true
-        video.muted = true
-        await video.play()
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { exact: "environment" },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+          audio: false,
+        })
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false,
+        })
       }
+
+      streamRef.current = stream
+      setBoundStream(stream)
       setScannerActive(true)
     } catch (e) {
+      const name =
+        e instanceof DOMException ? e.name : e instanceof Error ? e.name : typeof e === "object" && e && "name" in e ? String((e as { name: string }).name) : "Error"
+      setCameraErrorName(name)
       setCameraActivationError(formatCameraError(e))
     } finally {
       setActivatingCamera(false)
     }
-  }, [])
+  }, [stopStream])
 
   const uploadFile = useCallback(
     async (file: File) => {
@@ -239,6 +286,7 @@ export function EstacionMovilClient({ batchId }: Props) {
     stopStream()
     setPhase("pages")
     setCameraActivationError(null)
+    setCameraErrorName(null)
     setError(null)
   }, [stopStream])
 
@@ -330,8 +378,16 @@ export function EstacionMovilClient({ batchId }: Props) {
                     <>📷 ACTIVAR ESCÁNER</>
                   )}
                 </Button>
+                {cameraErrorName ? (
+                  <p
+                    className="text-center text-3xl sm:text-4xl font-black text-red-500 px-2 leading-tight tracking-tight"
+                    role="alert"
+                  >
+                    {cameraErrorName}
+                  </p>
+                ) : null}
                 {cameraActivationError ? (
-                  <p className="text-center text-xs text-red-400 px-1" role="alert">
+                  <p className="text-center text-sm text-red-400 px-2" role="alert">
                     {cameraActivationError}
                   </p>
                 ) : null}
@@ -340,7 +396,14 @@ export function EstacionMovilClient({ batchId }: Props) {
               <>
                 <p className="text-center text-sm font-medium text-indigo-200">Paso 3: Dispara la foto.</p>
                 <div className="relative w-full overflow-hidden rounded-lg border border-slate-700 bg-black aspect-[3/4] max-h-[55vh]">
-                  <video ref={videoRef} className="h-full w-full object-cover" playsInline muted autoPlay />
+                  {/* playsInline + muted + autoPlay: iOS/Android suelen bloquear reproducción sin esto */}
+                  <video
+                    ref={videoRef}
+                    className="h-full w-full object-cover"
+                    playsInline
+                    muted
+                    autoPlay
+                  />
                 </div>
                 <Button
                   type="button"
