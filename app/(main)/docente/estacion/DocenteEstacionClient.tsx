@@ -63,6 +63,16 @@ export function DocenteEstacionClient() {
     setBatchId((prev) => prev ?? crypto.randomUUID())
   }, [])
 
+  useEffect(() => {
+    if (!batchId) return
+    void fetch("/api/docente/batch-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ batch_id: batchId }),
+    }).catch(() => {})
+  }, [batchId])
+
   const onRegenerateBatch = useCallback(() => {
     setBatchId(crypto.randomUUID())
     setSourceExam(null)

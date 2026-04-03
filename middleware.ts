@@ -5,10 +5,43 @@ import { createMiddlewareClient } from "@supabase/auth-helpers-nextjs"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
 import { isMasterEmail } from "@/app/lib/master-access"
 
+function isPublicMobilePath(pathname: string): boolean {
+  return pathname.startsWith("/escaneo/")
+}
+
+function isLocalHost(host: string): boolean {
+  const h = host.split(":")[0]?.toLowerCase() ?? ""
+  return h === "localhost" || h === "127.0.0.1" || h.endsWith(".local")
+}
+
 export async function middleware(req: NextRequest) {
+  const pathname = req.nextUrl.pathname
+
+  // Captura móvil por QR: sin Supabase en middleware; normalizar HTTPS para proxy / cookies.
+  if (isPublicMobilePath(pathname)) {
+    const host = req.headers.get("host") ?? ""
+    if (!isLocalHost(host)) {
+      const xfRaw = req.headers.get("x-forwarded-proto")
+      const xf = xfRaw?.split(",")[0]?.trim().toLowerCase()
+      if (xf === "http") {
+        const u = req.nextUrl.clone()
+        u.protocol = "https:"
+        return NextResponse.redirect(u, 308)
+      }
+    }
+    const requestHeaders = new Headers(req.headers)
+    if (!isLocalHost(host)) {
+      requestHeaders.set("x-forwarded-proto", "https")
+      requestHeaders.set("x-forwarded-ssl", "on")
+    }
+    return NextResponse.next({ request: { headers: requestHeaders } })
+  }
+
   const res = NextResponse.next()
   const supabase = createMiddlewareClient({ req, res })
-  const { data: { session } } = await supabase.auth.getSession()
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
   const path = req.nextUrl.pathname
 
   if (!session && path === "/evaluar") {
@@ -25,7 +58,6 @@ export async function middleware(req: NextRequest) {
     return NextResponse.redirect(url)
   }
 
-  // Estación docente + captura móvil (Paso C): sesión obligatoria; `next` incluye query (?batch_id=) para el QR.
   if (!session && path.startsWith("/docente")) {
     const url = new URL("/login", req.url)
     const nextPath = `${req.nextUrl.pathname}${req.nextUrl.search}`
@@ -34,7 +66,6 @@ export async function middleware(req: NextRequest) {
     return NextResponse.redirect(url)
   }
 
-  // Master key: acceso total a paneles institucionales sin mirar rol en BD (prod + dev).
   if (
     session &&
     isMasterEmail(session.user.email) &&
@@ -45,10 +76,8 @@ export async function middleware(req: NextRequest) {
     return res
   }
 
-  // PHASE_5_INSTITUTIONAL_V1 — /dashboard/utp y /dashboard/direccion
   if (path.startsWith("/dashboard/utp") || path.startsWith("/dashboard/direccion")) {
     if (!session) return NextResponse.redirect(new URL("/", req.url))
-    // Paso libre en dev o con DEV_DASHBOARD_RELAX=1 (reversible; no exige rol UTP/Dirección).
     if (isDashboardInstitutionalRelaxEnabled()) {
       return res
     }
@@ -111,5 +140,5 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/evaluar", "/perfil", "/dashboard/:path*", "/docente/:path*"],
+  matcher: ["/evaluar", "/perfil", "/dashboard/:path*", "/docente/:path*", "/escaneo/:path*"],
 }

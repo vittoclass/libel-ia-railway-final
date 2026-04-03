@@ -13,6 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Camera, Loader2, CheckCircle2, AlertCircle } from "lucide-react"
+import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
@@ -87,7 +88,7 @@ export function MovilScanClient({ initialBatchId }: Props) {
       const objectName = `s${studentIndex}_p${pageIndex}_${crypto.randomUUID()}.${ext}`
       const storagePath = `${profile.teacher_id}/${batchId}/${objectName}`
 
-      const { error: upErr } = await supabase.storage.from("batch-scans").upload(storagePath, file, {
+      const { error: upErr } = await supabase.storage.from(BATCH_SCANS_BUCKET).upload(storagePath, file, {
         cacheControl: "3600",
         upsert: false,
         contentType: file.type || "image/jpeg",
@@ -142,7 +143,7 @@ export function MovilScanClient({ initialBatchId }: Props) {
           <p className="text-[11px] uppercase tracking-wider text-indigo-400">Paso C · Captura móvil</p>
           <h1 className="text-xl font-semibold">Carillas al lote</h1>
           <p className="text-xs text-slate-400 leading-relaxed">
-            Sube a <code className="text-slate-300">batch-scans</code> con orden por alumno. El PC agrupa por{" "}
+            Sube a <code className="text-slate-300">{BATCH_SCANS_BUCKET}</code> con orden por alumno. El PC agrupa por{" "}
             <code className="text-slate-300">student_index</code> y <code className="text-slate-300">page_index</code>{" "}
             (sin tocar OMR).
           </p>

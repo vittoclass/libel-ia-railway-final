@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useState } from "react"
 import type { SupabaseClient } from "@supabase/supabase-js"
 import { ImageIcon, Loader2 } from "lucide-react"
+import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 
 export type BatchPhotoRow = {
   id: string
@@ -70,7 +71,7 @@ export function BatchPhotoRealtimeGrid({ batchId, supabase }: Props) {
       const next: Record<string, string> = {}
       await Promise.all(
         rowPaths.map(async (path) => {
-          const { data, error } = await supabase.storage.from("batch-scans").createSignedUrl(path, 240)
+          const { data, error } = await supabase.storage.from(BATCH_SCANS_BUCKET).createSignedUrl(path, 240)
           if (!error && data?.signedUrl) next[path] = data.signedUrl
         }),
       )

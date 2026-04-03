@@ -27,9 +27,13 @@ type Props = {
 export function TeacherAssignmentSelector({ assignments, value, onChange, disabled }: Props) {
   if (assignments.length === 0) {
     return (
-      <div className="rounded-lg border border-amber-200 bg-amber-50/80 px-3 py-2 text-sm text-amber-900">
-        No hay filas en <code className="text-xs">teacher_assignments</code> para su usuario. Puede continuar con el lote;
-        cuando UTP cargue su carga horaria, el menú mostrará opciones tipo «Lenguaje — 8° L».
+      <div className="rounded-lg border border-amber-200 bg-amber-50/80 px-3 py-3 text-sm text-amber-950 space-y-2">
+        <p className="font-medium">No tienes cursos asignados hoy. ¡Dile a UTP que te los cargue!</p>
+        <p className="text-amber-900/90 text-xs leading-relaxed">
+          Mientras tanto puedes seguir con el lote y el QR; cuando existan filas en{" "}
+          <code className="rounded bg-amber-100/80 px-1">teacher_assignments</code> vinculadas a tu perfil, aquí verás
+          opciones como «Lenguaje — 8° Básico A».
+        </p>
       </div>
     )
   }

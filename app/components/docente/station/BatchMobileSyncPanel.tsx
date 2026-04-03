@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { QrCode, RefreshCw, Copy, Check } from "lucide-react"
+import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 
 const QR_SIZE_PX = 256
 
@@ -38,9 +39,7 @@ export function BatchMobileSyncPanel({ batchId, onRegenerateBatch }: Props) {
   }, [])
 
   const ready = isMounted && !!batchId && !!origin
-  const mobileUrl = ready
-    ? `${origin}/docente/movil-scan?batch_id=${encodeURIComponent(batchId!)}`
-    : ""
+  const mobileUrl = ready ? `${origin}/escaneo/${encodeURIComponent(batchId!)}` : ""
 
   const qrSrc = ready ? `/api/docente/station-qr?u=${encodeURIComponent(mobileUrl)}` : ""
 
@@ -71,7 +70,7 @@ export function BatchMobileSyncPanel({ batchId, onRegenerateBatch }: Props) {
           </h3>
           <p className="text-xs text-indigo-900/80 mt-1 max-w-prose">
             Escanee el código con el celular (o copie el enlace). El móvil usará el mismo <code>batch_id</code> que esta
-            estación. Las fotos deben subirse al bucket <code>batch-scans</code> con la ruta indicada abajo.
+            estación. Las fotos deben subirse al bucket <code>{BATCH_SCANS_BUCKET}</code> con la ruta indicada abajo.
           </p>
         </div>
         <Button type="button" variant="outline" size="sm" onClick={onRegenerateBatch} className="shrink-0 gap-1">

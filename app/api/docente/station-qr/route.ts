@@ -53,8 +53,20 @@ function collectAllowedOrigins(req: NextRequest): Set<string> {
   return origins
 }
 
+function batchIdFromMobileUrl(url: URL): string | null {
+  if (url.pathname === "/docente/movil-scan") {
+    const id = String(url.searchParams.get("batch_id") ?? "").trim()
+    return UUID_REGEX.test(id) ? id : null
+  }
+  const mEscaneo = /^\/escaneo\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(
+    url.pathname,
+  )
+  if (mEscaneo) return mEscaneo[1]
+  return null
+}
+
 /**
- * GET ?u= — PNG QR del enlace móvil (solo URLs de esta app, path /docente/movil-scan + batch_id UUID).
+ * GET ?u= — PNG QR del enlace móvil (/escaneo/[uuid] o legado movil-scan?batch_id=).
  */
 export async function GET(req: NextRequest) {
   const user = await getAuthUser()
@@ -79,13 +91,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Origen no permitido" }, { status: 400 })
   }
 
-  if (url.pathname !== "/docente/movil-scan") {
-    return NextResponse.json({ error: "Solo se permite /docente/movil-scan" }, { status: 400 })
-  }
-
-  const batchId = String(url.searchParams.get("batch_id") ?? "").trim()
-  if (!UUID_REGEX.test(batchId)) {
-    return NextResponse.json({ error: "batch_id inválido en URL" }, { status: 400 })
+  const batchId = batchIdFromMobileUrl(url)
+  if (!batchId) {
+    return NextResponse.json({ error: "URL móvil no permitida o batch_id inválido" }, { status: 400 })
   }
 
   try {
