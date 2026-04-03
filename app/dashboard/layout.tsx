@@ -3,10 +3,11 @@ import Image from "next/image"
 import Link from "next/link"
 import { cookies } from "next/headers"
 import { getAuthUser } from "@/app/lib/supabase-route"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
-const DEV_MASTER_EMAIL = (process.env.DEV_MASTER_EMAIL ?? "[TU CORREO AQUI]").trim().toLowerCase()
+const DEV_MASTER_EMAIL = (process.env.DEV_MASTER_EMAIL ?? "").trim().toLowerCase()
 
 async function getOrganizationBranding() {
   try {
@@ -24,6 +25,9 @@ async function getOrganizationBranding() {
       .trim()
       .toUpperCase()
     let effectiveRole = baseRole
+    if (isMasterEmail(user.email)) {
+      effectiveRole = "ADMIN_INSTITUCION"
+    }
     if (process.env.NODE_ENV === "development") {
       const sessionEmail = String(user.email ?? "").trim().toLowerCase()
       if (DEV_MASTER_EMAIL && sessionEmail === DEV_MASTER_EMAIL) {

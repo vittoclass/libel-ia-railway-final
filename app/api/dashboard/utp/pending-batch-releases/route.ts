@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { BATCH_RELEASE_PENDING_UTP } from "@/app/lib/evaluation-batch-release"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
@@ -45,7 +46,8 @@ export async function GET() {
     .maybeSingle()
 
   const role = normalizeRole((profile as { role?: string | null } | null)?.role)
-  if (!canAccess(role)) return NextResponse.json({ error: "Prohibido" }, { status: 403 })
+  if (!isMasterEmail(user.email) && !canAccess(role))
+    return NextResponse.json({ error: "Prohibido" }, { status: 403 })
 
   const schoolId = String((profile as { school_id?: string | null } | null)?.school_id ?? "").trim()
   let q = supabase

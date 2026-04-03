@@ -3,8 +3,7 @@ import { NextResponse } from "next/server"
 import type { NextRequest } from "next/server"
 import { createMiddlewareClient } from "@supabase/auth-helpers-nextjs"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
-
-const DEV_MASTER_EMAIL = (process.env.DEV_MASTER_EMAIL ?? "[TU CORREO AQUI]").trim().toLowerCase()
+import { isMasterEmail } from "@/app/lib/master-access"
 
 export async function middleware(req: NextRequest) {
   const res = NextResponse.next()
@@ -19,6 +18,13 @@ export async function middleware(req: NextRequest) {
     return NextResponse.redirect(url)
   }
 
+  if (!session && path === "/perfil") {
+    const url = new URL("/login", req.url)
+    url.searchParams.set("next", "/perfil")
+    url.searchParams.set("message", "Inicia sesión para ver tu perfil")
+    return NextResponse.redirect(url)
+  }
+
   // Estación docente + captura móvil (Paso C): sesión obligatoria; `next` incluye query (?batch_id=) para el QR.
   if (!session && path.startsWith("/docente")) {
     const url = new URL("/login", req.url)
@@ -28,10 +34,15 @@ export async function middleware(req: NextRequest) {
     return NextResponse.redirect(url)
   }
 
-  if (process.env.NODE_ENV === "development" && session && path.startsWith("/dashboard/")) {
-    const sessionEmail = String(session.user.email ?? "").trim().toLowerCase()
-    const isMasterByEmail = !!DEV_MASTER_EMAIL && sessionEmail === DEV_MASTER_EMAIL
-    if (isMasterByEmail) return res
+  // Master key: acceso total a paneles institucionales sin mirar rol en BD (prod + dev).
+  if (
+    session &&
+    isMasterEmail(session.user.email) &&
+    (path.startsWith("/dashboard/utp") ||
+      path.startsWith("/dashboard/direccion") ||
+      path.startsWith("/docente"))
+  ) {
+    return res
   }
 
   // PHASE_5_INSTITUTIONAL_V1 — /dashboard/utp y /dashboard/direccion
@@ -74,7 +85,10 @@ export async function middleware(req: NextRequest) {
     ) {
       role = devOverrideRole
     }
-    const normalizedRole = String(role ?? "").trim().toUpperCase()
+    let normalizedRole = String(role ?? "").trim().toUpperCase()
+    if (normalizedRole === "DOCENTE" || normalizedRole === "TEACHER") {
+      normalizedRole = "TEACHER"
+    }
     const allowedForUtp =
       normalizedRole === "UTP" ||
       normalizedRole === "DIRECCION" ||
@@ -97,5 +111,5 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/evaluar", "/dashboard/:path*", "/docente/:path*"],
+  matcher: ["/evaluar", "/perfil", "/dashboard/:path*", "/docente/:path*"],
 }

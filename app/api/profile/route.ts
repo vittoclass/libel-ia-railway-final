@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { DEFAULT_PROFILE_ROLE } from "@/app/lib/profile-defaults"
 
 export const dynamic = "force-dynamic"
 
-const PROFILE_COLUMNS = "user_id, teacher_id, school_id, department"
+const PROFILE_COLUMNS = "user_id, teacher_id, school_id, department, role"
 
 const CACHE_HEADERS = {
   "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -19,7 +20,7 @@ function toProfile(row: Record<string, unknown> | null, userId: string) {
     teacher_id: (row.teacher_id as string) ?? null,
     school_id: (row.school_id as string) ?? null,
     department: (row.department as string) ?? null,
-    role: (row.role as string) ?? "teacher",
+    role: (row.role as string) ?? DEFAULT_PROFILE_ROLE,
   }
 }
 
@@ -36,7 +37,7 @@ export async function GET() {
   if (!user) {
     if (process.env.NODE_ENV === "development") console.info("[API][PROFILE] no user, returning 200 profile null")
     return NextResponse.json(
-      { profile: null, user: null },
+      { profile: null, user: null, onboarded: false },
       { status: 200, headers: CACHE_HEADERS }
     )
   }
@@ -46,9 +47,17 @@ export async function GET() {
     if (process.env.NODE_ENV === "development") console.info("[API][PROFILE] supabase null, returning fallback")
     return NextResponse.json(
       {
-        profile: { id: null, user_id: user.id, teacher_id: null, school_id: null, department: null, role: "teacher" },
+        profile: {
+          id: null,
+          user_id: user.id,
+          teacher_id: null,
+          school_id: null,
+          department: null,
+          role: DEFAULT_PROFILE_ROLE,
+        },
         user: { id: user.id, email: user.email ?? null },
         isAdmin: false,
+        onboarded: false,
       },
       { status: 200, headers: CACHE_HEADERS }
     )
@@ -60,8 +69,17 @@ export async function GET() {
     .eq("user_id", user.id)
     .maybeSingle()
 
-  if (selectError && process.env.NODE_ENV === "development") {
-    console.info("[API][PROFILE] GET select error", user.id, selectError.message)
+  if (selectError) {
+    console.error("[API][PROFILE] GET select error", user.id, selectError.message, selectError)
+    return NextResponse.json(
+      {
+        error: selectError.message,
+        step: "select",
+        profile: null,
+        user: { id: user.id, email: user.email ?? null },
+      },
+      { status: 500, headers: CACHE_HEADERS }
+    )
   }
 
   let profileRow = row ? toProfile(row as Record<string, unknown>, user.id) : null
@@ -70,23 +88,41 @@ export async function GET() {
   }
 
   if (!profileRow) {
-    const { error: insertErr } = await supabase
-      .from("profiles")
-      .insert({ user_id: user.id })
+    const { error: insertErr } = await supabase.from("profiles").insert({
+      user_id: user.id,
+      role: DEFAULT_PROFILE_ROLE,
+    })
 
-    if (insertErr && process.env.NODE_ENV === "development") {
-      console.info("[API][PROFILE] GET insert error", user.id, insertErr.message)
+    if (insertErr) {
+      console.error("[API][PROFILE] GET insert error", user.id, insertErr.message, insertErr)
+      return NextResponse.json(
+        {
+          error: insertErr.message,
+          step: "insert",
+          profile: null,
+          user: { id: user.id, email: user.email ?? null },
+        },
+        { status: 500, headers: CACHE_HEADERS }
+      )
     }
 
-    const { data: insertedRow } = await supabase
+    const { data: insertedRow, error: afterSelectErr } = await supabase
       .from("profiles")
       .select(PROFILE_COLUMNS)
       .eq("user_id", user.id)
       .maybeSingle()
 
+    if (afterSelectErr) {
+      console.error("[API][PROFILE] GET post-insert select error", user.id, afterSelectErr.message)
+      return NextResponse.json(
+        { error: afterSelectErr.message, step: "post_insert_select", user: { id: user.id, email: user.email ?? null } },
+        { status: 500, headers: CACHE_HEADERS }
+      )
+    }
+
     profileRow = insertedRow ? toProfile(insertedRow as Record<string, unknown>, user.id) : null
     if (process.env.NODE_ENV === "development") {
-      console.info("[API][PROFILE] after insert, profileRow", !!profileRow, "returning fallback?", !profileRow)
+      console.info("[API][PROFILE] after insert, profileRow", !!profileRow)
     }
   }
 
@@ -100,17 +136,21 @@ export async function GET() {
     teacher_id: null,
     school_id: null,
     department: null,
-    role: "teacher" as const,
+    role: DEFAULT_PROFILE_ROLE,
   }
   if (process.env.NODE_ENV === "development" && !profileRow) {
     console.info("[API][PROFILE] returning fallback profile (no real row)")
   }
 
+  const roleNorm = String(finalProfile.role ?? "").toLowerCase()
+  const onboarded = !!finalProfile.teacher_id
+
   return NextResponse.json(
     {
       profile: finalProfile,
       user: { id: user.id, email: user.email ?? null },
-      isAdmin: (finalProfile.role ?? "teacher") === "admin",
+      isAdmin: roleNorm === "admin",
+      onboarded,
     },
     { status: 200, headers: CACHE_HEADERS }
   )

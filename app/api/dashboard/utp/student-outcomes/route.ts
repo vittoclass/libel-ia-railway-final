@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import {
   computeUtpStudentOutcomes,
@@ -37,7 +38,8 @@ export async function GET(req: NextRequest) {
       .maybeSingle()
 
     const role = normalizeRole((profile as { role?: string | null } | null)?.role)
-    if (!isAllowedRole(role)) return NextResponse.json({ error: "Prohibido" }, { status: 403 })
+    if (!isMasterEmail(user.email) && !isAllowedRole(role))
+      return NextResponse.json({ error: "Prohibido" }, { status: 403 })
 
     const auditReportId = String(req.nextUrl.searchParams.get("audit_report_id") ?? "").trim()
     const page = Number(req.nextUrl.searchParams.get("page") ?? "1")

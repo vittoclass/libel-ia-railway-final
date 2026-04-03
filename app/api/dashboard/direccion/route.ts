@@ -8,6 +8,7 @@ import {
 } from "@/app/lib/assessment-category"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { approxGradeChileFromLogroPct, resolveStudentDisplayName } from "@/app/lib/student-display-name"
 
@@ -55,7 +56,7 @@ export async function GET(_req: NextRequest) {
     role === "ADMIN_INSTITUCION" ||
     role === "ADMIN" ||
     role === "UTP"
-  if (!relax && !allowedProd) {
+  if (!relax && !isMasterEmail(user.email) && !allowedProd) {
     return jsonNoStore({ error: "Prohibido" }, { status: 403 })
   }
 

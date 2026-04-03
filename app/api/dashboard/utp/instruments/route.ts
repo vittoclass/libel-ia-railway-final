@@ -3,6 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js"
 import { parseAssessmentTypeToFlat, PATCH_ASSESSMENT_ALIASES } from "@/app/lib/assessment-category"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { generateUtpAuditAnalysis, sanitizeFileName } from "@/app/lib/services/utp-audit"
 import mammoth from "mammoth"
@@ -137,7 +138,8 @@ export async function GET(_req: NextRequest) {
 
   const role = normalizeRole((profile as { role?: string | null } | null)?.role)
   console.log("ROL DETECTADO:", role, "| profile.role:", (profile as { role?: string | null } | null)?.role ?? null)
-  if (!isAllowedRole(role)) return NextResponse.json({ error: "Prohibido" }, { status: 403 })
+  if (!isMasterEmail(user.email) && !isAllowedRole(role))
+    return NextResponse.json({ error: "Prohibido" }, { status: 403 })
   // MODO DIAGNOSTICO TEMPORAL: sin filtros user/org.
   const { data, error } = await supabase
     .from("utp_instrument_uploads")
@@ -182,7 +184,8 @@ export async function PATCH(req: NextRequest) {
       .maybeSingle()
 
     const role = normalizeRole((profile as { role?: string | null } | null)?.role)
-    if (!isAllowedRole(role)) return NextResponse.json({ ok: false, error: "Prohibido" }, { status: 403 })
+    if (!isMasterEmail(user.email) && !isAllowedRole(role))
+      return NextResponse.json({ ok: false, error: "Prohibido" }, { status: 403 })
 
     let body: { report_id?: string; evaluation_ids?: string[]; assessment_type?: string; clear?: boolean }
     try {
@@ -269,7 +272,8 @@ export async function POST(req: NextRequest) {
 
   const role = normalizeRole((profile as { role?: string | null } | null)?.role)
   console.log("ROL DETECTADO:", role, "| profile.role:", (profile as { role?: string | null } | null)?.role ?? null)
-  if (!isAllowedRole(role)) return NextResponse.json({ error: "Prohibido" }, { status: 403 })
+  if (!isMasterEmail(user.email) && !isAllowedRole(role))
+    return NextResponse.json({ error: "Prohibido" }, { status: 403 })
 
   const orgScope = scopeOrganization(profile as { organization_id?: string | null; school_id?: string | null; teacher_id?: string | null } | null)
   const orgId = orgScope ?? "00000000-0000-0000-0000-000000000000"

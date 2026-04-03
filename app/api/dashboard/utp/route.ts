@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
@@ -29,7 +30,7 @@ export async function GET(_req: NextRequest) {
 
   const role = normalizeRole((profile as { role?: string | null } | null)?.role)
   console.log("ROL DETECTADO:", role, "| profile.role:", (profile as { role?: string | null } | null)?.role ?? null)
-  if (!canAccessUtpApi(role)) {
+  if (!isMasterEmail(user.email) && !canAccessUtpApi(role)) {
     return NextResponse.json({ error: "Prohibido" }, { status: 403 })
   }
 

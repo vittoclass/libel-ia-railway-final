@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled as isDashboardRelax } from "@/app/lib/dev-dashboard-relax"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
@@ -55,7 +56,8 @@ export async function GET(_req: NextRequest) {
     .maybeSingle()
 
   const role = normalizeRole((profile as { role?: string | null } | null)?.role)
-  if (!isAllowedRole(role)) return NextResponse.json({ groups: [], orphans: [] }, { status: 200 })
+  if (!isMasterEmail(user.email) && !isAllowedRole(role))
+    return NextResponse.json({ groups: [], orphans: [] }, { status: 200 })
 
   const orgId = (profile as { organization_id?: string | null } | null)?.organization_id ?? null
   const schoolId = (profile as { school_id?: string | null } | null)?.school_id ?? null

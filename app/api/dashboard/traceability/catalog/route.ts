@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
@@ -25,7 +26,8 @@ export async function GET(req: NextRequest) {
 
   const { data: profile } = await supabase.from("profiles").select("role").eq("user_id", user.id).maybeSingle()
   const role = normalizeRole((profile as { role?: string | null } | null)?.role)
-  if (!canAccess(role)) return NextResponse.json({ error: "Prohibido" }, { status: 403 })
+  if (!isMasterEmail(user.email) && !canAccess(role))
+    return NextResponse.json({ error: "Prohibido" }, { status: 403 })
 
   const subject = String(req.nextUrl.searchParams.get("subject") ?? "Lenguaje").trim() || "Lenguaje"
 

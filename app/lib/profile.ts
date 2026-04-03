@@ -1,6 +1,7 @@
 import { User } from "@supabase/supabase-js"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { DEFAULT_PROFILE_ROLE } from "@/app/lib/profile-defaults"
 
 export type ProfileRow = {
   id: string | null
@@ -11,11 +12,10 @@ export type ProfileRow = {
   role: string | null
 }
 
-// Solo columnas que existen en la migración base (20250228). role viene de migración posterior.
-const PROFILE_COLUMNS = "user_id, teacher_id, school_id, department"
+const PROFILE_COLUMNS = "user_id, teacher_id, school_id, department, role"
 
 /**
- * Obtiene el perfil del usuario logueado; si no existe fila en profiles, la crea (user_id, role: 'teacher').
+ * Obtiene el perfil del usuario logueado; si no existe fila en profiles, la crea (user_id, role docente por defecto).
  * Siempre usa select con las columnas necesarias; tras insert hace SELECT y devuelve la fila real.
  * Retorna profile nunca null cuando hay sesión.
  */
@@ -38,7 +38,7 @@ export async function getOrCreateProfile(): Promise<{
     teacher_id: null,
     school_id: null,
     department: null,
-    role: "teacher",
+    role: DEFAULT_PROFILE_ROLE,
   }
 
   if (!supabase) {
@@ -72,9 +72,10 @@ export async function getOrCreateProfile(): Promise<{
   if (process.env.NODE_ENV === "development") {
     console.info("[profile][lib] no profile row, inserting")
   }
-  const { error: insertErr } = await supabase
-    .from("profiles")
-    .insert({ user_id: user.id })
+  const { error: insertErr } = await supabase.from("profiles").insert({
+    user_id: user.id,
+    role: DEFAULT_PROFILE_ROLE,
+  })
 
   if (insertErr) {
     if (process.env.NODE_ENV === "development") {
@@ -113,6 +114,6 @@ function toProfileRow(row: Record<string, unknown> | null, userId: string): Prof
     teacher_id: (row.teacher_id as string) ?? null,
     school_id: (row.school_id as string) ?? null,
     department: (row.department as string) ?? null,
-    role: (row.role as string) ?? "teacher",
+    role: (row.role as string) ?? DEFAULT_PROFILE_ROLE,
   }
 }

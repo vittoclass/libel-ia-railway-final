@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
@@ -33,7 +34,8 @@ export async function POST(req: NextRequest) {
     .maybeSingle()
 
   const role = normalizeRole((profile as { role?: string | null } | null)?.role)
-  if (!isAllowedRole(role)) return NextResponse.json({ ok: false, error: "Prohibido" }, { status: 403 })
+  if (!isMasterEmail(user.email) && !isAllowedRole(role))
+    return NextResponse.json({ ok: false, error: "Prohibido" }, { status: 403 })
 
   let body: { evaluation_id?: string; target_batch_id?: string }
   try {
