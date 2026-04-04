@@ -10,6 +10,7 @@ import {
   TeacherAssignmentSelector,
   type TeacherAssignmentOption,
 } from "@/app/components/docente/station/TeacherAssignmentSelector"
+import { writeDocenteActiveBatchId } from "@/app/lib/docente/active-batch-id"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -69,6 +70,10 @@ export function DocenteEstacionClient() {
   useEffect(() => {
     setBatchId((prev) => prev ?? crypto.randomUUID())
   }, [])
+
+  useEffect(() => {
+    if (batchId) writeDocenteActiveBatchId(batchId)
+  }, [batchId])
 
   useEffect(() => {
     if (!batchId) return

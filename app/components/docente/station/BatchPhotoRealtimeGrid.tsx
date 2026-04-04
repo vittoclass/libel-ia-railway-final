@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { SupabaseClient } from "@supabase/supabase-js"
 import { ImageIcon, Loader2, Users } from "lucide-react"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
+import { broadcastBatchPhotoActivity } from "@/app/lib/docente/active-batch-id"
 import { cn } from "@/lib/utils"
 
 export type BatchPhotoRow = {
@@ -173,6 +174,7 @@ export function BatchPhotoRealtimeGrid({
         },
         (payload) => {
           mergeRow(payload.new as BatchPhotoRow)
+          broadcastBatchPhotoActivity(batchId)
         },
       )
       .on(
@@ -185,6 +187,7 @@ export function BatchPhotoRealtimeGrid({
         },
         (payload) => {
           mergeRow(payload.new as BatchPhotoRow)
+          broadcastBatchPhotoActivity(batchId)
         },
       )
       .subscribe()

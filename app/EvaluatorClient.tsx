@@ -92,6 +92,13 @@ import { RobustLibeliaOMRModal } from "@/app/components/RobustLibeliaOMRModal"
 import ClosedAnswerOMRModal from "@/app/components/ClosedAnswerOMRModal"
 import DevAdminPanel from "@/app/components/DevAdminPanel"
 import { normalizeRutCanonical } from "@/app/lib/student-identity/rut"
+import {
+  BATCH_PHOTO_ACTIVITY_CHANNEL,
+  DOCENTE_ACTIVE_BATCH_ID_KEY,
+  isDocenteBatchUuid,
+  readDocenteActiveBatchId,
+  writeDocenteActiveBatchId,
+} from "@/app/lib/docente/active-batch-id"
 type ClosedAnswerOMRResult = any
 const SmartCameraModal = dynamic(() => import("@/components/smart-camera-modal"), {
   loading: () => <p>Cargando...</p>,
@@ -1275,6 +1282,8 @@ function mapSourceExamApiRowsToInputs(rows: unknown[]): EvaluationBaseSourceExam
 export default function EvaluatorClient() {
   const enablePedagogy = process.env.NEXT_PUBLIC_ENABLE_PEDAGOGY === "true"
   const [activeTab, setActiveTab] = useState("presentacion")
+  const activeTabRef = useRef(activeTab)
+  activeTabRef.current = activeTab
   const [userEmail, setUserEmail] = useState<string>("")
   const [unassignedFiles, setUnassignedFiles] = useState<FilePreview[]>([])
   const evaluatorStep2FilesRef = useRef<{ groups: StudentGroup[]; unassigned: FilePreview[] }>({
@@ -1325,6 +1334,23 @@ export default function EvaluatorClient() {
     }
   }, [evaluationBatchIdUi])
 
+  /** Ref alineado con el UUID mostrado (sync inmediato para fetch / Realtime / BroadcastChannel). */
+  useEffect(() => {
+    evaluationBatchIdRef.current = evaluationBatchIdUi
+  }, [evaluationBatchIdUi])
+
+  useEffect(() => {
+    if (evaluationBatchIdUi) writeDocenteActiveBatchId(evaluationBatchIdUi)
+  }, [evaluationBatchIdUi])
+
+  /** Al abrir /evaluar, reutilizar el mismo lote que la estación docente (QR / grilla). */
+  useEffect(() => {
+    const p = readDocenteActiveBatchId()
+    if (p) {
+      setEvaluationBatchIdUi((prev) => prev ?? p)
+    }
+  }, [])
+
   useEffect(() => {
     evaluatorStep2FilesRef.current = { groups: studentGroups, unassigned: unassignedFiles }
   }, [studentGroups, unassignedFiles])
@@ -1368,6 +1394,7 @@ export default function EvaluatorClient() {
   const logoInputRef = useRef<HTMLInputElement>(null)
   const supabaseBrowser = React.useMemo(() => createClientComponentClient(), [])
   const mobileBatchSyncingRef = useRef(false)
+  const syncMobileBatchPhotosRef = useRef<() => Promise<void>>(async () => {})
   const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKeyToPauta } = useEvaluator()
   const { toast } = useToast()
 
@@ -2057,6 +2084,22 @@ export default function EvaluatorClient() {
     )
     setUnassignedFiles([])
   }, [classSize])
+
+  const ensureEvaluationBatchId = useCallback((): string => {
+    if (evaluationBatchIdRef.current) return evaluationBatchIdRef.current
+    const persisted = readDocenteActiveBatchId()
+    if (persisted) {
+      evaluationBatchIdRef.current = persisted
+      setEvaluationBatchIdUi(persisted)
+      return persisted
+    }
+    const fresh = crypto.randomUUID()
+    evaluationBatchIdRef.current = fresh
+    setEvaluationBatchIdUi(fresh)
+    writeDocenteActiveBatchId(fresh)
+    return fresh
+  }, [])
+
   const processFiles = (files: File[]) => {
     const validTypes = [
       "image/jpeg",
@@ -2073,10 +2116,7 @@ export default function EvaluatorClient() {
       return false
     })
     if (validFiles.length === 0) return
-    if (!evaluationBatchIdRef.current) {
-      evaluationBatchIdRef.current = crypto.randomUUID()
-      setEvaluationBatchIdUi(evaluationBatchIdRef.current)
-    }
+    ensureEvaluationBatchId()
     validFiles.forEach((file) => {
       const reader = new FileReader()
       reader.onload = (e) => {
@@ -2122,10 +2162,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           previewUrl: URL.createObjectURL(file),
           dataUrl,
         }
-        if (!evaluationBatchIdRef.current) {
-          evaluationBatchIdRef.current = crypto.randomUUID()
-          setEvaluationBatchIdUi(evaluationBatchIdRef.current)
-        }
+        ensureEvaluationBatchId()
         setUnassignedFiles((prev) => [...prev, filePreview])
         handleOpenClosedAnswerOMR(dataUrl)
       })
@@ -2362,8 +2399,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   const isGenericGroupName = (name: string | undefined) => isGenericStudentSlotName(name)
 
   const syncMobileBatchPhotos = useCallback(async () => {
-    const batchId = evaluationBatchIdUi
-    if (!batchId || mobileBatchSyncingRef.current) return
+    const batchId = evaluationBatchIdRef.current
+    if (!batchId || !isDocenteBatchUuid(batchId) || mobileBatchSyncingRef.current) return
     mobileBatchSyncingRef.current = true
     try {
       const r = await fetch(`/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}`)
@@ -2449,7 +2486,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     } finally {
       mobileBatchSyncingRef.current = false
     }
-  }, [evaluationBatchIdUi, toast])
+  }, [toast])
 
   useEffect(() => {
     if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
@@ -2485,6 +2522,58 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       void supabaseBrowser.removeChannel(ch)
     }
   }, [activeTab, evaluationBatchIdUi, supabaseBrowser, syncMobileBatchPhotos])
+
+  syncMobileBatchPhotosRef.current = syncMobileBatchPhotos
+
+  /** Misma pestaña u otra: la grilla de estación emite al insertar/actualizar filas → Paso 2 sincroniza al instante. */
+  useEffect(() => {
+    let bc: BroadcastChannel | null = null
+    try {
+      bc = new BroadcastChannel(BATCH_PHOTO_ACTIVITY_CHANNEL)
+    } catch {
+      return
+    }
+    bc.onmessage = (ev: MessageEvent) => {
+      const d = ev.data as { type?: string; batchId?: string }
+      if (d?.type !== "batch_photo_change" || typeof d.batchId !== "string" || !isDocenteBatchUuid(d.batchId)) return
+      const bid = d.batchId.trim()
+      let cur = evaluationBatchIdRef.current
+      const persisted = readDocenteActiveBatchId()
+      if (!cur && persisted === bid) {
+        evaluationBatchIdRef.current = bid
+        setEvaluationBatchIdUi(bid)
+        cur = bid
+      }
+      if (cur !== bid) return
+      if (activeTabRef.current !== "evaluator") return
+      void syncMobileBatchPhotosRef.current()
+    }
+    return () => {
+      bc?.close()
+    }
+  }, [])
+
+  /** Otra pestaña fijó el lote en localStorage (estación docente). */
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== DOCENTE_ACTIVE_BATCH_ID_KEY || e.newValue == null || e.newValue === "") return
+      let id: string | null = null
+      try {
+        const p = JSON.parse(e.newValue) as unknown
+        id = typeof p === "string" ? p : e.newValue
+      } catch {
+        id = e.newValue.replace(/^"|"$/g, "")
+      }
+      if (!isDocenteBatchUuid(id)) return
+      const v = id.trim()
+      if (activeTabRef.current !== "evaluator") return
+      evaluationBatchIdRef.current = v
+      setEvaluationBatchIdUi(v)
+      void syncMobileBatchPhotosRef.current()
+    }
+    window.addEventListener("storage", onStorage)
+    return () => window.removeEventListener("storage", onStorage)
+  }, [])
 
   /** Extracción masiva de nombres: recorre grupos con archivos y nombre genérico, reutiliza /api/extract-name. No toca evaluación ni contratos. */
   const handleBulkNameExtraction = async () => {
@@ -2908,10 +2997,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   // Función para manejar evaluación masiva en lotes paralelos (3 lotes x 45 simultáneos)
   const handleEvaluateGroups = async (groupIDsToEvaluate: string[]) => {
-    if (!evaluationBatchIdRef.current) {
-      evaluationBatchIdRef.current = crypto.randomUUID()
-      setEvaluationBatchIdUi(evaluationBatchIdRef.current)
-    }
+    ensureEvaluationBatchId()
     const {
       rubrica,
       pauta,
@@ -4668,8 +4754,10 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         className="text-xs shrink-0"
                         disabled={!!evaluationBatchIdUi}
                         onClick={() => {
-                          evaluationBatchIdRef.current = crypto.randomUUID()
-                          setEvaluationBatchIdUi(evaluationBatchIdRef.current)
+                          const fresh = crypto.randomUUID()
+                          evaluationBatchIdRef.current = fresh
+                          setEvaluationBatchIdUi(fresh)
+                          writeDocenteActiveBatchId(fresh)
                           toast({
                             title: "Lote listo para el móvil",
                             description: "Usa este UUID en el escáner. Debe coincidir con el que escanees en QR.",
@@ -4716,6 +4804,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           )
                           evaluationBatchIdRef.current = null
                           setEvaluationBatchIdUi(null)
+                          writeDocenteActiveBatchId(null)
                           setBatchInstitutionalStatus(null)
                           setBatchUtpObservations(null)
                         }}
