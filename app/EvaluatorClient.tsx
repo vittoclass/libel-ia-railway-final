@@ -852,16 +852,42 @@ async function resolveFileUrlsForEvaluate(files: FilePreview[]): Promise<{ urls:
   for (const f of files) {
     const sp = f.batchScanStoragePath?.trim()
     if (sp) {
+      const relativeSignPath = `/api/docente/batch-photo-sign?path=${encodeURIComponent(sp)}`
+      const attemptedUrl =
+        typeof window !== "undefined" ? `${window.location.origin}${relativeSignPath}` : relativeSignPath
       try {
-        const r = await fetch(`/api/docente/batch-photo-sign?path=${encodeURIComponent(sp)}`)
-        const j = (await r.json().catch(() => ({}))) as { signed_url?: string }
+        const r = await fetch(relativeSignPath)
+        const rawText = await r.text()
+        let j: { signed_url?: string; error?: string } = {}
+        try {
+          j = rawText ? (JSON.parse(rawText) as { signed_url?: string; error?: string }) : {}
+        } catch {
+          j = {}
+        }
         if (r.ok && typeof j.signed_url === "string" && j.signed_url.length > 0) {
           urls.push(j.signed_url)
           mimes.push(f.file.type || "image/jpeg")
           continue
         }
-      } catch {
-        /* usar dataUrl */
+        console.error("[batch-photo-sign] Firma fallida (revisar storage_path y respuesta del servidor)", {
+          storage_path: sp,
+          attemptedUrl,
+          responseStatus: r.status,
+          responseStatusText: r.statusText,
+          responseBodyPreview: rawText.slice(0, 8000),
+          parsedJson: j,
+          fileId: f.id,
+        })
+      } catch (netErr) {
+        console.error("[batch-photo-sign] Error de red al firmar (fetch lanzó)", {
+          storage_path: sp,
+          attemptedUrl,
+          error:
+            netErr instanceof Error
+              ? { name: netErr.name, message: netErr.message, stack: netErr.stack }
+              : netErr,
+          fileId: f.id,
+        })
       }
     }
     urls.push(f.dataUrl)
@@ -1433,7 +1459,17 @@ export default function EvaluatorClient() {
   const supabaseBrowser = React.useMemo(() => createClientComponentClient(), [])
   const mobileBatchSyncingRef = useRef(false)
   const syncMobileBatchPhotosRef = useRef<() => Promise<void>>(async () => {})
-  const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKeyToPauta } = useEvaluator()
+  const {
+    evaluate,
+    isLoading,
+    answerKey,
+    saveAnswerKey,
+    clearAnswerKey,
+    answerKeyToPauta,
+    evaluateDiagnostic,
+    clearEvaluateDiagnostic,
+    reportEvaluateDiagnostic,
+  } = useEvaluator()
   const { toast } = useToast()
 
   // Estado para el modal de plantilla de respuestas del profesor
@@ -3204,6 +3240,9 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       }),
     )
 
+    const batchEvaluateUrlAttempted =
+      typeof window !== "undefined" ? `${window.location.origin}/api/evaluate/batch` : "/api/evaluate/batch"
+
     try {
       const response = await fetch("/api/evaluate/batch", {
         method: "POST",
@@ -3212,6 +3251,17 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       })
 
       if (!response.ok || !response.body) {
+        const errBody = await response.text().catch(() => "")
+        reportEvaluateDiagnostic({
+          phase: "evaluar_batch_http_error",
+          urlAttempted: batchEvaluateUrlAttempted,
+          method: "POST",
+          fetchPathUsed: "/api/evaluate/batch",
+          responseStatus: response.status,
+          responseStatusText: response.statusText,
+          responseBodyFromServer: errBody.slice(0, 120_000),
+          hint: !response.body ? "Respuesta sin body legible para streaming" : "HTTP no OK en /api/evaluate/batch",
+        })
         throw new Error("Error HTTP " + response.status + ": " + response.statusText)
       }
 
@@ -3379,8 +3429,19 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         }
       }
     } catch (err) {
-      // Si falla el batch, marcar todos como error
       const errorMsg = err instanceof Error ? err.message : "Error en evaluacion batch"
+      const alreadyReportedHttp = typeof errorMsg === "string" && errorMsg.startsWith("Error HTTP ")
+      if (!alreadyReportedHttp) {
+        reportEvaluateDiagnostic({
+          phase: "evaluar_batch_unexpected",
+          urlAttempted: batchEvaluateUrlAttempted,
+          method: "POST",
+          fetchPathUsed: "/api/evaluate/batch",
+          errorSerialized:
+            err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
+          hint: "Red, CORS, parseo del stream NDJSON u otro fallo distinto a HTTP ya informado arriba.",
+        })
+      }
       setStudentGroups((prev) =>
         prev.map((g) => {
           if (groupIDsToEvaluate.includes(g.id) && g.isEvaluating) {
@@ -3504,8 +3565,53 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     currentRole === "DIRECCION" || currentRole === "UTP" || currentRole === "ADMIN_INSTITUCION"
   const canSeePanelColegio = isIvan || isAdminRole
 
+  const evaluateDiagnosticText = evaluateDiagnostic
+    ? (() => {
+        try {
+          return JSON.stringify(evaluateDiagnostic, null, 2)
+        } catch {
+          return String(evaluateDiagnostic)
+        }
+      })()
+    : ""
+
   return (
     <EvaluatorRootDiv className={rootThemeClass}>
+      {evaluateDiagnostic != null && (
+        <div
+          className="fixed inset-0 z-[99999] flex flex-col gap-3 bg-zinc-950 p-4 text-zinc-100 shadow-2xl"
+          role="alertdialog"
+          aria-label="Modo diagnóstico evaluación"
+        >
+          <div className="flex shrink-0 flex-wrap items-center gap-3">
+            <h2 className="text-lg font-semibold text-red-400">Modo diagnóstico — error en evaluación</h2>
+            <Button
+              type="button"
+              size="lg"
+              className="bg-amber-500 text-black hover:bg-amber-400 font-semibold"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(evaluateDiagnosticText)
+                  toast({ title: "Copiado al portapapeles." })
+                } catch {
+                  toast({ title: "No se pudo copiar; selecciona el texto manualmente.", variant: "destructive" })
+                }
+              }}
+            >
+              COPIAR ERROR PARA GEMINI
+            </Button>
+            <Button type="button" variant="outline" className="border-zinc-500 text-zinc-100" onClick={() => clearEvaluateDiagnostic()}>
+              Cerrar panel
+            </Button>
+          </div>
+          <textarea
+            readOnly
+            className="min-h-0 w-full flex-1 resize-none rounded border border-zinc-600 bg-zinc-900 p-3 font-mono text-xs leading-relaxed text-zinc-100"
+            value={evaluateDiagnosticText}
+            spellCheck={false}
+          />
+        </div>
+      )}
       <GlobalStyles />
       {/* Banner: sin perfil completado no se guarda */}
       {mainProfile?.user && !mainProfile?.profile?.teacher_id && !onboardRefreshFailed && (

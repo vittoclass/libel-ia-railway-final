@@ -93,6 +93,19 @@ function shouldSkipClientOmr(payload: any): boolean {
   return false;
 }
 
+/** Modo diagnóstico temporal: pantalla completa en el cliente con detalle del fetch a /api/evaluate */
+export type EvaluateDiagnosticPayload = Record<string, unknown> & {
+  mode?: 'LIBELIA_EVALUATE_DEBUG_V1';
+  timestamp?: string;
+};
+
+function serializeUnknown(err: unknown): unknown {
+  if (err instanceof Error) {
+    return { name: err.name, message: err.message, stack: err.stack };
+  }
+  return err;
+}
+
 /** Detecta URLs/imagenes en el payload sin asumir un nombre único */
 function getPayloadFileUrls(payload: any): string[] | null {
   const candidates = [
@@ -113,6 +126,19 @@ function getPayloadFileUrls(payload: any): string[] | null {
 export const useEvaluator = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [answerKey, setAnswerKey] = useState<AnswerKeyData | null>(null);
+  const [evaluateDiagnostic, setEvaluateDiagnostic] = useState<EvaluateDiagnosticPayload | null>(null);
+
+  const clearEvaluateDiagnostic = useCallback(() => {
+    setEvaluateDiagnostic(null);
+  }, []);
+
+  const reportEvaluateDiagnostic = useCallback((partial: EvaluateDiagnosticPayload) => {
+    setEvaluateDiagnostic({
+      mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+      timestamp: new Date().toISOString(),
+      ...partial,
+    });
+  }, []);
 
   // Funcion para guardar la plantilla del profesor (memorizada por el sistema)
   const saveAnswerKey = useCallback((data: AnswerKeyData) => {
@@ -166,6 +192,26 @@ export const useEvaluator = () => {
 
   const evaluate = useCallback(async (payload: any): Promise<any> => {
     setIsLoading(true);
+    setEvaluateDiagnostic(null);
+    const urlAttempted =
+      typeof window !== 'undefined' ? `${window.location.origin}/api/evaluate` : '/api/evaluate';
+
+    const requestSummary = (p: any) => ({
+      fileUrlsCount: Array.isArray(p?.fileUrls) ? p.fileUrls.length : 0,
+      firstUrlKind:
+        Array.isArray(p?.fileUrls) && typeof p.fileUrls[0] === 'string'
+          ? p.fileUrls[0].startsWith('data:')
+            ? 'data_url'
+            : /^https?:\/\//i.test(p.fileUrls[0])
+              ? 'http_s'
+              : 'other_string'
+          : null,
+      firstUrlPreview:
+        Array.isArray(p?.fileUrls) && typeof p.fileUrls[0] === 'string'
+          ? String(p.fileUrls[0]).slice(0, 240)
+          : null,
+    });
+
     try {
       // ✅ No mutar el payload original
       const payloadFinal: any = { ...payload };
@@ -251,25 +297,112 @@ export const useEvaluator = () => {
       }
 
       // Llama a tu API para procesar imágenes y extraer texto (tu flujo actual)
-      const response = await fetch('/api/evaluate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payloadFinal),
-      });
+      let bodyStr: string;
+      try {
+        bodyStr = JSON.stringify(payloadFinal);
+      } catch (serErr) {
+        const diagnostic: EvaluateDiagnosticPayload = {
+          phase: 'serialize_request_body',
+          urlAttempted,
+          method: 'POST',
+          responseStatus: null,
+          responseStatusText: null,
+          responseBodyFromServer: null,
+          requestBodyBytes: null,
+          requestSummary: requestSummary(payloadFinal),
+          errorSerialized: serializeUnknown(serErr),
+          note: 'JSON.stringify(payloadFinal) falló (referencia circular, BigInt, etc.).',
+        };
+        setEvaluateDiagnostic({
+          mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+          timestamp: new Date().toISOString(),
+          ...diagnostic,
+        });
+        const msg =
+          serErr instanceof Error ? serErr.message : 'No se pudo serializar el cuerpo para /api/evaluate';
+        return { success: false, error: msg, diagnostic };
+      }
+
+      let response: Response;
+      try {
+        response = await fetch('/api/evaluate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: bodyStr,
+        });
+      } catch (netErr) {
+        const diagnostic: EvaluateDiagnosticPayload = {
+          phase: 'fetch_network_or_cors',
+          urlAttempted,
+          method: 'POST',
+          fetchPathUsed: '/api/evaluate',
+          responseStatus: null,
+          responseStatusText: null,
+          responseBodyFromServer: null,
+          requestBodyBytes: bodyStr.length,
+          requestSummary: requestSummary(payloadFinal),
+          errorSerialized: serializeUnknown(netErr),
+          hint: 'TypeError "fetch failed": red, CORS, TLS, proxy o cuerpo demasiado grande.',
+        };
+        setEvaluateDiagnostic({
+          mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+          timestamp: new Date().toISOString(),
+          ...diagnostic,
+        });
+        const msg = netErr instanceof Error ? netErr.message : 'fetch failed';
+        return { success: false, error: msg, diagnostic };
+      }
 
       const rawBody = await response.text();
       let data: any = {};
       try {
         data = rawBody ? JSON.parse(rawBody) : {};
-      } catch {
-        throw new Error(
-          `Error parseando JSON de /api/evaluate (status ${response.status}).`
-        );
+      } catch (parseErr) {
+        const diagnostic: EvaluateDiagnosticPayload = {
+          phase: 'parse_response_json',
+          urlAttempted,
+          method: 'POST',
+          responseStatus: response.status,
+          responseStatusText: response.statusText,
+          responseBodyFromServer: rawBody.slice(0, 120_000),
+          requestBodyBytes: bodyStr.length,
+          requestSummary: requestSummary(payloadFinal),
+          errorSerialized: serializeUnknown(parseErr),
+        };
+        setEvaluateDiagnostic({
+          mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+          timestamp: new Date().toISOString(),
+          ...diagnostic,
+        });
+        return {
+          success: false,
+          error: `Error parseando JSON de /api/evaluate (status ${response.status}).`,
+          diagnostic,
+        };
       }
+
       // SNAPSHOT_NATIONAL_ANALYTICS_V1: trazabilidad para inspeccionar payload real en navegador
       console.log("DEBUG - Respuesta completa:", data);
       if (!response.ok || !data?.success) {
-        throw new Error(data?.error || `Error en la evaluación (status ${response.status}).`);
+        const diagnostic: EvaluateDiagnosticPayload = {
+          phase: 'api_returned_error',
+          urlAttempted,
+          method: 'POST',
+          responseStatus: response.status,
+          responseStatusText: response.statusText,
+          responseBodyFromServer: rawBody.slice(0, 120_000),
+          parsedJson: data,
+          serverErrorMessage: data?.error ?? null,
+          requestBodyBytes: bodyStr.length,
+          requestSummary: requestSummary(payloadFinal),
+        };
+        setEvaluateDiagnostic({
+          mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+          timestamp: new Date().toISOString(),
+          ...diagnostic,
+        });
+        const msg = data?.error || `Error en la evaluación (status ${response.status}).`;
+        return { success: false, error: msg, diagnostic };
       }
 
       // Si hay pauta y respuestas extraídas, corrige autom��ticamente (tu lógica actual)
@@ -288,16 +421,28 @@ export const useEvaluator = () => {
       }
 
       return data;
-    } catch (err: any) {
+    } catch (err: unknown) {
       const msg =
         err instanceof Error
           ? err.message
-          : "Fallo de red o parsing en cliente al procesar /api/evaluate";
-      return { success: false, error: msg };
+          : "Fallo inesperado en cliente al procesar /api/evaluate";
+      const diagnostic: EvaluateDiagnosticPayload = {
+        phase: 'unexpected_catch',
+        urlAttempted,
+        method: 'POST',
+        errorSerialized: serializeUnknown(err),
+        requestSummary: requestSummary(payload),
+      };
+      setEvaluateDiagnostic({
+        mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+        timestamp: new Date().toISOString(),
+        ...diagnostic,
+      });
+      return { success: false, error: msg, diagnostic };
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [loadAnswerKey, answerKeyToPauta]);
 
 // Nueva funcion: Comparar respuestas del estudiante con la plantilla del profesor
   const compareWithAnswerKey = useCallback(async (studentAnswers: { pregunta: string | number; respuesta: string; confianza: number }[]) => {
@@ -343,6 +488,9 @@ export const useEvaluator = () => {
   return { 
     evaluate, 
     isLoading,
+    evaluateDiagnostic,
+    clearEvaluateDiagnostic,
+    reportEvaluateDiagnostic,
     // Funciones para manejar la plantilla del profesor
     answerKey,
     saveAnswerKey,
