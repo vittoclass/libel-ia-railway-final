@@ -107,13 +107,35 @@ export async function fileToImageBase64List(
   dataUrlOrBase64: string,
   mimeType?: string
 ): Promise<string[]> {
-  const raw = dataUrlOrBase64.startsWith("data:")
-    ? dataUrlOrBase64.replace(/^data:.*?;base64,/, "")
-    : dataUrlOrBase64
+  let source = String(dataUrlOrBase64 ?? "").trim()
+  let effectiveMime = mimeType
+
+  /** URLs firmadas (p. ej. Supabase): descargar en servidor; si no, el flujo trataba "https://..." como base64 y Mistral recibía data:image/jpeg;base64,https://... */
+  if (/^https?:\/\//i.test(source)) {
+    const res = await fetch(source)
+    if (!res.ok) {
+      throw new Error(
+        `No se pudo descargar el archivo para evaluar (${res.status}). URL: ${source.slice(0, 200)}`
+      )
+    }
+    const buf = Buffer.from(await res.arrayBuffer())
+    source = buf.toString("base64")
+    const ct = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase()
+    if (ct === "application/pdf") {
+      effectiveMime = "application/pdf"
+    } else if (ct.startsWith("image/") && !effectiveMime) {
+      effectiveMime = ct
+    }
+  }
+
+  const raw = source.startsWith("data:")
+    ? source.replace(/^data:.*?;base64,/, "")
+    : source
 
   const isPdf =
-    mimeType === "application/pdf" || isPdfBase64(raw)
+    effectiveMime === "application/pdf" || mimeType === "application/pdf" || isPdfBase64(raw)
   const isDocx =
+    effectiveMime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
     mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
     isDocxBase64(raw)
 

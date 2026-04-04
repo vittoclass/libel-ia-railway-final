@@ -245,6 +245,25 @@ async function urlToBase64(url: string): Promise<string> {
   return Buffer.from(buffer).toString("base64")
 }
 
+/**
+ * Parte `image_url` para Mistral Vision: si ya es https:// o data:, se usa tal cual;
+ * si es base64 crudo (sin prefijo), se envía como data:image/jpeg;base64,...
+ */
+function mistralVisionImagePart(imageRef: string): { type: "image_url"; image_url: { url: string } } {
+  const s = String(imageRef ?? "").trim()
+  if (!s) {
+    return { type: "image_url", image_url: { url: "" } }
+  }
+  const lower = s.toLowerCase()
+  if (lower.startsWith("http://") || lower.startsWith("https://")) {
+    return { type: "image_url", image_url: { url: s } }
+  }
+  if (lower.startsWith("data:")) {
+    return { type: "image_url", image_url: { url: s } }
+  }
+  return { type: "image_url", image_url: { url: `data:image/jpeg;base64,${s}` } }
+}
+
 /** Mistral solo acepta imágenes (JPEG, PNG, WEBP, etc.). PDF/Word se convierten antes con fileToImageBase64List. */
 
 /**
@@ -514,9 +533,9 @@ Responde SOLO este JSON:
 
   const content: any[] = []
   if (conPlantilla) {
-    content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${templateImageBase64}` } })
+    content.push(mistralVisionImagePart(templateImageBase64!))
   }
-  content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${studentImageBase64}` } })
+  content.push(mistralVisionImagePart(studentImageBase64))
   content.push({ type: "text", text: prompt })
 
   const res = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
@@ -778,10 +797,7 @@ INSTRUCCIONES PARA PREGUNTAS DE DESARROLLO (si la prueba tiene desarrollo):
       messages: [
         {
           role: "user",
-          content: [
-            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
-            { type: "text", text: prompt },
-          ],
+          content: [mistralVisionImagePart(imageBase64), { type: "text", text: prompt }],
         },
       ],
       temperature: 0.1,
@@ -860,10 +876,7 @@ Las claves de respuestas_desarrollo pueden ser P1, P2, P39, P40, etc. según los
       model: "pixtral-12b-2409",
       messages: [{
         role: "user",
-        content: [
-          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
-          { type: "text", text: prompt },
-        ],
+        content: [mistralVisionImagePart(imageBase64), { type: "text", text: prompt }],
       }],
       temperature: 0.1,
       response_format: { type: "json_object" },
