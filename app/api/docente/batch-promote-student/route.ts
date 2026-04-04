@@ -28,6 +28,8 @@ export async function POST(req: NextRequest) {
     student_index?: number
     course_label?: string | null
     subject?: string | null
+    /** Opcional: RUT detectado; el servidor intenta resolver nombre en public.students. */
+    student_rut?: string | null
   }
   try {
     body = await req.json()
@@ -76,6 +78,7 @@ export async function POST(req: NextRequest) {
     department,
     course_label: typeof body.course_label === "string" ? body.course_label : null,
     subject: typeof body.subject === "string" ? body.subject : null,
+    student_rut: typeof body.student_rut === "string" ? body.student_rut : null,
   })
 
   if (!result.ok) {

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { normalizeRutCanonical } from "@/app/lib/student-identity/rut"
 
 export const dynamic = "force-dynamic"
 
@@ -113,7 +114,8 @@ export async function GET(req: NextRequest) {
     .limit(200)
 
   const evalIds = (evalRows ?? []).map((e) => (e as { id: string }).id).filter(Boolean)
-  let studentsByEval = new Map<string, { student_name: string | null; student_identifier: string | null }>()
+  /** Varias filas por evaluation_id (upserts distintos): fusionar nombre y RUT sin quedarnos solo con la primera. */
+  const studentsByEval = new Map<string, { student_name: string | null; student_identifier: string | null }>()
   if (evalIds.length > 0) {
     const { data: stRows } = await server
       .from("evaluation_students")
@@ -121,12 +123,17 @@ export async function GET(req: NextRequest) {
       .in("evaluation_id", evalIds)
     for (const s of stRows ?? []) {
       const row = s as { evaluation_id: string; student_name?: string | null; student_identifier?: string | null }
-      if (row.evaluation_id && !studentsByEval.has(row.evaluation_id)) {
-        studentsByEval.set(row.evaluation_id, {
-          student_name: row.student_name ?? null,
-          student_identifier: row.student_identifier ?? null,
-        })
-      }
+      const evId = row.evaluation_id
+      if (!evId) continue
+      const sn = row.student_name != null && String(row.student_name).trim() !== "" ? String(row.student_name).trim() : null
+      const sid =
+        row.student_identifier != null && String(row.student_identifier).trim() !== ""
+          ? String(row.student_identifier).trim()
+          : null
+      const cur = studentsByEval.get(evId) ?? { student_name: null, student_identifier: null }
+      if (sn && !cur.student_name) cur.student_name = sn
+      if (sid && !cur.student_identifier) cur.student_identifier = sid
+      studentsByEval.set(evId, cur)
     }
   }
 
@@ -140,6 +147,17 @@ export async function GET(req: NextRequest) {
       student_rut: st?.student_identifier ?? null,
     }
   })
+
+  for (const slot of slots) {
+    const hasName = slot.student_name != null && String(slot.student_name).trim() !== ""
+    if (hasName) continue
+    const rutRaw = slot.student_rut?.trim()
+    const rutNorm = rutRaw ? normalizeRutCanonical(rutRaw) : null
+    if (!rutNorm) continue
+    const { data: stu } = await server.from("students").select("full_name").eq("rut_norm", rutNorm).maybeSingle()
+    const fn = (stu as { full_name?: string | null } | null)?.full_name?.trim()
+    if (fn) slot.student_name = fn
+  }
 
   return NextResponse.json({
     batch_id: batchId,

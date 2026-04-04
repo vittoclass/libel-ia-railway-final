@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
+import { normalizeRutCanonical } from "@/app/lib/student-identity/rut"
 
 export type PromoteBatchStudentResult =
   | { ok: true; evaluation_id: string; already_existed?: false }
@@ -113,6 +114,8 @@ export async function promoteBatchStudentToEvaluation(opts: {
   department?: string | null
   course_label?: string | null
   subject?: string | null
+  /** RUT detectado en móvil/OCR (opcional): busca nombre en public.students y guarda student_identifier. */
+  student_rut?: string | null
 }): Promise<PromoteBatchStudentResult> {
   const {
     supabase,
@@ -124,6 +127,7 @@ export async function promoteBatchStudentToEvaluation(opts: {
     department,
     course_label: courseLabel,
     subject,
+    student_rut: studentRutOpt,
   } = opts
 
   if (!Number.isFinite(studentIndex) || studentIndex < 1) {
@@ -186,9 +190,22 @@ export async function promoteBatchStudentToEvaluation(opts: {
     }
   }
 
-  const titleParts = [`Escaneo · Alumno ${studentIndex}`]
+  let displayStudentName = `Alumno lote · índice ${studentIndex}`
+  let studentIdentifier: string | null = null
+  const rutRaw = studentRutOpt != null ? String(studentRutOpt).trim() : ""
+  if (rutRaw) {
+    const rutNorm = normalizeRutCanonical(rutRaw)
+    if (rutNorm) {
+      studentIdentifier = rutRaw
+      const { data: stuRow } = await supabase.from("students").select("full_name").eq("rut_norm", rutNorm).maybeSingle()
+      const fn = (stuRow as { full_name?: string | null } | null)?.full_name?.trim()
+      if (fn) displayStudentName = fn
+    }
+  }
+
+  const titleParts = [displayStudentName, `Índice ${studentIndex}`]
   if (courseLabel?.trim()) titleParts.push(courseLabel.trim())
-  const title = titleParts.join(" · ")
+  const title = titleParts.join(" · ").slice(0, 500)
   const subjectFinal = (subject?.trim() || "Escaneo móvil").slice(0, 200)
   const courseLabelFinal = courseLabel?.trim() || null
   const sourceExamId = sess.source_exam_id ? String(sess.source_exam_id) : null
@@ -252,13 +269,13 @@ export async function promoteBatchStudentToEvaluation(opts: {
     return { ok: false, error: sumErr.message, code: sumErr.code }
   }
 
-  const slotName = `Alumno lote · índice ${studentIndex}`
-  const studentNormalized = slotName.trim().toLowerCase()
+  const studentNormalized = displayStudentName.trim().toLowerCase()
   const { error: stErr } = await supabase.from("evaluation_students").insert({
     evaluation_id: evaluationId,
-    student_name: slotName,
+    student_name: displayStudentName,
     student_normalized: studentNormalized,
     course_label: courseLabelFinal,
+    ...(studentIdentifier ? { student_identifier: studentIdentifier } : {}),
   })
 
   if (stErr) {

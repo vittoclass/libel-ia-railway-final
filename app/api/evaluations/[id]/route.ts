@@ -91,14 +91,21 @@ export async function GET(
       .maybeSingle(),
     supabase
       .from("evaluation_students")
-      .select("id, student_name, created_at")
+      .select("id, student_name, student_identifier, created_at")
       .eq("evaluation_id", id)
       .order("student_name", { ascending: true }),
   ])
 
   const items = Array.isArray(itemsRes.data) ? itemsRes.data : []
   const summary = summaryRes.data ?? null
-  const students = Array.isArray(studentsRes.data) ? studentsRes.data : []
+  const studentsRaw = Array.isArray(studentsRes.data) ? studentsRes.data : []
+  const students = [...studentsRaw].sort((a, b) => {
+    const an = String((a as { student_name?: string | null }).student_name ?? "").trim()
+    const bn = String((b as { student_name?: string | null }).student_name ?? "").trim()
+    if (!an && bn) return 1
+    if (an && !bn) return -1
+    return 0
+  })
   if (isDev) {
     if (itemsRes.error) console.info("[API][EVAL_DETAIL] evaluation_items error:", itemsRes.error.message)
     if (summaryRes.error) console.info("[API][EVAL_DETAIL] evaluation_summaries error:", summaryRes.error.message)
@@ -107,9 +114,15 @@ export async function GET(
     console.info("[API][EVAL_DETAIL] summary found", !!summary)
     console.info("[API][EVAL_DETAIL] response 200")
   }
-  const firstStudentName = students.length > 0 && (students[0] as { student_name?: string | null }).student_name
-    ? String((students[0] as { student_name: string }).student_name).trim()
-    : undefined
+  let firstStudentName: string | undefined
+  let firstStudentIdentifier: string | undefined
+  for (const st of students) {
+    const row = st as { student_name?: string | null; student_identifier?: string | null }
+    const n = row.student_name != null ? String(row.student_name).trim() : ""
+    if (n.length > 0 && !firstStudentName) firstStudentName = n
+    const idf = row.student_identifier != null ? String(row.student_identifier).trim() : ""
+    if (idf.length > 0 && !firstStudentIdentifier) firstStudentIdentifier = idf
+  }
 
   const rawPaths = (evaluation as { scan_image_paths?: unknown }).scan_image_paths
   const scanPaths = Array.isArray(rawPaths)
@@ -134,6 +147,7 @@ export async function GET(
         evaluated_at: evaluation.evaluated_at,
         status: evaluation.status ?? "draft",
         student_name: firstStudentName,
+        student_identifier: firstStudentIdentifier,
         source_exam_id: (evaluation as { source_exam_id?: string | null }).source_exam_id ?? undefined,
         batch_id: (evaluation as { batch_id?: string | null }).batch_id ?? undefined,
         batch_student_index: (evaluation as { batch_student_index?: number | null }).batch_student_index ?? undefined,

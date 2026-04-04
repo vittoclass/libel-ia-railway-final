@@ -841,6 +841,44 @@ interface FilePreview {
   /** Id fila `batch_photo_uploads` cuando la imagen viene del escáner móvil. */
   mobileBatchPhotoId?: string
   fromMobileBatch?: boolean
+  /** Ruta en bucket batch-scans; permite POST liviano a /api/evaluate vía URL firmada. */
+  batchScanStoragePath?: string | null
+}
+
+/** Evita POST enormes: imágenes ya en batch-scans se envían como URL firmada a /api/evaluate. */
+async function resolveFileUrlsForEvaluate(files: FilePreview[]): Promise<{ urls: string[]; mimes: string[] }> {
+  const urls: string[] = []
+  const mimes: string[] = []
+  for (const f of files) {
+    const sp = f.batchScanStoragePath?.trim()
+    if (sp) {
+      try {
+        const r = await fetch(`/api/docente/batch-photo-sign?path=${encodeURIComponent(sp)}`)
+        const j = (await r.json().catch(() => ({}))) as { signed_url?: string }
+        if (r.ok && typeof j.signed_url === "string" && j.signed_url.length > 0) {
+          urls.push(j.signed_url)
+          mimes.push(f.file.type || "image/jpeg")
+          continue
+        }
+      } catch {
+        /* usar dataUrl */
+      }
+    }
+    urls.push(f.dataUrl)
+    mimes.push(f.file.type)
+  }
+  return { urls, mimes }
+}
+
+function displayStudentNameForEvaluateGroup(
+  group: { studentName?: string },
+  studentGroups: Array<{ id: string; studentName?: string }>,
+  groupId: string,
+): string {
+  const t = group.studentName != null ? String(group.studentName).trim() : ""
+  if (t.length > 0) return t
+  const idx = studentGroups.findIndex((g) => g.id === groupId)
+  return `Alumno ${idx >= 0 ? idx + 1 : 1}`
 }
 interface AlternativeResult {
   pregunta: string
@@ -1083,11 +1121,11 @@ function mergeMobileBatchIntoEvaluatorState(
     if (si == null || si < 1 || si > next.length) continue
     const i = si - 1
     const g = next[i]
-    const slotName = slot.student_name?.trim()
+    const slotName = slot.student_name != null ? String(slot.student_name).trim() : ""
     const rutRaw = slot.student_rut?.trim()
     const rut = rutRaw ? normalizeRutCanonical(rutRaw) ?? rutRaw : undefined
     let newName = g.studentName
-    if (slotName && isGenericStudentSlotName(g.studentName)) newName = slotName
+    if (slotName.length > 0 && isGenericStudentSlotName(g.studentName)) newName = slotName
     let newRut = g.studentRut ?? ""
     if (rut && !String(g.studentRut ?? "").trim()) newRut = rut
     next[i] = {
@@ -2462,6 +2500,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             dataUrl,
             mobileBatchPhotoId: p.id,
             fromMobileBatch: true,
+            batchScanStoragePath: p.storage_path ?? null,
           }
           placement.push({
             preview,
@@ -2804,9 +2843,12 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     const teacherIdForPayload = profileIds?.teacher_id ?? null
     const schoolIdForPayload = profileIds?.school_id ?? null
 
+    const displayName = displayStudentNameForEvaluateGroup(group, studentGroups, groupId)
+    const { urls: evaluateFileUrls, mimes: evaluateFileMimes } = await resolveFileUrlsForEvaluate(group.files)
+
     const payload = {
-      fileUrls: group.files.map((f) => f.dataUrl),
-      fileMimeTypes: group.files.map((f) => f.file.type),
+      fileUrls: evaluateFileUrls,
+      fileMimeTypes: evaluateFileMimes,
       rubrica,
       pauta,
       flexibilidad: flexibilidad[0],
@@ -2827,7 +2869,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       evaluation_title: form.getValues("nombrePrueba") ?? "",
       evaluation_subject: form.getValues("asignatura") ?? "",
       course_id: form.getValues("curso") ?? "",
-      nombreEstudiante: group.studentName && String(group.studentName).trim() !== "" ? String(group.studentName).trim() : undefined,
+      nombreEstudiante: displayName,
       student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
       omrTemplateVariant: selectedOmrTemplateVariant,
       evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
@@ -2852,7 +2894,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               setShowRetrySaveButton(false)
               lastFailedSaveRef.current = null
               ;(async () => {
-                const finalStudentName = getFinalStudentNameForSync(group, null)
+                const finalStudentName = getFinalStudentNameForSync(group, null) || displayName
                 const finalStudentRut = getFinalStudentRutForSync(group, null)
                 const finalCourseLabel = getFinalCourseLabel(null)
                 if (!finalStudentName) {
@@ -3118,43 +3160,49 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         : null,
     }
 
-    // Construir items para el batch endpoint
-    const batchItems = validGroups.map((group) => ({
-      groupId: group.id,
-      payload: {
-        fileUrls: group.files.map((f) => f.dataUrl),
-        fileMimeTypes: group.files.map((f) => f.file.type),
-        rubrica,
-        pauta,
-        flexibilidad: flexibilidad[0],
-        tipoEvaluacion,
-        areaConocimiento,
-        userEmail,
-        puntajeTotal: puntajeTotalNum,
-        nivelEducativo,
-        nombresGrupales,
-        porcentajeExigencia: porcentajeExigenciaNum,
-        pautaEstructurada: pautaEstructuradaFinal,
-        pautaCorrectaAlternativas: pautaCorrectaAlternativasFinal,
-        tipoPrueba: tipoPrueba || "mixta",
-        respuestasAlternativas: answerKey ? undefined : group.alternativas_corregidas,
-        captureMode: captureMode,
-        ...(teacherIdForPayload && { teacher_id: teacherIdForPayload }),
-        ...(schoolIdForPayload && { school_id: schoolIdForPayload }),
-        evaluation_title: nombrePrueba ?? "",
-        evaluation_subject: asignatura ?? "",
-        course_id: curso ?? "",
-        nombreEstudiante: group.studentName && String(group.studentName).trim() !== "" ? String(group.studentName).trim() : undefined,
-        student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
-        omrTemplateVariant: selectedOmrTemplateVariant,
-        answerKeyFromTemplate: buildTeacherAnswerKeyFromFormPauta(
-          String(pautaEstructuradaFinal),
-          String(pautaCorrectaAlternativasFinal),
-          (tipoPrueba || "mixta") as any,
-        ),
-        evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
-      },
-    }))
+    // Construir items para el batch endpoint (URLs firmadas cuando hay batchScanStoragePath)
+    const batchItems = await Promise.all(
+      validGroups.map(async (group) => {
+        const { urls: evaluateFileUrls, mimes: evaluateFileMimes } = await resolveFileUrlsForEvaluate(group.files)
+        const displayName = displayStudentNameForEvaluateGroup(group, studentGroups, group.id)
+        return {
+          groupId: group.id,
+          payload: {
+            fileUrls: evaluateFileUrls,
+            fileMimeTypes: evaluateFileMimes,
+            rubrica,
+            pauta,
+            flexibilidad: flexibilidad[0],
+            tipoEvaluacion,
+            areaConocimiento,
+            userEmail,
+            puntajeTotal: puntajeTotalNum,
+            nivelEducativo,
+            nombresGrupales,
+            porcentajeExigencia: porcentajeExigenciaNum,
+            pautaEstructurada: pautaEstructuradaFinal,
+            pautaCorrectaAlternativas: pautaCorrectaAlternativasFinal,
+            tipoPrueba: tipoPrueba || "mixta",
+            respuestasAlternativas: answerKey ? undefined : group.alternativas_corregidas,
+            captureMode: captureMode,
+            ...(teacherIdForPayload && { teacher_id: teacherIdForPayload }),
+            ...(schoolIdForPayload && { school_id: schoolIdForPayload }),
+            evaluation_title: nombrePrueba ?? "",
+            evaluation_subject: asignatura ?? "",
+            course_id: curso ?? "",
+            nombreEstudiante: displayName,
+            student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
+            omrTemplateVariant: selectedOmrTemplateVariant,
+            answerKeyFromTemplate: buildTeacherAnswerKeyFromFormPauta(
+              String(pautaEstructuradaFinal),
+              String(pautaCorrectaAlternativasFinal),
+              (tipoPrueba || "mixta") as any,
+            ),
+            evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
+          },
+        }
+      }),
+    )
 
     try {
       const response = await fetch("/api/evaluate/batch", {
@@ -5011,18 +5059,25 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           id={`group-paso2-${group.id}`}
                           className={`border-2 p-4 rounded-xl ${stateColor}`}
                         >
-                          <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
-                            <Input
-                              className="text-lg font-bold border-0 shadow-none focus-visible:ring-0 p-1 bg-transparent flex-1 min-w-0"
-                              value={group.studentName}
-                              onChange={(e) => updateStudentName(group.id, e.target.value)}
-                            />
-                            <span className="text-xs font-semibold px-2 py-1 rounded-full bg-[var(--bg-muted)] text-[var(--text-secondary)]">
-                              {group.files.length} archivo{group.files.length !== 1 ? "s" : ""}
-                            </span>
-                            <span className="text-xs font-medium px-2 py-1 rounded-full border bg-white/80 dark:bg-gray-900/80">
-                              {stateLabel}
-                            </span>
+                          <div className="flex items-start justify-between flex-wrap gap-2 mb-2">
+                            <div className="flex-1 min-w-0 space-y-0.5">
+                              <Label className="text-xs text-[var(--text-muted)]">Nombre del estudiante</Label>
+                              <Input
+                                className="text-lg font-bold border border-transparent hover:border-[var(--border-color)] focus-visible:ring-1 p-1 bg-transparent w-full"
+                                placeholder="Escribe nombre y apellido si no se detectó solo"
+                                value={group.studentName}
+                                onChange={(e) => updateStudentName(group.id, e.target.value)}
+                                aria-label="Nombre del estudiante"
+                              />
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 shrink-0 pt-5">
+                              <span className="text-xs font-semibold px-2 py-1 rounded-full bg-[var(--bg-muted)] text-[var(--text-secondary)]">
+                                {group.files.length} archivo{group.files.length !== 1 ? "s" : ""}
+                              </span>
+                              <span className="text-xs font-medium px-2 py-1 rounded-full border bg-white/80 dark:bg-gray-900/80">
+                                {stateLabel}
+                              </span>
+                            </div>
                           </div>
                           <div className="mb-3">
                             <Label className="text-xs text-[var(--text-muted)]">RUT (secundario, ancla técnica)</Label>
