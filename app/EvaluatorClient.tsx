@@ -816,11 +816,24 @@ const formSchema = z.object({
   // Tipo de prueba: mixta (alternativas + desarrollo), solo_desarrollo, solo_alternativas
   tipoPrueba: z.enum(["mixta", "solo_desarrollo", "solo_alternativas"]).default("mixta"),
 })
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve(String(r.result ?? ""))
+    r.onerror = () => reject(r.error ?? new Error("readAsDataURL"))
+    r.readAsDataURL(file)
+  })
+}
+
 interface FilePreview {
   id: string
   file: File
   previewUrl: string
   dataUrl: string
+  /** Id fila `batch_photo_uploads` cuando la imagen viene del escáner móvil. */
+  mobileBatchPhotoId?: string
+  fromMobileBatch?: boolean
 }
 interface AlternativeResult {
   pregunta: string
@@ -999,6 +1012,8 @@ interface StudentGroup {
   }
   /** Id de la evaluación en BD cuando ya fue guardada; permite aplicar cambios de la tabla al resto de la app */
   evaluation_id?: string | null
+  /** Evaluación ya creada al promocionar/vincular foto del lote móvil (mismo batch). */
+  promotedEvaluationId?: string | null
   shouldUseOfficialAzureOmr?: boolean
   officialOmrActivationReason?: string
   officialOmrIntegrationEnabled?: boolean
@@ -1007,6 +1022,108 @@ interface StudentGroup {
   officialOmrFallbackUsed?: boolean
   officialOmrFallbackReason?: string | null
   omrDebug?: any
+}
+
+type MobileBatchPlacement = {
+  preview: FilePreview
+  student_index: number | null
+  evaluation_id: string | null
+}
+type MobileBatchSlot = {
+  evaluation_id: string
+  student_index: number | null
+  student_name: string | null
+  student_rut: string | null
+}
+
+/** Nombres de grupo que puede sobrescribir la sync del lote móvil (slots promovidos). */
+function isGenericStudentSlotName(name: string | undefined): boolean {
+  if (!name || typeof name !== "string") return true
+  const t = name.trim()
+  if (t === "" || /^Alumno\s+\d+$/i.test(t)) return true
+  if (/^Alumno\s+lote/i.test(t)) return true
+  if (/lote/i.test(t) && /índice/i.test(t)) return true
+  return false
+}
+
+function mergeMobileBatchIntoEvaluatorState(
+  prevGroups: StudentGroup[],
+  prevUnassigned: FilePreview[],
+  placement: MobileBatchPlacement[],
+  slots: MobileBatchSlot[],
+  apiIds: Set<string>,
+): { groups: StudentGroup[]; unassigned: FilePreview[] } {
+  let next = prevGroups.map((g) => ({ ...g, files: [...g.files] }))
+  for (let gi = 0; gi < next.length; gi++) {
+    const g = next[gi]
+    const kept: FilePreview[] = []
+    for (const f of g.files) {
+      if (f.fromMobileBatch && f.mobileBatchPhotoId && !apiIds.has(f.mobileBatchPhotoId)) {
+        try {
+          URL.revokeObjectURL(f.previewUrl)
+        } catch {
+          /* noop */
+        }
+      } else {
+        kept.push(f)
+      }
+    }
+    next[gi] = { ...g, files: kept }
+  }
+
+  for (const slot of slots) {
+    const si = slot.student_index
+    if (si == null || si < 1 || si > next.length) continue
+    const i = si - 1
+    const g = next[i]
+    const slotName = slot.student_name?.trim()
+    const rutRaw = slot.student_rut?.trim()
+    const rut = rutRaw ? normalizeRutCanonical(rutRaw) ?? rutRaw : undefined
+    let newName = g.studentName
+    if (slotName && isGenericStudentSlotName(g.studentName)) newName = slotName
+    let newRut = g.studentRut ?? ""
+    if (rut && !String(g.studentRut ?? "").trim()) newRut = rut
+    next[i] = {
+      ...g,
+      studentName: newName,
+      studentRut: newRut,
+      promotedEvaluationId: slot.evaluation_id || g.promotedEvaluationId || null,
+    }
+  }
+
+  const orphans: FilePreview[] = []
+  for (const item of placement) {
+    const { preview, student_index, evaluation_id } = item
+    if (next.some((g) => g.files.some((f) => f.id === preview.id))) continue
+    const gi =
+      student_index != null && student_index >= 1 && student_index <= next.length ? student_index - 1 : -1
+    if (gi >= 0) {
+      const g = next[gi]
+      next[gi] = {
+        ...g,
+        files: [...g.files, preview],
+        promotedEvaluationId: evaluation_id || g.promotedEvaluationId || null,
+      }
+    } else {
+      orphans.push(preview)
+    }
+  }
+
+  let unassigned = prevUnassigned.filter((f) => {
+    if (f.fromMobileBatch && f.mobileBatchPhotoId && !apiIds.has(f.mobileBatchPhotoId)) {
+      try {
+        URL.revokeObjectURL(f.previewUrl)
+      } catch {
+        /* noop */
+      }
+      return false
+    }
+    return true
+  })
+  for (const p of orphans) {
+    if (!unassigned.some((f) => f.id === p.id)) unassigned = [...unassigned, p]
+  }
+  return { groups: next, unassigned }
 }
 
 // *** TIPOS DECLARADOS PARA RESOLVER ERRORES LINT ***
@@ -1160,6 +1277,10 @@ export default function EvaluatorClient() {
   const [activeTab, setActiveTab] = useState("presentacion")
   const [userEmail, setUserEmail] = useState<string>("")
   const [unassignedFiles, setUnassignedFiles] = useState<FilePreview[]>([])
+  const evaluatorStep2FilesRef = useRef<{ groups: StudentGroup[]; unassigned: FilePreview[] }>({
+    groups: [],
+    unassigned: [],
+  })
   /** Sellado de lote (UUID); persiste en evaluations.batch_id. No interfiere con OMR. */
   const evaluationBatchIdRef = useRef<string | null>(null)
   const [evaluationBatchIdUi, setEvaluationBatchIdUi] = useState<string | null>(null)
@@ -1203,6 +1324,11 @@ export default function EvaluatorClient() {
       cancelled = true
     }
   }, [evaluationBatchIdUi])
+
+  useEffect(() => {
+    evaluatorStep2FilesRef.current = { groups: studentGroups, unassigned: unassignedFiles }
+  }, [studentGroups, unassignedFiles])
+
   const [isCameraOpen, setIsCameraOpen] = useState(false)
   // 🚨 NUEVOS ESTADOS PARA CAPTURA GUIADA
   const [isCaptureModeSelectionOpen, setIsCaptureModeSelectionOpen] = useState(false)
@@ -1240,7 +1366,9 @@ export default function EvaluatorClient() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const cameraInputRef = useRef<HTMLInputElement>(null)
   const logoInputRef = useRef<HTMLInputElement>(null)
-const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKeyToPauta } = useEvaluator()
+  const supabaseBrowser = React.useMemo(() => createClientComponentClient(), [])
+  const mobileBatchSyncingRef = useRef(false)
+  const { evaluate, isLoading, answerKey, saveAnswerKey, clearAnswerKey, answerKeyToPauta } = useEvaluator()
   const { toast } = useToast()
 
   // Estado para el modal de plantilla de respuestas del profesor
@@ -2160,7 +2288,13 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       return
     }
     if (unassignedFiles.length === 0) {
-      toast({ title: "No hay archivos pendientes para agrupar.", variant: "default" })
+      const hasMobile = studentGroups.some((g) => g.files.some((f) => f.fromMobileBatch))
+      toast({
+        title: hasMobile
+          ? "No hay archivos de PC pendientes. Las del móvil ya van a cada grupo según índice."
+          : "No hay archivos pendientes para agrupar.",
+        variant: "default",
+      })
       return
     }
     const toAssign: { fileId: string; groupId: string }[] = []
@@ -2225,12 +2359,132 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     }
   }
 
-  /** Nombre genérico que se puede sobrescribir de forma segura (solo "Alumno N" o vacío). */
-  const isGenericGroupName = (name: string | undefined) => {
-    if (!name || typeof name !== "string") return true
-    const t = name.trim()
-    return t === "" || /^Alumno\s+\d+$/i.test(t)
-  }
+  const isGenericGroupName = (name: string | undefined) => isGenericStudentSlotName(name)
+
+  const syncMobileBatchPhotos = useCallback(async () => {
+    const batchId = evaluationBatchIdUi
+    if (!batchId || mobileBatchSyncingRef.current) return
+    mobileBatchSyncingRef.current = true
+    try {
+      const r = await fetch(`/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}`)
+      const j = (await r.json().catch(() => ({}))) as {
+        error?: string
+        photos?: Array<{
+          id: string
+          student_index: number | null
+          page_index?: number | null
+          storage_path: string | null
+          evaluation_id: string | null
+          signed_url: string | null
+        }>
+        slots?: Array<{
+          evaluation_id: string
+          student_index: number | null
+          student_name: string | null
+          student_rut: string | null
+        }>
+      }
+      if (!r.ok) {
+        if (j?.error) {
+          toast({ title: "Sincronización del lote", description: j.error, variant: "destructive" })
+        }
+        return
+      }
+      const photos = j.photos ?? []
+      const slots = j.slots ?? []
+      const apiIds = new Set(photos.map((p) => p.id))
+
+      const snapPre = evaluatorStep2FilesRef.current
+      const knownMobilePhotoIds = new Set<string>()
+      for (const g of snapPre.groups) {
+        for (const f of g.files) {
+          if (f.mobileBatchPhotoId) knownMobilePhotoIds.add(f.mobileBatchPhotoId)
+        }
+      }
+      for (const f of snapPre.unassigned) {
+        if (f.mobileBatchPhotoId) knownMobilePhotoIds.add(f.mobileBatchPhotoId)
+      }
+
+      const placement: MobileBatchPlacement[] = []
+
+      for (const p of photos) {
+        if (!p.signed_url) continue
+        if (knownMobilePhotoIds.has(p.id)) continue
+        try {
+          const fr = await fetch(p.signed_url)
+          if (!fr.ok) continue
+          const blob = await fr.blob()
+          const ext = (p.storage_path?.split(".").pop() || "jpg").replace(/[^a-z0-9]/gi, "") || "jpg"
+          const mime = blob.type || "image/jpeg"
+          const file = new File([blob], `movil-${p.id}.${ext}`, { type: mime })
+          const dataUrl = await readFileAsDataUrl(file)
+          const preview: FilePreview = {
+            id: `mobile-${p.id}`,
+            file,
+            previewUrl: URL.createObjectURL(file),
+            dataUrl,
+            mobileBatchPhotoId: p.id,
+            fromMobileBatch: true,
+          }
+          placement.push({
+            preview,
+            student_index: p.student_index,
+            evaluation_id: p.evaluation_id,
+          })
+        } catch {
+          /* una fila no debe tumbar el lote */
+        }
+      }
+
+      const snap = evaluatorStep2FilesRef.current
+      const { groups: nextGroups, unassigned: nextUnassigned } = mergeMobileBatchIntoEvaluatorState(
+        snap.groups,
+        snap.unassigned,
+        placement,
+        slots,
+        apiIds,
+      )
+      setStudentGroups(nextGroups)
+      setUnassignedFiles(nextUnassigned)
+    } finally {
+      mobileBatchSyncingRef.current = false
+    }
+  }, [evaluationBatchIdUi, toast])
+
+  useEffect(() => {
+    if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
+    void syncMobileBatchPhotos()
+  }, [activeTab, evaluationBatchIdUi, syncMobileBatchPhotos])
+
+  useEffect(() => {
+    if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
+    const t = window.setInterval(() => {
+      void syncMobileBatchPhotos()
+    }, 20000)
+    return () => window.clearInterval(t)
+  }, [activeTab, evaluationBatchIdUi, syncMobileBatchPhotos])
+
+  useEffect(() => {
+    if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
+    const ch = supabaseBrowser
+      .channel(`evaluar-batch-photos-${evaluationBatchIdUi}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "batch_photo_uploads",
+          filter: `batch_id=eq.${evaluationBatchIdUi}`,
+        },
+        () => {
+          void syncMobileBatchPhotos()
+        },
+      )
+      .subscribe()
+    return () => {
+      void supabaseBrowser.removeChannel(ch)
+    }
+  }, [activeTab, evaluationBatchIdUi, supabaseBrowser, syncMobileBatchPhotos])
 
   /** Extracción masiva de nombres: recorre grupos con archivos y nombre genérico, reutiliza /api/extract-name. No toca evaluación ni contratos. */
   const handleBulkNameExtraction = async () => {
@@ -4330,6 +4584,12 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                       ) : (
                         <span className="ml-2 italic">Se asigna al subir la primera hoja o al iniciar evaluación.</span>
                       )}
+                      {evaluationBatchIdUi ? (
+                        <span className="block mt-1 text-[11px] text-amber-800 dark:text-amber-200/90">
+                          El escáner móvil debe enviar fotos con <strong>exactamente</strong> este{" "}
+                          <span className="font-mono">batch_id</span>. Si difiere, no verás las imágenes aquí.
+                        </span>
+                      ) : null}
                       {evaluationBatchIdUi && batchInstitutionalStatus && (
                         <span className="ml-2 block mt-1 text-[11px] text-slate-600 dark:text-slate-400">
                           Estado institucional:{" "}
@@ -4403,10 +4663,57 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                       </Button>
                       <Button
                         type="button"
+                        variant="secondary"
+                        size="sm"
+                        className="text-xs shrink-0"
+                        disabled={!!evaluationBatchIdUi}
+                        onClick={() => {
+                          evaluationBatchIdRef.current = crypto.randomUUID()
+                          setEvaluationBatchIdUi(evaluationBatchIdRef.current)
+                          toast({
+                            title: "Lote listo para el móvil",
+                            description: "Usa este UUID en el escáner. Debe coincidir con el que escanees en QR.",
+                          })
+                        }}
+                      >
+                        Fijar UUID para móvil
+                      </Button>
+                      <Button
+                        type="button"
                         variant="outline"
                         size="sm"
                         className="text-xs shrink-0"
                         onClick={() => {
+                          setStudentGroups((prev) =>
+                            prev.map((g) => ({
+                              ...g,
+                              files: g.files.filter((f) => {
+                                if (f.fromMobileBatch) {
+                                  try {
+                                    URL.revokeObjectURL(f.previewUrl)
+                                  } catch {
+                                    /* noop */
+                                  }
+                                  return false
+                                }
+                                return true
+                              }),
+                              promotedEvaluationId: null,
+                            })),
+                          )
+                          setUnassignedFiles((prev) =>
+                            prev.filter((f) => {
+                              if (f.fromMobileBatch) {
+                                try {
+                                  URL.revokeObjectURL(f.previewUrl)
+                                } catch {
+                                  /* noop */
+                                }
+                                return false
+                              }
+                              return true
+                            }),
+                          )
                           evaluationBatchIdRef.current = null
                           setEvaluationBatchIdUi(null)
                           setBatchInstitutionalStatus(null)
@@ -4426,7 +4733,9 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         Agrupación automática
                       </h3>
                       <p className="text-sm text-[var(--text-secondary)]">
-                        Indica cuántas imágenes corresponden a cada estudiante. Luego usa el botón para distribuir los archivos pendientes en orden.
+                        Indica cuántas imágenes corresponden a cada estudiante. Luego usa el botón para distribuir los archivos pendientes en orden. Las fotos del móvil (mismo{" "}
+                        <span className="font-mono text-xs">batch_id</span>) se suman al conteo y se ubican por{" "}
+                        <span className="font-mono text-xs">student_index</span> del lote.
                       </p>
                       <div className="flex flex-wrap items-end gap-4">
                         <div className="space-y-1">
@@ -4458,6 +4767,9 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         </Button>
                       </div>
                       {(() => {
+                        const mobileCount =
+                          studentGroups.reduce((acc, g) => acc + g.files.filter((f) => f.fromMobileBatch).length, 0) +
+                          unassignedFiles.filter((f) => f.fromMobileBatch).length
                         const totalLoaded = unassignedFiles.length + studentGroups.reduce((acc, g) => acc + g.files.length, 0)
                         const expected = studentGroups.length * Math.max(1, imagesPerStudent)
                         const missing = Math.max(0, expected - totalLoaded)
@@ -4467,7 +4779,14 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         return (
                           <div className="text-sm space-y-1 pt-2 border-t border-indigo-200 dark:border-indigo-800">
                             <p className="font-medium text-[var(--text-primary)]">
-                              Se detectaron {totalLoaded} imagen{totalLoaded !== 1 ? "es" : ""} en total.
+                              Se detectaron {totalLoaded} imagen{totalLoaded !== 1 ? "es" : ""} en total
+                              {mobileCount > 0 ? (
+                                <span className="text-[var(--text-secondary)] font-normal">
+                                  {" "}
+                                  ({mobileCount} desde móvil)
+                                </span>
+                              ) : null}
+                              .
                             </p>
                             <p className="text-[var(--text-secondary)]">
                               Configuración actual: {studentGroups.length} estudiantes × {Math.max(1, imagesPerStudent)} imágenes = {expected} esperadas.
@@ -4625,6 +4944,12 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                               onChange={(e) => updateStudentRut(group.id, e.target.value)}
                             />
                           </div>
+                          {group.promotedEvaluationId ? (
+                            <p className="text-[11px] text-emerald-800 dark:text-emerald-200/90 mb-2">
+                              Este índice tiene evaluación vinculada al lote móvil. Puedes usar{" "}
+                              <strong>Evaluar este estudiante</strong> para ir a corrección con la foto.
+                            </p>
+                          ) : null}
 
                           <Button
                             type="button"
@@ -4672,6 +4997,33 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                                 </select>
                               </div>
                             )}
+                          </div>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              disabled={
+                                group.files.length === 0 ||
+                                group.isEvaluating ||
+                                isLoading ||
+                                batchProgress.isActive ||
+                                (isCurrentlyEvaluatingAny && !group.isEvaluating) ||
+                                isCurrentlyValidatingAny
+                              }
+                              onClick={() => void handleEvaluateSingleGroup(group.id)}
+                            >
+                              {group.isEvaluating ? (
+                                <>
+                                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" aria-hidden />
+                                  Evaluando…
+                                </>
+                              ) : (
+                                <>
+                                  <Sparkles className="mr-2 h-3.5 w-3.5" aria-hidden />
+                                  Evaluar este estudiante
+                                </>
+                              )}
+                            </Button>
                           </div>
                         </div>
                       )

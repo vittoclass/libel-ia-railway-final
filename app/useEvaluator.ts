@@ -81,6 +81,18 @@ function saveOmrSession(obj: any) {
   }
 }
 
+/** Evita /api/omr en cliente cuando la evaluación es solo desarrollo o asignaturas sin lectura OMR típica (Arte, etc.). */
+function shouldSkipClientOmr(payload: any): boolean {
+  const tipo = String(payload?.tipoPrueba ?? '');
+  if (tipo === 'solo_desarrollo') return true;
+  const subj = String(payload?.evaluation_subject ?? payload?.asignatura ?? '').trim().toLowerCase();
+  if (!subj) return false;
+  if (/\bartes?\b/i.test(subj)) return true;
+  if (subj.includes('desarrollo personal')) return true;
+  if (subj.includes('educación en el desarrollo') || subj.includes('educacion en el desarrollo')) return true;
+  return false;
+}
+
 /** Detecta URLs/imagenes en el payload sin asumir un nombre único */
 function getPayloadFileUrls(payload: any): string[] | null {
   const candidates = [
@@ -197,7 +209,7 @@ export const useEvaluator = () => {
        */
       const fileUrls = getPayloadFileUrls(payloadFinal);
 
-      if (fileUrls && fileUrls.length > 0) {
+      if (fileUrls && fileUrls.length > 0 && !shouldSkipClientOmr(payloadFinal)) {
         const omrSession = loadOmrSession();
         const templateId = payloadFinal.templateId || omrSession.templateId || 'auto';
         const captureMode = payloadFinal.captureMode || 'X'; // cruces
