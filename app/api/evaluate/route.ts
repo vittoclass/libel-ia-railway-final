@@ -603,6 +603,8 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
    * Si está definido, la validación de longitud del layout usa este valor (no solo la plantilla del docente).
    */
   authoritativeOmrQuestionCount?: number
+  /** Orden pauta (isDevelopment) para orquestador Y; no altera visión de Azure. */
+  pautaItemsForOmSegmentation?: Array<{ isDevelopment: boolean }>
   templateKey: string
   templateVariant?: "odd_even_dual_column" | "sequential_dual_column"
 }): Promise<{
@@ -629,6 +631,9 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
     canonicalWidth: 1200,
     canonicalHeight: 1700,
     omrTemplateVariant: params.templateVariant ?? "odd_even_dual_column",
+    ...(Array.isArray(params.pautaItemsForOmSegmentation) && params.pautaItemsForOmSegmentation.length > 0
+      ? { pautaSegmentationItems: params.pautaItemsForOmSegmentation }
+      : {}),
   })
   if (!azure || (azure as any).success !== true) {
     if ((azure as any)?.errorCode === "AZURE_LAYOUT_PIPELINE_UNAVAILABLE") {
@@ -1561,6 +1566,9 @@ export async function POST(req: NextRequest) {
                 expectedQuestionCount: expectedQuestionCountUsed,
                 authoritativeOmrQuestionCount:
                   sourceExamOmrAuthoritative > 0 ? sourceExamOmrAuthoritative : undefined,
+                pautaItemsForOmSegmentation: parsePautaEstructurada(pautaEstructurada).map((it) => ({
+                  isDevelopment: it.isDevelopment,
+                })),
                 templateKey: templateKeyUsed,
                 templateVariant: omrTemplateVariant,
               })

@@ -3,6 +3,7 @@
  * Consumido solo desde app/api/evaluate/route.ts (OMR oficial).
  */
 import sharp from "sharp"
+import { mapDualPanelsWithPautaOrchestrator } from "./azure-layout-omr-pauta-orchestrator"
 
 export type OmrTemplateVariant = "odd_even_dual_column" | "sequential_dual_column" | "single_column"
 
@@ -369,6 +370,8 @@ export async function runAzureLayoutOmrPipeline(params: {
   canonicalWidth: number
   canonicalHeight: number
   omrTemplateVariant?: OmrTemplateVariant
+  /** Orden pauta (solo isDevelopment): orquestador Y sin tocar parseMarks/clusterRowsByY. */
+  pautaSegmentationItems?: Array<{ isDevelopment: boolean }>
 }): Promise<Record<string, unknown>> {
   const endpoint = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
   const key = process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY
@@ -441,13 +444,18 @@ export async function runAzureLayoutOmrPipeline(params: {
   const questionBlocksPerRow = forceDualByTemplate || variant !== "single_column" ? 2 : 1
 
   let perQuestion: Array<Record<string, unknown>>
+  let orchestratorQuestionOrder: string | null = null
   if (questionBlocksPerRow === 2) {
-    perQuestion = mapDualPanelsByContract({
+    const om = mapDualPanelsWithPautaOrchestrator({
       items: indexedMarks,
       variant,
       expectedQuestionCount: expected,
       expectedOptionCount,
+      pautaItems: params.pautaSegmentationItems ?? [],
+      legacyMapDual: mapDualPanelsByContract,
     })
+    perQuestion = om.perQuestion
+    orchestratorQuestionOrder = om.questionOrderSource
   } else {
     const rows = clusterRowsByY(indexedMarks)
     perQuestion = rows.map((r, i) => {
@@ -520,9 +528,11 @@ export async function runAzureLayoutOmrPipeline(params: {
     completedMissingQuestionsCount: Math.max(0, out.length - perQuestion.length),
     questionOrderSource:
       questionBlocksPerRow === 2
-        ? forceDualByTemplate
-          ? "template_forced_dual_columns"
-          : "azure_table_rows_then_x_columns"
+        ? orchestratorQuestionOrder === "pauta_orchestrator_odd_even_y_resync"
+          ? orchestratorQuestionOrder
+          : forceDualByTemplate
+            ? "template_forced_dual_columns"
+            : (orchestratorQuestionOrder ?? "azure_table_rows_then_x_columns")
         : "azure_marks_fallback_y_sort",
     templateKey: params.templateKey,
     omrTemplateVariant: variant,
