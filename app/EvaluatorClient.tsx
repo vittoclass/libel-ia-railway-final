@@ -2909,6 +2909,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
       omrTemplateVariant: selectedOmrTemplateVariant,
       evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
+      ...(hasSourceExamSelected ? { source_exam_id: selectedEvaluatorSourceExamId.trim() } : {}),
     }
 
     const result = await evaluate(payload)
@@ -3235,6 +3236,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               (tipoPrueba || "mixta") as any,
             ),
             evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
+            ...(hasSourceExamSelected ? { source_exam_id: selectedEvaluatorSourceExamId.trim() } : {}),
           },
         }
       }),

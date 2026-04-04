@@ -27,6 +27,10 @@ import {
   pruneCorreccionDetalladaForCanonicalDesarrollo,
   removeCorreccionEntriesForClosedPautaSlots,
 } from "../../lib/desarrollo-pipeline"
+import {
+  omrTemplateKeyForClosedQuestionCount,
+  resolveSourceExamOmrMetadata,
+} from "../../lib/source-exam-omr-metadata"
 
 export const runtime = "nodejs"
 // REFIX_404_RAILWAY: mantener respuesta dinámica en producción Railway
@@ -594,6 +598,11 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
   expectedOptionCount?: number
   /** Si se pasa >0, el pipeline completa huecos con BLANK inferido (completedByExpectation). Omitir para solo lectura sensorial. */
   expectedQuestionCount?: number
+  /**
+   * Filas del mapa OMR alineadas a la prueba base (source_exam.total_questions o ítems cerrados).
+   * Si está definido, la validación de longitud del layout usa este valor (no solo la plantilla del docente).
+   */
+  authoritativeOmrQuestionCount?: number
   templateKey: string
   templateVariant?: "odd_even_dual_column" | "sequential_dual_column"
 }): Promise<{
@@ -636,13 +645,17 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
   if (perQuestion.length === 0) {
     throw new Error("[official_azure_layout_family] pipeline devolvió 0 preguntas detectadas")
   }
-  const expectedClosedCount =
+  const fromTeacher =
     Array.isArray(params.closedQuestionIds) && params.closedQuestionIds.length > 0
       ? params.closedQuestionIds.length
       : params.teacherAnswerKey.length
-  if (expectedClosedCount > 0 && perQuestion.length !== expectedClosedCount) {
+  const layoutRowsExpected =
+    typeof params.authoritativeOmrQuestionCount === "number" && params.authoritativeOmrQuestionCount > 0
+      ? params.authoritativeOmrQuestionCount
+      : fromTeacher
+  if (layoutRowsExpected > 0 && perQuestion.length !== layoutRowsExpected) {
     throw new Error(
-      `[official_azure_layout_family] Layout Mismatch pipeline=${perQuestion.length} esperado=${expectedClosedCount}`
+      `[official_azure_layout_family] Layout Mismatch pipeline=${perQuestion.length} esperado=${layoutRowsExpected}`
     )
   }
   const sorted = [...perQuestion].sort(
@@ -1127,6 +1140,7 @@ export async function POST(req: NextRequest) {
       officialOmrEngineSelected: officialOmrEngineSelectedIn,
       omrTemplateVariant: omrTemplateVariantIn,
       officialOmrAllowFallbackToLegacy: officialOmrAllowFallbackToLegacyIn,
+      source_exam_id: sourceExamIdBody,
     } = body
     const officialOmrIntegrationEnabled = true
     const officialOmrEngineSelected: "legacy" | "azure_layout_family" = "azure_layout_family"
@@ -1148,6 +1162,11 @@ export async function POST(req: NextRequest) {
     let officialOmrTotalPregResolved = 0
     let officialOmrTemplateKeyUsed = "template_38_4"
     let officialOmrTemplateVariantUsed: "odd_even_dual_column" | "sequential_dual_column" = "odd_even_dual_column"
+    let officialOmrSourceExamIdUsed: string | null = null
+    let officialOmrMetadataSource: string | null = null
+    let officialOmrItemsClosedCountFromDb = 0
+    /** Filas del mapa OMR (rejilla) antes de alinear al inventario de pauta. */
+    let officialOmrGridQuestionCountAtEngine = 0
     const teacherAnswersSource = "teacher_key"
     const studentAnswersSource = "student_omr_read"
     console.info("[trace][omr_official][request_flags]", {
@@ -1178,6 +1197,8 @@ export async function POST(req: NextRequest) {
         }
       }
     }
+
+    const supabaseForEval = getSupabaseServer()
 
     // Memoria interna: si se envía templateId, cargar plantilla desde caché (Redis o memoria)
     let answerKeyFromTemplate = answerKeyFromBody
@@ -1350,7 +1371,6 @@ export async function POST(req: NextRequest) {
       const teacherAnswerKeyBase = Array.isArray(answerKeyFromTemplate?.respuestas)
         ? answerKeyFromTemplate.respuestas
         : []
-      const templateKeyUsed = "template_38_4"
       const closedQuestionsFromPauta = parsePautaEstructurada(pautaEstructurada).filter(
         (i) => !i.isDevelopment
       ).length
@@ -1361,7 +1381,35 @@ export async function POST(req: NextRequest) {
         closedQuestionsFromPauta ||
         Number(answerKeyFromTemplate?.totalPreguntas) ||
         1
-      officialOmrTotalPregResolved = totalPreg
+
+      let sourceExamOmrAuthoritative = 0
+      if (
+        tieneAlternativas &&
+        typeof sourceExamIdBody === "string" &&
+        sourceExamIdBody.trim() &&
+        supabaseForEval &&
+        effectiveTeacherId
+      ) {
+        const meta = await resolveSourceExamOmrMetadata(supabaseForEval, {
+          sourceExamId: sourceExamIdBody.trim(),
+          teacherId: effectiveTeacherId,
+        })
+        if (meta) {
+          sourceExamOmrAuthoritative = meta.totalQuestionsAuthoritative
+          officialOmrSourceExamIdUsed = meta.sourceExamId
+          officialOmrMetadataSource = meta.source
+          officialOmrItemsClosedCountFromDb = meta.itemsClosedCount
+        }
+      }
+
+      const omrExpectedQuestionCount = Math.max(
+        1,
+        sourceExamOmrAuthoritative > 0 ? sourceExamOmrAuthoritative : totalPreg,
+      )
+      const templateKeyUsed = omrTemplateKeyForClosedQuestionCount(omrExpectedQuestionCount)
+
+      officialOmrGridQuestionCountAtEngine = omrExpectedQuestionCount
+      officialOmrTotalPregResolved = omrExpectedQuestionCount
       officialOmrTeacherAnswerKeyLength = teacherAnswerKeyBase.length
       officialOmrTemplateKeyUsed = templateKeyUsed
       const altsSet = new Set<string>()
@@ -1398,12 +1446,6 @@ export async function POST(req: NextRequest) {
         teacherQuestionNumbers.length > 0 &&
         officialClosedQuestionNumbers.length === teacherQuestionNumbers.length &&
         officialClosedQuestionNumbers.some((n, idx) => n !== teacherQuestionNumbers[idx])
-      const legacyQuestionSpan = Math.max(
-        1,
-        ...officialClosedQuestionNumbers,
-        ...teacherQuestionNumbers,
-        totalPreg
-      )
       const remapLegacyRawToOfficialOrder = (
         legacyRaw: { pregunta: string; respuesta_detectada: string; confianza: number }[]
       ): { pregunta: string; respuesta_detectada: string; confianza: number }[] =>
@@ -1471,6 +1513,8 @@ export async function POST(req: NextRequest) {
             officialOmrAllowFallbackToLegacy,
             hasTemplateAnswerKey: Boolean(answerKeyFromTemplate?.respuestas?.length),
             totalPreg,
+            omrExpectedQuestionCount,
+            sourceExamOmrAuthoritative,
           })
           if (forceLegacyStableRouteForStructure) {
             officialOmrFallbackUsed = true
@@ -1478,7 +1522,7 @@ export async function POST(req: NextRequest) {
               "FORCED_LEGACY_STRUCTURAL_MISMATCH_STABLE_ROUTE"
             const legacyRaw = await extractStudentClosedAnswersOnly(
               studentBase64,
-              legacyQuestionSpan,
+              omrExpectedQuestionCount,
               alternativasArray,
               columnas,
               templateBase64,
@@ -1505,7 +1549,7 @@ export async function POST(req: NextRequest) {
                     .filter((v: any) => /^[A-Z]$/.test(v))
                 ).size || 4
               )
-              const expectedQuestionCountUsed = Math.max(1, totalPreg)
+              const expectedQuestionCountUsed = Math.max(1, omrExpectedQuestionCount)
               officialOmrExpectedQuestionCountUsed = expectedQuestionCountUsed
               officialOmrTemplateKeyUsed = templateKeyUsed
               officialOmrTemplateVariantUsed = omrTemplateVariant
@@ -1515,6 +1559,8 @@ export async function POST(req: NextRequest) {
                 closedQuestionIds: officialClosedOrderIds,
                 expectedOptionCount,
                 expectedQuestionCount: expectedQuestionCountUsed,
+                authoritativeOmrQuestionCount:
+                  sourceExamOmrAuthoritative > 0 ? sourceExamOmrAuthoritative : undefined,
                 templateKey: templateKeyUsed,
                 templateVariant: omrTemplateVariant,
               })
@@ -1547,7 +1593,7 @@ export async function POST(req: NextRequest) {
               console.warn("[Evaluate] official azure_layout_family falló, fallback legacy:", engineErr)
               const legacyRaw = await extractStudentClosedAnswersOnly(
                 studentBase64,
-                legacyQuestionSpan,
+                omrExpectedQuestionCount,
                 alternativasArray,
                 columnas,
                 templateBase64,
@@ -1566,7 +1612,7 @@ export async function POST(req: NextRequest) {
           } else {
             const legacyRaw = await extractStudentClosedAnswersOnly(
               studentBase64,
-              legacyQuestionSpan,
+              omrExpectedQuestionCount,
               alternativasArray,
               columnas,
               templateBase64,
@@ -2026,6 +2072,10 @@ export async function POST(req: NextRequest) {
           officialOmrDetectedAnswersCount,
           officialOmrDetectedVsPipelineMismatch,
           officialOmrAdapterMode,
+          sourceExamOmrIdUsed: officialOmrSourceExamIdUsed,
+          sourceExamOmrMetadataSource: officialOmrMetadataSource,
+          sourceExamOmrItemsClosedCountFromDb: officialOmrItemsClosedCountFromDb,
+          gridQuestionCountAtEngine: officialOmrGridQuestionCountAtEngine,
           officialOmrPerQuestionRawPreview: Array.isArray(officialOmrPerQuestionRaw)
             ? officialOmrPerQuestionRaw.slice(0, 10)
             : [],
