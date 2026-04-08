@@ -4,7 +4,7 @@ import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
 
-/** GET /api/evaluations/me — Lista evaluaciones del profesor asociado al usuario logueado. Query: courseId?, from?, to? */
+/** GET /api/evaluations/me — Lista evaluaciones compartidas por colegio (sin filtro por user_id). Query: courseId?, from?, to? */
 export async function GET(req: NextRequest) {
   const user = await getAuthUser()
   if (!user) {
@@ -18,23 +18,11 @@ export async function GET(req: NextRequest) {
 
   const { data: profile } = await supabase
     .from("profiles")
-    .select("teacher_id")
+    .select("school_id")
     .eq("user_id", user.id)
     .maybeSingle()
-
-  let teacher_id: string | null = profile?.teacher_id ?? null
-  if (!teacher_id) {
-    const { data: defaultTeacher } = await supabase
-      .from("teachers")
-      .select("id")
-      .limit(1)
-      .maybeSingle()
-    teacher_id = defaultTeacher?.id ?? null
-  }
-
-  if (!teacher_id) {
-    return NextResponse.json({ evaluations: [], message: "Completa tu perfil (nombre, colegio) para ver historial." }, { status: 200 })
-  }
+  const school_id: string | null =
+    profile?.school_id != null && String(profile.school_id).trim() !== "" ? String(profile.school_id).trim() : null
 
   const { searchParams } = new URL(req.url)
   const courseId = searchParams.get("courseId")?.trim() || undefined
@@ -44,8 +32,9 @@ export async function GET(req: NextRequest) {
   let query = supabase
     .from("evaluations")
     .select("id, title, subject, evaluated_at, created_at")
-    .eq("teacher_id", teacher_id)
     .order("evaluated_at", { ascending: false })
+
+  if (school_id) query = query.eq("school_id", school_id)
 
   if (courseId) query = query.eq("course_id", courseId)
   if (from) query = query.gte("evaluated_at", from)
