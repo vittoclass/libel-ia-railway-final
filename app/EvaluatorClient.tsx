@@ -1364,8 +1364,8 @@ function mapSourceExamApiRowsToInputs(rows: unknown[]): EvaluationBaseSourceExam
   return out
 }
 
-/** Debe coincidir con BATCH_SIZE en app/api/evaluate/batch/route.ts (solo orquestación; no OMR). */
-const EVALUATE_BATCH_PARALLEL_SIZE = 7
+/** Alineado con batch secuencial: meta.batchSize = 1 (app/api/evaluate/batch/route.ts). */
+const EVALUATE_BATCH_PARALLEL_SIZE = 1
 
 export default function EvaluatorClient() {
   const enablePedagogy = process.env.NEXT_PUBLIC_ENABLE_PEDAGOGY === "true"
@@ -3110,7 +3110,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     )
   }
 
-  // Función para manejar evaluación masiva: servidor procesa lotes de 7 en paralelo y espera cada lote antes del siguiente
+  // Función para manejar evaluación masiva: servidor ejecuta un estudiante tras otro (sin fetch interno)
   const handleEvaluateGroups = async (groupIDsToEvaluate: string[]) => {
     ensureEvaluationBatchId()
     const {
