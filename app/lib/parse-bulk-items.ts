@@ -10,6 +10,8 @@ export interface ParsedLine {
   item_text: string
   axis_label: string | null
   skill_label: string | null
+  /** Nivel cognitivo (pauta); si viene vacío se infiere en enriquecimiento. */
+  cognitive_level: string | null
   competence: string | null
   difficulty: string | null
   question_type: string | null
@@ -103,6 +105,7 @@ function trySimceFromParts(parts: string[], joinSep: string): ParsedLine | null 
     item_text: `Ítem ${num}`,
     axis_label,
     skill_label: null,
+    cognitive_level: null,
     competence: null,
     difficulty: null,
     question_type: isVf ? "true_false" : "multiple_choice",
@@ -127,6 +130,7 @@ function tryDesarrollo(parts: string[]): ParsedLine | null {
     item_text,
     axis_label: parts[3]?.trim() || null,
     skill_label: parts[4]?.trim() || null,
+    cognitive_level: null,
     competence: null,
     difficulty: null,
     question_type: type,
@@ -238,6 +242,7 @@ export function parseBulkItemsText(text: string): ParseResult {
         item_text,
         axis_label: parts[2] ?? null,
         skill_label: parts[3] ?? null,
+        cognitive_level: null,
         competence: parts[4] ?? null,
         difficulty: parts[5] ?? null,
         question_type: null,
@@ -262,6 +267,7 @@ export function parseBulkItemsText(text: string): ParseResult {
           item_text: rest,
           axis_label: null,
           skill_label: null,
+          cognitive_level: null,
           competence: null,
           difficulty: null,
           question_type: isVf ? "true_false" : hasAlts ? "multiple_choice" : null,

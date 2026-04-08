@@ -43,6 +43,38 @@ const EXAMPLE = `1 | Calcula el área del triángulo | Geometría | Resolución 
 
 const MAX_LINES = 500
 
+function sanitizeEditorItemsForApi(rows: ParsedLine[]): ParsedLine[] {
+  const emptyToNull = (s: string | null | undefined): string | null => {
+    const t = String(s ?? "").trim()
+    return t.length ? t : null
+  }
+  return rows.map((it) => {
+    const n = Math.floor(Number(it.item_number))
+    const item_number = Number.isFinite(n) && n >= 1 ? n : 1
+    let max_score: number | null = null
+    const ms = it.max_score
+    if (ms != null) {
+      const x =
+        typeof ms === "number" && Number.isFinite(ms) ? Math.floor(ms) : parseInt(String(ms), 10)
+      if (!Number.isNaN(x) && x >= 0) max_score = x
+    }
+    return {
+      ...it,
+      item_number,
+      item_text: String(it.item_text ?? "").trim(),
+      axis_label: emptyToNull(it.axis_label),
+      skill_label: emptyToNull(it.skill_label),
+      competence: emptyToNull(it.competence),
+      difficulty: emptyToNull(it.difficulty),
+      question_type: emptyToNull(it.question_type) as ParsedLine["question_type"],
+      correct_answer: emptyToNull(it.correct_answer),
+      max_score,
+      rubric_text: emptyToNull(it.rubric_text),
+      cognitive_level: emptyToNull(it.cognitive_level),
+    }
+  })
+}
+
 function createEmptyParsedLine(itemNumber: number): ParsedLine {
   return {
     item_number: itemNumber,
@@ -55,6 +87,7 @@ function createEmptyParsedLine(itemNumber: number): ParsedLine {
     correct_answer: null,
     max_score: null,
     rubric_text: null,
+    cognitive_level: null,
   }
 }
 
@@ -350,6 +383,7 @@ export default function SourceExamItemsImportDialog({
         correct_answer: p.correct_answer ?? null,
         max_score: p.max_score ?? null,
         rubric_text: p.rubric_text ?? null,
+        cognitive_level: p.cognitive_level ?? null,
       })),
     )
   }, [text])
@@ -362,7 +396,9 @@ export default function SourceExamItemsImportDialog({
     )
     const validFromParsed = dedupeParsedLinesByItemNumber([...bulkFiltered, ...dev.items])
     const editedFiltered = dedupeParsedLinesByItemNumber(
-      editorItems.filter((it) => Number(it.item_number) >= 1 && String(it.item_text || "").trim().length > 0),
+      sanitizeEditorItemsForApi(editorItems).filter(
+        (it) => Number(it.item_number) >= 1 && String(it.item_text || "").trim().length > 0,
+      ),
     )
     // Tras Previsualizar, solo cuenta la tabla (puedes vaciarla o añadir filas a mano); sin previsualizar, el texto parseado.
     const sourceForImport = preview !== null ? editedFiltered : validFromParsed
@@ -399,18 +435,23 @@ export default function SourceExamItemsImportDialog({
       }
       const res = await fetch(`/api/source-exams/${sourceExamId}/items/import`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+        },
         credentials: "include",
         body: JSON.stringify(body),
       })
-      const data = await res.json().catch(() => ({}))
+      const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
       if (res.ok) {
-        const inserted = data.inserted ?? 0
+        const inserted = Number(data.inserted ?? 0)
         const titleUpdated = data.title_updated === true
         toast({
-          title: data.message || (inserted > 0 ? `Importados ${inserted} ítem(s).` : "Sin ítems importados."),
+          title: (data.message as string) || (inserted > 0 ? `Importados ${inserted} ítem(s).` : "Sin ítems importados."),
           description:
-            data.invalid > 0
+            Number(data.invalid ?? 0) > 0
               ? `${data.invalid} línea(s) inválida(s) no importadas.`
               : undefined,
         })
@@ -426,16 +467,29 @@ export default function SourceExamItemsImportDialog({
           onOpenChange(false)
         }
       } else {
+        const debugPayload = { httpStatus: res.status, ...data }
+        alert(JSON.stringify(debugPayload, null, 2))
         toast({
-          title: data.error || "Error al importar",
-          description: data.errors?.slice(0, 3).join(" ") || data.message,
+          title: (data.error as string) || "Error al importar",
+          description: (Array.isArray(data.errors) ? data.errors : []).slice(0, 3).join(" ") || (data.message as string),
           variant: "destructive",
         })
       }
-    } catch {
+    } catch (e) {
+      alert(
+        JSON.stringify(
+          {
+            error: "fetch_failed",
+            message: e instanceof Error ? e.message : String(e),
+          },
+          null,
+          2,
+        ),
+      )
       toast({ title: "Error de conexión", variant: "destructive" })
     } finally {
       setImporting(false)
+      queueMicrotask(() => setImporting(false))
     }
   }, [text, instrumentTitle, replaceExistingItems, sourceExamId, onImported, onOpenChange, toast, editorItems, preview])
 
@@ -689,7 +743,7 @@ export default function SourceExamItemsImportDialog({
                             )
                           }
                         >
-                          <option value="">— (inferir)</option>
+                          <option value="">— (automático solo si vacío)</option>
                           <option value="multiple_choice">Alternativas</option>
                           <option value="true_false">Verdadero / falso</option>
                           <option value="short_answer">Respuesta corta</option>
@@ -740,7 +794,20 @@ export default function SourceExamItemsImportDialog({
                           }
                         />
                       </TableCell>
-                      <TableCell className="truncate text-xs text-muted-foreground">—</TableCell>
+                      <TableCell className="max-w-[100px] p-1">
+                        <Input
+                          className="h-8 text-xs"
+                          placeholder="Nivel cognitivo"
+                          value={p.cognitive_level ?? ""}
+                          onChange={(e) =>
+                            setEditorItems((prev) =>
+                              prev.map((row, idx) =>
+                                idx === i ? { ...row, cognitive_level: e.target.value.trim() || null } : row,
+                              ),
+                            )
+                          }
+                        />
+                      </TableCell>
                       <TableCell className="truncate text-xs">{p.difficulty ?? "—"}</TableCell>
                       <TableCell className="max-w-[220px]">
                         <textarea

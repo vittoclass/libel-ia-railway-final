@@ -12,6 +12,7 @@ import { enrichItemsWithPedagogy } from "@/app/lib/analyze-pedagogical-structure
 import { convertToNationalScore, nationalLevelLabel } from "@/app/lib/standard-scale/converters"
 import { mean, sampleStdDev, zScore } from "@/app/lib/pedagogical-intelligence/metrics"
 import { generateStrategicAnalysis } from "@/app/lib/pedagogical-intelligence/inference-engine"
+import { getInstrumentAnalyticsModeFromExamType } from "@/app/lib/assessment-category"
 import {
   analyzeLearningResults,
   normalizePedagogicalText,
@@ -47,7 +48,7 @@ export async function GET(
 
   const { data: evaluation, error: evErr } = await supabase
     .from("evaluations")
-    .select("id, teacher_id, user_id, course_id, evaluated_at")
+    .select("id, teacher_id, user_id, course_id, evaluated_at, exam_type")
     .eq("id", evaluationId)
     .maybeSingle()
 
@@ -63,6 +64,9 @@ export async function GET(
     return NextResponse.json({ error: "No autorizado para esta evaluación" }, { status: 403 })
   }
 
+  const examTypeRaw = (evaluation as { exam_type?: string | null }).exam_type ?? null
+  const instrument_analytics_mode = getInstrumentAnalyticsModeFromExamType(examTypeRaw)
+
   const sourceExamId = await getSourceExamForEvaluation(supabase, evaluationId)
 
   const [itemsRes, sourceItemsRes] = await Promise.all([
@@ -74,7 +78,7 @@ export async function GET(
     sourceExamId
       ? supabase
           .from("source_exam_items")
-          .select("id, item_number, item_text, axis_label, skill_label, max_score, rubric_text, question_type")
+          .select("id, item_number, item_text, axis_label, skill_label, cognitive_level, max_score, rubric_text, question_type")
           .eq("source_exam_id", sourceExamId)
           .order("item_number", { ascending: true })
       : Promise.resolve({ data: [] as unknown[], error: null }),
@@ -110,9 +114,12 @@ export async function GET(
   const totalMax = analysis.by_question.reduce((sum, q) => sum + (Number(q.score_max) || 0), 0)
   const logroPct = totalMax > 0 ? Math.round((totalObtained / totalMax) * 100) : null
   const projections = {
-    simce_estimated: convertToNationalScore(logroPct, "simce", scaleYear),
-    paes_estimated: convertToNationalScore(logroPct, "paes", scaleYear),
-    level_label: nationalLevelLabel(logroPct),
+    simce_estimated:
+      instrument_analytics_mode === "SIMCE" ? convertToNationalScore(logroPct, "simce", scaleYear) : null,
+    paes_estimated:
+      instrument_analytics_mode === "PAES" ? convertToNationalScore(logroPct, "paes", scaleYear) : null,
+    level_label:
+      instrument_analytics_mode === "SIMCE" ? nationalLevelLabel(logroPct) : null,
     year: scaleYear,
   }
   // PHASE_4_MEMORY_IDENTITY_V1
@@ -155,7 +162,7 @@ export async function GET(
           prevSourceExamId
             ? supabase
                 .from("source_exam_items")
-                .select("id, item_number, item_text, axis_label, skill_label, max_score, rubric_text, question_type")
+                .select("id, item_number, item_text, axis_label, skill_label, cognitive_level, max_score, rubric_text, question_type")
                 .eq("source_exam_id", prevSourceExamId)
                 .order("item_number", { ascending: true })
             : Promise.resolve({ data: [] as unknown[], error: null }),
@@ -229,6 +236,7 @@ export async function GET(
   } | null = null
   // PHASE_3_INFERENCE_SECURITY_V1
   try {
+    if (instrument_analytics_mode === "SIMCE") {
     const courseId = (evaluation as { course_id?: string | null }).course_id ?? null
     let zCourse: number | null = null
     if (courseId) {
@@ -284,6 +292,9 @@ export async function GET(
       // PHASE_4_MEMORY_IDENTITY_V1
       delta_by_skill: delta_analysis?.by_skill ?? [],
     })
+    } else {
+      strategic_analysis = null
+    }
   } catch (e) {
     // PHASE_3_INFERENCE_SECURITY_V1
     if (isDev) console.warn("[pedagogical-analysis][strategic_analysis] fallback", e)
@@ -312,6 +323,8 @@ export async function GET(
       has_source_exam_items,
       analysis_available,
       status_reason,
+      instrument_type: examTypeRaw,
+      instrument_analytics_mode,
       projections,
       delta_analysis,
       strategic_analysis,

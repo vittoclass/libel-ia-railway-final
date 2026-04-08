@@ -58,7 +58,9 @@ type AnalysisData = {
     lowest_cognitive_level: string | null
     highest_cognitive_level: string | null
   } | null
-  // PHASE_2_SCALES_V1
+  instrument_type?: string | null
+  instrument_analytics_mode?: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+  // PHASE_2_SCALES_V1 — campos nulos según modo (sin mezclar marcos nacionales).
   projections?: {
     simce_estimated: number | null
     paes_estimated: number | null
@@ -240,6 +242,13 @@ export default function PedagogicalAnalysisModal({
     data?.analysis_available === true ||
     (data && data.has_source_exam && (data.by_question?.length ?? 0) > 0 && data.analysis_available !== false)
   const showStatusMessage = data && !showAnalysis
+  const mode = data?.instrument_analytics_mode
+  const showNationalProjections =
+    data?.projections &&
+    (mode === "SIMCE" || mode === "PAES") &&
+    (data.projections.simce_estimated != null ||
+      data.projections.paes_estimated != null ||
+      data.projections.level_label != null)
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -272,27 +281,37 @@ export default function PedagogicalAnalysisModal({
           )}
           {!loading && !error && data && showAnalysis && (
             <>
-              {data.projections && (
+              {showNationalProjections && data.projections && (
                 <div className="space-y-3 rounded-md border border-[var(--border-color)] bg-[var(--bg-muted)] p-4">
-                  <h4 className="font-semibold text-[var(--text-accent)]">PROYECCIÓN DE ESTÁNDARES NACIONALES</h4>
+                  <h4 className="font-semibold text-[var(--text-accent)]">Proyección según tipo de instrumento</h4>
+                  <p className="text-xs text-[var(--text-muted)]">
+                    {mode === "SIMCE" && "Ensayo SIMCE: proyección escala SIMCE y nivel de desempeño (no se muestra PAES)."}
+                    {mode === "PAES" && "Ensayo PAES: proyección escala PAES (no se muestran puntaje SIMCE ni niveles tipo SIMCE/Agencia)."}
+                  </p>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
-                      <p className="text-xs font-medium text-[var(--text-muted)]">SIMCE (ESTIMADO)</p>
-                      <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.simce_estimated)}</p>
-                    </div>
-                    <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
-                      <p className="text-xs font-medium text-[var(--text-muted)]">PAES (ESTIMADO)</p>
-                      <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.paes_estimated)}</p>
-                    </div>
+                    {(mode === "SIMCE" || data.projections.simce_estimated != null) && (
+                      <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
+                        <p className="text-xs font-medium text-[var(--text-muted)]">SIMCE (ESTIMADO)</p>
+                        <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.simce_estimated)}</p>
+                      </div>
+                    )}
+                    {(mode === "PAES" || data.projections.paes_estimated != null) && (
+                      <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
+                        <p className="text-xs font-medium text-[var(--text-muted)]">PAES (ESTIMADO)</p>
+                        <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.paes_estimated)}</p>
+                      </div>
+                    )}
                   </div>
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="font-medium text-[var(--text-muted)]">NIVEL DE DESEMPEÑO:</span>
-                    <span
-                      className={`inline-flex items-center rounded-full border px-3 py-1 font-semibold ${levelBadgeClass(data.projections.level_label)}`}
-                    >
-                      {data.projections.level_label ? data.projections.level_label.toUpperCase() : "—"}
-                    </span>
-                  </div>
+                  {mode === "SIMCE" && data.projections.level_label != null && (
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="font-medium text-[var(--text-muted)]">NIVEL DE DESEMPEÑO (referencia SIMCE/Agencia):</span>
+                      <span
+                        className={`inline-flex items-center rounded-full border px-3 py-1 font-semibold ${levelBadgeClass(data.projections.level_label)}`}
+                      >
+                        {data.projections.level_label.toUpperCase()}
+                      </span>
+                    </div>
+                  )}
                 </div>
               )}
               {summary && (

@@ -22,6 +22,8 @@ export interface PedagogicalItemInput {
   item_text?: string | null
   axis_label?: string | null
   skill_label?: string | null
+  /** Texto declarado en pauta; si no está vacío, no se usa detectSkill. */
+  cognitive_level?: string | null
   question_type?: string | null
   max_score?: number | null
   rubric_text?: string | null
@@ -80,7 +82,7 @@ export function detectSkill(item: PedagogicalItemInput): string {
   const axis = normalizeAxis(item.axis_label)
   const text = (item.item_text ?? "").trim()
   const existing = (item.skill_label ?? "").trim()
-  if (existing.length >= 2) return existing
+  if (existing.length >= 1) return existing
 
   for (const [key, skills] of Object.entries(AXIS_SKILLS)) {
     if (axis.includes(key)) {
@@ -168,9 +170,11 @@ export function analyzePedagogicalStructure<T extends PedagogicalItemInput>(
 ): ItemWithPedagogy<T>[] {
   if (!Array.isArray(items)) return []
   return items.map((item) => {
+    const skillUser = String(item.skill_label ?? "").trim()
+    const cognitiveUser = String(item.cognitive_level ?? "").trim()
     const pedagogical: PedagogicalMetadata = {
-      skill: detectSkill(item),
-      cognitive_level: detectCognitiveLevel(item),
+      skill: skillUser.length > 0 ? skillUser : detectSkill(item),
+      cognitive_level: cognitiveUser.length > 0 ? cognitiveUser : detectCognitiveLevel(item),
       difficulty: estimateDifficulty(item),
       question_format: detectQuestionType(item),
     }

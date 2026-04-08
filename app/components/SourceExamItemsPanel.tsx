@@ -32,6 +32,7 @@ export type SourceExamItemRow = {
   skill_id: string | null
   axis_label?: string | null
   skill_label?: string | null
+  cognitive_level?: string | null
   competence: string | null
   difficulty: string | null
   question_type: string | null
@@ -60,6 +61,9 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
   const [formItemText, setFormItemText] = useState("")
   const [formAxisId, setFormAxisId] = useState("")
   const [formSkillId, setFormSkillId] = useState("")
+  const [formAxisLabel, setFormAxisLabel] = useState("")
+  const [formSkillLabel, setFormSkillLabel] = useState("")
+  const [formCognitiveLevel, setFormCognitiveLevel] = useState("")
   const [formCompetence, setFormCompetence] = useState("")
   const [formDifficulty, setFormDifficulty] = useState("")
   const [formQuestionType, setFormQuestionType] = useState("")
@@ -74,7 +78,11 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
   const loadItems = useCallback(async () => {
     setLoading(true)
     try {
-      const r = await fetch(`/api/source-exams/${sourceExamId}/items`, { credentials: "include" })
+      const r = await fetch(`/api/source-exams/${sourceExamId}/items`, {
+        credentials: "include",
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+      })
       const j = await r.json()
       if (r.ok && Array.isArray(j.items)) setItems(j.items)
       else setItems([])
@@ -93,6 +101,9 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
     setFormItemText("")
     setFormAxisId("")
     setFormSkillId("")
+    setFormAxisLabel("")
+    setFormSkillLabel("")
+    setFormCognitiveLevel("")
     setFormCompetence("")
     setFormDifficulty("")
     setFormQuestionType("")
@@ -108,6 +119,9 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
     setFormItemText(item.item_text ?? "")
     setFormAxisId(item.axis_id ?? "")
     setFormSkillId(item.skill_id ?? "")
+    setFormAxisLabel(item.axis_label ?? "")
+    setFormSkillLabel(item.skill_label ?? "")
+    setFormCognitiveLevel(item.cognitive_level ?? "")
     setFormCompetence(item.competence ?? "")
     setFormDifficulty(item.difficulty ?? "")
     setFormQuestionType(item.question_type ?? "")
@@ -126,6 +140,9 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
         item_text: formItemText.trim() || null,
         axis_id: formAxisId.trim() || null,
         skill_id: formSkillId.trim() || null,
+        axis_label: formAxisLabel.trim() || null,
+        skill_label: formSkillLabel.trim() || null,
+        cognitive_level: formCognitiveLevel.trim() || null,
         competence: formCompetence.trim() || null,
         difficulty: formDifficulty.trim() || null,
         question_type: formQuestionType.trim() || null,
@@ -133,37 +150,52 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
         max_score: formMaxScore.trim() ? (() => { const n = parseInt(formMaxScore, 10); return Number.isNaN(n) ? null : n; })() : null,
         rubric_text: formRubricText.trim() || null,
       }
+      const fetchOpts = {
+        cache: "no-store" as const,
+        credentials: "include" as const,
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+        },
+      }
       if (editingItem) {
         const r = await fetch(`/api/source-exams/${sourceExamId}/items/${editingItem.id}`, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
+          ...fetchOpts,
           body: JSON.stringify(payload),
         })
-        const j = await r.json()
+        const j = (await r.json().catch(() => ({}))) as Record<string, unknown>
         if (r.ok && j.item) {
           toast({ title: "Ítem actualizado." })
           setEditModalOpen(false)
           loadItems()
-        } else toast({ title: j.error || "Error al actualizar", variant: "destructive" })
+        } else {
+          alert(JSON.stringify({ httpStatus: r.status, ...j }, null, 2))
+          toast({ title: (j.error as string) || "Error al actualizar", variant: "destructive" })
+        }
       } else {
         const r = await fetch(`/api/source-exams/${sourceExamId}/items`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
+          ...fetchOpts,
           body: JSON.stringify({ items: [payload] }),
         })
-        const j = await r.json()
-        if (r.ok && (j.items?.length > 0 || j.inserted_count > 0)) {
+        const j = (await r.json().catch(() => ({}))) as Record<string, unknown>
+        if (r.ok && ((Array.isArray(j.items) ? j.items.length : 0) > 0 || Number(j.inserted_count ?? 0) > 0)) {
           toast({ title: "Ítem agregado." })
           setEditModalOpen(false)
           loadItems()
-        } else toast({ title: j.error || "Error al agregar", variant: "destructive" })
+        } else {
+          alert(JSON.stringify({ httpStatus: r.status, ...j }, null, 2))
+          toast({ title: (j.error as string) || "Error al agregar", variant: "destructive" })
+        }
       }
-    } catch {
+    } catch (e) {
+      alert(JSON.stringify({ error: "fetch_failed", message: e instanceof Error ? e.message : String(e) }, null, 2))
       toast({ title: "Error de conexión", variant: "destructive" })
     } finally {
       setSaving(false)
+      queueMicrotask(() => setSaving(false))
     }
   }
 
@@ -173,19 +205,24 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
       const r = await fetch(`/api/source-exams/${sourceExamId}/items/${itemId}`, {
         method: "DELETE",
         credentials: "include",
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
       })
       if (r.ok) {
         toast({ title: "Ítem eliminado." })
         setDeleteConfirmId(null)
         loadItems()
       } else {
-        const j = await r.json().catch(() => ({}))
-        toast({ title: j.error || "Error al eliminar", variant: "destructive" })
+        const j = (await r.json().catch(() => ({}))) as Record<string, unknown>
+        alert(JSON.stringify({ httpStatus: r.status, ...j }, null, 2))
+        toast({ title: (j.error as string) || "Error al eliminar", variant: "destructive" })
       }
-    } catch {
+    } catch (e) {
+      alert(JSON.stringify({ error: "fetch_failed", message: e instanceof Error ? e.message : String(e) }, null, 2))
       toast({ title: "Error de conexión", variant: "destructive" })
     } finally {
       setSaving(false)
+      queueMicrotask(() => setSaving(false))
     }
   }
 
@@ -195,19 +232,24 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
       const r = await fetch(`/api/source-exams/${sourceExamId}/items`, {
         method: "DELETE",
         credentials: "include",
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
       })
-      const j = await r.json().catch(() => ({}))
+      const j = (await r.json().catch(() => ({}))) as Record<string, unknown>
       if (r.ok && j.ok) {
         toast({ title: `Se borraron ${j.deleted_count ?? 0} ítems.` })
         setDeleteAllConfirmOpen(false)
         loadItems()
       } else {
-        toast({ title: j.error || "Error al borrar ítems", variant: "destructive" })
+        alert(JSON.stringify({ httpStatus: r.status, ...j }, null, 2))
+        toast({ title: (j.error as string) || "Error al borrar ítems", variant: "destructive" })
       }
-    } catch {
+    } catch (e) {
+      alert(JSON.stringify({ error: "fetch_failed", message: e instanceof Error ? e.message : String(e) }, null, 2))
       toast({ title: "Error de conexión", variant: "destructive" })
     } finally {
       setDeleteAllLoading(false)
+      queueMicrotask(() => setDeleteAllLoading(false))
     }
   }
 
@@ -274,11 +316,15 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
                     <TableCell className="text-xs">{item.question_type ?? "multiple_choice"}</TableCell>
                     <TableCell className="text-xs">{item.correct_answer ?? "—"}</TableCell>
                     <TableCell>{item.max_score ?? "—"}</TableCell>
-                    <TableCell className="max-w-[80px] truncate" title={(item.axis_label ?? item.axis_id) ?? ""}>{(item.axis_label ?? item.axis_id) ? "…" : "—"}</TableCell>
-                    <TableCell className="max-w-[80px] truncate" title={(item.pedagogical?.skill ?? item.skill_label ?? item.skill_id) ?? ""}>
-                      {item.pedagogical?.skill ?? item.skill_label ?? item.skill_id ?? "—"}
+                    <TableCell className="max-w-[80px] truncate" title={(item.axis_label ?? item.axis_id) ?? ""}>
+                      {(item.axis_label ?? "").trim() || (item.axis_id ? "…" : "—")}
                     </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{item.pedagogical?.cognitive_level ?? "—"}</TableCell>
+                    <TableCell className="max-w-[80px] truncate" title={(item.skill_label ?? item.pedagogical?.skill ?? item.skill_id) ?? ""}>
+                      {(item.skill_label ?? "").trim() || item.pedagogical?.skill || item.skill_id || "—"}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground" title={(item.cognitive_level ?? item.pedagogical?.cognitive_level) ?? ""}>
+                      {(item.cognitive_level ?? "").trim() || item.pedagogical?.cognitive_level || "—"}
+                    </TableCell>
                     <TableCell className="text-xs">{item.pedagogical?.difficulty ?? "—"}</TableCell>
                     <TableCell>{item.competence ?? "—"}</TableCell>
                     <TableCell>{item.difficulty ?? "—"}</TableCell>
@@ -319,12 +365,24 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
               <Input value={formItemText} onChange={(e) => setFormItemText(e.target.value)} placeholder="Texto del ítem" />
             </div>
             <div>
-              <Label>Eje (axis_id, opcional)</Label>
-              <Input value={formAxisId} onChange={(e) => setFormAxisId(e.target.value)} placeholder="UUID o texto" />
+              <Label>Eje (axis_id)</Label>
+              <Input value={formAxisId} onChange={(e) => setFormAxisId(e.target.value)} placeholder="UUID del diccionario (opcional)" />
             </div>
             <div>
-              <Label>Habilidad (skill_id, opcional)</Label>
-              <Input value={formSkillId} onChange={(e) => setFormSkillId(e.target.value)} placeholder="UUID o texto" />
+              <Label>Eje (texto / etiqueta)</Label>
+              <Input value={formAxisLabel} onChange={(e) => setFormAxisLabel(e.target.value)} placeholder="Ej. Números, Lectura" />
+            </div>
+            <div>
+              <Label>Habilidad (skill_id)</Label>
+              <Input value={formSkillId} onChange={(e) => setFormSkillId(e.target.value)} placeholder="UUID del diccionario (opcional)" />
+            </div>
+            <div>
+              <Label>Habilidad (texto)</Label>
+              <Input value={formSkillLabel} onChange={(e) => setFormSkillLabel(e.target.value)} placeholder="Ej. Relacionar, Localizar información" />
+            </div>
+            <div>
+              <Label>Nivel cognitivo</Label>
+              <Input value={formCognitiveLevel} onChange={(e) => setFormCognitiveLevel(e.target.value)} placeholder="Ej. aplicar, analizar, Relacionar" />
             </div>
             <div>
               <Label>Competencia</Label>

@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/select"
 import { Camera, Loader2, CheckCircle2, AlertCircle } from "lucide-react"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
+import { MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT, MOBILE_CAPTURE_PAGE_CHOICES } from "@/app/lib/docente/mobile-scan-constants"
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
@@ -168,7 +169,7 @@ export function MovilScanClient({ initialBatchId }: Props) {
             value={String(imagesPerStudent)}
             onValueChange={(v) => {
               const n = Number(v)
-              if (n >= 1 && n <= 5) {
+              if (n >= 1 && n <= MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT) {
                 setImagesPerStudent(n)
                 setPageIndex(1)
               }
@@ -178,7 +179,7 @@ export function MovilScanClient({ initialBatchId }: Props) {
               <SelectValue placeholder="Cantidad" />
             </SelectTrigger>
             <SelectContent>
-              {[1, 2, 3, 4, 5].map((n) => (
+              {MOBILE_CAPTURE_PAGE_CHOICES.map((n) => (
                 <SelectItem key={n} value={String(n)}>
                   {n} {n === 1 ? "imagen" : "imágenes"} por estudiante
                 </SelectItem>

@@ -11,6 +11,7 @@ import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-re
 import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { approxGradeChileFromLogroPct, resolveStudentDisplayName } from "@/app/lib/student-display-name"
+import { projectPaesFromLogroPct, projectSimceFromLogroPct } from "@/app/lib/standard-scale-converters"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -34,6 +35,27 @@ function jsonNoStore(data: unknown, init?: { status?: number }) {
       Pragma: "no-cache",
     },
   })
+}
+
+function normText(v: string | null | undefined): string {
+  return String(v ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+}
+
+type NationalExamIntent = "SIMCE" | "PAES" | "UNKNOWN"
+
+function detectIntentFromBatchTitles(titles: Array<string | null | undefined>): NationalExamIntent {
+  const text = titles.map((t) => normText(t)).join(" | ")
+  if (!text) return "UNKNOWN"
+  const paesTokens = ["paes", " m1", " m2", "pdt", "demre"]
+  const simceTokens = ["simce", "agencia"]
+  const hasPaes = paesTokens.some((k) => text.includes(k))
+  const hasSimce = simceTokens.some((k) => text.includes(k))
+  if (hasPaes && !hasSimce) return "PAES"
+  if (hasSimce && !hasPaes) return "SIMCE"
+  return "UNKNOWN"
 }
 
 // PHASE_5_INSTITUTIONAL_V1 — Fuente: evaluation_summaries + evaluation_items (OMR). Sin student_projections.
@@ -87,6 +109,7 @@ export async function GET(_req: NextRequest) {
     source_mode: "no_scope",
     warning: null as string | null,
     linked_evaluations_count: 0,
+    last_batch_id: null as string | null,
   }
 
   try {
@@ -147,17 +170,27 @@ export async function GET(_req: NextRequest) {
       const picked: string[] = []
 
       if (schoolId) {
+        // Sin vínculo UTP validado: priorizar universo SIMCE del colegio por filas individuales.
         const { data: evs } = await supabase
           .from("evaluations")
-          .select("id")
+          .select("id, assessment_category, exam_type")
+          .eq("is_archived", false)
           .eq("school_id", schoolId)
           .order("evaluated_at", { ascending: false })
-          .limit(3)
-        for (const e of evs ?? []) picked.push(String((e as { id: string }).id))
+          .limit(1000)
+        const simceRows = (evs ?? []).filter((e) => {
+          const row = e as { assessment_category?: string | null; exam_type?: string | null }
+          const fromCategory = parseAssessmentTypeToFlat(String(row.assessment_category ?? ""))
+          const fromExamType = parseAssessmentTypeToFlat(String(row.exam_type ?? ""))
+          return fromCategory === "ENSAYO_SIMCE" || fromExamType === "ENSAYO_SIMCE"
+        })
+        for (const e of simceRows) picked.push(String((e as { id: string }).id))
+        if (simceRows.length > 0) source_mode = "school_simce_no_link"
       } else if (profileTeacherId) {
         const { data: evs } = await supabase
           .from("evaluations")
           .select("id")
+          .eq("is_archived", false)
           .eq("teacher_id", profileTeacherId)
           .order("evaluated_at", { ascending: false })
           .limit(3)
@@ -173,6 +206,7 @@ export async function GET(_req: NextRequest) {
           const { data: evs } = await supabase
             .from("evaluations")
             .select("id")
+            .eq("is_archived", false)
             .in("teacher_id", tids)
             .order("evaluated_at", { ascending: false })
             .limit(3)
@@ -188,11 +222,84 @@ export async function GET(_req: NextRequest) {
       }
     }
 
-    const evalIds = scopeEvalIds
+    /** Último lote (batch_id) en alcance institucional: prioridad para velocímetros SIMCE/PAES. */
+    let lastBatchId: string | null = null
+    let batchEvalIds: string[] = []
+    {
+      type ScopeKind = "school" | "org_teachers" | "single_teacher" | "none"
+      let scopeKind: ScopeKind = "none"
+      let orgTeacherIds: string[] = []
+      if (schoolId) scopeKind = "school"
+      else if (orgId) {
+        const { data: peers } = await supabase
+          .from("profiles")
+          .select("teacher_id")
+          .eq("organization_id", orgId)
+          .not("teacher_id", "is", null)
+        orgTeacherIds = [
+          ...new Set(
+            (peers ?? [])
+              .map((p: { teacher_id?: string | null }) => p.teacher_id)
+              .filter(Boolean) as string[],
+          ),
+        ]
+        scopeKind = orgTeacherIds.length > 0 ? "org_teachers" : "none"
+      } else if (profileTeacherId) scopeKind = "single_teacher"
+
+      if (scopeKind !== "none") {
+        // Cable F: fuente maestra de lotes = batch_scan_sessions (no depende de release).
+        let latestSessionQ = supabase
+          .from("batch_scan_sessions")
+          .select("batch_id, teacher_id, school_id, created_at")
+          .eq("is_archived", false)
+        if (scopeKind === "school") latestSessionQ = latestSessionQ.eq("school_id", schoolId as string)
+        else if (scopeKind === "org_teachers") latestSessionQ = latestSessionQ.in("teacher_id", orgTeacherIds)
+        else latestSessionQ = latestSessionQ.eq("teacher_id", profileTeacherId as string)
+
+        const { data: latestSession } = await latestSessionQ
+          .order("created_at", { ascending: false, nullsFirst: false })
+          .limit(1)
+          .maybeSingle()
+
+        const bid = (latestSession as { batch_id?: string | null } | null)?.batch_id
+        if (bid) {
+          lastBatchId = String(bid)
+          // JOIN lógico evaluations x batch_scan_sessions por batch_id
+          let batchQ = supabase.from("evaluations").select("id").eq("batch_id", lastBatchId)
+          batchQ = batchQ.eq("is_archived", false)
+          if (scopeKind === "school") batchQ = batchQ.eq("school_id", schoolId as string)
+          else if (scopeKind === "org_teachers") batchQ = batchQ.in("teacher_id", orgTeacherIds)
+          else batchQ = batchQ.eq("teacher_id", profileTeacherId as string)
+          const { data: batchRows } = await batchQ
+          batchEvalIds = (batchRows ?? []).map((r: { id: string }) => String(r.id)).filter(Boolean)
+        } else {
+          // Fallback defensivo si aún no existe sesión, pero sí evaluaciones con batch_id.
+          let latestEvalQ = supabase
+            .from("evaluations")
+            .select("batch_id, evaluated_at")
+            .eq("is_archived", false)
+            .not("batch_id", "is", null)
+          if (scopeKind === "school") latestEvalQ = latestEvalQ.eq("school_id", schoolId as string)
+          else if (scopeKind === "org_teachers") latestEvalQ = latestEvalQ.in("teacher_id", orgTeacherIds)
+          else latestEvalQ = latestEvalQ.eq("teacher_id", profileTeacherId as string)
+          const { data: latestEval } = await latestEvalQ
+            .order("evaluated_at", { ascending: false, nullsFirst: false })
+            .limit(1)
+            .maybeSingle()
+          const fallbackBid = (latestEval as { batch_id?: string | null } | null)?.batch_id
+          if (fallbackBid) lastBatchId = String(fallbackBid)
+        }
+      }
+    }
+
+    const mergedScope = [...new Set([...scopeEvalIds, ...batchEvalIds])].filter(Boolean).slice(0, 1000)
+    const evalIds = mergedScope
+
     const [evalsRes, itemsRes, sumsRes] = await Promise.all([
       supabase
         .from("evaluations")
-        .select("id, evaluated_at, subject, title, course_label")
+        .select("id, evaluated_at, subject, title, course_label, exam_type, assessment_category")
+        .eq("is_archived", false)
         .in("id", evalIds),
       supabase.from("evaluation_items").select("evaluation_id, score_obtained, score_max").in("evaluation_id", evalIds),
       supabase
@@ -207,14 +314,27 @@ export async function GET(_req: NextRequest) {
       subject?: string | null
       title?: string | null
       course_label?: string | null
+      exam_type?: string | null
+      assessment_category?: string | null
     }>
-    const itemRows = (itemsRes.data ?? []) as Array<{ evaluation_id: string; score_obtained?: number | null; score_max?: number | null }>
-    const sumRows = (sumsRes.data ?? []) as Array<{
+    const visibleEvalIdSet = new Set(evalRows.map((e) => String(e.id)))
+    for (const e of evalRows) {
+      const flatExam = parseAssessmentTypeToFlat(String(e.exam_type ?? ""))
+      const flatCat = parseAssessmentTypeToFlat(String(e.assessment_category ?? ""))
+      const flats = [flatExam, flatCat].filter(Boolean) as FlatAssessmentType[]
+      for (const flat of flats) {
+        evalTypeMap.set(String(e.id), mergeFlatAssessmentType(evalTypeMap.get(String(e.id)), flat))
+      }
+    }
+    const itemRows = ((itemsRes.data ?? []) as Array<{ evaluation_id: string; score_obtained?: number | null; score_max?: number | null }>).filter((r) =>
+      visibleEvalIdSet.has(String(r.evaluation_id)),
+    )
+    const sumRows = ((sumsRes.data ?? []) as Array<{
       evaluation_id: string
       grade_chile?: number | null
       student_name_raw?: string | null
       raw?: unknown
-    }>
+    }>).filter((r) => visibleEvalIdSet.has(String(r.evaluation_id)))
 
     const sumByEval = new Map<string, { grade_chile?: number | null; student_name_raw?: string | null; raw?: unknown }>()
     for (const s of sumRows) {
@@ -265,7 +385,7 @@ export async function GET(_req: NextRequest) {
       return approxGradeChileFromLogroPct(logroByEvalId.get(String(eid)) ?? null)
     }
 
-    const gradesFinite = evalIds.map((id) => resolvedGradeForEval(String(id))).filter((g): g is number => Number.isFinite(g))
+    const gradesFinite = evalRows.map((e) => resolvedGradeForEval(String(e.id))).filter((g): g is number => Number.isFinite(g))
     const avgGradeChile =
       gradesFinite.length > 0 ? Math.round((gradesFinite.reduce((a, b) => a + b, 0) / gradesFinite.length) * 100) / 100 : null
 
@@ -287,25 +407,87 @@ export async function GET(_req: NextRequest) {
     let insuficiente = 0
     let elemental = 0
     let adecuado = 0
-    for (const eid of idsForSemaforoAgencia) {
-      const g = resolvedGradeForEval(String(eid))
-      if (g == null || !Number.isFinite(g)) continue
-      const band = classifyAgenciaNota(g)
-      if (band === "insuficiente") insuficiente++
-      else if (band === "elemental") elemental++
-      else if (band === "adecuado") adecuado++
+    const hasValidatedUtpLink = linkedEvalIds.length > 0
+    if (!hasValidatedUtpLink && sumRows.length > 0) {
+      // Sin informe UTP validado: desglosa por filas individuales de summary (alumno) en vez de promediar por lote.
+      for (const s of sumRows) {
+        const g = Number(s.grade_chile)
+        if (!Number.isFinite(g)) continue
+        const band = classifyAgenciaNota(g)
+        if (band === "insuficiente") insuficiente++
+        else if (band === "elemental") elemental++
+        else if (band === "adecuado") adecuado++
+      }
+    } else {
+      for (const eid of idsForSemaforoAgencia) {
+        const g = resolvedGradeForEval(String(eid))
+        if (g == null || !Number.isFinite(g)) continue
+        const band = classifyAgenciaNota(g)
+        if (band === "insuficiente") insuficiente++
+        else if (band === "elemental") elemental++
+        else if (band === "adecuado") adecuado++
+      }
+    }
+
+    const batchEvalIdSet = new Set(batchEvalIds)
+    const hasBatchFocus = batchEvalIds.length > 0
+
+    const evalIdsVisible = evalRows.map((e) => String(e.id))
+    const simceAll = evalIdsVisible.filter((id) => {
+      const t = evalTypeMap.get(String(id))
+      return t != null && isSimceFamilyFlat(t)
+    })
+    const paesAll = evalIdsVisible.filter((id) => {
+      const t = evalTypeMap.get(String(id))
+      return t != null && isPaesFamilyFlat(t)
+    })
+    const simcePool = hasBatchFocus ? simceAll.filter((id) => batchEvalIdSet.has(id)) : []
+    const paesPool = hasBatchFocus ? paesAll.filter((id) => batchEvalIdSet.has(id)) : []
+
+    // Prioridad 1: metadata (exam_type/assessment_type ya normalizado en evalTypeMap).
+    // Prioridad 2: string matching en nombre de lote (titles de evaluaciones del batch).
+    let batchIntent: NationalExamIntent = "UNKNOWN"
+    if (hasBatchFocus) {
+      if (simcePool.length > 0 && paesPool.length === 0) batchIntent = "SIMCE"
+      else if (paesPool.length > 0 && simcePool.length === 0) batchIntent = "PAES"
+      else if (simcePool.length > 0 && paesPool.length > 0) batchIntent = "UNKNOWN"
+      else {
+        const batchTitles = evalRows.filter((e) => batchEvalIdSet.has(String(e.id))).map((e) => e.title)
+        batchIntent = detectIntentFromBatchTitles(batchTitles)
+      }
+    }
+
+    let simceEffective: string[] = []
+    let paesEffective: string[] = []
+    if (!hasBatchFocus) {
+      // Sin lote reciente: usar histórico institucional etiquetado.
+      simceEffective = simceAll
+      paesEffective = paesAll
+    } else if (batchIntent === "SIMCE") {
+      // Limpieza de cuerdas: solo mueve SIMCE para este lote.
+      simceEffective = simcePool.length > 0 ? simcePool : batchEvalIds
+      paesEffective = []
+    } else if (batchIntent === "PAES") {
+      // Limpieza de cuerdas: solo mueve PAES para este lote.
+      simceEffective = []
+      paesEffective = paesPool.length > 0 ? paesPool : batchEvalIds
+    } else {
+      // Estado neutro: no proyectar nacional por lote ambiguo.
+      simceEffective = []
+      paesEffective = []
     }
 
     const simceValues: number[] = []
     const paesValues: number[] = []
-    for (const eid of evalIds) {
-      const g = resolvedGradeForEval(String(eid))
-      if (!Number.isFinite(g)) continue
-      const type = evalTypeMap.get(String(eid))
-      const simceScaled = Math.round(200 + (((g as number) - 1) / 6) * 150)
-      const paesScaled = Math.round(100 + (((g as number) - 1) / 6) * 900)
-      if (type && isSimceFamilyFlat(type)) simceValues.push(simceScaled)
-      if (type && isPaesFamilyFlat(type)) paesValues.push(paesScaled)
+    for (const eid of simceEffective) {
+      const pct = logroByEvalId.get(String(eid))
+      if (pct == null || !Number.isFinite(pct)) continue
+      simceValues.push(projectSimceFromLogroPct(pct))
+    }
+    for (const eid of paesEffective) {
+      const pct = logroByEvalId.get(String(eid))
+      if (pct == null || !Number.isFinite(pct)) continue
+      paesValues.push(projectPaesFromLogroPct(pct))
     }
     const simcePromedio = simceValues.length ? Math.round(simceValues.reduce((a, b) => a + b, 0) / simceValues.length) : 0
     const paesPromedio = paesValues.length ? Math.round(paesValues.reduce((a, b) => a + b, 0) / paesValues.length) : 0
@@ -395,7 +577,7 @@ export async function GET(_req: NextRequest) {
       grade_chile: resolvedGradeForEval(r.evaluation_id),
     }))
 
-    if (linkedEvalIds.length === 0 && simceTaggedIds.length === 0 && evalIds.length > 0) {
+    if (linkedEvalIds.length === 0 && simceTaggedIds.length === 0 && evalRows.length > 0) {
       warning =
         (warning ? `${warning} ` : "") +
         "Semáforo y estándar agencia usan todas las evaluaciones en alcance (no hay vínculo UTP tipo ENSAYO_SIMCE). Vincule en UTP para filtrar solo ensayos SIMCE."
@@ -416,7 +598,7 @@ export async function GET(_req: NextRequest) {
       },
       risk_distribution: riskCounts,
       aggregates: {
-        evaluations_in_scope: evalIds.length,
+        evaluations_in_scope: evalRows.length,
         summaries_count: sumRows.length,
         items_rows: itemRows.length,
         avg_grade_chile: avgGradeChile,
@@ -432,6 +614,8 @@ export async function GET(_req: NextRequest) {
         : null,
       warning,
       semaforo_source: simceTaggedIds.length > 0 ? "ensayo_simce_linked" : "all_in_scope",
+      last_batch_id: lastBatchId,
+      national_batch_intent: batchIntent,
     })
   } catch (e) {
     return jsonNoStore({

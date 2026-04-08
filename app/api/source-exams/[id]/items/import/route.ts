@@ -15,8 +15,32 @@ import {
   normalizeImportedSourceExamItems,
   type CanonicalImportTrace,
 } from "@/app/lib/normalize-imported-source-exam-items"
+import {
+  resolveAxisSkillIdsFromLabels,
+  sanitizeUuidOrNull,
+  validateAxisSkillPair,
+} from "@/app/lib/source-exam-traceability"
 
 export const dynamic = "force-dynamic"
+
+const NO_STORE = {
+  "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+  Pragma: "no-cache",
+} as const
+
+function jsonNs(body: unknown, status = 200) {
+  return NextResponse.json(body, { status, headers: NO_STORE })
+}
+
+function supabaseErrPayload(e: { message: string; code?: string; details?: string; hint?: string } | null | undefined) {
+  if (!e) return undefined
+  return {
+    message: e.message,
+    code: e.code ?? null,
+    details: e.details ?? null,
+    hint: e.hint ?? null,
+  }
+}
 
 const MAX_LINES = 500
 /** Tipos persistibles; en modo editor no se reinterpretan desde el texto. */
@@ -27,34 +51,62 @@ const ALLOWED_QUESTION_TYPES = new Set([
   "essay",
   "completion",
 ])
+type ImportItem = ParsedLine & { axis_id?: string | null; skill_id?: string | null }
 
-function sanitizeIncomingParsedItems(rows: unknown[]): ParsedLine[] {
-  const out: ParsedLine[] = []
+function dedupeImportItemsByNumber(items: ImportItem[]): ImportItem[] {
+  const m = new Map<number, ImportItem>()
+  for (const it of items) {
+    m.set(it.item_number, it)
+  }
+  return [...m.values()].sort((a, b) => a.item_number - b.item_number)
+}
+
+function sanitizeIncomingParsedItems(rows: unknown[]): ImportItem[] {
+  const out: ImportItem[] = []
   for (const row of rows) {
     const r = row as Record<string, unknown>
     const num = Number(r?.item_number)
     const item_number = Number.isFinite(num) && num >= 1 ? Math.floor(num) : NaN
-    const item_text = typeof r?.item_text === "string" ? r.item_text.trim() : ""
+    const item_text =
+      typeof r?.item_text === "string"
+        ? r.item_text.trim()
+        : r?.item_text != null
+          ? String(r.item_text).trim()
+          : ""
     if (!Number.isFinite(item_number) || item_number < 1 || !item_text) continue
 
-    const rawType = typeof r?.question_type === "string" ? r.question_type.trim().toLowerCase() : ""
+    const rawType =
+      typeof r?.question_type === "string"
+        ? r.question_type.trim().toLowerCase()
+        : r?.question_type != null
+          ? String(r.question_type).trim().toLowerCase()
+          : ""
     const question_type = ALLOWED_QUESTION_TYPES.has(rawType) ? rawType : null
     const rawCorr = typeof r?.correct_answer === "string" ? r.correct_answer.trim().toUpperCase() : ""
     const correct_answer = /^[A-EVF]$/.test(rawCorr) ? rawCorr : null
     const maxN = Number(r?.max_score)
     const max_score = Number.isFinite(maxN) && maxN >= 0 ? Math.floor(maxN) : null
 
+    const strOrNull = (v: unknown) => {
+      if (v == null) return null
+      const s = String(v).trim()
+      return s.length ? s : null
+    }
+
     out.push({
       item_number,
       item_text,
-      axis_label: typeof r?.axis_label === "string" ? r.axis_label.trim() || null : null,
-      skill_label: typeof r?.skill_label === "string" ? r.skill_label.trim() || null : null,
-      competence: typeof r?.competence === "string" ? r.competence.trim() || null : null,
-      difficulty: typeof r?.difficulty === "string" ? r.difficulty.trim() || null : null,
+      axis_id: strOrNull(r?.axis_id),
+      skill_id: strOrNull(r?.skill_id),
+      axis_label: strOrNull(r?.axis_label),
+      skill_label: strOrNull(r?.skill_label),
+      competence: strOrNull(r?.competence),
+      difficulty: strOrNull(r?.difficulty),
       question_type,
       correct_answer,
       max_score,
-      rubric_text: typeof r?.rubric_text === "string" ? r.rubric_text.trim() || null : null,
+      rubric_text: strOrNull(r?.rubric_text),
+      cognitive_level: strOrNull(r?.cognitive_level),
     })
   }
   return out
@@ -87,14 +139,20 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const user = await getAuthUser()
-  if (!user) return NextResponse.json({ error: "No autorizado" }, { status: 401 })
+  if (!user) return jsonNs({ error: "No autorizado" }, 401)
   const supabase = getSupabaseServer()
-  if (!supabase) return NextResponse.json({ error: "Supabase no configurado" }, { status: 503 })
+  if (!supabase) return jsonNs({ error: "Supabase no configurado" }, 503)
   const { id: sourceExamId } = await params
-  if (!sourceExamId) return NextResponse.json({ error: "Falta id de prueba base" }, { status: 400 })
+  if (!sourceExamId) return jsonNs({ error: "Falta id de prueba base" }, 400)
 
   const access = await checkSourceExamAccess(supabase, sourceExamId, user)
-  if (!access.ok) return NextResponse.json({ error: access.error }, { status: access.status })
+  if (!access.ok) return jsonNs({ error: access.error }, access.status)
+  const { data: sourceExam } = await supabase
+    .from("source_exams")
+    .select("id, subject")
+    .eq("id", sourceExamId)
+    .maybeSingle()
+  const sourceExamSubject = (sourceExam as { subject?: string | null } | null)?.subject ?? null
 
   let body: {
     text?: string
@@ -107,7 +165,7 @@ export async function POST(
   try {
     body = await req.json()
   } catch {
-    return NextResponse.json({ error: "Body JSON inválido" }, { status: 400 })
+    return jsonNs({ error: "Body JSON inválido" }, 400)
   }
   const replaceItems = body.replace_items !== false
   const text = typeof body.text === "string" ? body.text : ""
@@ -134,7 +192,7 @@ export async function POST(
   const hasParsedItemsPayload = Array.isArray(parsedItemsPayload)
   const editedRows = hasParsedItemsPayload ? sanitizeIncomingParsedItems(parsedItemsPayload) : []
   const validRaw = hasParsedItemsPayload
-    ? dedupeParsedLinesByItemNumber(editedRows)
+    ? dedupeImportItemsByNumber(editedRows)
     : dedupeParsedLinesByItemNumber([...bulk.valid, ...dev.items])
   const canonicalized = hasParsedItemsPayload
     ? { items: validRaw, trace: [] as CanonicalImportTrace[] }
@@ -145,19 +203,25 @@ export async function POST(
     ? []
     : bulk.invalid.filter((inv) => !consumedSet.has(inv.line.trim()))
   if (valid.length > MAX_LINES) {
-    return NextResponse.json({
+    return jsonNs({
       error: `Máximo ${MAX_LINES} líneas por importación`,
       total: valid.length + invalid.length,
       valid: valid.length,
       invalid: invalid.length,
       inserted: 0,
       errors: [`Se excedió el límite de ${MAX_LINES} líneas válidas.`],
-    }, { status: 400 })
+    }, 400)
   }
   if (valid.length > 0 && replaceItems) {
     const { error: delErr } = await supabase.from("source_exam_items").delete().eq("source_exam_id", sourceExamId)
     if (delErr) {
-      return NextResponse.json({ error: `No se pudieron eliminar ítems previos: ${delErr.message}` }, { status: 500 })
+      return jsonNs(
+        {
+          error: `No se pudieron eliminar ítems previos: ${delErr.message}`,
+          supabase_error: supabaseErrPayload(delErr),
+        },
+        500,
+      )
     }
   }
 
@@ -166,7 +230,7 @@ export async function POST(
       ...invalid.map((i) => `Línea: "${i.line}" — ${i.reason}`),
       ...(titleError ? [`No se pudo guardar el título: ${titleError}`] : []),
     ]
-    return NextResponse.json({
+    return jsonNs({
       total: valid.length + invalid.length,
       valid: 0,
       invalid: invalid.length,
@@ -178,24 +242,67 @@ export async function POST(
         : titleError && !titleUpdated
           ? "No hay líneas válidas para importar y el título no se pudo guardar."
           : "No hay líneas válidas para importar.",
-    }, { status: 200 })
+    }, 200)
   }
 
-  const rows = valid.map((p) => ({
-    source_exam_id: sourceExamId,
-    item_number: p.item_number,
-    item_text: p.item_text,
-    axis_id: null,
-    skill_id: null,
-    axis_label: p.axis_label || null,
-    skill_label: p.skill_label || null,
-    competence: p.competence || null,
-    difficulty: p.difficulty || null,
-    question_type: p.question_type || null,
-    correct_answer: p.correct_answer || null,
-    max_score: p.max_score ?? null,
-    rubric_text: p.rubric_text || null,
-  }))
+  const rows: Array<Record<string, unknown>> = []
+  /** Avisos no bloqueantes: ítems guardados sin par eje/habilidad del diccionario. */
+  const pedagogySoftWarnings: string[] = []
+  let pedagogyUnmappedCount = 0
+  const pushPedagogyWarning = (msg: string) => {
+    if (pedagogySoftWarnings.length < 25) pedagogySoftWarnings.push(msg)
+  }
+  for (let i = 0; i < valid.length; i++) {
+    const p = valid[i] as ImportItem
+    let axis_id = sanitizeUuidOrNull(p.axis_id ?? undefined)
+    let skill_id = sanitizeUuidOrNull(p.skill_id ?? undefined)
+    if (!axis_id || !skill_id) {
+      const resolved = await resolveAxisSkillIdsFromLabels(supabase, {
+        subject: sourceExamSubject,
+        axis_label: p.axis_label,
+        skill_label: p.skill_label,
+      })
+      axis_id = sanitizeUuidOrNull(resolved?.axis_id) ?? axis_id
+      skill_id = sanitizeUuidOrNull(resolved?.skill_id) ?? skill_id
+    }
+    let pedagogyWarned = false
+    if (axis_id && skill_id) {
+      const validPair = await validateAxisSkillPair(supabase, axis_id, skill_id)
+      if (!validPair.ok) {
+        pushPedagogyWarning(`Ítem ${p.item_number}: ${validPair.error} — se guarda sin axis_id/skill_id (etiquetas de texto se conservan).`)
+        axis_id = null
+        skill_id = null
+        pedagogyWarned = true
+      }
+    }
+    if (!axis_id || !skill_id) {
+      pedagogyUnmappedCount += 1
+      if (
+        !pedagogyWarned &&
+        (p.axis_label || p.skill_label || String(p.axis_id ?? "").trim() || String(p.skill_id ?? "").trim())
+      ) {
+        pushPedagogyWarning(
+          `Ítem ${p.item_number}: sin par oficial en diccionario; axis_id/skill_id en null (etiquetas de texto se conservan).`,
+        )
+      }
+    }
+    rows.push({
+      source_exam_id: sourceExamId,
+      item_number: p.item_number,
+      item_text: p.item_text,
+      axis_id,
+      skill_id,
+      axis_label: p.axis_label || null,
+      skill_label: p.skill_label || null,
+      competence: p.competence || null,
+      difficulty: p.difficulty || null,
+      question_type: p.question_type || null,
+      correct_answer: p.correct_answer || null,
+      max_score: p.max_score ?? null,
+      rubric_text: p.rubric_text || null,
+      cognitive_level: p.cognitive_level || null,
+    })
+  }
 
   const { data: inserted, error: insertErr } = await supabase
     .from("source_exam_items")
@@ -215,17 +322,39 @@ export async function POST(
     with_rubric: canonicalized.trace.filter((t) => t.rubricDetected).length,
   }
 
-  return NextResponse.json({
+  if (insertErr) {
+    return jsonNs(
+      {
+        error: insertErr.message || "Error al guardar ítems en la base de datos",
+        supabase_error: supabaseErrPayload(insertErr),
+        total: valid.length + invalid.length,
+        valid: valid.length,
+        invalid: invalid.length,
+        inserted: 0,
+        title_updated: titleUpdated,
+        errors,
+        message: "No se pudieron insertar las filas. Revise los datos o los mapeos eje/habilidad.",
+      },
+      500,
+    )
+  }
+
+  const pedagogyNote =
+    pedagogyUnmappedCount > 0
+      ? ` ${pedagogyUnmappedCount} ítem(s) sin eje/habilidad del diccionario (análisis por eje puede verse vacío).`
+      : ""
+
+  return jsonNs({
     total: valid.length + invalid.length,
     valid: valid.length,
     invalid: invalid.length,
-    inserted: insertErr ? 0 : insertedCount,
+    inserted: insertedCount,
     title_updated: titleUpdated,
+    pedagogy_unmapped_count: pedagogyUnmappedCount,
+    pedagogy_soft_warnings: pedagogySoftWarnings.length > 0 ? pedagogySoftWarnings : undefined,
     import_translation_trace_summary: traceSummary,
     import_translation_trace_preview: canonicalized.trace.slice(0, 60),
     errors: errors.length > 0 ? errors : undefined,
-    message: insertErr
-      ? "Error al insertar; revise los errores."
-      : `${replaceItems && insertedCount > 0 ? "Se reemplazaron los ítems anteriores. " : ""}Se importaron ${insertedCount} ítem(s).${titleUpdated ? " Título del instrumento actualizado." : ""}${invalid.length > 0 ? ` ${invalid.length} línea(s) inválida(s) no importadas.` : ""}`,
-  }, { status: 200 })
+    message: `${replaceItems && insertedCount > 0 ? "Se reemplazaron los ítems anteriores. " : ""}Se importaron ${insertedCount} ítem(s).${titleUpdated ? " Título del instrumento actualizado." : ""}${invalid.length > 0 ? ` ${invalid.length} línea(s) inválida(s) no importadas.` : ""}${pedagogyNote}`,
+  }, 200)
 }

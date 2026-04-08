@@ -1,6 +1,7 @@
 // app/api/evaluate/batch/route.ts
-// Endpoint para evaluación masiva en paralelo con streaming NDJSON
+// Endpoint para evaluación masiva: lotes secuenciales (N en paralelo dentro de cada lote), streaming NDJSON
 import { NextRequest } from "next/server"
+import type { EvaluateBatchNdjsonDone, EvaluateBatchNdjsonMeta } from "@/app/lib/evaluate-batch-ndjson"
 
 export const runtime = "nodejs"
 // REFIX_404_RAILWAY: mantener respuesta dinámica en producción Railway
@@ -8,7 +9,8 @@ export const dynamic = "force-dynamic"
 // REFIX_404_RAILWAY: timeout ampliado para evitar corte en rama serverless
 export const maxDuration = 300
 
-const BATCH_SIZE = 45 // Procesar 45 evaluaciones en paralelo
+/** Paralelismo por lote: completar el lote antes del siguiente (evita timeout 300s y picos de RAM en piloto). */
+const BATCH_SIZE = 7
 
 interface BatchItem {
   groupId: string
@@ -35,9 +37,13 @@ export async function POST(req: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       // Enviar metadata inicial
-      controller.enqueue(
-        encoder.encode(JSON.stringify({ type: "meta", totalItems: itemsToProcess.length, totalBatches }) + "\n")
-      )
+      const metaLine: EvaluateBatchNdjsonMeta = {
+        type: "meta",
+        totalItems: itemsToProcess.length,
+        totalBatches,
+        batchSize: BATCH_SIZE,
+      }
+      controller.enqueue(encoder.encode(JSON.stringify(metaLine) + "\n"))
 
       let completedCount = 0
 
@@ -94,10 +100,8 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // Enviar mensaje de finalización
-      controller.enqueue(
-        encoder.encode(JSON.stringify({ type: "done", completedCount }) + "\n")
-      )
+      const doneLine: EvaluateBatchNdjsonDone = { type: "done", completedCount }
+      controller.enqueue(encoder.encode(JSON.stringify(doneLine) + "\n"))
 
       controller.close()
     },

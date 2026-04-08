@@ -27,9 +27,16 @@ import {
   simceLevelFromLogroPct,
   type SimceLevel,
 } from "@/app/lib/standard-scale-converters"
+import { getInstrumentAnalyticsModeFromExamType, type InstrumentAnalyticsMode } from "@/app/lib/assessment-category"
 import { buildCourseQualityMetrics } from "@/app/lib/pedagogical-intelligence/metrics"
 import type { CourseStudentMetricInput } from "@/app/lib/pedagogical-intelligence/types"
 import type { SupabaseClient } from "@supabase/supabase-js"
+import { agencyAchievementLevelFromLogroPct } from "@/app/lib/chile-standards/agency-level-cuts"
+import {
+  inferSubjectForChileDictionary,
+  resolveChileMinisterialSkillCode,
+  resolveChileSkillTrace,
+} from "@/app/lib/chile-standards/evaluation-dictionary"
 
 export const dynamic = "force-dynamic"
 
@@ -51,12 +58,74 @@ type NationalAnalyticsRow = {
   score_obtained: number
   score_max: number
   logro_pct: number | null
-  paes_score: number
-  simce_score: number
-  simce_level: SimceLevel
+  /** Solo modo PAES; null si instrumento es SIMCE u otro. */
+  paes_score: number | null
+  /** Solo modo SIMCE; null si instrumento es PAES u otro. */
+  simce_score: number | null
+  /** Nivel estilo Agencia/SIMCE; null si instrumento es PAES u otro. */
+  simce_level: SimceLevel | null
+  instrument_analytics_mode: InstrumentAnalyticsMode
 }
 
 type DimensionKey = "axis" | "skill" | "cognitive_level"
+
+function dominantSubjectFromEvaluations(evals: Array<{ subject?: string | null }>): string {
+  const m = new Map<string, number>()
+  for (const e of evals) {
+    const s = String(e.subject ?? "").trim() || "Lenguaje"
+    m.set(s, (m.get(s) ?? 0) + 1)
+  }
+  let best = "Lenguaje"
+  let c = 0
+  for (const [k, v] of m) {
+    if (v > c) {
+      best = k
+      c = v
+    }
+  }
+  return best
+}
+
+function enrichSkillAggregateForChile(
+  row: { dimension_value: string; logro_pct: number | null; question_count: number },
+  subjectModes: string
+) {
+  const subj = inferSubjectForChileDictionary(subjectModes)
+  const label = pickLabel(row.dimension_value, "Sin habilidad")
+  const trace = resolveChileSkillTrace(subj, label)
+  const logro = row.logro_pct
+  const achievement_level =
+    logro == null || !Number.isFinite(Number(logro))
+      ? null
+      : agencyAchievementLevelFromLogroPct(Number(logro))
+  return {
+    ...row,
+    achievement_level,
+    chile_eje_tematico: trace?.eje_tematico ?? null,
+    chile_indicador_code: trace?.indicador_simce_paes_code ?? null,
+    chile_indicador_descriptor: trace?.indicador_simce_paes_descriptor ?? null,
+    chile_ministerial_skill_code: resolveChileMinisterialSkillCode(subj, label),
+  }
+}
+
+function enrichAxisAggregateForChile(row: {
+  dimension_value: string
+  logro_pct: number | null
+  question_count: number
+}) {
+  const logro = row.logro_pct
+  const achievement_level =
+    logro == null || !Number.isFinite(Number(logro))
+      ? null
+      : agencyAchievementLevelFromLogroPct(Number(logro))
+  return {
+    ...row,
+    achievement_level,
+    chile_eje_tematico: pickLabel(row.dimension_value, "Sin eje"),
+    chile_indicador_code: null as string | null,
+    chile_indicador_descriptor: null as string | null,
+  }
+}
 
 function pickLabel(value: unknown, fallback: string): string {
   if (value == null) return fallback
@@ -164,7 +233,7 @@ async function fetchAnalysisForEvaluation(
     sourceExamId
       ? supabase
           .from("source_exam_items")
-          .select("id, item_number, item_text, axis_label, skill_label, max_score, rubric_text, question_type")
+          .select("id, item_number, item_text, axis_label, skill_label, cognitive_level, max_score, rubric_text, question_type")
           .eq("source_exam_id", sourceExamId)
           .order("item_number", { ascending: true })
       : Promise.resolve({ data: [] as unknown[], error: null }),
@@ -208,6 +277,7 @@ function toNationalAnalyticsRows(params: {
   maxFallbackByEvaluation: Map<string, number>
   studentByEvaluation: Map<string, string>
   noteByEvaluation: Map<string, number>
+  examTypeByEvaluationId: Map<string, string | null>
 }): NationalAnalyticsRow[] {
   const rows: NationalAnalyticsRow[] = []
   const byEvaluationId = new Map(params.analyses.map((a) => [a.evaluation_id, a]))
@@ -223,6 +293,17 @@ function toNationalAnalyticsRows(params: {
     const score_max_fallback = params.maxFallbackByEvaluation.get(evaluationId) ?? 0
     const score_max = score_max_raw > 0 ? score_max_raw : score_max_fallback
     const logro_pct = score_max > 0 ? Math.round(clampLogroPctFromScores(score_obtained, score_max)) : null
+    const mode = getInstrumentAnalyticsModeFromExamType(params.examTypeByEvaluationId.get(evaluationId))
+    const lp = Number(logro_pct ?? 0)
+    let paes_score: number | null = null
+    let simce_score: number | null = null
+    let simce_level: SimceLevel | null = null
+    if (mode === "SIMCE") {
+      simce_score = projectSimceFromLogroPct(lp)
+      simce_level = simceLevelFromLogroPct(lp)
+    } else if (mode === "PAES") {
+      paes_score = projectPaesFromLogroPct(lp)
+    }
     rows.push({
       evaluation_id: evaluationId,
       student_name: params.studentByEvaluation.get(evaluationId) ?? "Estudiante",
@@ -230,9 +311,10 @@ function toNationalAnalyticsRows(params: {
       score_obtained,
       score_max,
       logro_pct,
-      paes_score: projectPaesFromLogroPct(Number(logro_pct ?? 0)),
-      simce_score: projectSimceFromLogroPct(Number(logro_pct ?? 0)),
-      simce_level: simceLevelFromLogroPct(Number(logro_pct ?? 0)),
+      paes_score,
+      simce_score,
+      simce_level,
+      instrument_analytics_mode: mode,
     })
   }
   return rows
@@ -261,7 +343,7 @@ function toCourseStudentMetricInputs(analyses: LearningResultsAnalysis[]): Cours
 }
 
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ courseId: string }> }
 ) {
   const { courseId } = await params
@@ -286,7 +368,7 @@ export async function GET(
 
   const { data: evaluations, error: evError } = await supabase
     .from("evaluations")
-    .select("id, course_id, course_label")
+    .select("id, course_id, course_label, exam_type, subject")
     .eq("teacher_id", teacherId)
     .order("evaluated_at", { ascending: false })
 
@@ -294,7 +376,13 @@ export async function GET(
     return NextResponse.json({ error: evError.message }, { status: 500 })
   }
 
-  const all = (evaluations ?? []) as Array<{ id: string; course_id: string | null; course_label?: string | null }>
+  const all = (evaluations ?? []) as Array<{
+    id: string
+    course_id: string | null
+    course_label?: string | null
+    exam_type?: string | null
+    subject?: string | null
+  }>
   const normalizeCourseKey = (v: unknown): string =>
     String(v ?? "")
       .trim()
@@ -318,7 +406,16 @@ export async function GET(
       ? filtered
       : all.filter((e) => e.course_id == null || String(e.course_id).trim() === "")
 
-  const evaluationIds = filteredWithUrlFallback.map((e) => e.id)
+  const examTypeParam = req.nextUrl.searchParams.get("exam_type")?.trim() ?? ""
+  const examNorm = examTypeParam.toLowerCase()
+  const courseEvalsForSummary = examNorm
+    ? filteredWithUrlFallback.filter(
+        (e) => String(e.exam_type ?? "").trim().toLowerCase() === examNorm
+      )
+    : filteredWithUrlFallback
+
+  const evaluationIds = courseEvalsForSummary.map((e) => e.id)
+  const subjectModes = dominantSubjectFromEvaluations(courseEvalsForSummary)
   const emptyNationalAnalytics = {
     enabled: ENABLE_NATIONAL_ANALYTICS,
     by_evaluation: [] as NationalAnalyticsRow[],
@@ -330,7 +427,7 @@ export async function GET(
       simce_distribution: {
         Adecuado: 0,
         Elemental: 0,
-        Insatisfactorio: 0,
+        Insuficiente: 0,
       } as Record<SimceLevel, number>,
     },
   }
@@ -354,6 +451,7 @@ export async function GET(
       most_failed_questions: [],
       question_heat_map: [],
       national_analytics: emptyNationalAnalytics,
+      exam_type_filter: examTypeParam || null,
     }
     if (isDev) console.info("[pedagogical-summary]", { courseId, normalizedCourse, ...payload })
     return NextResponse.json(payload, { status: 200, headers: { "Cache-Control": "no-store" } })
@@ -367,7 +465,7 @@ export async function GET(
     evaluation_items_count: number
     source_exam_items_count: number
   }> = []
-  for (const e of filteredWithUrlFallback) {
+  for (const e of courseEvalsForSummary) {
     const sourceExamId = await getSourceExamForEvaluation(supabase, e.id)
     let evaluation_items_count = 0
     let source_exam_items_count = 0
@@ -426,7 +524,7 @@ export async function GET(
 
   const evaluation_count_with_source_exam = evalsMeta.filter((m) => m.has_source_exam).length
   const evaluation_count_analyzable = analyses.filter((a) => a.by_question.length > 0).length
-  const evaluation_count_total = filteredWithUrlFallback.length
+  const evaluation_count_total = courseEvalsForSummary.length
   const evaluation_count_without_source_exam = evaluation_count_total - evaluation_count_with_source_exam
   const evaluation_count_without_items = evalsMeta.filter(
     (m) => m.has_source_exam && (m.evaluation_items_count === 0 || m.source_exam_items_count === 0)
@@ -514,6 +612,9 @@ export async function GET(
         most_failed_questions: [],
         question_heat_map: [],
         national_analytics: emptyNationalAnalytics,
+        exam_type_filter: examTypeParam || null,
+        chile_agency_cuts_note:
+          "Nivel de logro (Agencia / estándar porcentual): <50% Insuficiente · 50–69% Elemental · ≥70% Adecuado.",
       },
       { status: 200, headers: { "Cache-Control": "no-store" } }
     )
@@ -577,12 +678,17 @@ export async function GET(
       const itemMax = Number(meta.evaluation_items_count) || 0
       maxFallbackByEvaluation.set(meta.id, sourceMax > 0 ? sourceMax : itemMax)
     }
+    const examTypeByEvaluationId = new Map<string, string | null>()
+    for (const e of courseEvalsForSummary) {
+      examTypeByEvaluationId.set(e.id, e.exam_type ?? null)
+    }
     const byEvaluation = toNationalAnalyticsRows({
       analyses,
       evaluationIds,
       maxFallbackByEvaluation,
       studentByEvaluation,
       noteByEvaluation,
+      examTypeByEvaluationId,
     })
     const count = byEvaluation.length
     const average_note_7 =
@@ -598,24 +704,30 @@ export async function GET(
       count > 0
         ? Math.round(byEvaluation.reduce((s, r) => s + Number(r.logro_pct ?? 0), 0) / count)
         : 0
+    const paesRows = byEvaluation.filter((r) => r.paes_score != null)
+    const simceRows = byEvaluation.filter((r) => r.simce_score != null)
+    const simceLevelRows = byEvaluation.filter((r) => r.simce_level != null)
     const average_paes =
-      count > 0
-        ? Math.round(byEvaluation.reduce((s, r) => s + Number(r.paes_score ?? 0), 0) / count)
-        : 100
+      paesRows.length > 0
+        ? Math.round(paesRows.reduce((s, r) => s + Number(r.paes_score), 0) / paesRows.length)
+        : 0
     const average_simce =
-      count > 0
-        ? Math.round(byEvaluation.reduce((s, r) => s + Number(r.simce_score ?? 0), 0) / count)
+      simceRows.length > 0
+        ? Math.round(simceRows.reduce((s, r) => s + Number(r.simce_score), 0) / simceRows.length)
         : 0
     const distCount: Record<SimceLevel, number> = {
       Adecuado: 0,
       Elemental: 0,
-      Insatisfactorio: 0,
+      Insuficiente: 0,
     }
-    for (const r of byEvaluation) distCount[r.simce_level] += 1
+    for (const r of byEvaluation) {
+      if (r.simce_level) distCount[r.simce_level] += 1
+    }
+    const simceDenom = simceLevelRows.length
     const simce_distribution: Record<SimceLevel, number> = {
-      Adecuado: count > 0 ? Math.round((distCount.Adecuado / count) * 100) : 0,
-      Elemental: count > 0 ? Math.round((distCount.Elemental / count) * 100) : 0,
-      Insatisfactorio: count > 0 ? Math.round((distCount.Insatisfactorio / count) * 100) : 0,
+      Adecuado: simceDenom > 0 ? Math.round((distCount.Adecuado / simceDenom) * 100) : 0,
+      Elemental: simceDenom > 0 ? Math.round((distCount.Elemental / simceDenom) * 100) : 0,
+      Insuficiente: simceDenom > 0 ? Math.round((distCount.Insuficiente / simceDenom) * 100) : 0,
     }
     national_analytics = {
       enabled: true,
@@ -630,6 +742,23 @@ export async function GET(
     }
   }
 
+  const allInstitutionalOther = courseEvalsForSummary.every(
+    (e) => getInstrumentAnalyticsModeFromExamType(e.exam_type) === "INSTITUTIONAL_OTHER",
+  )
+  let by_axis_enriched = courseSummary.average_by_axis.map((r) => enrichAxisAggregateForChile(r))
+  let by_skill_enriched = courseSummary.average_by_skill.map((r) => enrichSkillAggregateForChile(r, subjectModes))
+  if (allInstitutionalOther) {
+    by_axis_enriched = by_axis_enriched.map((r) => ({ ...r, achievement_level: null }))
+    by_skill_enriched = by_skill_enriched.map((r) => ({
+      ...r,
+      achievement_level: null,
+      chile_eje_tematico: null,
+      chile_indicador_code: null,
+      chile_indicador_descriptor: null,
+      chile_ministerial_skill_code: null,
+    }))
+  }
+
   return NextResponse.json(
     {
       course: normalizedCourse,
@@ -642,14 +771,17 @@ export async function GET(
       summary_available,
       status_reason,
       student_count: studentCount,
-      by_axis: courseSummary.average_by_axis,
-      by_skill: courseSummary.average_by_skill,
+      by_axis: by_axis_enriched,
+      by_skill: by_skill_enriched,
       by_cognitive_level: courseSummary.average_by_cognitive_level,
       weakest_skills: courseSummary.weakest_skills,
       weakest_axes: weakest_axes,
       most_failed_questions,
       question_heat_map,
       national_analytics,
+      exam_type_filter: examTypeParam || null,
+      chile_agency_cuts_note:
+        "Nivel de logro (Agencia / estándar porcentual): <50% Insuficiente · 50–69% Elemental · ≥70% Adecuado.",
     },
     { status: 200, headers: { "Cache-Control": "no-store" } }
   )

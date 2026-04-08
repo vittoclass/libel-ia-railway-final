@@ -20,7 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Loader2, RefreshCw, BookOpen, Plus, List } from "lucide-react"
+import { Loader2, RefreshCw, BookOpen, Plus, List, Pencil } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { cn } from "@/lib/utils"
 import SourceExamItemsPanel from "@/app/components/SourceExamItemsPanel"
@@ -33,6 +33,88 @@ type SourceExamItem = {
   exam_type: string | null
   pedagogy_mode: string | null
   created_at?: string | null
+}
+
+function SourceExamTitleField({
+  row,
+  onTitleSaved,
+}: {
+  row: SourceExamItem
+  onTitleSaved: (id: string, title: string) => void
+}) {
+  const [value, setValue] = React.useState(row.title ?? "")
+  const [saving, setSaving] = React.useState(false)
+  const { toast } = useToast()
+
+  React.useEffect(() => {
+    setValue(row.title ?? "")
+  }, [row.id, row.title])
+
+  const commit = React.useCallback(async () => {
+    const next = value.trim() === "" ? "Sin título" : value.trim()
+    const prevNorm = !row.title?.trim() ? "Sin título" : row.title.trim()
+    if (next === prevNorm) return
+
+    setSaving(true)
+    try {
+      const r = await fetch(`/api/source-exams/${encodeURIComponent(row.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ title: value }),
+      })
+      const j = await r.json().catch(() => ({}))
+      if (!r.ok) {
+        toast({
+          title: typeof j.error === "string" ? j.error : "No se pudo guardar el título",
+          variant: "destructive",
+        })
+        setValue(row.title ?? "")
+        return
+      }
+      const saved = typeof j.source_exam?.title === "string" ? j.source_exam.title : next
+      setValue(saved)
+      onTitleSaved(row.id, saved)
+    } catch {
+      toast({ title: "Error de conexión al guardar el título", variant: "destructive" })
+      setValue(row.title ?? "")
+    } finally {
+      setSaving(false)
+    }
+  }, [value, row.id, row.title, onTitleSaved, toast])
+
+  return (
+    <div className="flex items-center gap-2 min-w-[10rem] max-w-[min(28rem,100%)]">
+      <Input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={() => void commit()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault()
+            ;(e.currentTarget as HTMLInputElement).blur()
+          }
+          if (e.key === "Escape") {
+            setValue(row.title ?? "")
+            ;(e.currentTarget as HTMLInputElement).blur()
+          }
+        }}
+        placeholder="Sin título"
+        disabled={saving}
+        aria-label={`Título de la prueba base ${row.id}`}
+        className={cn(
+          "h-8 text-sm bg-transparent shadow-none",
+          "border border-transparent hover:border-[var(--border-color)]",
+          "focus-visible:border-[var(--border-color)] focus-visible:ring-1 focus-visible:ring-[var(--text-accent)]/20",
+        )}
+      />
+      {saving ? (
+        <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--text-muted)]" aria-hidden />
+      ) : (
+        <Pencil className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)] opacity-40 pointer-events-none" aria-hidden />
+      )}
+    </div>
+  )
 }
 
 export default function SourceExamsSection() {
@@ -71,6 +153,13 @@ export default function SourceExamsSection() {
   }, [])
 
   useEffect(() => { loadList() }, [loadList])
+
+  const handleTitleSaved = React.useCallback((id: string, title: string) => {
+    setList((prev) => prev.map((x) => (x.id === id ? { ...x, title } : x)))
+    if (selectedSourceExamId === id) {
+      setSelectedSourceExamTitle(title)
+    }
+  }, [selectedSourceExamId])
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -234,7 +323,9 @@ export default function SourceExamsSection() {
               <TableBody>
                 {list.map((row) => (
                   <TableRow key={row.id}>
-                    <TableCell>{row.title ?? "—"}</TableCell>
+                    <TableCell className="align-middle py-2">
+                      <SourceExamTitleField row={row} onTitleSaved={handleTitleSaved} />
+                    </TableCell>
                     <TableCell>{row.subject ?? "—"}</TableCell>
                     <TableCell>{row.course_label ?? "—"}</TableCell>
                     <TableCell>{row.exam_type ?? "—"}</TableCell>

@@ -62,3 +62,29 @@ export function mergeFlatAssessmentType(
   if (!current) return next
   return rankForMerge(next) > rankForMerge(current) ? next : current
 }
+
+/**
+ * Marco de proyección en informes pedagógicos (exclusión cruzada SIMCE/PAES vs prueba propia).
+ * Se deriva de `evaluations.exam_type` (mismo significado que instrument_type en producto).
+ */
+export type InstrumentAnalyticsMode = "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+
+export function getInstrumentAnalyticsModeFromExamType(raw: string | null | undefined): InstrumentAnalyticsMode {
+  const flat = parseAssessmentTypeToFlat(raw)
+  if (flat === "ENSAYO_SIMCE") return "SIMCE"
+  if (flat === "ENSAYO_PAES") return "PAES"
+  return "INSTITUTIONAL_OTHER"
+}
+
+/**
+ * Inferencia desde título/nombre de archivo de prueba base (sin tocar OMR).
+ * Prioridad PAES > SIMCE > ENSAYO genérico (→ MENSUAL).
+ */
+export function inferFlatAssessmentCategoryFromExamLabel(raw: string | null | undefined): FlatAssessmentType | null {
+  const u = String(raw ?? "").toUpperCase()
+  if (!u.trim()) return null
+  if (u.includes("PAES")) return "ENSAYO_PAES"
+  if (u.includes("SIMCE")) return "ENSAYO_SIMCE"
+  if (u.includes("ENSAYO")) return "MENSUAL"
+  return null
+}

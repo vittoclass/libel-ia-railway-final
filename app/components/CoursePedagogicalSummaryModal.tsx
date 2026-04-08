@@ -39,6 +39,17 @@ import { useToast } from "@/hooks/use-toast"
 import { buildPedagogicalDiagnosis } from "@/app/lib/pedagogical-diagnosis-text"
 import { QuestionHeatMap } from "@/app/components/QuestionHeatMap"
 import { downloadCsvFile } from "@/app/lib/csv-export"
+import { EXAM_TYPE_FILTER_OPTIONS } from "@/app/lib/exam-type-constants"
+
+type LogroRowChile = {
+  dimension_value: string
+  logro_pct: number | null
+  question_count: number
+  achievement_level?: "Insuficiente" | "Elemental" | "Adecuado" | null
+  chile_eje_tematico?: string | null
+  chile_indicador_code?: string | null
+  chile_indicador_descriptor?: string | null
+}
 
 type SummaryData = {
   course: string
@@ -51,8 +62,8 @@ type SummaryData = {
   summary_available?: boolean
   status_reason?: string
   student_count: number
-  by_axis: Array<{ dimension_value: string; logro_pct: number | null; question_count: number }>
-  by_skill: Array<{ dimension_value: string; logro_pct: number | null; question_count: number }>
+  by_axis: LogroRowChile[]
+  by_skill: LogroRowChile[]
   by_cognitive_level: Array<{ dimension_value: string; logro_pct: number | null; question_count: number }>
   weakest_skills: Array<{ skill: string; average_logro_pct: number | null }>
   weakest_axes: Array<{ axis: string; average_logro_pct: number | null; question_count: number }>
@@ -64,6 +75,8 @@ type SummaryData = {
     student_count: number
   }>
   question_heat_map?: Array<{ item_number: number; logro_pct: number | null; axis?: string; skill?: string }>
+  exam_type_filter?: string | null
+  chile_agency_cuts_note?: string | null
   national_analytics?: {
     enabled: boolean
     by_evaluation: Array<{
@@ -73,9 +86,10 @@ type SummaryData = {
       score_obtained: number
       score_max: number
       logro_pct: number | null
-      paes_score: number
-      simce_score: number
-      simce_level: "Adecuado" | "Elemental" | "Insatisfactorio"
+      paes_score: number | null
+      simce_score: number | null
+      simce_level: "Adecuado" | "Elemental" | "Insuficiente" | null
+      instrument_analytics_mode?: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
     }>
     course_summary: {
       average_note_7: number | null
@@ -85,7 +99,7 @@ type SummaryData = {
       simce_distribution: {
         Adecuado: number
         Elemental: number
-        Insatisfactorio: number
+        Insuficiente: number
       }
     }
   }
@@ -130,7 +144,7 @@ function pickPedagogicalLabel(value: unknown, fallback = "N/A"): string {
 
 function normalizeSummaryData(raw: SummaryData): SummaryData {
   // SNAPSHOT_NATIONAL_ANALYTICS_V1: normalizacion de entrada para impedir objetos en render
-  const mapDimensionRows = (rows: Array<{ dimension_value: string; logro_pct: number | null; question_count: number }>) =>
+  const mapDimensionRows = (rows: LogroRowChile[]) =>
     (rows ?? []).map((r) => ({
       ...r,
       dimension_value: pickPedagogicalLabel(r.dimension_value),
@@ -261,6 +275,7 @@ export default function CoursePedagogicalSummaryModal({
   const reportRef = useRef<HTMLDivElement>(null)
   const [exportPdfLoading, setExportPdfLoading] = useState(false)
   const [showNationalAnalytics, setShowNationalAnalytics] = useState(true)
+  const [examTypeFilter, setExamTypeFilter] = useState("")
   const { toast } = useToast()
 
   useEffect(() => {
@@ -297,7 +312,10 @@ export default function CoursePedagogicalSummaryModal({
     setLoading(true)
     setError(null)
     setData(null)
-    const url = `/api/courses/${encodeURIComponent(courseId)}/pedagogical-summary`
+    const qs = new URLSearchParams()
+    if (examTypeFilter.trim()) qs.set("exam_type", examTypeFilter.trim())
+    const qstr = qs.toString()
+    const url = `/api/courses/${encodeURIComponent(courseId)}/pedagogical-summary${qstr ? `?${qstr}` : ""}`
     fetch(url, { credentials: "include", cache: "no-store" })
       .then((r) => r.json())
       .then((j) => {
@@ -353,7 +371,7 @@ export default function CoursePedagogicalSummaryModal({
         const safePaes = typeof row.paes_score === "number" && Number.isFinite(row.paes_score) ? row.paes_score : "N/A"
         const safeSimce = typeof row.simce_score === "number" && Number.isFinite(row.simce_score) ? row.simce_score : "N/A"
         const safeLevel =
-          row.simce_level === "Adecuado" || row.simce_level === "Elemental" || row.simce_level === "Insatisfactorio"
+          row.simce_level === "Adecuado" || row.simce_level === "Elemental" || row.simce_level === "Insuficiente"
             ? row.simce_level
             : "N/A"
         const safeLogro = row.logro_pct == null ? "N/A" : `${Math.round(Number(row.logro_pct))}%`
@@ -401,6 +419,28 @@ export default function CoursePedagogicalSummaryModal({
           )}
           {!loading && !error && data && (
             <>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                <div className="text-xs text-muted-foreground shrink-0">
+                  <span className="font-medium text-[var(--text-accent)]">Tipo de prueba (filtro reporte)</span>
+                  <select
+                    className="ml-2 rounded-md border border-[var(--border-color)] bg-background px-2 py-1 text-sm"
+                    value={examTypeFilter}
+                    onChange={(e) => setExamTypeFilter(e.target.value)}
+                    aria-label="Filtrar por exam_type"
+                  >
+                    {EXAM_TYPE_FILTER_OPTIONS.map((o) => (
+                      <option key={o.value || "all"} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              {data.chile_agency_cuts_note ? (
+                <p className="text-xs text-[var(--text-muted)] border border-dashed border-[var(--border-color)] rounded-md px-2 py-1.5">
+                  {data.chile_agency_cuts_note}
+                </p>
+              ) : null}
               <SummaryBlock data={data} />
               {(data.evaluation_count_without_items ?? 0) > 0 && (
                 <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
@@ -427,6 +467,7 @@ export default function CoursePedagogicalSummaryModal({
                       <TableRow>
                         <TableHead>Eje</TableHead>
                         <TableHead className="w-24">Logro %</TableHead>
+                        <TableHead className="w-28">Nivel</TableHead>
                         <TableHead className="w-20">Preguntas</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -439,6 +480,7 @@ export default function CoursePedagogicalSummaryModal({
                               {formatPct(r.logro_pct)}
                             </span>
                           </TableCell>
+                          <TableCell className="text-xs">{r.achievement_level ?? "—"}</TableCell>
                           <TableCell>{r.question_count}</TableCell>
                         </TableRow>
                       ))}
@@ -454,6 +496,8 @@ export default function CoursePedagogicalSummaryModal({
                       <TableRow>
                         <TableHead>Habilidad</TableHead>
                         <TableHead className="w-24">Logro %</TableHead>
+                        <TableHead className="w-28">Nivel</TableHead>
+                        <TableHead className="w-24">Indicador</TableHead>
                         <TableHead className="w-20">Preguntas</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -465,6 +509,10 @@ export default function CoursePedagogicalSummaryModal({
                             <span className={(r.logro_pct ?? -1) >= 70 ? "text-green-600" : (r.logro_pct ?? 999) < 50 ? "text-amber-600" : ""}>
                               {formatPct(r.logro_pct)}
                             </span>
+                          </TableCell>
+                          <TableCell className="text-xs font-medium">{r.achievement_level ?? "—"}</TableCell>
+                          <TableCell className="text-xs max-w-[140px]" title={r.chile_indicador_descriptor ?? undefined}>
+                            {r.chile_indicador_code ?? "—"}
                           </TableCell>
                           <TableCell>{r.question_count}</TableCell>
                         </TableRow>
@@ -620,8 +668,11 @@ export default function CoursePedagogicalSummaryModal({
               {/* SNAPSHOT_NATIONAL_ANALYTICS_V1 */}
               {hasNational && (
                 <div className="space-y-4 pt-4 border-t border-[var(--border-color)]">
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex flex-col gap-1">
                     <h4 className="font-semibold text-[var(--text-accent)]">Analítica Nacional (PAES/SIMCE)</h4>
+                    <p className="text-xs text-[var(--text-muted)]">
+                      Por fila: según <code className="text-[11px]">exam_type</code> de la evaluación — SIMCE sin PAES, PAES sin nivel SIMCE/Agencia, pruebas propias sin columnas nacionales (N/A).
+                    </p>
                   </div>
                   <div className="rounded-md border bg-[var(--bg-muted)] p-3 text-sm grid grid-cols-1 md:grid-cols-5 gap-2">
                     <div><strong>Nota 7.0 prom.</strong>: {national?.course_summary.average_note_7 ?? "—"}</div>
@@ -629,9 +680,9 @@ export default function CoursePedagogicalSummaryModal({
                     <div><strong>PAES prom.</strong>: {national?.course_summary.average_paes ?? 100}</div>
                     <div><strong>SIMCE prom.</strong>: {national?.course_summary.average_simce ?? 0}</div>
                     <div>
-                      <strong>Distribución SIMCE</strong>: A {national?.course_summary.simce_distribution.Adecuado ?? 0}% ·
+                      <strong>Distribución nivel logro %</strong>: A {national?.course_summary.simce_distribution.Adecuado ?? 0}% ·
                       E {national?.course_summary.simce_distribution.Elemental ?? 0}% ·
-                      I {national?.course_summary.simce_distribution.Insatisfactorio ?? 0}%
+                      I {national?.course_summary.simce_distribution.Insuficiente ?? 0}%
                     </div>
                   </div>
                   {/* SNAPSHOT_NATIONAL_ANALYTICS_V1: columnas nacionales forzadas en detalle */}
@@ -643,7 +694,7 @@ export default function CoursePedagogicalSummaryModal({
                           <TableHead className="w-20">Nota 7.0</TableHead>
                           <TableHead className="w-20">PAES</TableHead>
                           <TableHead className="w-20">SIMCE</TableHead>
-                          <TableHead className="w-24">Nivel SIMCE</TableHead>
+                          <TableHead className="w-28">Nivel (logro %)</TableHead>
                           <TableHead className="w-20">Logro %</TableHead>
                         </TableRow>
                       </TableHeader>

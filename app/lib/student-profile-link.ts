@@ -98,3 +98,35 @@ export async function ensureStudentProfile(
     return null
   }
 }
+
+/**
+ * Si no hay fila para el curso exacto, reutiliza el perfil más reciente del mismo
+ * profesor + nombre normalizado (rezagados / distinto course_label en el lote).
+ * No crea filas nuevas; solo evita quedarse sin vínculo cuando ya existe historial.
+ */
+export async function resolveStudentProfileLooseByTeacherAndName(
+  supabase: SupabaseClient,
+  teacher_id: string,
+  student_normalized: string
+): Promise<string | null> {
+  const norm = String(student_normalized ?? "").trim().toLowerCase()
+  if (!norm) return null
+  try {
+    const { data, error } = await supabase
+      .from("student_profiles")
+      .select("id")
+      .eq("teacher_id", teacher_id)
+      .eq("student_normalized", norm)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (error) {
+      if (isDev) console.warn("[student_profile] loose resolve error", error.message)
+      return null
+    }
+    return data?.id ? String(data.id) : null
+  } catch (e) {
+    if (isDev) console.warn("[student_profile] loose resolve", e)
+    return null
+  }
+}

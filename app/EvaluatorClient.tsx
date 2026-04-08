@@ -78,6 +78,11 @@ import {
   pdf,
 } from "@react-pdf/renderer"
 import { useEvaluator, AnswerKeyData } from "./useEvaluator"
+import {
+  type EvaluateBatchNdjsonMeta,
+  isEvaluateBatchDoneMsg,
+  isEvaluateBatchMetaMsg,
+} from "@/app/lib/evaluate-batch-ndjson"
 import { pickStudentDesarrolloVisibleText } from "@/app/lib/pick-student-desarrollo-text"
 import {
   buildPedagogicalResumenFromGroup,
@@ -792,37 +797,53 @@ interface RetroalimentacionEstructurada {
   nota?: number
   retroalimentacion_alternativas?: { pregunta: string; respuesta_estudiante: string; respuesta_correcta: string }[]
 }
-const formSchema = z.object({
-  tipoEvaluacion: z.string().default("prueba"),
-  // ✅ PUNTUACIÓN CRÍTICA: Rúbrica y puntaje total se mantienen
-  rubrica: z.string().min(10, "La rúbrica es necesaria."),
-  puntajeTotal: z
-    .string()
-    .min(1, "El puntaje total es obligatorio.")
-    .regex(/^[0-9]+$/, "El puntaje debe ser un número entero."),
-  pauta: z.string().optional(),
-  flexibilidad: z.array(z.number()).default([3]),
-  nombreProfesor: z.string().optional(),
-  nombrePrueba: z.string().optional(),
-  departamento: z.string().optional(),
-  asignatura: z.string().optional(),
-  curso: z.string().optional(),
-  fechaEvaluacion: z.date().optional(),
-  areaConocimiento: z.string().default("general"),
-  nivelEducativo: z.string().default("Educación Media"),
-  nombresGrupales: z.string().optional(),
-  // NUEVOS CAMPOS DE CONTROL
-  porcentajeExigencia: z
-    .string()
-    .min(1, "La exigencia es obligatoria.")
-    .regex(/^[0-9]+$/, "Debe ser un número."),
-  // 🟢 CRÍTICO: Pauta Estructurada OBLIGATORIA para la suma del backend
-  pautaEstructurada: z.string().min(5, "La pauta de puntajes es obligatoria para rigor."),
-  // 🔥 CRÍTICO: Campo para la pauta de alternativas.
-  pautaCorrectaAlternativas: z.string().optional(),
-  // Tipo de prueba: mixta (alternativas + desarrollo), solo_desarrollo, solo_alternativas
-  tipoPrueba: z.enum(["mixta", "solo_desarrollo", "solo_alternativas"]).default("mixta"),
-})
+/** Rúbrica y pauta estructurada son obligatorias salvo en prueba solo de alternativas (incl. V/F vía mismo modo). */
+const formSchema = z
+  .object({
+    tipoEvaluacion: z.string().default("prueba"),
+    rubrica: z.string(),
+    puntajeTotal: z
+      .string()
+      .min(1, "El puntaje total es obligatorio.")
+      .regex(/^[0-9]+$/, "El puntaje debe ser un número entero."),
+    pauta: z.string().optional(),
+    flexibilidad: z.array(z.number()).default([3]),
+    nombreProfesor: z.string().optional(),
+    nombrePrueba: z.string().optional(),
+    departamento: z.string().optional(),
+    asignatura: z.string().optional(),
+    curso: z.string().optional(),
+    fechaEvaluacion: z.date().optional(),
+    areaConocimiento: z.string().default("general"),
+    nivelEducativo: z.string().default("Educación Media"),
+    nombresGrupales: z.string().optional(),
+    porcentajeExigencia: z
+      .string()
+      .min(1, "La exigencia es obligatoria.")
+      .regex(/^[0-9]+$/, "Debe ser un número."),
+    pautaEstructurada: z.string(),
+    pautaCorrectaAlternativas: z.string().optional(),
+    tipoPrueba: z.enum(["mixta", "solo_desarrollo", "solo_alternativas"]).default("mixta"),
+  })
+  .superRefine((data, ctx) => {
+    if (data.tipoPrueba === "solo_alternativas") return
+    const rub = (data.rubrica ?? "").trim()
+    if (rub.length < 10) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "La rúbrica es necesaria.",
+        path: ["rubrica"],
+      })
+    }
+    const pe = (data.pautaEstructurada ?? "").trim()
+    if (pe.length < 5) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "La pauta de puntajes es obligatoria para rigor.",
+        path: ["pautaEstructurada"],
+      })
+    }
+  })
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -1342,6 +1363,9 @@ function mapSourceExamApiRowsToInputs(rows: unknown[]): EvaluationBaseSourceExam
   }
   return out
 }
+
+/** Debe coincidir con BATCH_SIZE en app/api/evaluate/batch/route.ts (solo orquestación; no OMR). */
+const EVALUATE_BATCH_PARALLEL_SIZE = 7
 
 export default function EvaluatorClient() {
   const enablePedagogy = process.env.NEXT_PUBLIC_ENABLE_PEDAGOGY === "true"
@@ -1880,6 +1904,18 @@ export default function EvaluatorClient() {
       tipoPrueba: "mixta",
     },
   })
+
+  const watchedTipoPrueba = form.watch("tipoPrueba")
+  const prevTipoPruebaRef = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    const prev = prevTipoPruebaRef.current
+    if (watchedTipoPrueba === "solo_alternativas") {
+      form.clearErrors(["rubrica", "pautaEstructurada"])
+    } else if (prev === "solo_alternativas") {
+      void form.trigger(["rubrica", "pautaEstructurada"])
+    }
+    prevTipoPruebaRef.current = watchedTipoPrueba
+  }, [watchedTipoPrueba, form])
 
   const applyEvaluatorSourceExamHintsToEmptyFields = useCallback(() => {
     if (!evaluatorLastSourceExamPayload) return
@@ -3074,7 +3110,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     )
   }
 
-  // Función para manejar evaluación masiva en lotes paralelos (3 lotes x 45 simultáneos)
+  // Función para manejar evaluación masiva: servidor procesa lotes de 7 en paralelo y espera cada lote antes del siguiente
   const handleEvaluateGroups = async (groupIDsToEvaluate: string[]) => {
     ensureEvaluationBatchId()
     const {
@@ -3097,16 +3133,18 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     const puntajeTotalNum = Number(puntajeTotal)
     const porcentajeExigenciaNum = Number(porcentajeExigencia)
 
-    if (!rubrica) {
-      form.setError("rubrica", { type: "manual", message: "La rubrica es requerida." })
-      return
-    }
-    if (!pautaEstructurada) {
-      form.setError("pautaEstructurada", {
-        type: "manual",
-        message: "La pauta de puntajes estructurada es requerida para el rigor.",
-      })
-      return
+    if (tipoPrueba !== "solo_alternativas") {
+      if (!String(rubrica ?? "").trim()) {
+        form.setError("rubrica", { type: "manual", message: "La rubrica es requerida." })
+        return
+      }
+      if (!String(pautaEstructurada ?? "").trim()) {
+        form.setError("pautaEstructurada", {
+          type: "manual",
+          message: "La pauta de puntajes estructurada es requerida para el rigor.",
+        })
+        return
+      }
     }
 
     // Filtrar grupos validos
@@ -3115,6 +3153,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     )
 
     if (validGroups.length === 0) return
+
+    const validGroupById = new Map(validGroups.map((g) => [g.id, g]))
 
     // Marcar todos como evaluando
     setStudentGroups((prev) =>
@@ -3127,7 +3167,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     )
 
     // Inicializar progreso de batch
-    const totalBatches = Math.ceil(validGroups.length / 45)
+    const totalBatches = Math.ceil(validGroups.length / EVALUATE_BATCH_PARALLEL_SIZE)
     setBatchProgress({
       isActive: true,
       totalItems: validGroups.length,
@@ -3267,13 +3307,163 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         throw new Error("Error HTTP " + response.status + ": " + response.statusText)
       }
 
-      // Leer stream NDJSON línea por línea
+      // Leer stream NDJSON: acumular actualizaciones de grupos y aplicarlas en requestAnimationFrame (menos re-renders).
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ""
       let completed = 0
       let successes = 0
       let errors = 0
+      let serverBatchSize = EVALUATE_BATCH_PARALLEL_SIZE
+      const pendingResults = new Map<string, any>()
+      let streamRafId: number | null = null
+
+      const flushStreamUIUpdates = () => {
+        const snapshot = new Map(pendingResults)
+        if (snapshot.size > 0) {
+          pendingResults.clear()
+          setStudentGroups((prev) =>
+            prev.map((g) => {
+              const msg = snapshot.get(g.id)
+              if (!msg) return g
+              if (msg.success && msg.data) {
+                return {
+                  ...g,
+                  isEvaluating: false,
+                  isEvaluated: true,
+                  isValidationStep: false,
+                  retroalimentacion: msg.data.retroalimentacion,
+                  puntaje: msg.data.puntaje,
+                  nota: msg.data.nota,
+                  detalle_desarrollo: msg.data.detalle_desarrollo,
+                  puntosAprobacion: msg.data.puntosAprobacion,
+                  puntosMaximos: msg.data.puntosMaximos,
+                  alternativas_corregidas:
+                    msg.data.alternativas_corregidas ||
+                    msg.data.retroalimentacion?.retroalimentacion_alternativas,
+                  omrDebug: msg.data.omrDebug,
+                  evaluationTrace: { payload: evaluationTracePayloadCommon },
+                  error: undefined,
+                  evaluation_id: (msg.data as { evaluation_id?: string }).evaluation_id ?? undefined,
+                }
+              }
+              return { ...g, isEvaluating: false, error: msg.error || "Error en la evaluacion" }
+            }),
+          )
+
+          for (const [, msg] of snapshot) {
+            if (!msg.success || !msg.data) continue
+            if (msg.data.saved && typeof (msg.data as { evaluation_id?: string }).evaluation_id === "string") {
+              setLastSavedEvaluationId((msg.data as { evaluation_id: string }).evaluation_id)
+              setLastSaveReason(null)
+              setLastSaveError(null)
+              setActiveTab("evaluaciones")
+            } else if (!msg.data.saved) {
+              const reason =
+                typeof (msg.data as { reason?: string }).reason === "string"
+                  ? (msg.data as { reason: string }).reason
+                  : null
+              const saveError =
+                typeof (msg.data as { save_error?: string }).save_error === "string"
+                  ? (msg.data as { save_error: string }).save_error
+                  : "Error desconocido"
+              setLastSaveReason(reason)
+              setLastSaveError(saveError)
+              toast({ title: "❌ No se pudo guardar: " + (reason || saveError), variant: "destructive" })
+            }
+          }
+
+          for (const [groupId, msg] of snapshot) {
+            if (msg.success && msg.data?.saved && typeof (msg.data as { evaluation_id?: string }).evaluation_id === "string") {
+              const evalId = (msg.data as { evaluation_id: string }).evaluation_id
+              const group = validGroupById.get(groupId)
+              const finalStudentName = getFinalStudentNameForSync(group ?? undefined, null)
+              const finalStudentRut = getFinalStudentRutForSync(group ?? undefined, null)
+              const finalCourseLabel = getFinalCourseLabel(null)
+              if (finalStudentName) {
+                fetch(`/api/evaluations/${evalId}/sync-student`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    student_name: finalStudentName,
+                    course_label: finalCourseLabel,
+                    student_rut: finalStudentRut,
+                  }),
+                })
+                  .then(async (res) => {
+                    const data = await res.json()
+                    setLastStudentSyncResult({
+                      ok: !!data.ok,
+                      evaluation_id: data.evaluation_id ?? evalId,
+                      received_student_name: data.received_student_name ?? finalStudentName,
+                      received_course_label: data.received_course_label ?? null,
+                      normalized_student_name: data.normalized_student_name ?? "",
+                      student_profile_id: data.student_profile_id ?? null,
+                      created_or_existing: data.created_or_existing ?? null,
+                      message: data.message ?? "",
+                    })
+                    if (data.ok) {
+                      loadStudentsList()
+                      loadEvaluationsList()
+                      setStudentsListFetchKey((k) => k + 1)
+                      await registerAuditAction(
+                        "ALUMNO_EDITADO",
+                        evalId,
+                        `${finalStudentName}${finalCourseLabel ? ` · ${finalCourseLabel}` : ""}`,
+                      )
+                    } else {
+                      toast({ title: "La evaluación se guardó, pero no se pudo sincronizar el estudiante", variant: "default" })
+                    }
+                  })
+                  .catch(() => {
+                    setLastStudentSyncResult({
+                      ok: false,
+                      evaluation_id: evalId,
+                      received_student_name: finalStudentName,
+                      received_course_label: finalCourseLabel,
+                      normalized_student_name: "",
+                      student_profile_id: null,
+                      created_or_existing: null,
+                      message: "Error de red al llamar sync-student",
+                    })
+                    toast({ title: "La evaluación se guardó, pero no se pudo sincronizar el estudiante", variant: "default" })
+                  })
+                  .finally(() => loadEvaluationsList())
+              } else {
+                setLastStudentSyncResult({
+                  ok: false,
+                  evaluation_id: evalId,
+                  received_student_name: "",
+                  received_course_label: finalCourseLabel,
+                  normalized_student_name: "",
+                  student_profile_id: null,
+                  created_or_existing: null,
+                  message: "student_name vacío en UI",
+                })
+                toast({ title: "La evaluación se guardó, pero no había nombre de estudiante para sincronizar", variant: "default" })
+                loadEvaluationsList()
+              }
+            }
+          }
+        }
+
+        const currentBatch = completed > 0 ? Math.floor((completed - 1) / serverBatchSize) + 1 : 0
+        setBatchProgress((prev) => ({
+          ...prev,
+          completedItems: completed,
+          successCount: successes,
+          errorCount: errors,
+          currentBatch,
+        }))
+      }
+
+      const scheduleStreamFlush = () => {
+        if (streamRafId !== null) return
+        streamRafId = requestAnimationFrame(() => {
+          streamRafId = null
+          flushStreamUIUpdates()
+        })
+      }
 
       while (true) {
         const { done, value } = await reader.read()
@@ -3286,140 +3476,40 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         for (const line of lines) {
           if (!line.trim()) continue
           try {
-            const msg = JSON.parse(line)
+            const msg: unknown = JSON.parse(line)
 
-            if (msg.type === "meta") {
-              setBatchProgress((prev) => ({
-                ...prev,
-                totalBatches: msg.totalBatches,
-              }))
-            } else if (msg.type === "result") {
-              completed++
-              if (msg.success) successes++
-              else errors++
-
-              const currentBatch = Math.floor((completed - 1) / 45) + 1
-
-              setBatchProgress((prev) => ({
-                ...prev,
-                completedItems: completed,
-                successCount: successes,
-                errorCount: errors,
-                currentBatch,
-              }))
-
-              // Actualizar el grupo específico con su resultado
-              setStudentGroups((prev) =>
-                prev.map((g) => {
-                  if (g.id !== msg.groupId) return g
-                  if (msg.success && msg.data) {
-                    if (msg.data.saved && typeof (msg.data as { evaluation_id?: string }).evaluation_id === "string") {
-                      setLastSavedEvaluationId((msg.data as { evaluation_id: string }).evaluation_id)
-                      setLastSaveReason(null)
-                      setLastSaveError(null)
-                      setActiveTab("evaluaciones")
-                    } else if (!msg.data.saved) {
-                      const reason = typeof (msg.data as { reason?: string }).reason === "string" ? (msg.data as { reason: string }).reason : null
-                      const saveError = typeof (msg.data as { save_error?: string }).save_error === "string" ? (msg.data as { save_error: string }).save_error : "Error desconocido"
-                      setLastSaveReason(reason)
-                      setLastSaveError(saveError)
-                      toast({ title: "❌ No se pudo guardar: " + (reason || saveError), variant: "destructive" })
-                    }
-                    return {
-                      ...g,
-                      isEvaluating: false,
-                      isEvaluated: true,
-                      isValidationStep: false,
-                      retroalimentacion: msg.data.retroalimentacion,
-                      puntaje: msg.data.puntaje,
-                      nota: msg.data.nota,
-                      detalle_desarrollo: msg.data.detalle_desarrollo,
-                      puntosAprobacion: msg.data.puntosAprobacion,
-                      puntosMaximos: msg.data.puntosMaximos,
-                      alternativas_corregidas:
-                        msg.data.alternativas_corregidas ||
-                        msg.data.retroalimentacion?.retroalimentacion_alternativas,
-                      omrDebug: msg.data.omrDebug,
-                      evaluationTrace: { payload: evaluationTracePayloadCommon },
-                      error: undefined,
-                      evaluation_id: (msg.data as { evaluation_id?: string }).evaluation_id ?? undefined,
-                    }
-                  } else {
-                    return { ...g, isEvaluating: false, error: msg.error || "Error en la evaluacion" }
-                  }
-                }),
-              )
-              if (msg.success && msg.data?.saved && typeof (msg.data as { evaluation_id?: string }).evaluation_id === "string") {
-                const evalId = (msg.data as { evaluation_id: string }).evaluation_id
-                const group = studentGroups.find((g) => g.id === msg.groupId)
-                const finalStudentName = getFinalStudentNameForSync(group ?? undefined, null)
-                const finalStudentRut = getFinalStudentRutForSync(group ?? undefined, null)
-                const finalCourseLabel = getFinalCourseLabel(null)
-                if (finalStudentName) {
-                  fetch(`/api/evaluations/${evalId}/sync-student`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      student_name: finalStudentName,
-                      course_label: finalCourseLabel,
-                      student_rut: finalStudentRut,
-                    }),
-                  })
-                    .then(async (res) => {
-                      const data = await res.json()
-                      setLastStudentSyncResult({
-                        ok: !!data.ok,
-                        evaluation_id: data.evaluation_id ?? evalId,
-                        received_student_name: data.received_student_name ?? finalStudentName,
-                        received_course_label: data.received_course_label ?? null,
-                        normalized_student_name: data.normalized_student_name ?? "",
-                        student_profile_id: data.student_profile_id ?? null,
-                        created_or_existing: data.created_or_existing ?? null,
-                        message: data.message ?? "",
-                      })
-                      if (data.ok) {
-                        loadStudentsList()
-                        loadEvaluationsList()
-                        setStudentsListFetchKey((k) => k + 1)
-                        await registerAuditAction(
-                          "ALUMNO_EDITADO",
-                          evalId,
-                          `${finalStudentName}${finalCourseLabel ? ` · ${finalCourseLabel}` : ""}`,
-                        )
-                      } else {
-                        toast({ title: "La evaluación se guardó, pero no se pudo sincronizar el estudiante", variant: "default" })
-                      }
-                    })
-                    .catch(() => {
-                      setLastStudentSyncResult({
-                        ok: false,
-                        evaluation_id: evalId,
-                        received_student_name: finalStudentName,
-                        received_course_label: finalCourseLabel,
-                        normalized_student_name: "",
-                        student_profile_id: null,
-                        created_or_existing: null,
-                        message: "Error de red al llamar sync-student",
-                      })
-                      toast({ title: "La evaluación se guardó, pero no se pudo sincronizar el estudiante", variant: "default" })
-                    })
-                    .finally(() => loadEvaluationsList())
-                } else {
-                  setLastStudentSyncResult({
-                    ok: false,
-                    evaluation_id: evalId,
-                    received_student_name: "",
-                    received_course_label: finalCourseLabel,
-                    normalized_student_name: "",
-                    student_profile_id: null,
-                    created_or_existing: null,
-                    message: "student_name vacío en UI",
-                  })
-                  toast({ title: "La evaluación se guardó, pero no había nombre de estudiante para sincronizar", variant: "default" })
-                  loadEvaluationsList()
-                }
+            if (isEvaluateBatchMetaMsg(msg)) {
+              const meta: EvaluateBatchNdjsonMeta = msg
+              if (meta.batchSize >= 1) {
+                serverBatchSize = meta.batchSize
               }
-            } else if (msg.type === "done") {
+              setBatchProgress((prev) => ({
+                ...prev,
+                totalBatches: meta.totalBatches,
+              }))
+            } else if (
+              msg &&
+              typeof msg === "object" &&
+              (msg as { type?: string }).type === "result"
+            ) {
+              const m = msg as {
+                type: string
+                groupId: string
+                success: boolean
+                data?: unknown
+                error?: string
+              }
+              completed++
+              if (m.success) successes++
+              else errors++
+              pendingResults.set(m.groupId, m)
+              scheduleStreamFlush()
+            } else if (isEvaluateBatchDoneMsg(msg)) {
+              if (streamRafId !== null) {
+                cancelAnimationFrame(streamRafId)
+                streamRafId = null
+              }
+              flushStreamUIUpdates()
               if (successes > 0) {
                 toast({ title: "✅ Guardadas y agregadas al listado." })
                 loadEvaluationsList()
@@ -3430,6 +3520,12 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           }
         }
       }
+
+      if (streamRafId !== null) {
+        cancelAnimationFrame(streamRafId)
+        streamRafId = null
+      }
+      flushStreamUIUpdates()
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "Error en evaluacion batch"
       const alreadyReportedHttp = typeof errorMsg === "string" && errorMsg.startsWith("Error HTTP ")
@@ -3458,6 +3554,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   }
 
   const onEvaluateAll = async () => {
+    if (batchProgress.isActive || isLoading) return
     const groupsToEvaluate = studentGroups
       .filter((g) => g.files.length > 0 && !g.isEvaluated && !g.isEvaluating)
       .map((g) => g.id)
@@ -4097,7 +4194,8 @@ w-8"
                   <form
                     onSubmit={(e) => {
                       e.preventDefault()
-                      onEvaluateAll()
+                      if (batchProgress.isActive || isLoading) return
+                      void onEvaluateAll()
                     }}
                     className="space-y-8"
                   >
@@ -4447,27 +4545,29 @@ font-semibold"
                       </div>
                     </div>
 
-                    <FormField
-                      control={form.control}
-                      name="rubrica"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel className="font-bold text-[var(--text-accent)]">
-                            Rúbrica (Criterios de Evaluación)
-                          </FormLabel>
-                          <FormControl>
-                            <Textarea
-                              placeholder="Ej: Claridad (0-10), Estructura (0-10), Ortografía (0-10).
+                    {watchedTipoPrueba !== "solo_alternativas" && (
+                      <FormField
+                        control={form.control}
+                        name="rubrica"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="font-bold text-[var(--text-accent)]">
+                              Rúbrica (Criterios de Evaluación)
+                            </FormLabel>
+                            <FormControl>
+                              <Textarea
+                                placeholder="Ej: Claridad (0-10), Estructura (0-10), Ortografía (0-10).
 La IA usará una escala 0-10 por criterio de desarrollo."
-                              className="min-h-[100px]"
-                              {...field}
-                            />
-                          </FormControl>
-                          <FormDescription>Describe los criterios de evaluación de desarrollo.</FormDescription>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
+                                className="min-h-[100px]"
+                                {...field}
+                              />
+                            </FormControl>
+                            <FormDescription>Describe los criterios de evaluación de desarrollo.</FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    )}
 {/* 🔥 CAMPO MANTENIDO: La clave de alternativas es vital para la corrección objetiva. */}
                     <FormField
                       control={form.control}
@@ -5124,7 +5224,12 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         type="button"
                         variant="outline"
                         size="sm"
-                        disabled={isExtractingNames || studentGroups.filter((g) => g.files.length > 0 && isGenericGroupName(g.studentName)).length === 0}
+                        disabled={
+                          isExtractingNames ||
+                          batchProgress.isActive ||
+                          isLoading ||
+                          studentGroups.filter((g) => g.files.length > 0 && isGenericGroupName(g.studentName)).length === 0
+                        }
                         onClick={handleBulkNameExtraction}
                         title="Extrae el nombre del estudiante para cada grupo que aún tenga nombre genérico (Alumno 1, Alumno 2…). No sobrescribe nombres ya asignados."
                       >
@@ -5207,7 +5312,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                             type="button"
                             variant="outline"
                             onClick={() => handleNameExtraction(group.id)}
-                            disabled={isExtractingNames}
+                            disabled={isExtractingNames || batchProgress.isActive || isLoading}
                             className="mb-3 bg-transparent"
                           >
                             {isExtractingNames ? (
@@ -5223,8 +5328,10 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                               <div key={file.id} className="relative w-20 h-20 rounded-md overflow-hidden border border-[var(--border-color)]">
                                 {renderFilePreview(file)}
                                 <button
+                                  type="button"
                                   onClick={() => removeFileFromGroup(file.id, group.id)}
-                                  className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5"
+                                  disabled={batchProgress.isActive || isLoading}
+                                  className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5 disabled:opacity-40 disabled:pointer-events-none"
                                 >
                                   <X className="h-3 w-3" />
                                 </button>
@@ -5234,6 +5341,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                             {unassignedFiles.length > 0 && (
                               <div className="flex items-center justify-center w-20 h-20 border-2 border-dashed rounded-lg border-[var(--border-color)]">
                                 <select
+                                  disabled={batchProgress.isActive || isLoading}
                                   onChange={(e) => {
                                     if (e.target.value) assignFileToGroup(e.target.value, group.id)
                                     e.target.value = ""
@@ -5288,6 +5396,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                       </Label>
                       <Select
                         value={selectedOmrTemplateVariant}
+                        disabled={batchProgress.isActive || isLoading}
                         onValueChange={(v) =>
                           setSelectedOmrTemplateVariant(v as "odd_even_dual_column" | "sequential_dual_column")
                         }
@@ -5308,9 +5417,11 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                     {/* Botón de Evaluación */}
                     <Button
                       size="lg"
-                      onClick={onEvaluateAll}
+                      type="button"
+                      onClick={() => void onEvaluateAll()}
                       className="w-full"
                       disabled={
+                        isLoading ||
                         isCurrentlyEvaluatingAny ||
                         batchProgress.isActive ||
                         studentGroups.every((g) => g.files.length === 0) ||

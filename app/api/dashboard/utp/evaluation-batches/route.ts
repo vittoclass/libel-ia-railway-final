@@ -23,6 +23,13 @@ type EvaluationBatchGroup = {
   suggest_annex_to_batch_id: string | null
 }
 
+type BatchSessionRow = {
+  batch_id: string
+  teacher_id: string | null
+  school_id: string | null
+  created_at: string | null
+}
+
 function normalizeRole(role: unknown): string {
   return String(role ?? "").trim().toUpperCase()
 }
@@ -66,6 +73,7 @@ export async function GET(_req: NextRequest) {
   let query = supabase
     .from("evaluations")
     .select("id, title, course_label, evaluated_at, batch_id")
+    .eq("is_archived", false)
     .order("evaluated_at", { ascending: false, nullsFirst: false })
     .limit(400)
 
@@ -88,6 +96,25 @@ export async function GET(_req: NextRequest) {
   if (error) {
     return NextResponse.json({ groups: [], orphans: [], warning: error.message }, { status: 200 })
   }
+
+  // Fuente maestra de lotes: batch_scan_sessions (independiente de release/validación).
+  let sessionsQuery = supabase
+    .from("batch_scan_sessions")
+    .select("batch_id, teacher_id, school_id, created_at")
+    .eq("is_archived", false)
+    .order("created_at", { ascending: false, nullsFirst: false })
+    .limit(400)
+  if (schoolId) sessionsQuery = sessionsQuery.eq("school_id", schoolId)
+  else if (orgId) {
+    const { data: peers } = await supabase
+      .from("profiles")
+      .select("teacher_id")
+      .eq("organization_id", orgId)
+      .not("teacher_id", "is", null)
+    const tids = [...new Set((peers ?? []).map((p: { teacher_id?: string | null }) => p.teacher_id).filter(Boolean))] as string[]
+    if (tids.length > 0) sessionsQuery = sessionsQuery.in("teacher_id", tids)
+  }
+  const { data: sessionRows } = await sessionsQuery
 
   const evalRows = (evs ?? []) as Array<{
     id: string
@@ -123,6 +150,13 @@ export async function GET(_req: NextRequest) {
     }
   }
 
+  // Pre-crear lotes desde sesiones (aunque aún no tengan evaluaciones).
+  for (const s of (sessionRows ?? []) as BatchSessionRow[]) {
+    const bid = String(s.batch_id ?? "").trim()
+    if (!bid) continue
+    if (!batchMap.has(bid)) batchMap.set(bid, [])
+  }
+
   const titleCourseToBatchId = new Map<string, string>()
   for (const [bid, rows] of batchMap) {
     const t0 = rows[0]
@@ -134,9 +168,10 @@ export async function GET(_req: NextRequest) {
 
   for (const [batch_id, rows] of batchMap) {
     const sorted = [...rows].sort((a, b) => String(b.evaluated_at ?? "").localeCompare(String(a.evaluated_at ?? "")))
-    const title = String(sorted[0]?.title ?? "Sin título")
+    const title = String(sorted[0]?.title ?? `Lote ${batch_id.slice(0, 8)}…`)
     const course_label = String(sorted[0]?.course_label ?? "Sin curso")
-    const evaluated_at = sorted[0]?.evaluated_at ?? null
+    const fromSession = ((sessionRows ?? []) as BatchSessionRow[]).find((s) => String(s.batch_id) === String(batch_id))
+    const evaluated_at = sorted[0]?.evaluated_at ?? fromSession?.created_at ?? null
     const members: EvaluationBatchMember[] = sorted.map((r) => ({
       id: r.id,
       student_name: nameByEval.get(r.id) ?? null,

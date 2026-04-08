@@ -36,6 +36,7 @@ export async function GET(req: NextRequest) {
     .from("source_exams")
     .select("id, title, subject, course_label, exam_type, created_at")
     .eq("teacher_id", teacherId)
+    .or("is_archived.is.null,is_archived.eq.false")
     .order("created_at", { ascending: false })
     .limit(limit)
 
@@ -55,5 +56,13 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  return NextResponse.json({ exams: data ?? [] })
+  return NextResponse.json(
+    { exams: data ?? [] },
+    {
+      headers: {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        Pragma: "no-cache",
+      },
+    },
+  )
 }

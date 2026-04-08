@@ -2,6 +2,7 @@
  * Motor heurístico de asignación de habilidades a partir del resultado de evaluación.
  * No modifica scoring ni evaluación. Solo capa pedagógica adicional.
  */
+import { canonicalPedagogicalSkillDisplayLabel } from "@/app/lib/analyze-learning-results"
 import { getPedagogyCatalog } from "@/app/lib/pedagogy-catalog"
 
 export interface EvaluationResultForSkills {
@@ -63,11 +64,24 @@ export async function evaluateSkillsFromEvaluation(
     return []
   }
 
-  const skillNameToIds = new Map<string, { axis_id: string; skill_id: string }>()
+  const skillCanonToIds = new Map<string, { axis_id: string; skill_id: string }>()
+  const skillExactToIds = new Map<string, { axis_id: string; skill_id: string }>()
   for (const axis of catalog.axes) {
     for (const sk of axis.skills) {
-      if (sk.skill_name) skillNameToIds.set(sk.skill_name.trim(), { axis_id: axis.axis_id, skill_id: sk.skill_id })
+      const raw = (sk.skill_name ?? "").trim()
+      if (!raw) continue
+      const ids = { axis_id: axis.axis_id, skill_id: sk.skill_id }
+      skillExactToIds.set(raw, ids)
+      const canon = canonicalPedagogicalSkillDisplayLabel(raw)
+      if (!skillCanonToIds.has(canon)) skillCanonToIds.set(canon, ids)
     }
+  }
+
+  function resolveSkillIds(heuristicLabel: string): { axis_id: string; skill_id: string } | null {
+    const trimmed = String(heuristicLabel ?? "").trim()
+    if (!trimmed) return null
+    const canon = canonicalPedagogicalSkillDisplayLabel(trimmed)
+    return skillCanonToIds.get(canon) ?? skillExactToIds.get(trimmed) ?? null
   }
 
   const agg = new Map<string, { obtained: number; max: number }>()
@@ -88,7 +102,7 @@ export async function evaluateSkillsFromEvaluation(
     const scoreObtained = isCorrect ? 1 : 0
     const scoreMax = 1
     const skillName = matchSkillNameByKeywords(preguntaText, subject)
-    const ids = skillNameToIds.get(skillName)
+    const ids = resolveSkillIds(skillName)
     if (ids) {
       addScore(ids.axis_id, ids.skill_id, scoreObtained, scoreMax)
     } else if (catalog.axes[0]?.skills[0]) {
@@ -108,7 +122,7 @@ export async function evaluateSkillsFromEvaluation(
     }
     const text = (item.texto_estudiante != null ? String(item.texto_estudiante) : "").trim() || preguntaKey
     const skillName = matchSkillNameByKeywords(text, subject)
-    const ids = skillNameToIds.get(skillName)
+    const ids = resolveSkillIds(skillName)
     if (ids && max > 0) {
       addScore(ids.axis_id, ids.skill_id, obtained, max)
     } else if (catalog.axes[0]?.skills[0] && max > 0) {

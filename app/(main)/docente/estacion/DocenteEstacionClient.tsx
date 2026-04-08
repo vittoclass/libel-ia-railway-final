@@ -28,7 +28,7 @@ export function DocenteEstacionClient() {
   const [batchSessionError, setBatchSessionError] = useState<string | null>(null)
   /** Respuesta cruda de /api/docente/batch-session para depuración en pantalla. */
   const [debugError, setDebugError] = useState<unknown>(null)
-  /** Debe coincidir con “páginas por estudiante” en el móvil (EstacionMovilClient). */
+  /** Debe coincidir con el móvil (QR /escaneo): ver MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT en mobile-scan-constants. */
   const [pagesPerStudent, setPagesPerStudent] = useState(2)
 
   const loadAssignments = useCallback(async () => {

@@ -1,0 +1,16 @@
+---
+description: Asegurar migración cognitive_level en Supabase antes de depurar errores al guardar ítems
+globs: app/api/source-exams/**/*.ts,app/components/SourceExamItems*.tsx,supabase/migrations/*.sql
+alwaysApply: false
+---
+
+# Columna `cognitive_level` en `source_exam_items`
+
+El código persiste `cognitive_level` en `public.source_exam_items`. Si al guardar aparece error de columna desconocida o fallo de PostgREST, la base remota debe tener aplicada la migración:
+
+- Archivo: `supabase/migrations/20260407120000_source_exam_items_cognitive_level.sql`
+- SQL equivalente: `ALTER TABLE public.source_exam_items ADD COLUMN IF NOT EXISTS cognitive_level text NULL;`
+
+**Aplicación:** Supabase Dashboard → SQL Editor (pegar el `ALTER` anterior), o `supabase link` + `supabase db push` con el proyecto correcto.
+
+No asumir que Railway/deploy aplicó migraciones automáticamente salvo que el flujo del repo lo haga explícitamente.

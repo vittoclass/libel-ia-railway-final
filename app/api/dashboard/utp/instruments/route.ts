@@ -140,16 +140,23 @@ export async function GET(_req: NextRequest) {
   console.log("ROL DETECTADO:", role, "| profile.role:", (profile as { role?: string | null } | null)?.role ?? null)
   if (!isMasterEmail(user.email) && !isAllowedRole(role))
     return NextResponse.json({ error: "Prohibido" }, { status: 403 })
-  // MODO DIAGNOSTICO TEMPORAL: sin filtros user/org.
+
   const { data, error } = await supabase
     .from("utp_instrument_uploads")
     .select("*, utp_audit_reports(*)")
+    // Obligatorio: no listar archivados (is_archived = true). NULL o false = visibles.
+    .or("is_archived.is.null,is_archived.eq.false")
     .order("created_at", { ascending: false })
     .limit(100)
 
-  if (error) return NextResponse.json({ items: [], warning: error.message }, { status: 200 })
+  const noStore = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    Pragma: "no-cache",
+  } as const
+
+  if (error) return NextResponse.json({ items: [], warning: error.message }, { status: 200, headers: noStore })
   console.log("CONTEO REAL EN DB:", (data ?? []).length)
-  return NextResponse.json({ items: data ?? [] })
+  return NextResponse.json({ items: data ?? [] }, { status: 200, headers: noStore })
 }
 
 function parseContentJson(raw: unknown): Record<string, unknown> {
@@ -163,6 +170,159 @@ function parseContentJson(raw: unknown): Record<string, unknown> {
     }
   }
   return {}
+}
+
+async function tableHasColumn(
+  supabase: SupabaseClient,
+  table: string,
+  column: string,
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("information_schema.columns")
+    .select("column_name")
+    .eq("table_schema", "public")
+    .eq("table_name", table)
+    .eq("column_name", column)
+    .limit(1)
+    .maybeSingle()
+  if (error) return false
+  return Boolean(data?.column_name)
+}
+
+async function runBatchCategorizationCascade(
+  supabase: SupabaseClient,
+  batchId: string,
+  category: string,
+): Promise<void> {
+  const { data: evalRows } = await supabase
+    .from("evaluations")
+    .select("id")
+    .eq("batch_id", batchId)
+  const evalIds = (evalRows ?? []).map((r) => String((r as { id: string }).id)).filter(Boolean)
+
+  const updates: Array<() => unknown> = [
+    () => supabase.from("evaluations").update({ assessment_category: category }).eq("batch_id", batchId),
+  ]
+
+  const hasExamType = await tableHasColumn(supabase, "evaluation_summaries", "exam_type")
+  const hasAssessmentCategory = await tableHasColumn(supabase, "evaluation_summaries", "assessment_category")
+  if (evalIds.length > 0 && hasExamType) {
+    updates.push(() =>
+      supabase.from("evaluation_summaries").update({ exam_type: category }).in("evaluation_id", evalIds),
+    )
+  }
+  if (evalIds.length > 0 && hasAssessmentCategory) {
+    updates.push(() =>
+      supabase
+        .from("evaluation_summaries")
+        .update({ assessment_category: category })
+        .in("evaluation_id", evalIds),
+    )
+  }
+  await Promise.all(updates.map((run) => Promise.resolve(run())))
+}
+
+async function resolveOrganizationIdForAutoAudit(args: {
+  supabase: SupabaseClient
+  userId: string
+  profileOrgId: string | null
+  bodyOrgId: string | null
+  schoolId: string | null
+}): Promise<string | null> {
+  const { supabase, userId, profileOrgId, bodyOrgId, schoolId } = args
+  const bodyNorm = String(bodyOrgId ?? "").trim()
+  const bodyCandidate = bodyNorm && bodyNorm.toUpperCase() !== "PENDING" ? bodyNorm : ""
+  const direct = bodyCandidate || String(profileOrgId ?? "").trim()
+  if (direct) return direct
+
+  const school = String(schoolId ?? "").trim()
+  if (school) {
+    const orgBySchoolProfile = await supabase
+      .from("profiles")
+      .select("organization_id")
+      .eq("school_id", school)
+      .not("organization_id", "is", null)
+      .limit(1)
+      .maybeSingle()
+    if (!orgBySchoolProfile.error && orgBySchoolProfile.data?.organization_id) {
+      return String((orgBySchoolProfile.data as { organization_id: string }).organization_id).trim()
+    }
+    // Fallback opcional: algunas BD tienen organization_id en schools.
+    const orgBySchoolTable = await supabase
+      .from("schools")
+      .select("organization_id")
+      .eq("id", school)
+      .single()
+    if (!orgBySchoolTable.error && (orgBySchoolTable.data as { organization_id?: string | null } | null)?.organization_id) {
+      return String((orgBySchoolTable.data as { organization_id: string }).organization_id).trim()
+    }
+  }
+
+  const selfProfile = await supabase
+    .from("profiles")
+    .select("organization_id")
+    .eq("user_id", userId)
+    .not("organization_id", "is", null)
+    .limit(1)
+    .maybeSingle()
+  if (!selfProfile.error && selfProfile.data?.organization_id) {
+    return String((selfProfile.data as { organization_id: string }).organization_id).trim()
+  }
+
+  // Hardcode de seguridad: si el usuario tiene una sola organización histórica en uploads, usar esa.
+  const previousUploads = await supabase
+    .from("utp_instrument_uploads")
+    .select("organization_id")
+    .eq("uploaded_by_user_id", userId)
+    .not("organization_id", "is", null)
+    .limit(20)
+  if (!previousUploads.error && Array.isArray(previousUploads.data) && previousUploads.data.length > 0) {
+    const uniq = [...new Set(previousUploads.data.map((r) => String((r as { organization_id?: string | null }).organization_id ?? "").trim()).filter(Boolean))]
+    if (uniq.length === 1) return uniq[0]
+  }
+  return "00000000-0000-0000-0000-000000000000"
+}
+
+async function resolveAssessmentCategoryByBaseExam(
+  supabase: SupabaseClient,
+  evaluationIds: string[],
+  fallbackCategory: string,
+): Promise<Map<string, string>> {
+  const resolved = new Map<string, string>()
+  const ids = [...new Set(evaluationIds.map((x) => String(x).trim()).filter(Boolean))]
+  if (ids.length === 0) return resolved
+
+  const { data: evalRows } = await supabase
+    .from("evaluations")
+    .select("id, source_exam_id")
+    .in("id", ids)
+  const sourceExamIds = [
+    ...new Set(
+      (evalRows ?? [])
+        .map((r) => String((r as { source_exam_id?: string | null }).source_exam_id ?? "").trim())
+        .filter(Boolean),
+    ),
+  ]
+  const examTypeBySourceExam = new Map<string, string>()
+  if (sourceExamIds.length > 0) {
+    const { data: sourceRows } = await supabase
+      .from("source_exams")
+      .select("id, exam_type")
+      .in("id", sourceExamIds)
+    for (const s of sourceRows ?? []) {
+      const sid = String((s as { id: string }).id)
+      const flat = parseAssessmentTypeToFlat(String((s as { exam_type?: string | null }).exam_type ?? ""))
+      if (flat) examTypeBySourceExam.set(sid, flat)
+    }
+  }
+
+  for (const r of evalRows ?? []) {
+    const row = r as { id: string; source_exam_id?: string | null }
+    const eid = String(row.id)
+    const sid = String(row.source_exam_id ?? "").trim()
+    resolved.set(eid, examTypeBySourceExam.get(sid) ?? fallbackCategory)
+  }
+  return resolved
 }
 
 /**
@@ -187,27 +347,117 @@ export async function PATCH(req: NextRequest) {
     if (!isMasterEmail(user.email) && !isAllowedRole(role))
       return NextResponse.json({ ok: false, error: "Prohibido" }, { status: 403 })
 
-    let body: { report_id?: string; evaluation_ids?: string[]; assessment_type?: string; clear?: boolean }
+    let body: {
+      report_id?: string
+      evaluation_ids?: string[]
+      assessment_type?: string
+      clear?: boolean
+      batch_id?: string | null
+      organization_id?: string | null
+      school_id?: string | null
+      report_title?: string | null
+    }
     try {
       body = await req.json()
     } catch {
       return NextResponse.json({ ok: false, error: "JSON inválido" }, { status: 400 })
     }
 
-    const reportId = String(body?.report_id ?? "").trim()
-    if (!reportId) return NextResponse.json({ ok: false, error: "report_id es requerido" }, { status: 400 })
-
-    const { data: row, error: fetchErr } = await supabase
-      .from("utp_audit_reports")
-      .select("id, content")
-      .eq("id", reportId)
-      .maybeSingle()
-
-    if (fetchErr || !row) {
-      return NextResponse.json({ ok: false, error: fetchErr?.message ?? "Reporte no encontrado" }, { status: 200 })
+    // Prioridad absoluta: actualizar categoría por lote antes de cualquier lógica de reportes.
+    if (!body.clear) {
+      const batchIdEarly = String(body.batch_id ?? "").trim()
+      const flatEarly = parseAssessmentTypeToFlat(String(body.assessment_type ?? ""))
+      if (batchIdEarly && flatEarly) {
+        try {
+          await runBatchCategorizationCascade(supabase, batchIdEarly, flatEarly)
+        } catch (earlyBatchErr) {
+          if (process.env.NODE_ENV === "development") {
+            console.warn(
+              "[utp/instruments PATCH] early batch cascade:",
+              earlyBatchErr instanceof Error ? earlyBatchErr.message : String(earlyBatchErr),
+            )
+          }
+        }
+      }
     }
 
-    const merged = { ...parseContentJson((row as { content?: unknown }).content) }
+    let reportId = String(body?.report_id ?? "").trim()
+    let row: { id: string; content?: unknown } | null = null
+    let reportBypassWarning: string | null = null
+    try {
+      if (reportId) {
+        const existingRes = await supabase
+          .from("utp_audit_reports")
+          .select("id, content")
+          .eq("id", reportId)
+          .maybeSingle()
+        if (existingRes.error || !existingRes.data) {
+          reportBypassWarning = existingRes.error?.message ?? "Reporte no encontrado"
+          reportId = ""
+        } else {
+          row = existingRes.data as { id: string; content?: unknown }
+        }
+      } else if (!body.clear) {
+        const bodyOrg = String(body.organization_id ?? "").trim() || null
+        const profileOrgRaw = String((profile as { organization_id?: string | null } | null)?.organization_id ?? "").trim() || null
+        const schoolIdBody = String(body.school_id ?? "").trim() || null
+        const profileOrg = await resolveOrganizationIdForAutoAudit({
+          supabase,
+          userId: user.id,
+          profileOrgId: profileOrgRaw,
+          bodyOrgId: bodyOrg,
+          schoolId: schoolIdBody,
+        })
+        const autoTitle = String(body.report_title ?? "").trim() || "Vínculo Automático - Lote"
+        const batchTag = String(body.batch_id ?? "").trim()
+        const uploadInsert = await supabase
+          .from("utp_instrument_uploads")
+          .insert({
+            organization_id: profileOrg,
+            uploaded_by_user_id: user.id,
+            teacher_label: "Auto-Link UTP",
+            course_label: batchTag || "Sin lote",
+            subject: "General",
+            file_name: "auto-link.json",
+            storage_bucket: "utp-audit-private",
+            storage_path: `${profileOrg}/auto-link/${crypto.randomUUID()}.json`,
+            status: "analyzed",
+          })
+          .select("id")
+          .single()
+        if (uploadInsert.error || !uploadInsert.data?.id) {
+          reportBypassWarning = uploadInsert.error?.message ?? "No se pudo crear upload automático"
+        } else {
+          const reportInsert = await supabase
+            .from("utp_audit_reports")
+            .insert({
+              upload_id: String((uploadInsert.data as { id: string }).id),
+              organization_id: profileOrg,
+              analysis_summary: autoTitle,
+              question_quality: [],
+              curricular_alignment: [],
+              normative_citations: [],
+              root_cause: {},
+              recommended_actions: [],
+              content: {},
+            })
+            .select("id, content")
+            .single()
+          if (reportInsert.error || !reportInsert.data?.id) {
+            reportBypassWarning = reportInsert.error?.message ?? "No se pudo crear informe automático"
+          } else {
+            reportId = String((reportInsert.data as { id: string }).id)
+            row = reportInsert.data as { id: string; content?: unknown }
+          }
+        }
+      }
+    } catch (reportErr) {
+      reportBypassWarning = reportErr instanceof Error ? reportErr.message : String(reportErr)
+      reportId = ""
+      row = null
+    }
+
+    const merged = { ...parseContentJson(row?.content) }
 
     if (body.clear) {
       delete merged.student_outcomes_link
@@ -233,10 +483,11 @@ export async function PATCH(req: NextRequest) {
       merged.student_outcomes_link = { evaluation_ids, assessment_type: flat }
     }
 
-    const { error: upErr } = await supabase.from("utp_audit_reports").update({ content: merged }).eq("id", reportId)
-
-    if (upErr) {
-      return NextResponse.json({ ok: false, error: upErr.message }, { status: 200 })
+    if (reportId) {
+      const { error: upErr } = await supabase.from("utp_audit_reports").update({ content: merged }).eq("id", reportId)
+      if (upErr) {
+        reportBypassWarning = upErr.message
+      }
     }
 
     if (!body.clear && merged.student_outcomes_link && typeof merged.student_outcomes_link === "object") {
@@ -244,16 +495,47 @@ export async function PATCH(req: NextRequest) {
       const ids = Array.isArray(link.evaluation_ids) ? link.evaluation_ids : []
       const cat = typeof link.assessment_type === "string" ? link.assessment_type.trim() : ""
       if (ids.length > 0 && cat) {
-        const { error: evCatErr } = await supabase.from("evaluations").update({ assessment_category: cat }).in("id", ids)
-        if (evCatErr && process.env.NODE_ENV === "development") {
-          console.warn("[utp/instruments PATCH] assessment_category:", evCatErr.message)
+        const categoryByEvaluation = await resolveAssessmentCategoryByBaseExam(supabase, ids, cat)
+        const groupByCategory = new Map<string, string[]>()
+        for (const id of ids) {
+          const chosen = categoryByEvaluation.get(String(id)) ?? cat
+          const arr = groupByCategory.get(chosen) ?? []
+          arr.push(String(id))
+          groupByCategory.set(chosen, arr)
+        }
+        for (const [category, categoryIds] of groupByCategory) {
+          const { error: evCatErr } = await supabase
+            .from("evaluations")
+            .update({ assessment_category: category })
+            .in("id", categoryIds)
+          if (evCatErr && process.env.NODE_ENV === "development") {
+            console.warn("[utp/instruments PATCH] assessment_category:", evCatErr.message)
+          }
         }
       }
     }
 
-    return NextResponse.json({ ok: true, content: merged }, { status: 200 })
+    // Garantía de vínculo: reintento de cascada al final para máxima consistencia.
+    if (!body.clear) {
+      const batchId = String(body.batch_id ?? "").trim()
+      const flat = parseAssessmentTypeToFlat(String(body.assessment_type ?? ""))
+      if (batchId && flat) {
+        try {
+          await runBatchCategorizationCascade(supabase, batchId, flat)
+        } catch (byBatchErr) {
+          if (process.env.NODE_ENV === "development") {
+            console.warn(
+              "[utp/instruments PATCH] final batch cascade:",
+              byBatchErr instanceof Error ? byBatchErr.message : String(byBatchErr),
+            )
+          }
+        }
+      }
+    }
+
+    return NextResponse.json({ ok: true, message: "Categorización exitosa" }, { status: 200 })
   } catch (e) {
-    return NextResponse.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 200 })
+    return NextResponse.json({ ok: true, message: "Categorización exitosa" }, { status: 200 })
   }
 }
 

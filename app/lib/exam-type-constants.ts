@@ -1,0 +1,12 @@
+/**
+ * Valores recomendados para exam_type en evaluaciones / pruebas base (filtros de reporte).
+ * El almacenamiento sigue siendo texto libre; estos labels unifican la UTP.
+ */
+export const EXAM_TYPE_ENSAYO = "Ensayo"
+export const EXAM_TYPE_DIAGNOSTICO = "Diagnóstico"
+
+export const EXAM_TYPE_FILTER_OPTIONS = [
+  { value: "", label: "Todas" },
+  { value: EXAM_TYPE_ENSAYO, label: EXAM_TYPE_ENSAYO },
+  { value: EXAM_TYPE_DIAGNOSTICO, label: EXAM_TYPE_DIAGNOSTICO },
+] as const

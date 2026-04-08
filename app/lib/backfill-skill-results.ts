@@ -12,6 +12,7 @@ import { generateSkillsFromTextItems, type GenerateSkillsFromItemsResult } from 
 import { generateSkillsFromStructuredBlueprint } from "@/app/lib/generate-skills-structured"
 import { generateSkillsFromSourceExam } from "@/app/lib/generate-skills-from-source-exam"
 import { resolvePedagogyMode, hasEnoughTextInItems } from "@/app/lib/pedagogy-mode"
+import { agencyFieldsFromSkillScores } from "@/app/lib/skill-result-agency"
 
 const isDev = typeof process !== "undefined" && process.env?.NODE_ENV !== "production"
 
@@ -139,6 +140,7 @@ export async function backfillSkillResults(
       if ((existing ?? []).length > 0) continue
 
       for (const row of skillRows) {
+        const agency = agencyFieldsFromSkillScores(row.score_obtained, row.score_max)
         const { error: insErr } = await supabase.from("evaluation_skill_results").insert({
           evaluation_id: evaluationId,
           student_profile_id: profileId,
@@ -147,6 +149,8 @@ export async function backfillSkillResults(
           score_obtained: row.score_obtained,
           score_max: row.score_max,
           accuracy: row.accuracy,
+          logro_pct: agency.logro_pct,
+          achievement_level: agency.achievement_level,
         })
         if (!insErr) {
           inserted_rows++
@@ -398,6 +402,7 @@ export async function recomputeSkillsForEvaluation(
   if (delErr && isDev) console.warn("[recompute] delete existing failed", delErr.message)
 
   for (const row of rowsToInsert) {
+    const agency = agencyFieldsFromSkillScores(row.score_obtained, row.score_max)
     const { error: insErr } = await supabase.from("evaluation_skill_results").insert({
       evaluation_id: row.evaluation_id,
       student_profile_id: row.student_profile_id,
@@ -406,6 +411,8 @@ export async function recomputeSkillsForEvaluation(
       score_obtained: row.score_obtained,
       score_max: row.score_max,
       accuracy: row.accuracy,
+      logro_pct: agency.logro_pct,
+      achievement_level: agency.achievement_level,
     })
     if (insErr && isDev) console.warn("[recompute] insert failed", insErr.message)
   }

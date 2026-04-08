@@ -67,17 +67,17 @@ export default async function DashboardLayout({
     <div className="min-h-screen bg-[var(--bg-default)] text-[var(--text-primary)]">
       <header className="border-b border-[var(--border-color)] bg-white">
         <div className="mx-auto max-w-7xl px-4 py-3 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            {branding.logo_url ? (
-              <Image src={branding.logo_url} alt={branding.name} width={44} height={44} className="rounded-md border" />
-            ) : (
-              <div className="h-11 w-11 rounded-md border bg-slate-100 flex items-center justify-center text-[10px] font-semibold text-slate-700 px-1 text-center">
-                Colegio Oscar Salinas
-              </div>
-            )}
+          <div className="flex flex-col items-center justify-center gap-2 text-center">
+            <Image
+              src={branding.logo_url || "/logo-colegio.png"}
+              alt={branding.name}
+              width={96}
+              height={96}
+              className="h-24 w-auto object-contain"
+            />
             <div>
-              <p className="text-xs text-[var(--text-muted)]">Panel Institucional</p>
               <h1 className="font-semibold">{branding.name}</h1>
+              <p className="text-xs text-[var(--text-muted)]">Panel Institucional</p>
             </div>
           </div>
           <nav className="flex items-center gap-3 text-sm">

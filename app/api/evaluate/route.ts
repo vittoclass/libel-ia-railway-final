@@ -14,9 +14,12 @@ import { getSupabaseServer } from "../../lib/supabase-server"
 import { runAzureLayoutOmrPipeline } from "../../lib/omr/experimental/azure-layout-omr-pipeline"
 import {
   buildEvaluationBase,
+  buildTeacherAnswerKeyFromFormPauta,
   getFormItemCorrectAnswer,
   isEvaluationBaseItemClosedForOmr,
   isFormStructuredRowClosedForOmr,
+  toCanonicalPautaFromEvaluationBaseItems,
+  type EvaluationBaseSourceExamItemInput,
 } from "../../lib/evaluation-base"
 import {
   accumulateDesarrolloAcrossPages,
@@ -31,6 +34,7 @@ import {
   omrTemplateKeyForClosedQuestionCount,
   resolveSourceExamOmrMetadata,
 } from "../../lib/source-exam-omr-metadata"
+import { enhanceOmrStudentImageBase64 } from "../../lib/omr-image-preenhance"
 
 export const runtime = "nodejs"
 // REFIX_404_RAILWAY: mantener respuesta dinámica en producción Railway
@@ -47,6 +51,21 @@ const DEFAULT_STUDENT_NAME = "Estudiante No Identificado"
 const DESARROLLO_MIN_ATTEMPT_SCORE = 0.5
 // HUMAN_CONTEXT_TRANSCRIPTION_V1
 // Regla reversible: usar contexto local solo para descifrar trazos, nunca para inventar/reemplazar evidencia.
+
+/** Sin narrativa IA: informe ejecutivo solo alternativas (OMR + pauta). */
+const RETRO_SOLO_ALTERNATIVAS_EJECUTIVO = "Evaluación de respuestas cerradas finalizada."
+
+function retroalimentacionEjecutivaSoloAlternativas(): {
+  fortalezas: string
+  areas_mejora: string
+  correccion_detallada: { seccion: string; detalle: string }[]
+} {
+  return {
+    fortalezas: RETRO_SOLO_ALTERNATIVAS_EJECUTIVO,
+    areas_mejora: "",
+    correccion_detallada: [],
+  }
+}
 
 /** Reintentos para 502/503/429 (overload/servicio no disponible). */
 async function fetchMistralWithRetry(url: string, init: RequestInit): Promise<Response> {
@@ -200,13 +219,153 @@ function alignCerradasToOfficialInventory(
   const lookup = buildCerradaDetectionLookup(detected)
   const sorted = [...officialClosed].sort((a, b) => a.order - b.order)
   const out: CerradaNormRow[] = []
+  const usedDetectedKeys = new Set<string>()
   for (const it of sorted) {
     const hit = lookupCerradaForOfficialId(lookup, it.id)
+    if (hit) usedDetectedKeys.add(String(hit.pregunta ?? "").trim().toUpperCase())
     out.push({
       pregunta: it.id,
       respuesta_detectada: hit ? normalizeRespuestaCerrada(hit.respuesta_detectada) : "BLANK",
       confianza: hit ? hit.confianza : 0,
     })
+  }
+  // Regla anti-truncamiento: nunca descartar detecciones extra si el inventario oficial viene corto.
+  for (const row of dedupeCerradasDetectedOnly(detected)) {
+    const k = String(row.pregunta ?? "").trim().toUpperCase()
+    if (!k || usedDetectedKeys.has(k)) continue
+    out.push(row)
+  }
+  return out
+}
+
+function extractClosedOrdinalFromQuestionId(id: string): number | null {
+  const m = String(id ?? "").toUpperCase().match(/(\d+)/)
+  if (!m) return null
+  const n = Number(m[1])
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+/** ¿La lectura OMR de cerrada es vacía / no detectada? (alineado a isBlankLikeDetectedAnswer en POST). */
+function isOmrBlankForRetroVeto(value: string): boolean {
+  const norm = String(value ?? "").trim().toUpperCase()
+  return norm === "" || norm === "BLANK" || norm === "SIN_RESPUESTA"
+}
+
+function resolveOmrLegacyForRow(
+  r: { pregunta?: string },
+  legacyByUpper: Map<string, boolean>
+): boolean {
+  const k = String(r.pregunta ?? "").trim().toUpperCase()
+  if (legacyByUpper.get(k) === true) return true
+  const n = extractClosedOrdinalFromQuestionId(k)
+  if (n != null) {
+    if (legacyByUpper.get(`SM${n}`) === true) return true
+    if (legacyByUpper.get(`C${n}`) === true) return true
+    if (legacyByUpper.get(`VF${n}`) === true) return true
+  }
+  return false
+}
+
+function claimsConcreteAlternativeInText(text: string): boolean {
+  const t = String(text ?? "")
+  return (
+    /\b(marc[óo]|eligi[óo]|seleccion[óo]|indic[óo]|contest[óo]|respondi[óo])\s+([A-E]|la\s+[A-E])\b/i.test(
+      t
+    ) ||
+    /\bletra\s+[A-E]\b/i.test(t) ||
+    /\bopci[oó]n\s+[A-E]\b/i.test(t)
+  )
+}
+
+function correccionReferencesClosedQuestion(detalle: string, seccion: string, label: string): boolean {
+  const blob = `${detalle} ${seccion}`.toUpperCase()
+  const u = label.trim().toUpperCase()
+  if (u && blob.includes(u)) return true
+  const n = extractClosedOrdinalFromQuestionId(u)
+  if (n != null) {
+    if (blob.includes(`SM${n}`) || blob.includes(`C${n}`) || blob.includes(`VF${n}`)) return true
+    if (blob.includes(`PREGUNTA ${n}`) || blob.includes(`ÍTEM ${n}`) || blob.includes(`ITEM ${n}`))
+      return true
+  }
+  return false
+}
+
+/**
+ * Veto de alucinación: si OMR dijo BLANK, no permitir texto que asuma una marca concreta en alternativas.
+ * No altera puntajes; solo sanea retroalimentación generada por IA.
+ */
+function applyOmrBlankHonestyToRetroalimentacion(
+  retro: any,
+  cerradas: Array<{ pregunta: string; respuesta_detectada: string }>
+): any {
+  if (!retro || typeof retro !== "object") return retro
+  const blanks: { label: string }[] = []
+  for (const r of cerradas) {
+    if (!isOmrBlankForRetroVeto(r.respuesta_detectada)) continue
+    const label = String(r.pregunta ?? "").trim() || "ítem"
+    blanks.push({ label })
+  }
+  if (blanks.length === 0) return retro
+
+  const HONEST = "Respuesta no detectada o vacía."
+  let cd = Array.isArray(retro.correccion_detallada) ? [...retro.correccion_detallada] : []
+  cd = cd.filter((c: any) => {
+    const det = String(c?.detalle ?? "")
+    const sec = String(c?.seccion ?? "")
+    if (!claimsConcreteAlternativeInText(det) && !claimsConcreteAlternativeInText(sec)) return true
+    for (const b of blanks) {
+      if (!correccionReferencesClosedQuestion(det, sec, b.label)) continue
+      return false
+    }
+    return true
+  })
+
+  const seenHonest = new Set<string>()
+  for (const b of blanks) {
+    const key = b.label.toUpperCase()
+    if (seenHonest.has(key)) continue
+    seenHonest.add(key)
+    cd.push({ seccion: "Alternativas (OMR)", detalle: `${b.label}: ${HONEST}` })
+  }
+
+  const out = { ...retro, correccion_detallada: cd }
+  if (typeof out.fortalezas === "string" && claimsConcreteAlternativeInText(out.fortalezas)) {
+    for (const b of blanks) {
+      if (correccionReferencesClosedQuestion(out.fortalezas, "", b.label)) {
+        out.fortalezas = `${HONEST} (Lectura OMR sin marca detectada en ${b.label}.)`
+        break
+      }
+    }
+  }
+  if (typeof out.areas_mejora === "string" && claimsConcreteAlternativeInText(out.areas_mejora)) {
+    for (const b of blanks) {
+      if (correccionReferencesClosedQuestion(out.areas_mejora, "", b.label)) {
+        out.areas_mejora = `${HONEST} (Revisar imagen o marcar a mano si corresponde: ${b.label}.)`
+        break
+      }
+    }
+  }
+  return out
+}
+
+function ensureOfficialClosedInventorySize(
+  officialClosed: Array<{ id: string; order: number }>,
+  targetCount: number
+): Array<{ id: string; order: number }> {
+  const t = Math.max(0, Math.floor(targetCount))
+  if (t <= 0) return officialClosed
+
+  const byOrdinal = new Map<number, { id: string; order: number }>()
+  for (const it of officialClosed) {
+    const n = extractClosedOrdinalFromQuestionId(it.id)
+    if (n != null && n >= 1 && !byOrdinal.has(n)) {
+      byOrdinal.set(n, { id: it.id, order: n })
+    }
+  }
+  const out: Array<{ id: string; order: number }> = []
+  for (let n = 1; n <= t; n++) {
+    const existing = byOrdinal.get(n)
+    out.push(existing ?? { id: `C${n}`, order: n })
   }
   return out
 }
@@ -290,6 +449,72 @@ async function resolveToImageBase64List(
   return list
 }
 
+/**
+ * Puente autoritativo Source Exam -> clave docente.
+ * Evita truncamientos del formulario: reconstruye pauta/clave directamente desde source_exam_items.
+ */
+async function loadAuthoritativeTeacherKeyFromSourceExam(
+  supabase: NonNullable<ReturnType<typeof getSupabaseServer>>,
+  sourceExamId: string,
+  teacherId: string,
+  tipoPrueba: "mixta" | "solo_desarrollo" | "solo_alternativas",
+): Promise<{
+  answerKeyFromTemplate: {
+    respuestas: Array<{ pregunta: number; respuestaCorrecta: string; confianza: number; metodo: "manual" }>
+    totalPreguntas: number
+  } | null
+  pautaEstructuradaCanonical: string
+  pautaAlternativasCanonical: string
+  closedItemsCount: number
+} | null> {
+  const sid = String(sourceExamId ?? "").trim()
+  const tid = String(teacherId ?? "").trim()
+  if (!sid || !tid) return null
+
+  const { data: exam, error: examErr } = await supabase
+    .from("source_exams")
+    .select("id, teacher_id")
+    .eq("id", sid)
+    .maybeSingle()
+  if (examErr || !exam) return null
+  if (String((exam as { teacher_id?: string | null }).teacher_id ?? "").trim() !== tid) return null
+
+  const { data: rows, error: rowsErr } = await supabase
+    .from("source_exam_items")
+    .select("id, item_number, item_text, axis_id, skill_id, question_type, correct_answer, max_score, rubric_text")
+    .eq("source_exam_id", sid)
+    .order("item_number", { ascending: true })
+  if (rowsErr || !rows?.length) return null
+
+  const items: EvaluationBaseSourceExamItemInput[] = rows.map((r) => ({
+    rowId: String((r as { id: string }).id),
+    item_number: (r as { item_number?: number | null }).item_number ?? null,
+    item_text: (r as { item_text?: string | null }).item_text ?? null,
+    axis_id: (r as { axis_id?: string | null }).axis_id ?? null,
+    skill_id: (r as { skill_id?: string | null }).skill_id ?? null,
+    question_type: (r as { question_type?: string | null }).question_type ?? null,
+    correct_answer: (r as { correct_answer?: string | null }).correct_answer ?? null,
+    max_score: (r as { max_score?: number | null }).max_score ?? null,
+    rubric_text: (r as { rubric_text?: string | null }).rubric_text ?? null,
+  }))
+
+  const eb = buildEvaluationBase({ sourceExam: { items } })
+  const canonical = toCanonicalPautaFromEvaluationBaseItems(eb.items)
+  const answerKeyFromTemplate = buildTeacherAnswerKeyFromFormPauta(
+    String(canonical.pautaEstructurada ?? ""),
+    String(canonical.pautaCorrectaAlternativas ?? ""),
+    tipoPrueba,
+  )
+  const closedItemsCount = eb.items.filter((it) => isEvaluationBaseItemClosedForOmr(it)).length
+
+  return {
+    answerKeyFromTemplate,
+    pautaEstructuradaCanonical: canonical.pautaEstructurada,
+    pautaAlternativasCanonical: canonical.pautaCorrectaAlternativas,
+    closedItemsCount,
+  }
+}
+
 /** Obtiene base64 listo para Mistral. Si es PDF, convierte la primera página a imagen. */
 async function getImageBase64ForVision(url: string): Promise<string> {
   const base64 = await urlToBase64(url)
@@ -357,6 +582,18 @@ async function analyzeWithMistralText(
   const itemScores = parsePautaEstructurada(pautaEstructurada)
   const soloDesarrollo = tipoPrueba === "solo_desarrollo"
   const soloAlternativas = tipoPrueba === "solo_alternativas"
+  if (soloAlternativas) {
+    const n =
+      nombreEstudiante && nombreEstudiante.trim() && nombreEstudiante !== "Estudiante"
+        ? nombreEstudiante.trim()
+        : null
+    return {
+      nombreEstudiante: n,
+      respuestas_cerradas: [],
+      respuestas_desarrollo: {},
+      retroalimentacion: retroalimentacionEjecutivaSoloAlternativas(),
+    }
+  }
   const desarrolloItems = itemScores.filter((i) => i.isDevelopment)
   const desarrolloPuntajes = desarrolloItems.map((item) => `${item.id} (Máx: ${item.maxScore} pts)`).join(", ")
   const alternativasItems = itemScores.filter((i) => !i.isDevelopment)
@@ -964,10 +1201,13 @@ function calculateFinalScore(
       || pautaMap.get(`SM${num}`) 
       || ""
 
+    const legacyRead = (resp as { _omr_legacy_read?: boolean })._omr_legacy_read === true
+    const confOmr = Number((resp as { confianza?: number }).confianza) || 0
     alternativasCorregidas.push({
       pregunta: preguntaId,
       respuesta_estudiante: respuestaDetectada,
       respuesta_correcta: respuestaCorrecta,
+      ...(legacyRead && confOmr < 0.7 ? { requires_review: true as const } : {}),
     })
 
     if (respuestaCorrecta && respuestaDetectada === respuestaCorrecta) {
@@ -1256,7 +1496,44 @@ export async function POST(req: NextRequest) {
     }
     const tipoPruebaReal = tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
     const tieneAlternativas = tipoPruebaReal !== "solo_desarrollo"
+    if (
+      typeof sourceExamIdBody === "string" &&
+      sourceExamIdBody.trim() &&
+      supabaseForEval &&
+      effectiveTeacherId
+    ) {
+      const authoritative = await loadAuthoritativeTeacherKeyFromSourceExam(
+        supabaseForEval,
+        sourceExamIdBody.trim(),
+        effectiveTeacherId,
+        tipoPruebaReal,
+      )
+      if (authoritative) {
+        const currentLen =
+          Array.isArray(answerKeyFromTemplate?.respuestas) ? answerKeyFromTemplate.respuestas.length : 0
+        const authoritativeLen =
+          Array.isArray(authoritative.answerKeyFromTemplate?.respuestas)
+            ? authoritative.answerKeyFromTemplate.respuestas.length
+            : 0
+        if (authoritativeLen > currentLen) {
+          answerKeyFromTemplate = authoritative.answerKeyFromTemplate
+          if (authoritative.pautaAlternativasCanonical.trim()) {
+            pautaAlternativasFinal = authoritative.pautaAlternativasCanonical
+          }
+          if (process.env.NODE_ENV !== "production") {
+            console.info("[evaluate] source_exam key override", {
+              sourceExamId: sourceExamIdBody.trim(),
+              previousKeyLength: currentLen,
+              authoritativeKeyLength: authoritativeLen,
+              closedItemsCount: authoritative.closedItemsCount,
+            })
+          }
+        }
+      }
+    }
     let respuestasCerradasDesdeOMR: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
+    /** Solo se rellena en rama imágenes (OMR); en PDF queda vacío. */
+    const omrLegacyByPreguntaUpper = new Map<string, boolean>()
 
     const evaluationBaseFormBuilt = buildEvaluationBase({
       form: {
@@ -1412,6 +1689,8 @@ export async function POST(req: NextRequest) {
         sourceExamOmrAuthoritative > 0 ? sourceExamOmrAuthoritative : totalPreg,
       )
       const templateKeyUsed = omrTemplateKeyForClosedQuestionCount(omrExpectedQuestionCount)
+      // Prioridad plantilla/base: el inventario oficial debe tener al menos el tamaño esperado del OMR.
+      officialClosedItems = ensureOfficialClosedInventorySize(officialClosedItems, omrExpectedQuestionCount)
 
       officialOmrGridQuestionCountAtEngine = omrExpectedQuestionCount
       officialOmrTotalPregResolved = omrExpectedQuestionCount
@@ -1436,8 +1715,7 @@ export async function POST(req: NextRequest) {
       }
       const hasClosedInventoryMismatch =
         officialClosedOrderIds.length > 0 &&
-        teacherAnswerKeyBase.length > 0 &&
-        officialClosedOrderIds.length !== teacherAnswerKeyBase.length
+        officialClosedOrderIds.length !== omrExpectedQuestionCount
       const officialClosedQuestionNumbers = officialClosedSorted.map((it, idx) => {
         const fromId = extractClosedOrdinal(String(it.id ?? ""))
         if (fromId != null) return fromId
@@ -1493,6 +1771,25 @@ export async function POST(req: NextRequest) {
       let azureSuccessfulPages = 0
       let azureFailedPages = 0
 
+      const ingestExtradas = (
+        rows: { pregunta: string; respuesta_detectada: string; confianza: number }[],
+        fromLegacyPipeline: boolean
+      ) => {
+        for (const item of rows) {
+          const pid = item.pregunta.toUpperCase()
+          const incoming = {
+            pregunta: item.pregunta,
+            respuesta_detectada: String(item.respuesta_detectada ?? ""),
+            confianza: Number(item.confianza) || 0.4,
+          }
+          const current = detectedByPregunta.get(pid)
+          if (!current || shouldReplaceDetectedAnswer(current, incoming)) {
+            detectedByPregunta.set(pid, incoming)
+            omrLegacyByPreguntaUpper.set(pid, fromLegacyPipeline)
+          }
+        }
+      }
+
       for (let i = 0; i < imageBase64List.length; i++) {
         try {
           const studentBase64 = imageBase64List[i]
@@ -1540,44 +1837,76 @@ export async function POST(req: NextRequest) {
             })
             officialOmrAdapterMode = "legacy_extract_student_only"
             officialOmrEngineUsed = "legacy"
+            ingestExtradas(extraidas, true)
           } else if (tryOfficialAzure) {
-            try {
-              const teacherAnswerKey = teacherAnswerKeyBase.map((r: any) => ({
-                pregunta: String(r?.pregunta ?? ""),
-                respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
-              }))
-              const expectedOptionCount = Math.max(
-                2,
-                new Set(
-                  teacherAnswerKey
-                    .map((r: any) => String(r?.respuestaCorrecta ?? "").trim().toUpperCase())
-                    .filter((v: any) => /^[A-Z]$/.test(v))
-                ).size || 4
-              )
-              const expectedQuestionCountUsed = Math.max(1, omrExpectedQuestionCount)
-              officialOmrExpectedQuestionCountUsed = expectedQuestionCountUsed
-              officialOmrTemplateKeyUsed = templateKeyUsed
-              officialOmrTemplateVariantUsed = omrTemplateVariant
-              const azureOfficial = await extractStudentClosedAnswersAzureLayoutOfficial({
-                studentImageBase64: studentBase64,
-                teacherAnswerKey,
-                closedQuestionIds: officialClosedOrderIds,
-                expectedOptionCount,
-                expectedQuestionCount: expectedQuestionCountUsed,
-                authoritativeOmrQuestionCount:
-                  sourceExamOmrAuthoritative > 0 ? sourceExamOmrAuthoritative : undefined,
-                pautaItemsForOmSegmentation: parsePautaEstructurada(pautaEstructurada).map((it) => ({
-                  isDevelopment: it.isDevelopment,
-                })),
-                templateKey: templateKeyUsed,
-                templateVariant: omrTemplateVariant,
-              })
+            const teacherAnswerKey = teacherAnswerKeyBase.map((r: any) => ({
+              pregunta: String(r?.pregunta ?? ""),
+              respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
+            }))
+            const expectedOptionCount = Math.max(
+              2,
+              new Set(
+                teacherAnswerKey
+                  .map((r: any) => String(r?.respuestaCorrecta ?? "").trim().toUpperCase())
+                  .filter((v: any) => /^[A-Z]$/.test(v))
+              ).size || 4
+            )
+            const expectedQuestionCountUsed = Math.max(1, omrExpectedQuestionCount)
+            officialOmrExpectedQuestionCountUsed = expectedQuestionCountUsed
+            officialOmrTemplateKeyUsed = templateKeyUsed
+            officialOmrTemplateVariantUsed = omrTemplateVariant
+            const azureParams = {
+              teacherAnswerKey,
+              closedQuestionIds: officialClosedOrderIds,
+              expectedOptionCount,
+              expectedQuestionCount: expectedQuestionCountUsed,
+              authoritativeOmrQuestionCount:
+                sourceExamOmrAuthoritative > 0 ? sourceExamOmrAuthoritative : undefined,
+              pautaItemsForOmSegmentation: parsePautaEstructurada(pautaEstructurada).map((it) => ({
+                isDevelopment: it.isDevelopment,
+              })),
+              templateKey: templateKeyUsed,
+              templateVariant: omrTemplateVariant,
+            }
+            let azureOfficial: Awaited<ReturnType<typeof extractStudentClosedAnswersAzureLayoutOfficial>> | null =
+              null
+            let lastAzureErr: unknown = null
+            let azureRecoveredAfterImageEnhance = false
+            for (let attempt = 0; attempt < 2 && !azureOfficial; attempt++) {
+              const imgForAttempt =
+                attempt === 0
+                  ? studentBase64
+                  : await enhanceOmrStudentImageBase64(studentBase64).catch((preErr) => {
+                      console.warn(
+                        "[Evaluate] pre-mejoras imagen OMR omitidas (reintento Azure cancelado)",
+                        preErr
+                      )
+                      return null
+                    })
+              if (attempt === 1 && !imgForAttempt) break
+              try {
+                azureOfficial = await extractStudentClosedAnswersAzureLayoutOfficial({
+                  ...azureParams,
+                  studentImageBase64: imgForAttempt ?? studentBase64,
+                })
+                if (attempt === 1) azureRecoveredAfterImageEnhance = true
+              } catch (e) {
+                lastAzureErr = e
+                if (attempt === 1) {
+                  console.warn("[Evaluate] Azure OMR falló también tras 1 reintento con imagen mejorada", e)
+                }
+              }
+            }
+            if (azureOfficial) {
+              if (azureRecoveredAfterImageEnhance) {
+                console.info("[Evaluate] Azure OMR: éxito en reintento tras pre-mejoras de imagen")
+              }
               console.info("[official_azure_layout_family] adapter_result", {
                 detectedAnswersCount: azureOfficial.detectedAnswers.length,
                 questionCountFromPipeline: azureOfficial.officialOmrQuestionCountFromPipeline,
               })
               extraidas = azureOfficial.detectedAnswers
-              console.info("[CRITICAL] USING EXPERIMENTAL OMR", extraidas.slice(0,5))
+              console.info("[CRITICAL] USING EXPERIMENTAL OMR", extraidas.slice(0, 5))
               console.info("[trace][omr_official][extraidas_after_azure]", {
                 extraidasFirst10: extraidas.slice(0, 10),
                 extraidasCount: extraidas.length,
@@ -1593,12 +1922,16 @@ export async function POST(req: NextRequest) {
               officialOmrAdapterMode = azureOfficial.officialOmrAdapterMode
               officialOmrEngineUsed = "azure_layout_family"
               azureSuccessfulPages++
-            } catch (engineErr) {
+              ingestExtradas(extraidas, false)
+            } else {
               if (!officialOmrAllowFallbackToLegacy) {
-                throw engineErr
+                throw lastAzureErr instanceof Error ? lastAzureErr : new Error(String(lastAzureErr))
               }
               azureFailedPages++
-              console.warn("[Evaluate] official azure_layout_family falló, fallback legacy:", engineErr)
+              console.warn(
+                "[Evaluate] official azure_layout_family falló (incl. reintento con imagen mejorada), fallback legacy:",
+                lastAzureErr
+              )
               const legacyRaw = await extractStudentClosedAnswersOnly(
                 studentBase64,
                 omrExpectedQuestionCount,
@@ -1613,9 +1946,10 @@ export async function POST(req: NextRequest) {
                 extraidasCount: extraidas.length,
                 officialOmrFallbackUsed: true,
                 officialOmrFallbackReason:
-                  engineErr instanceof Error ? engineErr.message : String(engineErr),
+                  lastAzureErr instanceof Error ? lastAzureErr.message : String(lastAzureErr),
               })
               officialOmrAdapterMode = "legacy_extract_student_only"
+              ingestExtradas(extraidas, true)
             }
           } else {
             const legacyRaw = await extractStudentClosedAnswersOnly(
@@ -1632,18 +1966,7 @@ export async function POST(req: NextRequest) {
               extraidasCount: extraidas.length,
             })
             officialOmrAdapterMode = "legacy_extract_student_only"
-          }
-          for (const item of extraidas) {
-            const pid = item.pregunta.toUpperCase()
-            const incoming = {
-              pregunta: item.pregunta,
-              respuesta_detectada: String(item.respuesta_detectada ?? ""),
-              confianza: Number(item.confianza) || 0.4,
-            }
-            const current = detectedByPregunta.get(pid)
-            if (!current || shouldReplaceDetectedAnswer(current, incoming)) {
-              detectedByPregunta.set(pid, incoming)
-            }
+            ingestExtradas(extraidas, true)
           }
         } catch (e) {
           if (
@@ -1706,7 +2029,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Procesar cada imagen
+    // Procesar cada imagen (Mistral Vision + desarrollo dedicado), salvo solo_alternativas: solo OMR + pauta.
     combinedAnalysis = {
       respuestas_cerradas: [],
       respuestas_desarrollo: {},
@@ -1718,101 +2041,108 @@ export async function POST(req: NextRequest) {
       nombreEstudiante: null,
     }
 
-    for (let i = 0; i < imageBase64List.length; i++) {
-      const imageBase64 = imageBase64List[i]
-
-      const analysis = await analyzeWithMistralVision(
-        imageBase64,
-        rubrica,
-        pauta,
-        pautaEstructurada,
-        pautaAlternativasFinal,
-        nivelEducativo,
-        areaConocimiento,
-        Number(puntajeTotal),
-        Number(porcentajeExigencia),
-        tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
-      )
-
-      // Combinar resultados
-      if (analysis.nombreEstudiante && !combinedAnalysis.nombreEstudiante) {
-        combinedAnalysis.nombreEstudiante = analysis.nombreEstudiante
+    if (tipoPruebaReal === "solo_alternativas") {
+      combinedAnalysis.retroalimentacion = retroalimentacionEjecutivaSoloAlternativas()
+      if (process.env.NODE_ENV !== "production") {
+        console.info("[evaluate] solo_alternativas: omitiendo analyzeWithMistralVision y analyzeDevelopmentOnly (informe ejecutivo)")
       }
+    } else {
+      for (let i = 0; i < imageBase64List.length; i++) {
+        const imageBase64 = imageBase64List[i]
 
-      if (analysis.respuestas_cerradas && respuestasCerradasDesdeOMR.length === 0) {
-        // Evitar duplicados al combinar respuestas de multiples paginas
-        for (const resp of analysis.respuestas_cerradas) {
-          const preguntaId = String(resp.pregunta).toUpperCase()
-          const exists = combinedAnalysis.respuestas_cerradas.some(
-            (r: any) => String(r.pregunta).toUpperCase() === preguntaId
-          )
-          if (!exists) {
-            combinedAnalysis.respuestas_cerradas.push(resp)
-          }
+        const analysis = await analyzeWithMistralVision(
+          imageBase64,
+          rubrica,
+          pauta,
+          pautaEstructurada,
+          pautaAlternativasFinal,
+          nivelEducativo,
+          areaConocimiento,
+          Number(puntajeTotal),
+          Number(porcentajeExigencia),
+          tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
+        )
+
+        // Combinar resultados
+        if (analysis.nombreEstudiante && !combinedAnalysis.nombreEstudiante) {
+          combinedAnalysis.nombreEstudiante = analysis.nombreEstudiante
         }
-      }
 
-      if (analysis.retroalimentacion) {
-        if (i === 0) {
-          combinedAnalysis.retroalimentacion = analysis.retroalimentacion
-        } else {
-          // Combinar retroalimentación de múltiples páginas
-          combinedAnalysis.retroalimentacion.correccion_detallada.push(
-            ...(analysis.retroalimentacion.correccion_detallada || [])
-          )
-        }
-      }
-
-      // FASE 3.5: desarrollo — una sola clave canónica P{n} por ítem; fusión Vision + dedicada con criterio estable.
-      const tieneDesarrollo = tipoPrueba !== "solo_alternativas"
-      const ejecutarDesarrolloDedicado =
-        tieneDesarrollo && (tipoPrueba === "solo_desarrollo" || !!pauta || !!pautaEstructurada)
-
-      let pageMergedDev: Record<string, unknown>
-      if (ejecutarDesarrolloDedicado) {
-        try {
-          const devResult = await analyzeDevelopmentOnly(
-            imageBase64,
-            rubrica,
-            pauta,
-            pautaEstructurada,
-            nivelEducativo,
-            areaConocimiento
-          )
-          pageMergedDev = mergeVisionAndDedicatedDesarrollo(
-            (analysis.respuestas_desarrollo || {}) as Record<string, unknown>,
-            (devResult.respuestas_desarrollo || {}) as Record<string, unknown>
-          )
-          if (devResult.retroalimentacion && (devResult.retroalimentacion.fortalezas || devResult.retroalimentacion.areas_mejora || (Array.isArray(devResult.retroalimentacion.correccion_detallada) && devResult.retroalimentacion.correccion_detallada.length > 0))) {
-            if (i === 0) {
-              combinedAnalysis.retroalimentacion = {
-                ...combinedAnalysis.retroalimentacion,
-                ...devResult.retroalimentacion,
-              }
-            } else {
-              combinedAnalysis.retroalimentacion.fortalezas = combinedAnalysis.retroalimentacion.fortalezas || devResult.retroalimentacion.fortalezas
-              combinedAnalysis.retroalimentacion.areas_mejora = combinedAnalysis.retroalimentacion.areas_mejora || devResult.retroalimentacion.areas_mejora
-              combinedAnalysis.retroalimentacion.correccion_detallada.push(
-                ...(devResult.retroalimentacion.correccion_detallada || [])
-              )
+        if (analysis.respuestas_cerradas && respuestasCerradasDesdeOMR.length === 0) {
+          // Evitar duplicados al combinar respuestas de multiples paginas
+          for (const resp of analysis.respuestas_cerradas) {
+            const preguntaId = String(resp.pregunta).toUpperCase()
+            const exists = combinedAnalysis.respuestas_cerradas.some(
+              (r: any) => String(r.pregunta).toUpperCase() === preguntaId
+            )
+            if (!exists) {
+              combinedAnalysis.respuestas_cerradas.push(resp)
             }
           }
-        } catch (e) {
-          console.warn("[Evaluate] Análisis desarrollo dedicado falló", e)
+        }
+
+        if (analysis.retroalimentacion) {
+          if (i === 0) {
+            combinedAnalysis.retroalimentacion = analysis.retroalimentacion
+          } else {
+            // Combinar retroalimentación de múltiples páginas
+            combinedAnalysis.retroalimentacion.correccion_detallada.push(
+              ...(analysis.retroalimentacion.correccion_detallada || [])
+            )
+          }
+        }
+
+        // FASE 3.5: desarrollo — una sola clave canónica P{n} por ítem; fusión Vision + dedicada con criterio estable.
+        const tieneDesarrollo = tipoPrueba !== "solo_alternativas"
+        const ejecutarDesarrolloDedicado =
+          tieneDesarrollo && (tipoPrueba === "solo_desarrollo" || !!pauta || !!pautaEstructurada)
+
+        let pageMergedDev: Record<string, unknown>
+        if (ejecutarDesarrolloDedicado) {
+          try {
+            const devResult = await analyzeDevelopmentOnly(
+              imageBase64,
+              rubrica,
+              pauta,
+              pautaEstructurada,
+              nivelEducativo,
+              areaConocimiento
+            )
+            pageMergedDev = mergeVisionAndDedicatedDesarrollo(
+              (analysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+              (devResult.respuestas_desarrollo || {}) as Record<string, unknown>
+            )
+            if (devResult.retroalimentacion && (devResult.retroalimentacion.fortalezas || devResult.retroalimentacion.areas_mejora || (Array.isArray(devResult.retroalimentacion.correccion_detallada) && devResult.retroalimentacion.correccion_detallada.length > 0))) {
+              if (i === 0) {
+                combinedAnalysis.retroalimentacion = {
+                  ...combinedAnalysis.retroalimentacion,
+                  ...devResult.retroalimentacion,
+                }
+              } else {
+                combinedAnalysis.retroalimentacion.fortalezas = combinedAnalysis.retroalimentacion.fortalezas || devResult.retroalimentacion.fortalezas
+                combinedAnalysis.retroalimentacion.areas_mejora = combinedAnalysis.retroalimentacion.areas_mejora || devResult.retroalimentacion.areas_mejora
+                combinedAnalysis.retroalimentacion.correccion_detallada.push(
+                  ...(devResult.retroalimentacion.correccion_detallada || [])
+                )
+              }
+            }
+          } catch (e) {
+            console.warn("[Evaluate] Análisis desarrollo dedicado falló", e)
+            pageMergedDev = collapseDevelopmentKeysToCanonical(
+              (analysis.respuestas_desarrollo || {}) as Record<string, unknown>
+            )
+          }
+        } else {
           pageMergedDev = collapseDevelopmentKeysToCanonical(
             (analysis.respuestas_desarrollo || {}) as Record<string, unknown>
           )
         }
-      } else {
-        pageMergedDev = collapseDevelopmentKeysToCanonical(
-          (analysis.respuestas_desarrollo || {}) as Record<string, unknown>
-        )
-      }
 
-      combinedAnalysis.respuestas_desarrollo = accumulateDesarrolloAcrossPages(
-        combinedAnalysis.respuestas_desarrollo as Record<string, unknown>,
-        pageMergedDev
-      ) as typeof combinedAnalysis.respuestas_desarrollo
+        combinedAnalysis.respuestas_desarrollo = accumulateDesarrolloAcrossPages(
+          combinedAnalysis.respuestas_desarrollo as Record<string, unknown>,
+          pageMergedDev
+        ) as typeof combinedAnalysis.respuestas_desarrollo
+      }
     }
 
     }  // fin else (rama imágenes: Mistral Vision)
@@ -1869,8 +2199,36 @@ export async function POST(req: NextRequest) {
       confianza: Number(r.confianza) || 0.8,
     }))
     const cerradasAlineadas = alignCerradasToOfficialInventory(cerradasParaAlinear, officialClosedItems)
-    combinedAnalysis.respuestas_cerradas = cerradasAlineadas
-    officialOmrExpectedQuestionCountUsed = cerradasAlineadas.length
+    const expectedClosedCount = Math.max(
+      1,
+      cerradasParaAlinear.length,
+      officialClosedItems.length,
+      officialOmrTotalPregResolved || 0
+    )
+    const byId = new Map<string, CerradaNormRow>()
+    for (const r of cerradasAlineadas) {
+      const k = String(r.pregunta ?? "").trim().toUpperCase()
+      if (!k || byId.has(k)) continue
+      byId.set(k, r)
+    }
+    for (let q = 1; q <= expectedClosedCount; q++) {
+      const cKey = `C${q}`
+      const smKey = `SM${q}`
+      if (!byId.has(cKey) && !byId.has(smKey)) {
+        byId.set(cKey, { pregunta: cKey, respuesta_detectada: "BLANK", confianza: 0 })
+      }
+    }
+    combinedAnalysis.respuestas_cerradas = Array.from(byId.values()).sort((a, b) => {
+      const na = extractClosedOrdinalFromQuestionId(String(a.pregunta ?? "")) ?? Number.MAX_SAFE_INTEGER
+      const nb = extractClosedOrdinalFromQuestionId(String(b.pregunta ?? "")) ?? Number.MAX_SAFE_INTEGER
+      if (na !== nb) return na - nb
+      return String(a.pregunta ?? "").localeCompare(String(b.pregunta ?? ""))
+    })
+    combinedAnalysis.respuestas_cerradas = combinedAnalysis.respuestas_cerradas.map((r: any) => ({
+      ...r,
+      _omr_legacy_read: resolveOmrLegacyForRow(r, omrLegacyByPreguntaUpper),
+    }))
+    officialOmrExpectedQuestionCountUsed = combinedAnalysis.respuestas_cerradas.length
     console.info("[trace][omr_official][combined_before_scoring]", {
       combinedRespuestasCerradasCount: Array.isArray(combinedAnalysis.respuestas_cerradas)
         ? combinedAnalysis.respuestas_cerradas.length
@@ -1907,8 +2265,18 @@ export async function POST(req: NextRequest) {
       (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>
     )
 
+    combinedAnalysis.retroalimentacion = applyOmrBlankHonestyToRetroalimentacion(
+      combinedAnalysis.retroalimentacion,
+      combinedAnalysis.respuestas_cerradas as Array<{ pregunta: string; respuesta_detectada: string }>
+    )
+
     // Sanitizar retroalimentación para no culpar al estudiante cuando es problema de lectura/OCR
     combinedAnalysis.retroalimentacion = sanitizeRetroalimentacion(combinedAnalysis.retroalimentacion)
+
+    if (tipoPruebaReal === "solo_alternativas") {
+      combinedAnalysis.respuestas_desarrollo = {}
+      combinedAnalysis.retroalimentacion = retroalimentacionEjecutivaSoloAlternativas()
+    }
 
     // Copias defensivas y separación explícita de fuentes (teacher key vs student OMR read).
     const teacherClosedAnswersForScoring = JSON.parse(JSON.stringify(pautaAlternativasFinal))
@@ -1948,21 +2316,33 @@ export async function POST(req: NextRequest) {
     )
 
     // Construir respuesta
+    const retroForResult =
+      tipoPruebaReal === "solo_alternativas"
+        ? {
+            ...retroalimentacionEjecutivaSoloAlternativas(),
+            resumen_general: {
+              fortalezas: RETRO_SOLO_ALTERNATIVAS_EJECUTIVO,
+              areas_mejora: "",
+            },
+            retroalimentacion_alternativas: scores.alternativas_corregidas,
+          }
+        : sanitizeRetroalimentacion({
+            ...combinedAnalysis.retroalimentacion,
+            resumen_general: {
+              fortalezas: combinedAnalysis.retroalimentacion?.fortalezas || "Análisis pendiente",
+              areas_mejora: combinedAnalysis.retroalimentacion?.areas_mejora || "Análisis pendiente",
+            },
+            retroalimentacion_alternativas: scores.alternativas_corregidas,
+          })
+
     const result = {
       success: true,
-      retroalimentacion: sanitizeRetroalimentacion({
-        ...combinedAnalysis.retroalimentacion,
-        resumen_general: {
-          fortalezas: combinedAnalysis.retroalimentacion?.fortalezas || "Análisis pendiente",
-          areas_mejora: combinedAnalysis.retroalimentacion?.areas_mejora || "Análisis pendiente",
-        },
-        retroalimentacion_alternativas: scores.alternativas_corregidas,
-      }),
+      retroalimentacion: retroForResult,
       puntaje: scores.puntaje,
       nota: scores.nota,
       puntosAprobacion: scores.puntosAprobacion,
       puntosMaximos: scores.puntosMaximos,
-      detalle_desarrollo: combinedAnalysis.respuestas_desarrollo,
+      detalle_desarrollo: tipoPruebaReal === "solo_alternativas" ? {} : combinedAnalysis.respuestas_desarrollo,
       alternativas_corregidas: scores.alternativas_corregidas,
       // SNAPSHOT_NATIONAL_ANALYTICS_V1:
       // Original: nombreEstudianteDetectado: combinedAnalysis.nombreEstudiante,
@@ -1986,6 +2366,20 @@ export async function POST(req: NextRequest) {
           ? answerKeyFromTemplate.respuestas.length
           : 0,
       studentClosedAnswersCount: studentClosedAnswersDetected.length,
+      ...(tipoPruebaReal === "solo_alternativas"
+        ? {
+            informe_ejecutivo: {
+              modo: "solo_alternativas" as const,
+              mensaje: RETRO_SOLO_ALTERNATIVAS_EJECUTIVO,
+              logro_sobre_pauta_pct:
+                Number(scores.puntosMaximos) > 0
+                  ? Math.round(
+                      ((scores.scoreAlternativas + scores.scoreDesarrollo) / Number(scores.puntosMaximos)) * 100,
+                    )
+                  : null,
+            },
+          }
+        : {}),
     }
     console.info("[trace][omr_official][response_summary]", {
       success: true,
@@ -2042,6 +2436,10 @@ export async function POST(req: NextRequest) {
             typeof evaluationBatchIdBody === "string" && evaluationBatchIdBody.trim() !== ""
               ? evaluationBatchIdBody.trim()
               : null,
+          source_exam_id:
+            typeof sourceExamIdBody === "string" && sourceExamIdBody.trim() !== ""
+              ? sourceExamIdBody.trim()
+              : null,
         })
       } catch (e) {
         if (process.env.NODE_ENV !== "production") console.error("[Evaluate] persistEvaluation threw:", e)
@@ -2056,9 +2454,35 @@ export async function POST(req: NextRequest) {
     const saved = saveResult.saved
     const evaluationId = saved ? saveResult.evaluation_id : null
     const status = saved ? saveResult.status : null
+    const evaluationIdLooksUuid =
+      typeof evaluationId === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(evaluationId)
     const save_error: string | null =
       !saved && saveResult.error ? `${saveResult.error.step}: ${saveResult.error.message}` : null
     const save_reason: string | undefined = !saved && "reason" in saveResult ? (saveResult as { reason?: string }).reason : undefined
+    if (saved && !evaluationIdLooksUuid) {
+      console.error("[evaluate][SAVE_INVALID_EVALUATION_ID]", { evaluationId, status })
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Guardado devolvió evaluation_id inválido (no UUID)",
+          saved: false,
+          evaluation_id: null,
+          save_error: "save: invalid evaluation_id returned by persistence layer",
+          reason: "INVALID_EVALUATION_ID",
+        },
+        { status: 500 }
+      )
+    }
+    if (!saved) {
+      console.error("[evaluate][SAVE_FAILED]", {
+        step: saveResult.error?.step ?? "unknown",
+        message: saveResult.error?.message ?? "unknown",
+        reason: save_reason ?? null,
+      })
+    } else {
+      console.info("[evaluate][SAVE_OK]", { evaluation_id: evaluationId, status })
+    }
 
     return NextResponse.json(
       {

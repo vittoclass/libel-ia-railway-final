@@ -6,8 +6,14 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { sanitizeUuidOrNull } from "@/app/lib/source-exam-traceability"
 
 export const dynamic = "force-dynamic"
+
+const NO_STORE = {
+  "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+  Pragma: "no-cache",
+} as const
 
 async function checkItemAccess(
   supabase: NonNullable<ReturnType<typeof getSupabaseServer>>,
@@ -58,8 +64,8 @@ export async function PATCH(
   if (typeof body.item_number === "number" && !Number.isNaN(body.item_number)) update.item_number = body.item_number
   if (typeof body.item_number === "string") update.item_number = parseInt(body.item_number, 10)
   if (typeof body.item_text === "string") update.item_text = body.item_text
-  if (typeof body.axis_id === "string") update.axis_id = body.axis_id || null
-  if (typeof body.skill_id === "string") update.skill_id = body.skill_id || null
+  if (typeof body.axis_id === "string") update.axis_id = sanitizeUuidOrNull(body.axis_id)
+  if (typeof body.skill_id === "string") update.skill_id = sanitizeUuidOrNull(body.skill_id)
   if (typeof body.competence === "string") update.competence = body.competence
   if (typeof body.difficulty === "string") update.difficulty = body.difficulty
   if (typeof body.question_type === "string") update.question_type = body.question_type || null
@@ -67,6 +73,9 @@ export async function PATCH(
   if (typeof body.max_score === "number" && !Number.isNaN(body.max_score)) update.max_score = body.max_score
   if (typeof body.max_score === "string") update.max_score = parseInt(body.max_score, 10)
   if (typeof body.rubric_text === "string") update.rubric_text = body.rubric_text
+  if (typeof body.axis_label === "string") update.axis_label = body.axis_label.trim() || null
+  if (typeof body.skill_label === "string") update.skill_label = body.skill_label.trim() || null
+  if (typeof body.cognitive_level === "string") update.cognitive_level = body.cognitive_level.trim() || null
   if (Object.keys(update).length === 0) return NextResponse.json({ error: "Nada que actualizar" }, { status: 400 })
 
   const { data, error } = await supabase
@@ -74,11 +83,23 @@ export async function PATCH(
     .update(update)
     .eq("id", itemId)
     .eq("source_exam_id", sourceExamId)
-    .select("id, item_number, item_text, axis_id, skill_id, competence, difficulty, question_type, correct_answer, max_score, rubric_text")
+    .select("id, item_number, item_text, axis_id, skill_id, axis_label, skill_label, cognitive_level, competence, difficulty, question_type, correct_answer, max_score, rubric_text")
     .single()
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
-  return NextResponse.json({ item: data }, { status: 200 })
+  if (error)
+    return NextResponse.json(
+      {
+        error: error.message,
+        supabase_error: {
+          message: error.message,
+          code: error.code ?? null,
+          details: error.details ?? null,
+          hint: error.hint ?? null,
+        },
+      },
+      { status: 500, headers: NO_STORE },
+    )
+  return NextResponse.json({ item: data }, { status: 200, headers: NO_STORE })
 }
 
 export async function DELETE(
@@ -101,6 +122,18 @@ export async function DELETE(
     .eq("id", itemId)
     .eq("source_exam_id", sourceExamId)
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
-  return NextResponse.json({ ok: true }, { status: 200 })
+  if (error)
+    return NextResponse.json(
+      {
+        error: error.message,
+        supabase_error: {
+          message: error.message,
+          code: error.code ?? null,
+          details: error.details ?? null,
+          hint: error.hint ?? null,
+        },
+      },
+      { status: 500, headers: NO_STORE },
+    )
+  return NextResponse.json({ ok: true }, { status: 200, headers: NO_STORE })
 }

@@ -27,10 +27,14 @@ export async function GET() {
     .from("source_exams")
     .select("id, title, subject, course_label, exam_type, pedagogy_mode, created_at")
     .eq("teacher_id", teacherId)
+    .or("is_archived.is.null,is_archived.eq.false")
     .order("created_at", { ascending: false })
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
-  return NextResponse.json({ source_exams: data ?? [] }, { status: 200, headers: { "Cache-Control": "no-store" } })
+  return NextResponse.json(
+    { source_exams: data ?? [] },
+    { status: 200, headers: { "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", Pragma: "no-cache" } },
+  )
 }
 
 export async function POST(req: NextRequest) {

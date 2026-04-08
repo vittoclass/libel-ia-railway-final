@@ -24,7 +24,7 @@ export async function GET(_req: NextRequest) {
 
   const { data: profile } = await supabase
     .from("profiles")
-    .select("role, organization_id")
+    .select("role, organization_id, school_id, teacher_id")
     .eq("user_id", user.id)
     .maybeSingle()
 
@@ -35,6 +35,8 @@ export async function GET(_req: NextRequest) {
   }
 
   const orgId = (profile as { organization_id?: string | null } | null)?.organization_id ?? null
+  const schoolId = (profile as { school_id?: string | null } | null)?.school_id ?? null
+  const teacherId = (profile as { teacher_id?: string | null } | null)?.teacher_id ?? null
   try {
     let query = supabase
       .from("evaluation_audit_logs")
@@ -56,6 +58,67 @@ export async function GET(_req: NextRequest) {
       student_or_course: String((r.metadata as Record<string, unknown> | null)?.["student_or_course"] ?? "—"),
       created_at: r.created_at,
     }))
+    // Bypass de validación: lotes directos desde batch_scan_sessions (sin release).
+    let batchesQ = supabase
+      .from("batch_scan_sessions")
+      .select("batch_id, teacher_id, school_id, created_at, expires_at")
+      .eq("is_archived", false)
+      .order("created_at", { ascending: false, nullsFirst: false })
+      .limit(60)
+    if (schoolId) batchesQ = batchesQ.eq("school_id", schoolId)
+    else if (orgId) {
+      const { data: peers } = await supabase
+        .from("profiles")
+        .select("teacher_id")
+        .eq("organization_id", orgId)
+        .not("teacher_id", "is", null)
+      const tids = [...new Set((peers ?? []).map((p: { teacher_id?: string | null }) => p.teacher_id).filter(Boolean))] as string[]
+      if (tids.length > 0) batchesQ = batchesQ.in("teacher_id", tids)
+      else if (teacherId) batchesQ = batchesQ.eq("teacher_id", teacherId)
+    } else if (teacherId) {
+      batchesQ = batchesQ.eq("teacher_id", teacherId)
+    }
+    const { data: batchSessions, error: batchSessionsErr } = await batchesQ
+    const rawBatchSessions = (batchSessions ?? []) as Array<{
+      batch_id: string
+      teacher_id?: string | null
+      school_id?: string | null
+      created_at?: string | null
+      expires_at?: string | null
+    }>
+    const batchIds = [...new Set(rawBatchSessions.map((b) => String(b.batch_id ?? "").trim()).filter(Boolean))]
+    const evalCountByBatch = new Map<string, number>()
+    if (batchIds.length > 0) {
+      const { data: evalRows } = await supabase
+        .from("evaluations")
+        .select("batch_id")
+        .eq("is_archived", false)
+        .in("batch_id", batchIds)
+      for (const row of (evalRows ?? []) as Array<{ batch_id?: string | null }>) {
+        const bid = String(row.batch_id ?? "").trim()
+        if (!bid) continue
+        evalCountByBatch.set(bid, (evalCountByBatch.get(bid) ?? 0) + 1)
+      }
+    }
+    const cleanBatchSessions = rawBatchSessions
+      .map((b) => {
+        const bid = String(b.batch_id ?? "").trim()
+        const evaluation_count = evalCountByBatch.get(bid) ?? 0
+        return {
+          ...b,
+          evaluation_count,
+        }
+      })
+      .filter((b) => Number(b.evaluation_count) > 0)
+      .sort((a, b) => {
+        if (Number(b.evaluation_count) !== Number(a.evaluation_count)) {
+          return Number(b.evaluation_count) - Number(a.evaluation_count)
+        }
+        const ta = a.created_at ? new Date(a.created_at).getTime() : 0
+        const tb = b.created_at ? new Date(b.created_at).getTime() : 0
+        return tb - ta
+      })
+
     // PHASE_6_NORMATIVE_ENGINE_V1: incluir foco de riesgo desde student_projections
     let projectionsQuery = supabase
       .from("student_projections")
@@ -116,12 +179,15 @@ export async function GET(_req: NextRequest) {
 
     return NextResponse.json({
       items,
+      organization_id: orgId,
+      school_id: schoolId,
+      batch_sessions: cleanBatchSessions,
       risk_rows: riskRows,
       semaforo: {
         ...semaforo,
         total: (projections ?? []).length,
       },
-      warning: projectionsErr ? String(projectionsErr.message) : undefined,
+      warning: [projectionsErr?.message, batchSessionsErr?.message].filter(Boolean).join(" | ") || undefined,
     })
   } catch (e) {
     return NextResponse.json({ items: [], warning: e instanceof Error ? e.message : String(e) }, { status: 200 })

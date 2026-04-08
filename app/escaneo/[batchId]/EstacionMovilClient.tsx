@@ -7,6 +7,10 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Camera, Loader2, CheckCircle2, AlertCircle } from "lucide-react"
+import {
+  MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT,
+  MOBILE_CAPTURE_PAGE_CHOICES,
+} from "@/app/lib/docente/mobile-scan-constants"
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
@@ -42,6 +46,8 @@ export function EstacionMovilClient({ batchId }: Props) {
   const [batchGateError, setBatchGateError] = useState<string | null>(null)
   /** Respuesta cruda de GET /public para depuración en pantalla. */
   const [publicApiDebug, setPublicApiDebug] = useState<unknown>(null)
+  /** Valor que envió la estación PC (batch_scan_sessions.expected_pages_per_student), si viene en GET /public. */
+  const [pcExpectedPages, setPcExpectedPages] = useState<number | null>(null)
   const [uploading, setUploading] = useState(false)
   const [lastOk, setLastOk] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -122,8 +128,9 @@ export function EstacionMovilClient({ batchId }: Props) {
       } catch {
         parsed = { _parseError: true, rawBody: text }
       }
-      const body = parsed as { ok?: boolean; error?: string }
+      const body = parsed as { ok?: boolean; error?: string; expected_pages_per_student?: number }
       if (!res.ok || !body?.ok) {
+        setPcExpectedPages(null)
         setBatchGateOk(false)
         setBatchGateError(typeof body?.error === "string" ? body.error : `HTTP ${res.status}`)
         setPublicApiDebug({
@@ -138,7 +145,15 @@ export function EstacionMovilClient({ batchId }: Props) {
       }
       setBatchGateOk(true)
       setPublicApiDebug(null)
+      const rawEp = body.expected_pages_per_student
+      const ep =
+        typeof rawEp === "number" && Number.isFinite(rawEp)
+          ? Math.max(1, Math.min(50, Math.floor(rawEp)))
+          : 2
+      setPcExpectedPages(ep)
+      setImagesPerStudent(Math.min(MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT, ep))
     } catch (e) {
+      setPcExpectedPages(null)
       setBatchGateOk(false)
       setBatchGateError("Sin conexión. Intente de nuevo.")
       setPublicApiDebug({
@@ -158,7 +173,7 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   const goToScanner = useCallback(
     (n: number) => {
-      if (n < 1 || n > 3) return
+      if (n < 1 || n > MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT) return
       stopStream()
       setImagesPerStudent(n)
       setPageIndex(1)
@@ -337,14 +352,27 @@ export function EstacionMovilClient({ batchId }: Props) {
       <div className="max-w-md mx-auto w-full flex-1 flex flex-col gap-6 pt-6">
         {phase === "pages" ? (
           <div className="space-y-6 flex-1 flex flex-col justify-center">
-            <p className="text-center text-sm font-medium text-slate-200">Paso 1: Elige 1, 2 o 3 páginas.</p>
-            <div className="grid grid-cols-3 gap-3">
-              {[1, 2, 3].map((n) => (
+            <p className="text-center text-sm font-medium text-slate-200">
+              Paso 1: ¿Cuántas fotos por alumno? (hasta {MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT})
+            </p>
+            {pcExpectedPages != null && pcExpectedPages > MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT ? (
+              <p className="text-center text-xs text-amber-300/95 px-1">
+                La estación PC indica <strong>{pcExpectedPages}</strong> foto{pcExpectedPages !== 1 ? "s" : ""} por alumno;
+                aquí puede elegir como máximo {MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT}. Ajuste el número en la estación o
+                reparta en más de un lote.
+              </p>
+            ) : pcExpectedPages != null ? (
+              <p className="text-center text-xs text-slate-500 px-1">
+                Sugerido según estación PC: <strong>{pcExpectedPages}</strong> (puede cambiar antes de capturar).
+              </p>
+            ) : null}
+            <div className="grid grid-cols-4 gap-2 sm:gap-3 sm:grid-cols-7">
+              {MOBILE_CAPTURE_PAGE_CHOICES.map((n) => (
                 <Button
                   key={n}
                   type="button"
                   variant={imagesPerStudent === n ? "default" : "secondary"}
-                  className="h-16 text-xl font-semibold"
+                  className="h-14 sm:h-16 text-lg sm:text-xl font-semibold min-w-0 px-1"
                   onClick={() => goToScanner(n)}
                 >
                   {n}

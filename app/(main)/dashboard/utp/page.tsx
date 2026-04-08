@@ -1,6 +1,8 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
+import { useRouter } from "next/navigation"
+import { Trash2 } from "lucide-react"
 import { EvaluationLinkSelector } from "@/app/components/dashboard/utp/EvaluationLinkSelector"
 import { ResultsMirror } from "@/app/components/dashboard/utp/ResultsMirror"
 import { UtpAuditoriaJuezPanel } from "@/app/components/dashboard/utp/UtpAuditoriaJuezPanel"
@@ -39,6 +41,21 @@ type RiskRow = {
   calculated_at: string | null
 }
 
+type SchoolAnalyticsRow = {
+  skill_name: string
+  subject: string | null
+  avg_logro_pct: number | null
+  student_result_rows: number
+}
+
+type SchoolAnalyticsPayload = {
+  school_id: string | null
+  evaluation_count: number
+  skill_result_rows?: number
+  batch_id_filter?: string | null
+  by_skill: SchoolAnalyticsRow[]
+}
+
 type UtpReport = {
   id: string
   upload_id?: string
@@ -66,13 +83,23 @@ type EvalLotGroup = {
   suggest_annex_to_batch_id: string | null
 }
 
+type BatchLinkChoice = "SIMCE" | "PAES"
+
 type EvalOrphanRow = EvalLotMember & {
   title: string
   course_label: string
   suggest_annex_to_batch_id: string | null
 }
 
+function filterNonArchivedInstrumentRows(rawItems: unknown[]): unknown[] {
+  return rawItems.filter((raw) => {
+    const a = (raw as { is_archived?: boolean | null })?.is_archived
+    return a !== true
+  })
+}
+
 export default function DashboardUtpPage() {
+  const router = useRouter()
   const [rows, setRows] = useState<AuditRow[]>([])
   const [riskRows, setRiskRows] = useState<RiskRow[]>([])
   const [semaforo, setSemaforo] = useState({
@@ -84,6 +111,8 @@ export default function DashboardUtpPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [reports, setReports] = useState<UtpReport[]>([])
+  const [currentOrganizationId, setCurrentOrganizationId] = useState<string | null>(null)
+  const [currentSchoolId, setCurrentSchoolId] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
   const [teacherLabel, setTeacherLabel] = useState("")
   const [courseLabel, setCourseLabel] = useState("")
@@ -105,6 +134,17 @@ export default function DashboardUtpPage() {
   const [expandedEvalLots, setExpandedEvalLots] = useState<Record<string, boolean>>({})
   /** IDs prellenados desde un lote OMR para vínculo masivo en el selector. */
   const [utpLotDraftIds, setUtpLotDraftIds] = useState<string[] | null>(null)
+  const [utpLotDraftAssessmentType, setUtpLotDraftAssessmentType] = useState<string | null>(null)
+  const [showBatchLinkModal, setShowBatchLinkModal] = useState(false)
+  const [batchLinkPending, setBatchLinkPending] = useState<EvalLotGroup | null>(null)
+  const [batchLinkSaving, setBatchLinkSaving] = useState(false)
+  const [batchLinkStatus, setBatchLinkStatus] = useState<string | null>(null)
+  const [archivingBatchId, setArchivingBatchId] = useState<string | null>(null)
+  const [archivingAll, setArchivingAll] = useState(false)
+  const [schoolAnalytics, setSchoolAnalytics] = useState<SchoolAnalyticsPayload | null>(null)
+  const [schoolAnalyticsLoading, setSchoolAnalyticsLoading] = useState(false)
+  const [archivingInstrumentId, setArchivingInstrumentId] = useState<string | null>(null)
+  const [archivingAllInstruments, setArchivingAllInstruments] = useState(false)
 
   function juezRootCause(content: Record<string, unknown>): { approval_risk_pct?: number } {
     const rc = content.root_cause
@@ -201,9 +241,12 @@ export default function DashboardUtpPage() {
       merged.analysis_summary = JSON.stringify(merged ?? base ?? raw)
     }
 
+    /** Fila raíz = utp_instrument_uploads; el id del upload es siempre raw.id. */
+    const uploadPk = String(raw?.id ?? "").trim() || String((base as { upload_id?: string })?.upload_id ?? "").trim()
+
     return {
       id: String(base?.id ?? raw?.id ?? crypto.randomUUID()),
-      upload_id: String(base?.upload_id ?? raw?.id ?? ""),
+      upload_id: uploadPk,
       teacher_label: raw?.teacher_label ?? base?.teacher_label ?? null,
       course_label: raw?.course_label ?? base?.course_label ?? null,
       subject: raw?.subject ?? base?.subject ?? null,
@@ -218,7 +261,8 @@ export default function DashboardUtpPage() {
   async function fetchInstruments() {
     const reportRes = await fetch("/api/dashboard/utp/instruments", { cache: "no-store" })
     const reportJson = await reportRes.json()
-    const data = Array.isArray(reportJson?.items) ? reportJson.items.map(normalizeInstrumentItem) : []
+    const raw = Array.isArray(reportJson?.items) ? filterNonArchivedInstrumentRows(reportJson.items) : []
+    const data = raw.map(normalizeInstrumentItem)
     console.log("DATOS RECUPERADOS PARA LA TABLA:", data)
     setReports(data)
   }
@@ -234,22 +278,57 @@ export default function DashboardUtpPage() {
         fetch("/api/dashboard/utp/evaluation-batches", { cache: "no-store" }),
       ])
       const json = await auditRes.json()
+      setCurrentOrganizationId(
+        typeof json?.organization_id === "string" && json.organization_id.trim() !== ""
+          ? json.organization_id
+          : null
+      )
+      setCurrentSchoolId(typeof json?.school_id === "string" && json.school_id.trim() !== "" ? json.school_id : null)
       const reportJson = await reportRes.json()
-      const data = Array.isArray(reportJson?.items) ? reportJson.items.map(normalizeInstrumentItem) : []
+      const rawItems = Array.isArray(reportJson?.items) ? filterNonArchivedInstrumentRows(reportJson.items) : []
+      const data = rawItems.map(normalizeInstrumentItem)
       console.log("DATOS RECUPERADOS PARA LA TABLA:", data)
 
       try {
+        let latestBatchId: string | null = null
         if (batchesRes.ok) {
           const bj = (await batchesRes.json()) as { groups?: EvalLotGroup[]; orphans?: EvalOrphanRow[] }
-          setEvalLotGroups(Array.isArray(bj?.groups) ? bj.groups : [])
+          const groups = Array.isArray(bj?.groups) ? bj.groups : []
+          setEvalLotGroups(groups)
           setEvalOrphans(Array.isArray(bj?.orphans) ? bj.orphans : [])
+          const sortedByDate = [...groups].sort((a, b) => {
+            const ta = a.evaluated_at ? new Date(a.evaluated_at).getTime() : 0
+            const tb = b.evaluated_at ? new Date(b.evaluated_at).getTime() : 0
+            return tb - ta
+          })
+          latestBatchId = sortedByDate.find((g) => g.batch_id)?.batch_id ?? null
         } else {
           setEvalLotGroups([])
           setEvalOrphans([])
         }
+        const schoolId = String((json?.school_id as string | null | undefined) ?? "").trim()
+        if (schoolId) {
+          setSchoolAnalyticsLoading(true)
+          const qs = new URLSearchParams({ school_id: schoolId })
+          if (latestBatchId) qs.set("batch_id", latestBatchId)
+          try {
+            const schoolRes = await fetch(`/api/dashboard/direccion/school-pedagogy?${qs.toString()}`, { cache: "no-store" })
+            const sj = (await schoolRes.json()) as SchoolAnalyticsPayload
+            setSchoolAnalytics(schoolRes.ok ? sj : null)
+          } catch {
+            setSchoolAnalytics(null)
+          } finally {
+            setSchoolAnalyticsLoading(false)
+          }
+        } else {
+          setSchoolAnalytics(null)
+          setSchoolAnalyticsLoading(false)
+        }
       } catch {
         setEvalLotGroups([])
         setEvalOrphans([])
+        setSchoolAnalytics(null)
+        setSchoolAnalyticsLoading(false)
       }
 
       let omrSemaforo: { insuficiente: number; elemental: number; adecuado: number; total: number } | null = null
@@ -319,6 +398,8 @@ export default function DashboardUtpPage() {
       }
     } catch {
       setError("Error de red al cargar auditoría")
+      setCurrentOrganizationId(null)
+      setCurrentSchoolId(null)
       setRows([])
       setRiskRows([])
       setCoberturaInstitucionalOmr(null)
@@ -327,6 +408,8 @@ export default function DashboardUtpPage() {
       setPaesProyectadoOmr(0)
       setEvalLotGroups([])
       setEvalOrphans([])
+      setSchoolAnalytics(null)
+      setSchoolAnalyticsLoading(false)
     } finally {
       setLoading(false)
     }
@@ -343,6 +426,7 @@ export default function DashboardUtpPage() {
       /* noop */
     }
     setOutcomesRefresh((x) => x + 1)
+    router.refresh()
     void loadUtpDashboard()
   }
 
@@ -351,7 +435,62 @@ export default function DashboardUtpPage() {
       setDetailTab("juez")
     }
     setUtpLotDraftIds(null)
+    setUtpLotDraftAssessmentType(null)
   }, [selectedReport?.id])
+
+  function handleUseBatchInLink(group: EvalLotGroup) {
+    const batchId = group.batch_id ?? "sin-batch-id"
+    console.log("Iniciando vínculo para el lote:", batchId)
+    setBatchLinkStatus(null)
+    setBatchLinkPending(group)
+    setShowBatchLinkModal(true)
+  }
+
+  async function confirmBatchLink(choice: BatchLinkChoice) {
+    const pending = batchLinkPending
+    if (!pending) {
+      setShowBatchLinkModal(false)
+      return
+    }
+    const report = selectedReport ?? reports[0] ?? null
+    const batchId = pending.batch_id ?? "sin-batch-id"
+    const category = choice
+    const endpoint = "/api/dashboard/utp/instruments"
+    try {
+      setBatchLinkSaving(true)
+      setBatchLinkStatus("Vinculando lote...")
+      console.log("Enviando vínculo...", { batchId, category })
+      const res = await fetch(endpoint, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          report_id: report?.id ?? null,
+          evaluation_ids: pending.evaluation_ids,
+          assessment_type: category,
+          batch_id: pending.batch_id,
+          organization_id: currentOrganizationId ?? "PENDING",
+          school_id: currentSchoolId,
+          report_title: `Vínculo Automático - ${pending.title}`,
+        }),
+      })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok || !j?.ok) {
+        console.warn("Vinculación de lote no confirmada por servidor:", j?.error ?? res.statusText)
+        setBatchLinkStatus("No se pudo confirmar el vínculo. Reintentando no bloquea el flujo.")
+      } else {
+        setUtpLotDraftIds([...pending.evaluation_ids])
+        setUtpLotDraftAssessmentType(choice === "SIMCE" ? "SIMCE" : "PAES")
+        setShowBatchLinkModal(false)
+        setBatchLinkPending(null)
+        setDetailTab("aula")
+      }
+    } catch {
+      setBatchLinkStatus("Error de red temporal al vincular lote.")
+    } finally {
+      setBatchLinkSaving(false)
+      window.location.reload()
+    }
+  }
 
   async function annexOrphanToBatch(evaluationId: string, targetBatchId: string) {
     try {
@@ -368,6 +507,50 @@ export default function DashboardUtpPage() {
       void loadUtpDashboard()
     } catch {
       alert("Error de red al anexar.")
+    }
+  }
+
+  async function archiveBatch(batchId: string, title: string) {
+    const ok = window.confirm(`¿Archivar el lote "${title}"? Esta acción lo ocultará de la bandeja.`)
+    if (!ok) return
+    setArchivingBatchId(batchId)
+    try {
+      const res = await fetch("/api/dashboard/utp/archive-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batch_id: batchId }),
+      })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok || !j?.ok) {
+        alert(j?.error ?? "No se pudo archivar el lote.")
+        return
+      }
+      void loadUtpDashboard()
+    } catch {
+      alert("Error de red al archivar lote.")
+    } finally {
+      setArchivingBatchId(null)
+    }
+  }
+
+  async function archiveAllBatches() {
+    const confirmed = window.confirm("¡ATENCIÓN! Esto archivará todos los lotes y reseteará los velocímetros a 0. ¿Estás seguro?")
+    if (!confirmed) return
+    setArchivingAll(true)
+    try {
+      const res = await fetch("/api/dashboard/utp/archive-all", {
+        method: "POST",
+      })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok || !j?.ok) {
+        alert(j?.error ?? "No se pudo archivar toda la bandeja.")
+        return
+      }
+      void loadUtpDashboard()
+    } catch {
+      alert("Error de red al limpiar la bandeja.")
+    } finally {
+      setArchivingAll(false)
     }
   }
 
@@ -405,17 +588,79 @@ export default function DashboardUtpPage() {
     }
   }
 
+  async function archiveInstrument(uploadId: string) {
+    const ok = window.confirm(
+      "¿Estás seguro de eliminar esta PRUEBA BASE por completo? Los profesores ya no podrán verla para escanear",
+    )
+    if (!ok) return
+    setArchivingInstrumentId(uploadId)
+    try {
+      const res = await fetch("/api/dashboard/utp/instruments/archive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: uploadId }),
+      })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok || !j?.ok) {
+        alert(j?.error ?? "No se pudo archivar el instrumento.")
+        return
+      }
+      setSelectedReport((prev) => {
+        if (prev && String(prev.upload_id ?? "").trim() === uploadId) return null
+        return prev
+      })
+      await fetchInstruments()
+      router.refresh()
+    } catch {
+      alert("Error de red al archivar instrumento.")
+    } finally {
+      setArchivingInstrumentId(null)
+    }
+  }
+
+  async function archiveAllInstruments() {
+    const ok = window.confirm("¿Estás seguro? Esto ocultará todas las pruebas base actuales")
+    if (!ok) return
+    setArchivingAllInstruments(true)
+    try {
+      const res = await fetch("/api/dashboard/utp/instruments/archive-all", {
+        method: "POST",
+      })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok || !j?.ok) {
+        alert(j?.error ?? "No se pudo archivar la lista completa.")
+        return
+      }
+      await fetchInstruments()
+      router.refresh()
+    } catch {
+      alert("Error de red al archivar todos los instrumentos.")
+    } finally {
+      setArchivingAllInstruments(false)
+    }
+  }
+
   return (
     <section className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-xl font-semibold">Auditoría UTP</h2>
-        <button
-          type="button"
-          onClick={() => syncRealData()}
-          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-800 hover:bg-slate-50"
-        >
-          Sincronizar Datos Reales
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void archiveAllBatches()}
+            disabled={archivingAll}
+            className="rounded-md border border-rose-300 bg-rose-50 px-3 py-1.5 text-sm font-medium text-rose-800 hover:bg-rose-100 disabled:opacity-60"
+          >
+            {archivingAll ? "Limpiando…" : "Limpiar Toda la Bandeja"}
+          </button>
+          <button
+            type="button"
+            onClick={() => syncRealData()}
+            className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-800 hover:bg-slate-50"
+          >
+            Sincronizar Datos Reales
+          </button>
+        </div>
       </div>
       <UtpPendingBatchReleasesPanel refreshTrigger={outcomesRefresh} />
       {loading && <p className="text-sm text-[var(--text-muted)]">Cargando auditoría...</p>}
@@ -470,6 +715,93 @@ export default function DashboardUtpPage() {
           {uploadResult && <span className="text-sm text-[var(--text-muted)]">{uploadResult}</span>}
         </div>
       </div>
+      {!loading && (
+        <div className="rounded-xl border border-[var(--border-color)] bg-white overflow-hidden shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3">
+            <div>
+              <h3 className="font-semibold">Pruebas base (instrumentos)</h3>
+              <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                Listado principal: columna <strong>Acciones</strong> archiva la prueba completa (no solo preguntas del
+                editor). Registros en <code className="text-[11px]">utp_instrument_uploads</code>.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void archiveAllInstruments()}
+              disabled={archivingAllInstruments || reports.length === 0}
+              className="rounded-md bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50 disabled:pointer-events-none"
+            >
+              {archivingAllInstruments ? "Archivando…" : "Archivar todos los instrumentos viejos"}
+            </button>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead className="bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th className="text-left px-4 py-3 font-semibold">Resumen / título</th>
+                  <th className="text-left px-4 py-3 font-semibold">Profesor</th>
+                  <th className="text-left px-4 py-3 font-semibold">Curso</th>
+                  <th className="text-left px-4 py-3 font-semibold">Asignatura</th>
+                  <th className="text-left px-4 py-3 font-semibold">Archivo</th>
+                  <th className="text-left px-4 py-3 font-semibold">Fecha</th>
+                  <th className="text-right px-4 py-3 font-semibold w-32">BORRAR</th>
+                </tr>
+              </thead>
+              <tbody>
+                {reports.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-8 text-[var(--text-muted)]">
+                      No hay pruebas base visibles. Suba un instrumento arriba o reactive archivados en BD si aplica.
+                    </td>
+                  </tr>
+                ) : (
+                  reports.map((r) => {
+                    const doc = r.content ?? {}
+                    const summary = String(doc.analysis_summary ?? "").trim()
+                    const label = summary.length > 80 ? `${summary.slice(0, 80)}…` : summary || r.file_name || "—"
+                    const uploadId = String(r.upload_id ?? "").trim()
+                    return (
+                      <tr key={uploadId || r.id} className="border-t border-[var(--border-color)] hover:bg-slate-50/80">
+                        <td className="px-4 py-3 max-w-xs">
+                          <span className="font-medium text-slate-900 line-clamp-2">{label}</span>
+                        </td>
+                        <td className="px-4 py-3 text-[var(--text-muted)]">{r.teacher_label ?? "—"}</td>
+                        <td className="px-4 py-3 text-[var(--text-muted)]">{r.course_label ?? "—"}</td>
+                        <td className="px-4 py-3 text-[var(--text-muted)]">{r.subject ?? "—"}</td>
+                        <td className="px-4 py-3 text-[var(--text-muted)] text-xs">{r.file_name ?? "—"}</td>
+                        <td className="px-4 py-3 text-[var(--text-muted)] whitespace-nowrap">
+                          {r.created_at ? new Date(r.created_at).toLocaleString("es-CL") : "—"}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <button
+                            type="button"
+                            title="Borrar prueba base completa de la lista"
+                            aria-label="Borrar prueba base completa"
+                            disabled={!uploadId || archivingInstrumentId === uploadId}
+                            className="inline-flex items-center justify-center gap-2 rounded-md bg-red-500 px-3 py-2 text-white shadow-sm hover:bg-red-600 disabled:opacity-50 disabled:pointer-events-none"
+                            onClick={() => void archiveInstrument(uploadId)}
+                          >
+                            {archivingInstrumentId === uploadId ? (
+                              <span className="text-sm font-bold px-1">…</span>
+                            ) : (
+                              <>
+                                <span className="text-base leading-none font-extrabold" aria-hidden>
+                                  X
+                                </span>
+                                <Trash2 className="h-4 w-4 shrink-0" aria-hidden />
+                              </>
+                            )}
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
       {!loading && !error && (
         <div className="space-y-2">
           {omrLiveActive ? (
@@ -543,6 +875,37 @@ export default function DashboardUtpPage() {
           </div>
         </div>
       )}
+      {!loading && !error && (
+        <div className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm">
+          <h3 className="font-semibold">Analítica por Colegio (habilidades)</h3>
+          <p className="text-xs text-[var(--text-muted)] mt-1">
+            Vista directa por <code>school_id</code> y último <code>batch_id</code> detectado (sin depender de aprobación de lote).
+          </p>
+          {schoolAnalyticsLoading ? (
+            <p className="text-sm text-[var(--text-muted)] mt-3">Cargando analítica…</p>
+          ) : !schoolAnalytics || schoolAnalytics.by_skill.length === 0 ? (
+            <p className="text-sm text-[var(--text-muted)] mt-3">Sin datos de habilidades para el colegio/lote actual.</p>
+          ) : (
+            <div className="mt-3 space-y-2">
+              <p className="text-xs text-[var(--text-muted)]">
+                school_id: <strong>{schoolAnalytics.school_id ?? "—"}</strong> · batch_id:{" "}
+                <strong>{schoolAnalytics.batch_id_filter ?? "último disponible"}</strong> · filas:{" "}
+                <strong>{schoolAnalytics.skill_result_rows ?? 0}</strong>
+              </p>
+              <div className="grid gap-3 md:grid-cols-3">
+                {schoolAnalytics.by_skill.slice(0, 6).map((r, i) => (
+                  <article key={`${r.skill_name}-${i}`} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                    <p className="text-xs text-[var(--text-muted)]">{r.subject ?? "—"}</p>
+                    <p className="text-sm font-semibold text-slate-900">{r.skill_name}</p>
+                    <p className="mt-1 text-2xl font-bold text-indigo-700">{Math.round(Number(r.avg_logro_pct ?? 0))}%</p>
+                    <p className="text-xs text-[var(--text-muted)]">{r.student_result_rows} registros</p>
+                  </article>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       {!loading && !error && (evalLotGroups.length > 0 || evalOrphans.length > 0) && (
         <div className="rounded-xl border border-[var(--border-color)] bg-white overflow-hidden">
           <div className="px-4 py-3 border-b bg-slate-50">
@@ -576,9 +939,21 @@ export default function DashboardUtpPage() {
                     <button
                       type="button"
                       className="text-xs rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-sky-900 hover:bg-sky-100 ml-auto"
-                      onClick={() => setUtpLotDraftIds([...g.evaluation_ids])}
+                      onClick={() => handleUseBatchInLink(g)}
                     >
                       Usar lote en vínculo
+                    </button>
+                    <button
+                      type="button"
+                      title="Archivar lote"
+                      disabled={!g.batch_id || archivingBatchId === g.batch_id}
+                      className="text-xs rounded-md border border-rose-300 bg-rose-50 px-2 py-1 text-rose-800 hover:bg-rose-100 disabled:opacity-60"
+                      onClick={() => {
+                        if (!g.batch_id) return
+                        void archiveBatch(g.batch_id, g.title)
+                      }}
+                    >
+                      {archivingBatchId === g.batch_id ? "…" : "✕"}
                     </button>
                   </div>
                   {open && (
@@ -626,6 +1001,48 @@ export default function DashboardUtpPage() {
               </ul>
             </div>
           )}
+        </div>
+      )}
+      {showBatchLinkModal && batchLinkPending && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-4 shadow-xl">
+            <h4 className="text-base font-semibold text-slate-900">Confirmar categoría del lote</h4>
+            <p className="mt-1 text-sm text-slate-600">
+              Lote: <strong>{batchLinkPending.title}</strong>. Selecciona categoría para precargar el vínculo.
+            </p>
+            {batchLinkStatus ? (
+              <p className="mt-2 text-xs text-slate-600">{batchLinkStatus}</p>
+            ) : null}
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={batchLinkSaving}
+                className="rounded-md bg-sky-700 px-3 py-2 text-sm font-medium text-white hover:bg-sky-800 disabled:opacity-60"
+                onClick={() => confirmBatchLink("SIMCE")}
+              >
+                {batchLinkSaving ? "Vinculando..." : "Vincular como SIMCE"}
+              </button>
+              <button
+                type="button"
+                disabled={batchLinkSaving}
+                className="rounded-md bg-indigo-700 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-800 disabled:opacity-60"
+                onClick={() => confirmBatchLink("PAES")}
+              >
+                Vincular como PAES
+              </button>
+              <button
+                type="button"
+                disabled={batchLinkSaving}
+                className="ml-auto rounded-md border border-slate-300 px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-60"
+                onClick={() => {
+                  setShowBatchLinkModal(false)
+                  setBatchLinkPending(null)
+                }}
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
         </div>
       )}
       {!loading && !error && (
@@ -677,28 +1094,48 @@ export default function DashboardUtpPage() {
           </table>
         </div>
       )}
-      {!loading && !error && (
+      {!loading && (
         <div className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm">
-          <h3 className="font-semibold">Análisis 360° (El Juez)</h3>
-          <p className="text-xs text-[var(--text-muted)] mb-3">
-            Hallazgos preventivos, sustento normativo y diagnóstico de causa raíz.
-          </p>
+          <div className="mb-3">
+            <h3 className="font-semibold">Análisis 360° (El Juez)</h3>
+            <p className="text-xs text-[var(--text-muted)]">
+              Misma lista que arriba: el botón rojo quita la prueba completa de la bandeja (no es borrar preguntas del
+              informe).
+            </p>
+          </div>
           {reports.length === 0 ? (
             <p className="text-sm text-[var(--text-muted)]">Aún no hay informes auditados.</p>
           ) : (
             <div className="space-y-3">
-              {reports.slice(0, 5).map((r) => {
+              {reports.map((r) => {
                 const doc = r.content ?? {}
                 const rc = juezRootCause(doc)
                 const qQual = asArray<{ issue: string; severity: string; evidence: string }>(doc.question_quality)
                 const cAlign = asArray<{ check: string; status: string; detail: string }>(doc.curricular_alignment)
+                const cardUploadId = String(r.upload_id ?? "").trim()
                 return (
                 <article key={r.id} className="rounded-lg border border-[var(--border-color)] p-3">
-                  <div className="flex items-center justify-between">
-                    <p className="font-medium">{String(doc.analysis_summary ?? "")}</p>
-                    <span className="text-xs text-[var(--text-muted)]">
-                      {r.created_at ? new Date(r.created_at).toLocaleString("es-CL") : "—"}
-                    </span>
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <p className="font-medium min-w-0 flex-1">{String(doc.analysis_summary ?? "")}</p>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-xs text-[var(--text-muted)] whitespace-nowrap">
+                        {r.created_at ? new Date(r.created_at).toLocaleString("es-CL") : "—"}
+                      </span>
+                      <button
+                        type="button"
+                        title="Archivar prueba base completa"
+                        aria-label="Archivar prueba base completa"
+                        disabled={!cardUploadId || archivingInstrumentId === cardUploadId}
+                        className="inline-flex items-center justify-center rounded-md bg-red-600 p-2 text-white hover:bg-red-700 disabled:opacity-50"
+                        onClick={() => void archiveInstrument(cardUploadId)}
+                      >
+                        {archivingInstrumentId === cardUploadId ? (
+                          <span className="text-xs font-semibold px-0.5">…</span>
+                        ) : (
+                          <Trash2 className="h-4 w-4" aria-hidden />
+                        )}
+                      </button>
+                    </div>
                   </div>
                   <div className="mt-2">
                     <span
@@ -785,7 +1222,10 @@ export default function DashboardUtpPage() {
                   <button
                     type="button"
                     className="text-xs underline text-sky-800 ml-auto"
-                    onClick={() => setUtpLotDraftIds(null)}
+                    onClick={() => {
+                      setUtpLotDraftIds(null)
+                      setUtpLotDraftAssessmentType(null)
+                    }}
                   >
                     Quitar selección de lote
                   </button>
@@ -794,10 +1234,15 @@ export default function DashboardUtpPage() {
               <EvaluationLinkSelector
                 reportId={selectedReport.id}
                 linkedEvaluationIds={utpLotDraftIds ?? getLinkedEvalIds(selectedReport)}
-                linkedAssessmentType={getLinkedAssessmentType(selectedReport)}
-                onSaved={(payload) => {
+                linkedAssessmentType={utpLotDraftAssessmentType ?? getLinkedAssessmentType(selectedReport)}
+                onSaved={(payload: { evaluation_ids: string[]; assessment_type?: string | null }) => {
                   setUtpLotDraftIds(null)
+                  setUtpLotDraftAssessmentType(null)
                   setOutcomesRefresh((x) => x + 1)
+                  void loadUtpDashboard()
+                  router.refresh()
+                  alert("Vínculo UTP guardado correctamente.")
+                  window.location.reload()
                   setSelectedReport((prev) => {
                     if (!prev) return null
                     const baseContent = { ...(prev.content ?? {}) }

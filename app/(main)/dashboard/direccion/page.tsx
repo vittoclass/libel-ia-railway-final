@@ -159,6 +159,12 @@ export default function DashboardDireccionPage() {
         <h2 className="text-xl font-semibold">Dirección - Resumen Ejecutivo</h2>
         <div className="flex flex-wrap items-center gap-2">
           <Link
+            href="/dashboard/direccion/analitica-colegio"
+            className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-sm font-medium text-indigo-900 hover:bg-indigo-100"
+          >
+            Analítica por colegio
+          </Link>
+          <Link
             href="/dashboard/direccion/trazabilidad"
             className="rounded-md border border-sky-200 bg-sky-50 px-3 py-1.5 text-sm font-medium text-sky-900 hover:bg-sky-100"
           >

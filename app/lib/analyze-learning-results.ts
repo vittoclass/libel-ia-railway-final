@@ -21,6 +21,7 @@ export interface SourceExamItemWithPedagogy {
   item_text?: string | null
   axis_label?: string | null
   skill_label?: string | null
+  cognitive_level?: string | null
   max_score?: number | null
   rubric_text?: string | null
   pedagogical?: PedagogicalMetadata
@@ -91,6 +92,21 @@ const LOGRO_WEAK_PCT = 50
 const MIN_QUESTIONS_FOR_STRENGTH = 1
 const EXIGENCIA_DEFAULT_DECIMAL = 0.6
 
+const SKILL_CANONICAL_ALIASES: Record<string, string> = {
+  LECTOR: "LECTURA",
+  LECTORA: "LECTURA",
+  "COMPRENSION LECTORA": "LECTURA",
+  "COMPRENSION DE LECTURA": "LECTURA",
+  "RESOLUCION DE PROBLEMAS": "RESOLUCION DE PROBLEMAS",
+  LOCALIZARINFORMACION: "LOCALIZAR INFORMACION",
+}
+
+const AXIS_CANONICAL_ALIASES: Record<string, string> = {
+  NUMEROS: "NUMEROS Y OPERACIONES",
+  NUMERACION: "NUMEROS Y OPERACIONES",
+  LECTOR: "LECTURA",
+}
+
 // DATA_NORMALIZATION_V2: normaliza texto pedagogico para usar como llave de agrupacion.
 export function normalizePedagogicalText(text: string): string {
   // LOGICA_ANTERIOR_LOCAL: se agrupaba con el texto tal cual.
@@ -107,6 +123,20 @@ export function normalizePedagogicalText(text: string): string {
     // DATA_NORMALIZATION_V2: fallback seguro para no romper render.
     return text
   }
+}
+
+function canonicalizePedagogicalDimension(text: string, dimension: "skill" | "axis"): string {
+  const normalized = normalizePedagogicalText(text)
+  if (!normalized) return normalized
+  if (dimension === "skill") return SKILL_CANONICAL_ALIASES[normalized] ?? normalized
+  return AXIS_CANONICAL_ALIASES[normalized] ?? normalized
+}
+
+/** Misma etiqueta canónica que usan los gráficos de logro pedagógico (habilidad). */
+export function canonicalPedagogicalSkillDisplayLabel(raw: string | null | undefined): string {
+  const s = String(raw ?? "").trim() || "—"
+  const canon = canonicalizePedagogicalDimension(s, "skill")
+  return formatPedagogicalDisplayText(canon)
 }
 
 // DATA_NORMALIZATION_V2: formato de visualizacion estable (mantiene tildes si existen).
@@ -198,10 +228,17 @@ export function analyzeLearningResults(
     if (Number.isNaN(qn)) continue
     const source = sourceByNumber.get(qn)
     const axisRaw = source?.axis_label?.trim() || "Sin eje"
-    const skillRaw = source?.pedagogical?.skill || source?.skill_label?.trim() || "Sin habilidad"
-    const axis = formatPedagogicalDisplayText(axisRaw)
-    const skill = formatPedagogicalDisplayText(skillRaw)
-    const cognitiveLevel = source?.pedagogical?.cognitive_level || "aplicar"
+    const skillLabelDb = (source?.skill_label ?? "").trim()
+    const skillRaw =
+      skillLabelDb.length > 0 ? skillLabelDb : String(source?.pedagogical?.skill ?? "").trim() || "Sin habilidad"
+    const axisCanonical = canonicalizePedagogicalDimension(axisRaw, "axis")
+    const skillCanonical = canonicalizePedagogicalDimension(skillRaw, "skill")
+    const axis = formatPedagogicalDisplayText(axisCanonical)
+    const skill = formatPedagogicalDisplayText(skillCanonical)
+    const cognitiveDb = (source?.cognitive_level ?? "").trim()
+    const cognitiveLevelRaw =
+      cognitiveDb.length > 0 ? cognitiveDb : String(source?.pedagogical?.cognitive_level ?? "").trim() || "aplicar"
+    const cognitiveLevel = formatPedagogicalDisplayText(cognitiveLevelRaw)
     const scoreMaxSource = Number(source?.max_score) || 0
     const { obtained, max } = normalizeScoreObtained(ei, scoreMaxSource || 1)
     // LOGICA_ANTERIOR_LOCAL: const logroPct = max > 0 ? Math.round((obtained / max) * 100) : 0
@@ -231,8 +268,8 @@ export function analyzeLearningResults(
         count: cur.count + 1,
       })
     }
-    addAgg(skillMap, normalizePedagogicalText(skill), obtained, max)
-    addAgg(axisMap, normalizePedagogicalText(axis), obtained, max)
+    addAgg(skillMap, canonicalizePedagogicalDimension(skill, "skill"), obtained, max)
+    addAgg(axisMap, canonicalizePedagogicalDimension(axis, "axis"), obtained, max)
     addAgg(cognitiveMap, cognitiveLevel, obtained, max)
   }
 

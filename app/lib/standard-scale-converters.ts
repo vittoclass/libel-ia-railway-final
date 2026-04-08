@@ -4,7 +4,10 @@
  * No altera nota 1.0-7.0 ni OMR; solo transforma porcentaje de logro.
  */
 
-export type SimceLevel = "Adecuado" | "Elemental" | "Insatisfactorio"
+import { agencyAchievementLevelFromLogroPct } from "@/app/lib/chile-standards/agency-level-cuts"
+
+/** Nivel de desempeño por logro % (cortes Agencia: &lt;50 · 50–69 · ≥70). */
+export type SimceLevel = "Adecuado" | "Elemental" | "Insuficiente"
 
 export function clampLogroPctFromScores(scoreObtained: number, scoreMax: number): number {
   if (!Number.isFinite(scoreObtained) || !Number.isFinite(scoreMax) || scoreMax <= 0) return 0
@@ -14,17 +17,17 @@ export function clampLogroPctFromScores(scoreObtained: number, scoreMax: number)
 
 export function projectPaesFromLogroPct(logroPct: number): number {
   const pct = Math.max(0, Math.min(100, logroPct))
+  /** Piso 100 (escala PAES institucional 100–1000); evita 0 cuando hay logro registrado. */
   return Math.round(100 + (pct / 100) * 900)
 }
 
 export function projectSimceFromLogroPct(logroPct: number): number {
   const pct = Math.max(0, Math.min(100, logroPct))
-  return Math.round((pct / 100) * 400)
+  /** Misma forma que el velocímetro institucional: 200 (0% logro) → 350 (100% logro). */
+  return Math.floor(200 + (pct / 100) * 150)
 }
 
 export function simceLevelFromLogroPct(logroPct: number): SimceLevel {
-  if (logroPct >= 75) return "Adecuado"
-  if (logroPct >= 50) return "Elemental"
-  return "Insatisfactorio"
+  return agencyAchievementLevelFromLogroPct(logroPct)
 }
 
