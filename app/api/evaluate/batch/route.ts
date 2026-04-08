@@ -29,6 +29,7 @@ export async function POST(req: NextRequest) {
 
   // Regla de oro: /api/evaluate obtiene user y profile desde cookies; NO inyectar teacher_id/school_id en el body.
   // Solo reenviar las cookies para que cada item se guarde con el mismo user_id y profile.teacher_id.
+  // getAuthUser() usa cliente read-only (supabase-route) para no llamar cookies().set dentro del stream.
   const itemsToProcess = items
   const totalBatches = Math.ceil(itemsToProcess.length / BATCH_SIZE)
 
