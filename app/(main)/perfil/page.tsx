@@ -54,6 +54,7 @@ export default function PerfilPage() {
   const [initError, setInitError] = useState<string | null>(null)
   const [fullName, setFullName] = useState("")
   const [schoolName, setSchoolName] = useState("")
+  const [schoolNameLocked, setSchoolNameLocked] = useState(false)
   const [department, setDepartment] = useState("")
   const [submitLoading, setSubmitLoading] = useState(false)
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
@@ -126,6 +127,16 @@ export default function PerfilPage() {
 
       const onboarded = Boolean(data.onboarded)
       setProfileOnboarded(onboarded)
+      const pilot = data.pilotSchool as
+        | { id?: string; name?: string; schoolNameLocked?: boolean }
+        | null
+        | undefined
+      if (pilot?.schoolNameLocked && pilot?.name && typeof pilot.name === "string") {
+        setSchoolName(pilot.name)
+        setSchoolNameLocked(true)
+      } else {
+        setSchoolNameLocked(false)
+      }
       setLoadState("ready")
     } catch (e) {
       const text = e instanceof Error ? e.message : "No se pudo cargar el perfil."
@@ -277,14 +288,19 @@ export default function PerfilPage() {
                   />
                 </div>
                 <div>
-                  <Label htmlFor="school_name">Colegio / Establecimiento *</Label>
+                  <Label htmlFor="school_name">
+                    Colegio / Establecimiento
+                    {schoolNameLocked ? " (piloto)" : " *"}
+                  </Label>
                   <Input
                     id="school_name"
                     value={schoolName}
                     onChange={(e) => setSchoolName(e.target.value)}
-                    placeholder="Ej. Liceo San José"
-                    required
-                    className="mt-1"
+                    placeholder={schoolNameLocked ? undefined : "Ej. Liceo San José"}
+                    readOnly={schoolNameLocked}
+                    disabled={schoolNameLocked}
+                    required={!schoolNameLocked}
+                    className="mt-1 bg-muted/40 disabled:opacity-100 disabled:cursor-not-allowed"
                   />
                 </div>
                 <div>

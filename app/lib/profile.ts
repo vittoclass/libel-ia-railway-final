@@ -2,6 +2,7 @@ import { User } from "@supabase/supabase-js"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { DEFAULT_PROFILE_ROLE } from "@/app/lib/profile-defaults"
+import { resolvePilotSchool } from "@/app/lib/pilot-school"
 
 export type ProfileRow = {
   id: string | null
@@ -72,9 +73,11 @@ export async function getOrCreateProfile(): Promise<{
   if (process.env.NODE_ENV === "development") {
     console.info("[profile][lib] no profile row, inserting")
   }
+  const pilot = await resolvePilotSchool(supabase)
   const { error: insertErr } = await supabase.from("profiles").insert({
     user_id: user.id,
     role: DEFAULT_PROFILE_ROLE,
+    ...(pilot ? { school_id: pilot.id } : {}),
   })
 
   if (insertErr) {

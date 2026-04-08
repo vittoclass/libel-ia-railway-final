@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { resolvePilotSchool } from "@/app/lib/pilot-school"
 
 export const dynamic = "force-dynamic"
 
@@ -46,38 +47,49 @@ export async function POST(req: NextRequest) {
   const tName = typeof teacherName === "string" ? teacherName.trim() : ""
   const sName = typeof schoolName === "string" ? schoolName.trim() : ""
 
-  if (!tName || !sName) {
-    return NextResponse.json(
-      { step: "internal", error: "teacherName y schoolName son requeridos" },
-      { status: 400 }
-    )
-  }
-
   try {
-    // 1) Buscar o crear school por name
-    const { data: existingSchool } = await supabase
-      .from("schools")
-      .select("id")
-      .eq("name", sName)
-      .limit(1)
-      .maybeSingle()
+    const pilot = await resolvePilotSchool(supabase)
 
     let schoolId: string
-    if (existingSchool?.id) {
-      schoolId = existingSchool.id
+    if (pilot) {
+      schoolId = pilot.id
     } else {
-      const { data: newSchool, error: schoolErr } = await supabase
-        .from("schools")
-        .insert({ name: sName })
-        .select("id")
-        .single()
-      if (schoolErr || !newSchool?.id) {
+      if (!tName || !sName) {
         return NextResponse.json(
-          { step: "school", error: schoolErr?.message ?? "Error al crear escuela" },
-          { status: 500 }
-        );
+          { step: "internal", error: "teacherName y schoolName son requeridos" },
+          { status: 400 }
+        )
       }
-      schoolId = newSchool.id
+      const { data: existingSchool } = await supabase
+        .from("schools")
+        .select("id")
+        .eq("name", sName)
+        .limit(1)
+        .maybeSingle()
+
+      if (existingSchool?.id) {
+        schoolId = existingSchool.id
+      } else {
+        const { data: newSchool, error: schoolErr } = await supabase
+          .from("schools")
+          .insert({ name: sName })
+          .select("id")
+          .single()
+        if (schoolErr || !newSchool?.id) {
+          return NextResponse.json(
+            { step: "school", error: schoolErr?.message ?? "Error al crear escuela" },
+            { status: 500 }
+          )
+        }
+        schoolId = newSchool.id
+      }
+    }
+
+    if (!tName) {
+      return NextResponse.json(
+        { step: "internal", error: "teacherName es requerido" },
+        { status: 400 }
+      )
     }
 
     // 2) Buscar o crear teacher por (school_id, name)

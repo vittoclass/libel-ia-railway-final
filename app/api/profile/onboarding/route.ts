@@ -3,6 +3,8 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { DEFAULT_PROFILE_ROLE } from "@/app/lib/profile-defaults"
+import { resolvePilotSchool } from "@/app/lib/pilot-school"
 
 export const dynamic = "force-dynamic"
 
@@ -23,11 +25,8 @@ export async function POST(req: NextRequest) {
   const schoolName = typeof body.school_name === "string" ? body.school_name.trim() : ""
   const department = typeof body.department === "string" ? body.department.trim() || null : null
 
-  if (!fullName || !schoolName) {
-    return NextResponse.json(
-      { error: "Nombre del profesor y nombre del colegio son obligatorios" },
-      { status: 400 }
-    )
+  if (!fullName) {
+    return NextResponse.json({ error: "El nombre del profesor es obligatorio" }, { status: 400 })
   }
 
   const supabase = getSupabaseServer()
@@ -35,66 +34,101 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Supabase no configurado" }, { status: 503 })
   }
 
-  // Obtener o crear escuela por nombre
-  const { data: existingSchool } = await supabase
-    .from("schools")
+  const pilot = await resolvePilotSchool(supabase)
+
+  let schoolId: string
+  if (pilot) {
+    schoolId = pilot.id
+  } else {
+    if (!schoolName) {
+      return NextResponse.json(
+        { error: "Nombre del profesor y nombre del colegio son obligatorios" },
+        { status: 400 }
+      )
+    }
+    const { data: existingSchool } = await supabase
+      .from("schools")
+      .select("id")
+      .ilike("name", schoolName)
+      .limit(1)
+      .maybeSingle()
+
+    if (existingSchool?.id) {
+      schoolId = existingSchool.id
+    } else {
+      const { data: newSchool, error: schoolErr } = await supabase
+        .from("schools")
+        .insert({ name: schoolName })
+        .select("id")
+        .single()
+      if (schoolErr || !newSchool?.id) {
+        return NextResponse.json(
+          { error: "No se pudo crear el colegio: " + (schoolErr?.message ?? "unknown") },
+          { status: 500 }
+        )
+      }
+      schoolId = newSchool.id
+    }
+  }
+
+  const { data: existingTeacher } = await supabase
+    .from("teachers")
     .select("id")
-    .ilike("name", schoolName)
+    .eq("school_id", schoolId)
+    .eq("name", fullName)
     .limit(1)
     .maybeSingle()
 
-  let schoolId: string
-  if (existingSchool?.id) {
-    schoolId = existingSchool.id
+  let teacherId: string
+  if (existingTeacher?.id) {
+    teacherId = existingTeacher.id
   } else {
-    const { data: newSchool, error: schoolErr } = await supabase
-      .from("schools")
-      .insert({ name: schoolName })
+    const { data: newTeacher, error: teacherErr } = await supabase
+      .from("teachers")
+      .insert({ school_id: schoolId, name: fullName })
       .select("id")
       .single()
-    if (schoolErr || !newSchool?.id) {
+
+    if (teacherErr || !newTeacher?.id) {
       return NextResponse.json(
-        { error: "No se pudo crear el colegio: " + (schoolErr?.message ?? "unknown") },
+        { error: "No se pudo crear el profesor: " + (teacherErr?.message ?? "unknown") },
         { status: 500 }
       )
     }
-    schoolId = newSchool.id
+    teacherId = newTeacher.id
   }
 
-  // Crear profesor vinculado al colegio
-  const { data: newTeacher, error: teacherErr } = await supabase
-    .from("teachers")
-    .insert({ school_id: schoolId, name: fullName })
-    .select("id")
-    .single()
-
-  if (teacherErr || !newTeacher?.id) {
-    return NextResponse.json(
-      { error: "No se pudo crear el profesor: " + (teacherErr?.message ?? "unknown") },
-      { status: 500 }
-    )
-  }
-
-  // Actualizar perfil: teacher_id, school_id, department
-  const { error: profileErr } = await supabase
+  const { data: existingProfile } = await supabase
     .from("profiles")
-    .update({
-      teacher_id: newTeacher.id,
+    .select("role")
+    .eq("user_id", user.id)
+    .maybeSingle()
+  const role =
+    existingProfile != null && typeof (existingProfile as { role?: string }).role === "string"
+      ? (existingProfile as { role: string }).role
+      : DEFAULT_PROFILE_ROLE
+
+  const { error: profileErr } = await supabase.from("profiles").upsert(
+    {
+      user_id: user.id,
+      teacher_id: teacherId,
       school_id: schoolId,
       department,
-    })
-    .eq("user_id", user.id)
+      role,
+    },
+    { onConflict: "user_id" }
+  )
 
   if (profileErr) {
     return NextResponse.json(
-      { error: "No se pudo actualizar el perfil: " + profileErr.message },
+      { error: "No se pudo guardar el perfil: " + profileErr.message },
       { status: 500 }
     )
   }
 
   return NextResponse.json({
     success: true,
-    teacher_id: newTeacher.id,
+    teacher_id: teacherId,
     school_id: schoolId,
     message: "Perfil completado. Ya puedes guardar evaluaciones.",
   })

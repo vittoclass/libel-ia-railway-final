@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { DEFAULT_PROFILE_ROLE } from "@/app/lib/profile-defaults"
+import { resolvePilotSchool } from "@/app/lib/pilot-school"
 
 export const dynamic = "force-dynamic"
 
@@ -88,9 +89,11 @@ export async function GET() {
   }
 
   if (!profileRow) {
+    const pilot = await resolvePilotSchool(supabase)
     const { error: insertErr } = await supabase.from("profiles").insert({
       user_id: user.id,
       role: DEFAULT_PROFILE_ROLE,
+      ...(pilot ? { school_id: pilot.id } : {}),
     })
 
     if (insertErr) {
@@ -145,12 +148,18 @@ export async function GET() {
   const roleNorm = String(finalProfile.role ?? "").toLowerCase()
   const onboarded = !!finalProfile.teacher_id
 
+  const pilotSchool = await resolvePilotSchool(supabase)
+
   return NextResponse.json(
     {
       profile: finalProfile,
       user: { id: user.id, email: user.email ?? null },
       isAdmin: roleNorm === "admin",
       onboarded,
+      pilotSchool:
+        pilotSchool != null
+          ? { id: pilotSchool.id, name: pilotSchool.name, schoolNameLocked: true as const }
+          : null,
     },
     { status: 200, headers: CACHE_HEADERS }
   )

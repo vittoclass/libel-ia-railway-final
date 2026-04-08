@@ -12,7 +12,9 @@ const supabaseHost = supabaseUrl ? new URL(supabaseUrl).host : "(no url)"
 /**
  * GET /api/evaluations/list
  * Query: course_id, subject, status, from_date, to_date, search (título).
- * Autentica con cookies; re-lee profile desde BD; lista evaluaciones del teacher_id del perfil.
+ * Autentica con cookies; re-lee profile desde BD.
+ * Lista evaluaciones compartidas por colegio: teacher_id del perfil, user_id del usuario,
+ * o school_id del perfil (p. ej. pruebas base del piloto visibles para todo el colegio).
  */
 export async function GET(req: NextRequest) {
   const { user } = await getOrCreateProfile()
@@ -67,11 +69,18 @@ export async function GET(req: NextRequest) {
 
   const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s)
 
-  // Incluir evaluaciones del teacher_id del perfil O del user_id (por si hay filas con user_id pero teacher_id distinto/null)
+  const schoolIdRaw = profileRow?.school_id != null ? String(profileRow.school_id).trim() : ""
+  const school_id_used = schoolIdRaw !== "" && isUuid(schoolIdRaw) ? schoolIdRaw : null
+
+  const orFilters = [`teacher_id.eq.${teacher_id_used}`, `user_id.eq.${user.id}`]
+  if (school_id_used) {
+    orFilters.push(`school_id.eq.${school_id_used}`)
+  }
+
   let query = supabase
     .from("evaluations")
     .select("id, title, course_id, course_label, subject, evaluated_at, status")
-    .or(`teacher_id.eq.${teacher_id_used},user_id.eq.${user.id}`)
+    .or(orFilters.join(","))
     .order("evaluated_at", { ascending: false })
 
   if (courseId) query = isUuid(courseId) ? query.eq("course_id", courseId) : query.eq("course_label", courseId)
@@ -89,7 +98,7 @@ export async function GET(req: NextRequest) {
         step: "list",
         message: res.error.message,
         details: (res.error as { details?: string })?.details ?? null,
-        ...(isDev && { debug: { teacher_id_used, supabaseHost, hasServiceRole } }),
+        ...(isDev && { debug: { teacher_id_used, school_id_used, supabaseHost, hasServiceRole } }),
       },
       { status: 500 }
     )
@@ -112,7 +121,7 @@ export async function GET(req: NextRequest) {
           step: "summaries",
           message: sumRes.error.message,
           details: (sumRes.error as { details?: string })?.details ?? null,
-          ...(isDev && { debug: { teacher_id_used, supabaseHost, hasServiceRole } }),
+          ...(isDev && { debug: { teacher_id_used, school_id_used, supabaseHost, hasServiceRole } }),
         },
         { status: 500 }
       )
@@ -153,7 +162,7 @@ export async function GET(req: NextRequest) {
     {
       evaluations: withGrade,
       isAdmin: false,
-      ...(isDev && { debug: { teacher_id_used, rows: withGrade.length, supabaseHost, hasServiceRole } }),
+      ...(isDev && { debug: { teacher_id_used, school_id_used, rows: withGrade.length, supabaseHost, hasServiceRole } }),
     },
     { status: 200, headers: { "Cache-Control": "no-store" } }
   )
