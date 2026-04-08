@@ -18,7 +18,9 @@ interface BatchItem {
 }
 
 export async function POST(req: NextRequest) {
+  console.log("[evaluate/batch] ANTES req.json()")
   const { items } = await req.json() as { items: BatchItem[] }
+  console.log("[evaluate/batch] DESPUÉS req.json()", { itemCount: Array.isArray(items) ? items.length : 0 })
 
   if (!items || items.length === 0) {
     return new Response(
@@ -37,6 +39,13 @@ export async function POST(req: NextRequest) {
   const encoder = new TextEncoder()
   const stream = new ReadableStream({
     async start(controller) {
+      try {
+      console.log("[evaluate/batch] Stream start", {
+        totalItems: itemsToProcess.length,
+        totalBatches,
+        batchSize: BATCH_SIZE,
+        nota: "Mistral / Supabase / imágenes ocurren dentro de cada POST /api/evaluate",
+      })
       // Enviar metadata inicial
       const metaLine: EvaluateBatchNdjsonMeta = {
         type: "meta",
@@ -45,6 +54,7 @@ export async function POST(req: NextRequest) {
         batchSize: BATCH_SIZE,
       }
       controller.enqueue(encoder.encode(JSON.stringify(metaLine) + "\n"))
+      console.log("[evaluate/batch] DESPUÉS enqueue meta NDJSON")
 
       let completedCount = 0
 
@@ -53,18 +63,36 @@ export async function POST(req: NextRequest) {
         const batchStart = batchIndex * BATCH_SIZE
         const batchEnd = Math.min(batchStart + BATCH_SIZE, itemsToProcess.length)
         const currentBatch = itemsToProcess.slice(batchStart, batchEnd)
+        console.log("[evaluate/batch] ANTES lote paralelo", {
+          batchIndex: batchIndex + 1,
+          totalBatches,
+          slice: [batchStart, batchEnd],
+          groupIds: currentBatch.map((i) => i.groupId),
+        })
 
         // Procesar batch en paralelo
         const promises = currentBatch.map(async (item) => {
           try {
             const cookieHeader = req.headers.get("cookie") || ""
+            const evaluateUrl = new URL("/api/evaluate", req.url).toString()
+            console.log("[evaluate/batch] ANTES fetch /api/evaluate", { groupId: item.groupId, evaluateUrl })
             const response = await fetch(new URL("/api/evaluate", req.url), {
               method: "POST",
               headers: { "Content-Type": "application/json", ...(cookieHeader ? { Cookie: cookieHeader } : {}) },
               body: JSON.stringify(item.payload),
             })
+            console.log("[evaluate/batch] DESPUÉS fetch /api/evaluate", {
+              groupId: item.groupId,
+              ok: response.ok,
+              status: response.status,
+            })
 
+            console.log("[evaluate/batch] ANTES response.json()", { groupId: item.groupId })
             const data = await response.json()
+            console.log("[evaluate/batch] DESPUÉS response.json()", {
+              groupId: item.groupId,
+              success: !!(data as { success?: boolean }).success,
+            })
 
             if (data.success) {
               return {
@@ -82,6 +110,11 @@ export async function POST(req: NextRequest) {
               }
             }
           } catch (error: any) {
+            console.error("[evaluate/batch] catch item fetch/json", {
+              groupId: item.groupId,
+              message: error?.message,
+              stack: typeof error?.stack === "string" ? error.stack.slice(0, 500) : undefined,
+            })
             return {
               type: "result",
               groupId: item.groupId,
@@ -92,19 +125,41 @@ export async function POST(req: NextRequest) {
         })
 
         // Esperar resultados del batch actual
+        console.log("[evaluate/batch] ANTES Promise.all(lote)", { batchIndex: batchIndex + 1 })
         const results = await Promise.all(promises)
+        console.log("[evaluate/batch] DESPUÉS Promise.all(lote)", { batchIndex: batchIndex + 1, n: results.length })
 
         // Enviar cada resultado al stream
         for (const result of results) {
           completedCount++
           controller.enqueue(encoder.encode(JSON.stringify(result) + "\n"))
         }
+        console.log("[evaluate/batch] DESPUÉS enqueue resultados lote", {
+          batchIndex: batchIndex + 1,
+          completedCount,
+        })
       }
 
       const doneLine: EvaluateBatchNdjsonDone = { type: "done", completedCount }
       controller.enqueue(encoder.encode(JSON.stringify(doneLine) + "\n"))
+      console.log("[evaluate/batch] Stream cerrado OK", { completedCount })
 
       controller.close()
+      } catch (streamErr) {
+        console.error("[evaluate/batch] FATAL en stream start()", {
+          message: streamErr instanceof Error ? streamErr.message : String(streamErr),
+          stack: streamErr instanceof Error ? streamErr.stack?.slice(0, 800) : undefined,
+        })
+        try {
+          controller.error(streamErr instanceof Error ? streamErr : new Error(String(streamErr)))
+        } catch {
+          try {
+            controller.close()
+          } catch {
+            /* ignore */
+          }
+        }
+      }
     },
   })
 
@@ -112,7 +167,8 @@ export async function POST(req: NextRequest) {
     headers: {
       "Content-Type": "application/x-ndjson",
       "Transfer-Encoding": "chunked",
-      "Cache-Control": "no-cache",
+      "Cache-Control": "no-cache, no-store",
+      Connection: "keep-alive",
     },
   })
 }

@@ -67,14 +67,31 @@ function retroalimentacionEjecutivaSoloAlternativas(): {
   }
 }
 
-/** Reintentos para 502/503/429 (overload/servicio no disponible). */
+/** Si la llamada HTTP a Mistral supera este tiempo, se asume IA/red colgada (logs Railway). */
+const MISTRAL_FETCH_TIMEOUT_MS = 25_000
+
+function mergeAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+  const anyFn = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any
+  if (typeof anyFn === "function") return anyFn([a, b])
+  return b
+}
+
+/** Reintentos para 502/503/429 (overload/servicio no disponible). Timeout por intento: ERROR_MISTRAL_TIMEOUT. */
 async function fetchMistralWithRetry(url: string, init: RequestInit): Promise<Response> {
   const maxRetries = 3
   const retryStatuses = [502, 503, 429]
   let lastError: Error | null = null
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const timeoutController = new AbortController()
+    const timeoutId = setTimeout(() => timeoutController.abort(), MISTRAL_FETCH_TIMEOUT_MS)
+    console.log("[evaluate][Mistral] ANTES fetch", { attempt, maxRetries, timeoutMs: MISTRAL_FETCH_TIMEOUT_MS })
     try {
-      const res = await fetch(url, init)
+      const signal = init.signal
+        ? mergeAbortSignals(init.signal, timeoutController.signal)
+        : timeoutController.signal
+      const res = await fetch(url, { ...init, signal })
+      clearTimeout(timeoutId)
+      console.log("[evaluate][Mistral] DESPUÉS fetch", { attempt, ok: res.ok, status: res.status })
       if (res.ok) return res
       const body = await res.text()
       const errMsg = `Mistral API error: ${res.status} - ${body.slice(0, 300)}`
@@ -83,13 +100,22 @@ async function fetchMistralWithRetry(url: string, init: RequestInit): Promise<Re
       }
       const delayMs = 2000 * Math.pow(2, attempt - 1)
       console.warn(`[Mistral] ${res.status} (intento ${attempt}/${maxRetries}), reintento en ${delayMs}ms`)
-      await new Promise(r => setTimeout(r, delayMs))
+      await new Promise((r) => setTimeout(r, delayMs))
     } catch (e) {
+      clearTimeout(timeoutId)
+      const abortedByTimeout = timeoutController.signal.aborted
+      const isAbortError =
+        e instanceof Error && (e.name === "AbortError" || (e as { code?: string }).code === "ABORT_ERR")
+      if (abortedByTimeout && isAbortError) {
+        console.error("[evaluate][Mistral] ERROR_MISTRAL_TIMEOUT", { attempt, url: url.slice(0, 96) })
+        throw new Error("ERROR_MISTRAL_TIMEOUT")
+      }
       lastError = e instanceof Error ? e : new Error(String(e))
+      if (lastError.message === "ERROR_MISTRAL_TIMEOUT") throw lastError
       if (attempt === maxRetries) throw lastError
       const delayMs = 2000 * Math.pow(2, attempt - 1)
       console.warn(`[Mistral] Error (intento ${attempt}/${maxRetries}):`, lastError.message)
-      await new Promise(r => setTimeout(r, delayMs))
+      await new Promise((r) => setTimeout(r, delayMs))
     }
   }
   throw lastError || new Error("Mistral API error: servicio no disponible")
@@ -443,7 +469,9 @@ async function resolveToImageBase64List(
   for (let i = 0; i < fileUrls.length; i++) {
     const url = fileUrls[i]
     const mime = fileMimeTypes?.[i]
+    console.log("[evaluate][imagen] ANTES fileToImageBase64List", { index: i, mime: mime ?? null })
     const pages = await fileToImageBase64List(url, mime)
+    console.log("[evaluate][imagen] DESPUÉS fileToImageBase64List", { index: i, pageCount: pages.length })
     list.push(...pages)
   }
   return list
@@ -519,7 +547,9 @@ async function loadAuthoritativeTeacherKeyFromSourceExam(
 async function getImageBase64ForVision(url: string): Promise<string> {
   const base64 = await urlToBase64(url)
   if (isPdfBase64(base64)) {
+    console.log("[evaluate][imagen] ANTES fileToImageBase64List (PDF→visión)")
     const pages = await fileToImageBase64List(url, "application/pdf")
+    console.log("[evaluate][imagen] DESPUÉS fileToImageBase64List (PDF→visión)", { pageCount: pages.length })
     if (pages.length === 0) throw new Error("El PDF no pudo convertirse a imágenes.")
     return pages[0]
   }
@@ -1355,7 +1385,13 @@ export async function POST(req: NextRequest) {
       )
     }
 
+    console.log("[evaluate] ANTES req.json()")
     const body = await req.json()
+    console.log("[evaluate] DESPUÉS req.json()", {
+      fileUrlsLen: Array.isArray((body as { fileUrls?: unknown }).fileUrls)
+        ? (body as { fileUrls: unknown[] }).fileUrls.length
+        : 0,
+    })
     const {
       fileUrls = [],
       fileMimeTypes = [],
@@ -1425,16 +1461,20 @@ export async function POST(req: NextRequest) {
     let effectiveTeacherId: string | null = null
     let effectiveSchoolId: string | null = null
     let authUserId: string | null = null
+    console.log("[evaluate] ANTES getAuthUser (Supabase auth cookies / read-only)")
     const user = await getAuthUser()
+    console.log("[evaluate] DESPUÉS getAuthUser", { hasUser: !!user })
     if (user) {
       authUserId = user.id
       const supabase = getSupabaseServer()
       if (supabase) {
+        console.log("[evaluate] ANTES Supabase profiles SELECT")
         const { data: profile } = await supabase
           .from("profiles")
           .select("teacher_id, school_id")
           .eq("user_id", user.id)
           .maybeSingle()
+        console.log("[evaluate] DESPUÉS Supabase profiles SELECT", { hasTeacherId: !!profile?.teacher_id })
         if (profile?.teacher_id) {
           effectiveTeacherId = profile.teacher_id
           effectiveSchoolId = profile.school_id ?? null
@@ -2424,6 +2464,7 @@ export async function POST(req: NextRequest) {
           console.info("[student] detected_students_raw =", JSON.stringify([result.nombreEstudianteDetectado].filter(Boolean)))
           console.info("[student] confirmed_students_before_save =", JSON.stringify(confirmedStudentName ? [confirmedStudentName] : []))
         }
+        console.log("[evaluate] ANTES persistEvaluation (Supabase service role)")
         saveResult = await persistEvaluation(result, {
           user_id: authUserId,
           teacher_id: effectiveTeacherId,
@@ -2441,6 +2482,7 @@ export async function POST(req: NextRequest) {
               ? sourceExamIdBody.trim()
               : null,
         })
+        console.log("[evaluate] DESPUÉS persistEvaluation", { saved: saveResult.saved })
       } catch (e) {
         if (process.env.NODE_ENV !== "production") console.error("[Evaluate] persistEvaluation threw:", e)
         saveResult = {

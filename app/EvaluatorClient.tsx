@@ -3293,7 +3293,32 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       })
 
       if (!response.ok || !response.body) {
-        const errBody = await response.text().catch(() => "")
+        const errRaw = await response.text().catch(() => "")
+        let errorData: unknown = errRaw
+        try {
+          const t = errRaw.trim()
+          if (t.startsWith("{") || t.startsWith("[")) errorData = JSON.parse(t) as unknown
+        } catch {
+          /* mantener texto */
+        }
+        const serialized =
+          typeof errorData === "string" ? errorData : JSON.stringify(errorData, null, 2)
+        console.error(
+          "══════════════════════════════════════════════════════════════════════",
+          "\n[evaluate/batch] FETCH FALLIDO — HTTP",
+          response.status,
+          response.statusText,
+          "\nCUERPO (servidor):",
+          errorData,
+          "\nSERIALIZADO:\n",
+          serialized,
+          "\n══════════════════════════════════════════════════════════════════════",
+        )
+        window.alert(
+          `[evaluate/batch] HTTP ${response.status} ${response.statusText}\n\n` +
+            serialized.slice(0, 8000) +
+            (serialized.length > 8000 ? "\n…(truncado en alert, ver consola)…" : ""),
+        )
         reportEvaluateDiagnostic({
           phase: "evaluar_batch_http_error",
           urlAttempted: batchEvaluateUrlAttempted,
@@ -3301,10 +3326,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           fetchPathUsed: "/api/evaluate/batch",
           responseStatus: response.status,
           responseStatusText: response.statusText,
-          responseBodyFromServer: errBody.slice(0, 120_000),
+          responseBodyFromServer: serialized.slice(0, 120_000),
           hint: !response.body ? "Respuesta sin body legible para streaming" : "HTTP no OK en /api/evaluate/batch",
         })
-        throw new Error("Error HTTP " + response.status + ": " + response.statusText)
+        throw new Error(`Error HTTP ${response.status}: ${response.statusText} — ${serialized.slice(0, 500)}`)
       }
 
       // Leer stream NDJSON: acumular actualizaciones de grupos y aplicarlas en requestAnimationFrame (menos re-renders).
