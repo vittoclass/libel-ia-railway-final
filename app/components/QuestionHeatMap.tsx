@@ -30,6 +30,7 @@ const LEVEL_STYLES = {
 
 type Props = {
   items: QuestionHeatMapItem[]
+  totalQuestions?: number
 }
 
 function safeHeatMapLabel(value: unknown, fallback = "—"): string {
@@ -71,20 +72,37 @@ function HeatMapLegend() {
   )
 }
 
-export function QuestionHeatMap({ items }: Props) {
+export function QuestionHeatMap({ items, totalQuestions }: Props) {
   const sorted = React.useMemo(
     () => [...items].sort((a, b) => a.item_number - b.item_number),
     [items]
   )
 
   if (sorted.length === 0) return null
+  const maxItem = Math.max(
+    1,
+    totalQuestions && Number.isFinite(totalQuestions) ? Math.floor(totalQuestions) : 0,
+    ...sorted.map((q) => q.item_number),
+  )
+  const byNum = new Map(sorted.map((q) => [q.item_number, q] as const))
+  const aligned: QuestionHeatMapItem[] = []
+  for (let i = 1; i <= maxItem; i++) {
+    aligned.push(
+      byNum.get(i) ?? {
+        item_number: i,
+        logro_pct: 0,
+        axis: "—",
+        skill: "—",
+      },
+    )
+  }
 
   return (
     <div className="rounded-md border bg-[var(--bg-muted)] p-4">
       <HeatMapLegend />
       <TooltipProvider delayDuration={200}>
         <div className="grid grid-cols-5 sm:grid-cols-8 md:grid-cols-10 gap-1.5 w-full">
-          {sorted.map((q) => {
+          {aligned.map((q) => {
             const level = getHeatMapLevel(q.logro_pct)
             const style = LEVEL_STYLES[level]
             const axis = safeHeatMapLabel(q.axis, "—")

@@ -17,6 +17,9 @@ import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 import { MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT, MOBILE_CAPTURE_PAGE_CHOICES } from "@/app/lib/docente/mobile-scan-constants"
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const MOBILE_UPLOAD_MAX_DIMENSION = 1280
+const MOBILE_UPLOAD_JPEG_QUALITY = 0.72
+const MOBILE_UPLOAD_MAX_RETRIES = 3
 
 type ProfileIds = { teacher_id: string; school_id: string; user_id: string }
 
@@ -71,6 +74,78 @@ export function MovilScanClient({ initialBatchId }: Props) {
     fileRef.current?.click()
   }
 
+  const optimizeCaptureForUpload = useCallback(async (file: File): Promise<File> => {
+    if (!file.type.startsWith("image/")) return file
+    try {
+      const bitmap = await createImageBitmap(file)
+      const maxSide = Math.max(bitmap.width, bitmap.height)
+      const scale = maxSide > MOBILE_UPLOAD_MAX_DIMENSION ? MOBILE_UPLOAD_MAX_DIMENSION / maxSide : 1
+      const targetW = Math.max(1, Math.round(bitmap.width * scale))
+      const targetH = Math.max(1, Math.round(bitmap.height * scale))
+      const canvas = document.createElement("canvas")
+      canvas.width = targetW
+      canvas.height = targetH
+      const ctx = canvas.getContext("2d")
+      if (!ctx) return file
+      ctx.drawImage(bitmap, 0, 0, targetW, targetH)
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob(resolve, "image/jpeg", MOBILE_UPLOAD_JPEG_QUALITY),
+      )
+      if (!blob) return file
+      return new File([blob], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" })
+    } catch {
+      return file
+    }
+  }, [])
+
+  const sleep = useCallback((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)), [])
+
+  const uploadWithRetry = useCallback(
+    async (storagePath: string, file: File) => {
+      let lastError: string | null = null
+      for (let attempt = 1; attempt <= MOBILE_UPLOAD_MAX_RETRIES; attempt++) {
+        const { error: upErr } = await supabase.storage.from(BATCH_SCANS_BUCKET).upload(storagePath, file, {
+          cacheControl: "3600",
+          upsert: false,
+          contentType: file.type || "image/jpeg",
+        })
+        if (!upErr) return null
+        lastError = upErr.message
+        if (attempt < MOBILE_UPLOAD_MAX_RETRIES) {
+          await sleep(400 * attempt)
+        }
+      }
+      return lastError ?? "Falló la subida de imagen."
+    },
+    [sleep, supabase],
+  )
+
+  const insertRowWithRetry = useCallback(
+    async (row: {
+      batch_id: string
+      school_id: string
+      teacher_id: string
+      storage_path: string
+      content_type: string
+      file_size: number
+      created_by: string
+      student_index: number
+      page_index: number
+    }) => {
+      let lastError: string | null = null
+      for (let attempt = 1; attempt <= MOBILE_UPLOAD_MAX_RETRIES; attempt++) {
+        const { error: insErr } = await supabase.from("batch_photo_uploads").insert(row)
+        if (!insErr) return null
+        lastError = insErr.message
+        if (attempt < MOBILE_UPLOAD_MAX_RETRIES) {
+          await sleep(400 * attempt)
+        }
+      }
+      return lastError ?? "Falló el registro de la foto en lote."
+    },
+    [sleep, supabase],
+  )
+
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     e.target.value = ""
@@ -82,20 +157,18 @@ export function MovilScanClient({ initialBatchId }: Props) {
 
     setUploading(true)
     setError(null)
-    setLastOk(null)
+    // ACK inmediato: la UI responde al instante y la subida sigue en segundo plano.
+    setLastOk(`Captura recibida (alumno ${studentIndex}, foto ${pageIndex}). Subiendo...`)
 
     try {
-      const ext = file.type.includes("png") ? "png" : file.type.includes("webp") ? "webp" : "jpg"
+      const optimizedFile = await optimizeCaptureForUpload(file)
+      const ext = optimizedFile.type.includes("png") ? "png" : optimizedFile.type.includes("webp") ? "webp" : "jpg"
       const objectName = `s${studentIndex}_p${pageIndex}_${crypto.randomUUID()}.${ext}`
       const storagePath = `${profile.teacher_id}/${batchId}/${objectName}`
 
-      const { error: upErr } = await supabase.storage.from(BATCH_SCANS_BUCKET).upload(storagePath, file, {
-        cacheControl: "3600",
-        upsert: false,
-        contentType: file.type || "image/jpeg",
-      })
-      if (upErr) {
-        setError(upErr.message)
+      const uploadErr = await uploadWithRetry(storagePath, optimizedFile)
+      if (uploadErr) {
+        setError(uploadErr)
         setUploading(false)
         return
       }
@@ -108,16 +181,16 @@ export function MovilScanClient({ initialBatchId }: Props) {
         school_id: profile.school_id,
         teacher_id: profile.teacher_id,
         storage_path: storagePath,
-        content_type: file.type,
-        file_size: file.size,
+        content_type: optimizedFile.type,
+        file_size: optimizedFile.size,
         created_by: uid,
         student_index: studentIndex,
         page_index: pageIndex,
       }
 
-      const { error: insErr } = await supabase.from("batch_photo_uploads").insert(row)
-      if (insErr) {
-        setError(insErr.message)
+      const insertErr = await insertRowWithRetry(row)
+      if (insertErr) {
+        setError(insertErr)
         setUploading(false)
         return
       }

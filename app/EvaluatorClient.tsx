@@ -1366,6 +1366,8 @@ function mapSourceExamApiRowsToInputs(rows: unknown[]): EvaluationBaseSourceExam
 
 /** Alineado con batch secuencial: meta.batchSize = 1 (app/api/evaluate/batch/route.ts). */
 const EVALUATE_BATCH_PARALLEL_SIZE = 1
+const SEQUENTIAL_EVALUATION_DELAY_MS = 1200
+const MOBILE_BATCH_SYNC_TIMEOUT_MS = 15000
 
 export default function EvaluatorClient() {
   const enablePedagogy = process.env.NEXT_PUBLIC_ENABLE_PEDAGOGY === "true"
@@ -1482,6 +1484,7 @@ export default function EvaluatorClient() {
   const logoInputRef = useRef<HTMLInputElement>(null)
   const supabaseBrowser = React.useMemo(() => createClientComponentClient(), [])
   const mobileBatchSyncingRef = useRef(false)
+  const mobileBatchSyncPendingRef = useRef(false)
   const syncMobileBatchPhotosRef = useRef<() => Promise<void>>(async () => {})
   const {
     evaluate,
@@ -2080,7 +2083,7 @@ export default function EvaluatorClient() {
         const j = await r.json()
         if (cancelled) return
         setHistorialProfile({ profile: j.profile, user: j.user })
-        if (j.profile?.teacher_id) {
+        if (j.user) {
           const q = new URLSearchParams()
           if (historialFilters.courseId) q.set("courseId", historialFilters.courseId)
           if (historialFilters.from) q.set("from", historialFilters.from)
@@ -2510,10 +2513,18 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   const syncMobileBatchPhotos = useCallback(async () => {
     const batchId = evaluationBatchIdRef.current
-    if (!batchId || !isDocenteBatchUuid(batchId) || mobileBatchSyncingRef.current) return
+    if (!batchId || !isDocenteBatchUuid(batchId)) return
+    if (mobileBatchSyncingRef.current) {
+      mobileBatchSyncPendingRef.current = true
+      return
+    }
     mobileBatchSyncingRef.current = true
     try {
-      const r = await fetch(`/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}`)
+      const controller = new AbortController()
+      const timeoutId = window.setTimeout(() => controller.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
+      const r = await fetch(`/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}`, {
+        signal: controller.signal,
+      }).finally(() => window.clearTimeout(timeoutId))
       const j = (await r.json().catch(() => ({}))) as {
         error?: string
         photos?: Array<{
@@ -2558,7 +2569,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         if (!p.signed_url) continue
         if (knownMobilePhotoIds.has(p.id)) continue
         try {
-          const fr = await fetch(p.signed_url)
+          const photoController = new AbortController()
+          const photoTimeoutId = window.setTimeout(() => photoController.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
+          const fr = await fetch(p.signed_url, { signal: photoController.signal }).finally(() =>
+            window.clearTimeout(photoTimeoutId),
+          )
           if (!fr.ok) continue
           const blob = await fr.blob()
           const ext = (p.storage_path?.split(".").pop() || "jpg").replace(/[^a-z0-9]/gi, "") || "jpg"
@@ -2596,6 +2611,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       setUnassignedFiles(nextUnassigned)
     } finally {
       mobileBatchSyncingRef.current = false
+      if (mobileBatchSyncPendingRef.current) {
+        mobileBatchSyncPendingRef.current = false
+        void syncMobileBatchPhotosRef.current()
+      }
     }
   }, [toast])
 
@@ -2608,7 +2627,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
     const t = window.setInterval(() => {
       void syncMobileBatchPhotos()
-    }, 20000)
+    }, 5000)
     return () => window.clearInterval(t)
   }, [activeTab, evaluationBatchIdUi, syncMobileBatchPhotos])
 
@@ -2898,7 +2917,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     }
 
     const group = studentGroups.find((g) => g.id === groupId)
-    if (!group || group.files.length === 0) return
+    if (!group || group.files.length === 0) return false
 
     setStudentGroups((prev) =>
       prev.map((g) => (g.id === groupId ? { ...g, isEvaluating: true, isEvaluated: false, error: undefined } : g)),
@@ -3108,6 +3127,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         }
       }),
     )
+    return !!result.success
   }
 
   // Función para manejar evaluación masiva: servidor ejecuta un estudiante tras otro (sin fetch interno)
@@ -3578,6 +3598,60 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     }
   }
 
+  const handleEvaluateGroupsSequential = async (groupIDsToEvaluate: string[]) => {
+    const validGroups = studentGroups.filter(
+      (g) => groupIDsToEvaluate.includes(g.id) && g.files.length > 0,
+    )
+    if (validGroups.length === 0) return
+
+    setBatchProgress({
+      isActive: true,
+      totalItems: validGroups.length,
+      completedItems: 0,
+      successCount: 0,
+      errorCount: 0,
+      currentBatch: 1,
+      totalBatches: validGroups.length,
+    })
+
+    let completed = 0
+    let successCount = 0
+    let errorCount = 0
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+    try {
+      for (const group of validGroups) {
+        try {
+          const ok = await handleEvaluateSingleGroup(group.id)
+          if (ok) successCount++
+          else errorCount++
+        } catch (err) {
+          errorCount++
+          const errMsg = err instanceof Error ? err.message : "Error en evaluación secuencial"
+          setStudentGroups((prev) =>
+            prev.map((g) => (g.id === group.id ? { ...g, isEvaluating: false, error: errMsg } : g)),
+          )
+        } finally {
+          completed++
+          setBatchProgress((prev) => ({
+            ...prev,
+            completedItems: completed,
+            successCount,
+            errorCount,
+            currentBatch: completed > 0 ? completed : 1,
+            totalBatches: validGroups.length,
+          }))
+        }
+
+        if (completed < validGroups.length) {
+          await sleep(SEQUENTIAL_EVALUATION_DELAY_MS)
+        }
+      }
+    } finally {
+      setBatchProgress((prev) => ({ ...prev, isActive: false }))
+    }
+  }
+
   const onEvaluateAll = async () => {
     if (batchProgress.isActive || isLoading) return
     const groupsToEvaluate = studentGroups
@@ -3594,7 +3668,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     if (validationGroup) {
       await handleEvaluateSingleGroup(validationGroup.id)
     } else {
-      await handleEvaluateGroups(groupsToEvaluate)
+      await handleEvaluateGroupsSequential(groupsToEvaluate)
     }
   }
 

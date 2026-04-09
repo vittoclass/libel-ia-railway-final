@@ -13,8 +13,8 @@ const supabaseHost = supabaseUrl ? new URL(supabaseUrl).host : "(no url)"
  * GET /api/evaluations/list
  * Query: course_id, subject, status, from_date, to_date, search (título).
  * Autentica con cookies; re-lee profile desde BD.
- * Lista evaluaciones sin filtro por usuario. Si el perfil tiene school_id válido,
- * filtra por ese colegio; si no, trae todas las evaluaciones.
+ * Lista evaluaciones en scope seguro: por school_id del perfil; si falta school_id,
+ * cae a teacher_id del perfil. Nunca lista global.
  */
 export async function GET(req: NextRequest) {
   const { user } = await getOrCreateProfile()
@@ -58,8 +58,21 @@ export async function GET(req: NextRequest) {
 
   const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s)
 
+  const teacherIdRaw = profileRow?.teacher_id != null ? String(profileRow.teacher_id).trim() : ""
+  const teacher_id_used = teacherIdRaw !== "" && isUuid(teacherIdRaw) ? teacherIdRaw : null
   const schoolIdRaw = profileRow?.school_id != null ? String(profileRow.school_id).trim() : ""
   const school_id_used = schoolIdRaw !== "" && isUuid(schoolIdRaw) ? schoolIdRaw : null
+  if (!school_id_used && !teacher_id_used) {
+    return NextResponse.json(
+      {
+        evaluations: [],
+        reason: "PROFILE_NOT_ONBOARDED",
+        message: "Completa tu perfil para ver evaluaciones del colegio.",
+        ...(isDev && { debug: { school_id_used: null, teacher_id_used: null, rows: 0, supabaseHost, hasServiceRole } }),
+      },
+      { status: 200 },
+    )
+  }
 
   let query = supabase
     .from("evaluations")
@@ -67,6 +80,7 @@ export async function GET(req: NextRequest) {
     .order("evaluated_at", { ascending: false })
 
   if (school_id_used) query = query.eq("school_id", school_id_used)
+  else if (teacher_id_used) query = query.eq("teacher_id", teacher_id_used)
 
   if (courseId) query = isUuid(courseId) ? query.eq("course_id", courseId) : query.eq("course_label", courseId)
   if (subject) query = query.eq("subject", subject)
@@ -77,13 +91,24 @@ export async function GET(req: NextRequest) {
 
   const res = await query
 
+  if (isDev) {
+    console.info("[evaluations/list][raw]", {
+      school_id_used,
+      teacher_id_used,
+      filters: { courseId, subject, statusFilter, fromDate, toDate, search },
+      error: res.error?.message ?? null,
+      rows: Array.isArray(res.data) ? res.data.length : 0,
+      sample: Array.isArray(res.data) && res.data.length > 0 ? res.data[0] : null,
+    })
+  }
+
   if (res.error) {
     return NextResponse.json(
       {
         step: "list",
         message: res.error.message,
         details: (res.error as { details?: string })?.details ?? null,
-        ...(isDev && { debug: { school_id_used, supabaseHost, hasServiceRole } }),
+        ...(isDev && { debug: { school_id_used, teacher_id_used, supabaseHost, hasServiceRole } }),
       },
       { status: 500 }
     )
@@ -106,7 +131,7 @@ export async function GET(req: NextRequest) {
           step: "summaries",
           message: sumRes.error.message,
           details: (sumRes.error as { details?: string })?.details ?? null,
-          ...(isDev && { debug: { school_id_used, supabaseHost, hasServiceRole } }),
+          ...(isDev && { debug: { school_id_used, teacher_id_used, supabaseHost, hasServiceRole } }),
         },
         { status: 500 }
       )
@@ -147,7 +172,7 @@ export async function GET(req: NextRequest) {
     {
       evaluations: withGrade,
       isAdmin: false,
-      ...(isDev && { debug: { school_id_used, rows: withGrade.length, supabaseHost, hasServiceRole } }),
+      ...(isDev && { debug: { school_id_used, teacher_id_used, rows: withGrade.length, supabaseHost, hasServiceRole } }),
     },
     { status: 200, headers: { "Cache-Control": "no-store" } }
   )

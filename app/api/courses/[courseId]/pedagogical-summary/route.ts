@@ -68,6 +68,123 @@ type NationalAnalyticsRow = {
 }
 
 type DimensionKey = "axis" | "skill" | "cognitive_level"
+type ExamMode = "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+
+type ItemAnalysisCourseRow = {
+  item_number: number
+  correct_answer: string | null
+  pct_correct: number
+  pct_wrong: number
+  pct_omitted: number
+  biserial_xc: number | null
+  distractors: { A: number; B: number; C: number; D: number; E: number }
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10
+}
+
+function normalizeOption(raw: unknown): "A" | "B" | "C" | "D" | "E" | null {
+  if (raw == null) return null
+  const s = String(raw).trim().toUpperCase()
+  if (s === "A" || s === "B" || s === "C" || s === "D" || s === "E") return s
+  return null
+}
+
+function pearsonCorrelation(xs: number[], ys: number[]): number | null {
+  const n = xs.length
+  if (n < 2 || ys.length !== n) return null
+  const meanX = xs.reduce((a, b) => a + b, 0) / n
+  const meanY = ys.reduce((a, b) => a + b, 0) / n
+  let num = 0
+  let denX = 0
+  let denY = 0
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX
+    const dy = ys[i] - meanY
+    num += dx * dy
+    denX += dx * dx
+    denY += dy * dy
+  }
+  if (denX <= 0 || denY <= 0) return null
+  return num / Math.sqrt(denX * denY)
+}
+
+function computeCourseItemAnalysis(params: {
+  items: Array<{
+    evaluation_id: string
+    question_number: number | null
+    student_answer: string | null
+    correct_answer: string | null
+    is_correct: boolean | null
+  }>
+  totalScoreByEvaluation: Map<string, number>
+}): ItemAnalysisCourseRow[] {
+  const byQuestion = new Map<
+    number,
+    {
+      rows: Array<{ evaluation_id: string; correct01: number; studentOpt: "A" | "B" | "C" | "D" | "E" | null; correctOpt: "A" | "B" | "C" | "D" | "E" | null }>
+      correctByOption: Record<string, number>
+    }
+  >()
+
+  for (const row of params.items) {
+    const qn = Number(row.question_number)
+    if (!Number.isFinite(qn) || qn <= 0) continue
+    const correctOpt = normalizeOption(row.correct_answer)
+    const studentOpt = normalizeOption(row.student_answer)
+    const correct01 = row.is_correct === true ? 1 : 0
+    const cur = byQuestion.get(qn) ?? { rows: [], correctByOption: {} }
+    if (correctOpt) cur.correctByOption[correctOpt] = (cur.correctByOption[correctOpt] ?? 0) + 1
+    cur.rows.push({
+      evaluation_id: String(row.evaluation_id),
+      correct01,
+      studentOpt,
+      correctOpt,
+    })
+    byQuestion.set(qn, cur)
+  }
+
+  const out: ItemAnalysisCourseRow[] = []
+  for (const [item_number, bucket] of byQuestion) {
+    const total = bucket.rows.length
+    if (total === 0) continue
+    let correctCount = 0
+    let omitCount = 0
+    const dist = { A: 0, B: 0, C: 0, D: 0, E: 0 }
+    const xs: number[] = []
+    const ys: number[] = []
+    for (const r of bucket.rows) {
+      if (r.correct01 === 1) correctCount += 1
+      if (!r.studentOpt) {
+        omitCount += 1
+      } else {
+        dist[r.studentOpt] += 1
+      }
+      xs.push(r.correct01)
+      ys.push(Number(params.totalScoreByEvaluation.get(r.evaluation_id) ?? 0))
+    }
+    const wrongCount = total - correctCount - omitCount
+    const biserial = pearsonCorrelation(xs, ys)
+    const majorityCorrectAnswer = Object.entries(bucket.correctByOption).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null
+    out.push({
+      item_number,
+      correct_answer: majorityCorrectAnswer,
+      pct_correct: round1((correctCount / total) * 100),
+      pct_wrong: round1((wrongCount / total) * 100),
+      pct_omitted: round1((omitCount / total) * 100),
+      biserial_xc: biserial == null ? null : Math.round(biserial * 1000) / 1000,
+      distractors: {
+        A: round1((dist.A / total) * 100),
+        B: round1((dist.B / total) * 100),
+        C: round1((dist.C / total) * 100),
+        D: round1((dist.D / total) * 100),
+        E: round1((dist.E / total) * 100),
+      },
+    })
+  }
+  return out.sort((a, b) => a.item_number - b.item_number)
+}
 
 function dominantSubjectFromEvaluations(evals: Array<{ subject?: string | null }>): string {
   const m = new Map<string, number>()
@@ -240,15 +357,74 @@ async function fetchAnalysisForEvaluation(
   ])
   const evaluationItems = (itemsRes.data ?? []) as EvaluationItemRow[]
   const sourceItemsRaw = (sourceItemsRes.data ?? []) as SourceExamItemWithPedagogy[]
+  const sourceItemsNormalized = sourceItemsRaw.map((s, idx) => {
+    const rawNum = Number(s.item_number)
+    const safeItemNumber = Number.isFinite(rawNum) && rawNum > 0 ? rawNum : idx + 1
+    return { ...s, item_number: safeItemNumber }
+  })
   const sourceExamItemsEnriched =
-    sourceItemsRaw.length > 0 ? enrichItemsWithPedagogy(sourceItemsRaw) : ([] as SourceExamItemWithPedagogy[])
+    sourceItemsNormalized.length > 0
+      ? enrichItemsWithPedagogy(sourceItemsNormalized)
+      : ([] as SourceExamItemWithPedagogy[])
   const analysis = analyzeLearningResults(evaluationId, evaluationItems, sourceExamItemsEnriched)
+  const sourceByItem = new Map<number, SourceExamItemWithPedagogy>()
+  for (const s of sourceExamItemsEnriched) {
+    const n = Number(s.item_number)
+    if (Number.isFinite(n) && n > 0) sourceByItem.set(n, s)
+  }
+  const existingItems = new Set<number>(analysis.by_question.map((q) => q.item_number))
+  const normalizedByQuestion = analysis.by_question.map((q) => {
+    const src = sourceByItem.get(q.item_number)
+    const srcAxis = src?.axis_label != null && String(src.axis_label).trim() !== "" ? String(src.axis_label).trim() : null
+    const srcSkill = src?.skill_label != null && String(src.skill_label).trim() !== "" ? String(src.skill_label).trim() : null
+    const srcCog =
+      src?.cognitive_level != null && String(src.cognitive_level).trim() !== ""
+        ? String(src.cognitive_level).trim()
+        : null
+    const axis =
+      q.axis === "Sin eje" && srcAxis
+        ? srcAxis
+        : q.axis
+    const skill =
+      q.skill === "Sin habilidad" && srcSkill
+        ? srcSkill
+        : q.skill
+    const cognitive =
+      q.cognitive_level === "aplicar" && srcCog
+        ? srcCog
+        : q.cognitive_level
+    return { ...q, axis, skill, cognitive_level: cognitive }
+  })
+  const completedByQuestion = [...normalizedByQuestion]
+  for (const [itemNo, src] of sourceByItem.entries()) {
+    if (existingItems.has(itemNo)) continue
+    const axis = String(src.axis_label ?? "").trim() || "Sin eje"
+    const skill = String(src.skill_label ?? "").trim() || String(src.pedagogical?.skill ?? "").trim() || "Sin habilidad"
+    const cognitive =
+      String(src.cognitive_level ?? "").trim() ||
+      String(src.pedagogical?.cognitive_level ?? "").trim() ||
+      "aplicar"
+    const max = Number(src.max_score)
+    completedByQuestion.push({
+      item_number: itemNo,
+      axis,
+      skill,
+      cognitive_level: cognitive,
+      score_obtained: 0,
+      score_max: Number.isFinite(max) && max > 0 ? max : 1,
+      logro_pct: 0,
+    })
+  }
+  const completedAnalysis: LearningResultsAnalysis = {
+    ...analysis,
+    by_question: completedByQuestion.sort((a, b) => a.item_number - b.item_number),
+  }
 
   // SNAPSHOT_NATIONAL_ANALYTICS_V1: fallback robusto si no hay match question_number<->item_number
-  if (analysis.by_question.length === 0 && evaluationItems.length > 0) {
+  if (completedAnalysis.by_question.length === 0 && evaluationItems.length > 0) {
     const fallbackByQuestion = buildFallbackByQuestionFromEvaluationItems(evaluationItems)
     const fallbackAnalysis: LearningResultsAnalysis = {
-      ...analysis,
+      ...completedAnalysis,
       by_question: fallbackByQuestion,
       by_axis: buildAggregatesFromByQuestion(fallbackByQuestion, "axis"),
       by_skill: buildAggregatesFromByQuestion(fallbackByQuestion, "skill"),
@@ -257,7 +433,7 @@ async function fetchAnalysisForEvaluation(
     return sanitizeAnalysis(fallbackAnalysis)
   }
 
-  return sanitizeAnalysis(analysis)
+  return sanitizeAnalysis(completedAnalysis)
 }
 
 /** Encuentra axis y skill para un item_number en la lista de by_question. */
@@ -354,7 +530,10 @@ export async function GET(
   const { user, profile } = await getOrCreateProfile()
   if (!user) return NextResponse.json({ error: "No autorizado" }, { status: 401 })
   const teacherId = profile?.teacher_id ?? null
-  if (!teacherId) {
+  const schoolId = profile?.school_id ?? null
+  const roleNorm = String(profile?.role ?? "").trim().toLowerCase()
+  const canViewSchoolScope = roleNorm === "admin" || roleNorm === "utp" || roleNorm === "direccion"
+  if (!teacherId && !(canViewSchoolScope && schoolId)) {
     return NextResponse.json({ error: "Completa tu perfil" }, { status: 403 })
   }
 
@@ -366,11 +545,16 @@ export async function GET(
   const normalizedCourse =
     courseId === "_" || courseId === "Sin%20curso" ? "Sin curso" : decodeURIComponent(courseId)
 
-  const { data: evaluations, error: evError } = await supabase
+  let evaluationsQuery = supabase
     .from("evaluations")
-    .select("id, course_id, course_label, exam_type, subject")
-    .eq("teacher_id", teacherId)
+    .select("id, course_id, course_label, exam_type, subject, school_id")
     .order("evaluated_at", { ascending: false })
+  if (canViewSchoolScope && schoolId) {
+    evaluationsQuery = evaluationsQuery.eq("school_id", schoolId)
+  } else {
+    evaluationsQuery = evaluationsQuery.eq("teacher_id", teacherId as string)
+  }
+  const { data: evaluations, error: evError } = await evaluationsQuery
 
   if (evError) {
     return NextResponse.json({ error: evError.message }, { status: 500 })
@@ -382,6 +566,7 @@ export async function GET(
     course_label?: string | null
     exam_type?: string | null
     subject?: string | null
+    school_id?: string | null
   }>
   const normalizeCourseKey = (v: unknown): string =>
     String(v ?? "")
@@ -431,6 +616,14 @@ export async function GET(
       } as Record<SimceLevel, number>,
     },
   }
+  const analyticsModeByEval = courseEvalsForSummary.map((e) =>
+    getInstrumentAnalyticsModeFromExamType(e.exam_type)
+  )
+  const analyticsMode: ExamMode =
+    analyticsModeByEval.filter((m) => m === "PAES").length >=
+    analyticsModeByEval.filter((m) => m === "SIMCE").length
+      ? "PAES"
+      : "SIMCE"
   if (evaluationIds.length === 0) {
     const payload = {
       course: normalizedCourse,
@@ -450,6 +643,8 @@ export async function GET(
       weakest_axes: [],
       most_failed_questions: [],
       question_heat_map: [],
+      item_analysis_course: [],
+      analytics_mode: analyticsMode,
       national_analytics: emptyNationalAnalytics,
       exam_type_filter: examTypeParam || null,
     }
@@ -519,6 +714,26 @@ export async function GET(
     const analysis = await fetchAnalysisForEvaluation(supabase, evaluationId)
     analyses.push(analysis)
   }
+  const totalScoreByEvaluation = new Map<string, number>()
+  for (const a of analyses) {
+    const totalScore = a.by_question.reduce((sum, q) => sum + (Number(q.score_obtained) || 0), 0)
+    totalScoreByEvaluation.set(a.evaluation_id, totalScore)
+  }
+  const allItemsRes = await supabase
+    .from("evaluation_items")
+    .select("evaluation_id, question_number, student_answer, correct_answer, is_correct")
+    .in("evaluation_id", evaluationIds)
+  const itemRows = (allItemsRes.data ?? []) as Array<{
+    evaluation_id: string
+    question_number: number | null
+    student_answer: string | null
+    correct_answer: string | null
+    is_correct: boolean | null
+  }>
+  const itemAnalysisCourse = computeCourseItemAnalysis({
+    items: itemRows,
+    totalScoreByEvaluation,
+  })
   // PHASE_1_METRICS_V1: integración silenciosa de métricas de calidad (sin cambios de UI en esta fase).
   const phase1Metrics = buildCourseQualityMetrics(toCourseStudentMetricInputs(analyses))
 
@@ -611,6 +826,8 @@ export async function GET(
         weakest_axes: [],
         most_failed_questions: [],
         question_heat_map: [],
+        item_analysis_course: itemAnalysisCourse,
+        analytics_mode: analyticsMode,
         national_analytics: emptyNationalAnalytics,
         exam_type_filter: examTypeParam || null,
         chile_agency_cuts_note:
@@ -778,6 +995,8 @@ export async function GET(
       weakest_axes: weakest_axes,
       most_failed_questions,
       question_heat_map,
+      item_analysis_course: itemAnalysisCourse,
+      analytics_mode: analyticsMode,
       national_analytics,
       exam_type_filter: examTypeParam || null,
       chile_agency_cuts_note:

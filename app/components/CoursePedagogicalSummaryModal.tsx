@@ -40,6 +40,7 @@ import { buildPedagogicalDiagnosis } from "@/app/lib/pedagogical-diagnosis-text"
 import { QuestionHeatMap } from "@/app/components/QuestionHeatMap"
 import { downloadCsvFile } from "@/app/lib/csv-export"
 import { EXAM_TYPE_FILTER_OPTIONS } from "@/app/lib/exam-type-constants"
+import { projectPaesFromLogroPct, projectSimceFromLogroPct } from "@/app/lib/standard-scale-converters"
 
 type LogroRowChile = {
   dimension_value: string
@@ -75,6 +76,16 @@ type SummaryData = {
     student_count: number
   }>
   question_heat_map?: Array<{ item_number: number; logro_pct: number | null; axis?: string; skill?: string }>
+  analytics_mode?: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+  item_analysis_course?: Array<{
+    item_number: number
+    correct_answer: string | null
+    pct_correct: number
+    pct_wrong: number
+    pct_omitted: number
+    biserial_xc: number | null
+    distractors: { A: number; B: number; C: number; D: number; E: number }
+  }>
   exam_type_filter?: string | null
   chile_agency_cuts_note?: string | null
   national_analytics?: {
@@ -196,6 +207,24 @@ function chartPct(value: number | null | undefined): number {
   return value == null || !Number.isFinite(Number(value)) ? 0 : Math.round(Number(value))
 }
 
+function computeGlobalLogroPct(data: SummaryData): number | null {
+  const fromItems =
+    (data.item_analysis_course ?? []).length > 0
+      ? (data.item_analysis_course ?? []).reduce((sum, r) => sum + Number(r.pct_correct ?? 0), 0) /
+        (data.item_analysis_course ?? []).length
+      : null
+  const fromAxes =
+    (data.by_axis ?? []).length > 0
+      ? (data.by_axis ?? []).reduce((sum, r) => sum + Number(r.logro_pct ?? 0), 0) / (data.by_axis ?? []).length
+      : null
+  const fromNational =
+    data.national_analytics?.course_summary?.average_logro_pct != null
+      ? Number(data.national_analytics.course_summary.average_logro_pct)
+      : null
+  const value = fromItems ?? fromAxes ?? fromNational
+  return value == null || !Number.isFinite(value) ? null : Math.round(value)
+}
+
 function isMissingPedagogyLabel(value: unknown): boolean {
   const normalized = pickPedagogicalLabel(value, "N/A").trim().toLowerCase()
   return (
@@ -212,6 +241,14 @@ function SummaryBlock({ data }: { data: SummaryData }) {
   const withSource = data.evaluation_count_with_source_exam
   const analyzable = data.evaluation_count_analyzable
   const hasNewFields = withSource !== undefined || analyzable !== undefined
+  const avgLogro = computeGlobalLogroPct(data)
+  const mode = data.analytics_mode === "SIMCE" ? "SIMCE" : "PAES"
+  const estimatedScore =
+    avgLogro == null || !Number.isFinite(avgLogro)
+      ? null
+      : mode === "SIMCE"
+        ? projectSimceFromLogroPct(avgLogro)
+        : projectPaesFromLogroPct(avgLogro)
   return (
     <div className="rounded-md border bg-[var(--bg-muted)] p-3 space-y-2">
       <div className="font-medium text-[var(--text-accent)]">Resumen del curso</div>
@@ -226,6 +263,17 @@ function SummaryBlock({ data }: { data: SummaryData }) {
         {hasNewFields && withSource !== undefined && ` ${withSource} con prueba base asociada.`}
         {hasNewFields && analyzable !== undefined && ` ${analyzable} con análisis pedagógico disponible.`}
       </p>
+      <div className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm">
+        <span className="font-semibold text-indigo-900">
+          Puntaje estimado del curso ({mode}):
+        </span>{" "}
+        <span className="text-indigo-800 font-bold">
+          {estimatedScore != null ? `${Math.round(estimatedScore)} puntos` : "—"}
+        </span>
+        {avgLogro != null && Number.isFinite(avgLogro) ? (
+          <span className="text-indigo-700"> · basado en logro promedio {Math.round(avgLogro)}%</span>
+        ) : null}
+      </div>
     </div>
   )
 }
@@ -331,7 +379,7 @@ export default function CoursePedagogicalSummaryModal({
         setData(null)
       })
       .finally(() => setLoading(false))
-  }, [open, courseId])
+  }, [open, courseId, examTypeFilter])
 
   useEffect(() => {
     if (typeof window !== "undefined" && process.env.NODE_ENV !== "production" && open && courseId) {
@@ -388,6 +436,13 @@ export default function CoursePedagogicalSummaryModal({
         }
       })
     : []
+  const itemAnalysisRows = data?.item_analysis_course ?? []
+  const analyticsModeLabel =
+    data?.analytics_mode === "SIMCE"
+      ? "SIMCE"
+      : data?.analytics_mode === "PAES"
+        ? "PAES"
+        : "Institucional"
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -665,6 +720,52 @@ export default function CoursePedagogicalSummaryModal({
                   </div>
                 )}
               </div>
+              {itemAnalysisRows.length > 0 && (
+                <div className="space-y-3 pt-4 border-t border-[var(--border-color)]">
+                  <div>
+                    <h4 className="font-semibold text-[var(--text-accent)]">Tabla de análisis de ítems del curso</h4>
+                    <p className="text-xs text-[var(--text-muted)]">
+                      Formato técnico para seguimiento UTP/Dirección. Selector automático activo: <strong>{analyticsModeLabel}</strong>.
+                    </p>
+                  </div>
+                  <div className="w-full overflow-x-auto rounded-md border border-[var(--border-color)]">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Nº</TableHead>
+                          <TableHead>Clave</TableHead>
+                          <TableHead>% Correctas</TableHead>
+                          <TableHead>% Erradas</TableHead>
+                          <TableHead>% Omitidas</TableHead>
+                          <TableHead>XC Biserial</TableHead>
+                          <TableHead>A</TableHead>
+                          <TableHead>B</TableHead>
+                          <TableHead>C</TableHead>
+                          <TableHead>D</TableHead>
+                          <TableHead>E</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {itemAnalysisRows.map((r) => (
+                          <TableRow key={`item-analysis-${r.item_number}`}>
+                            <TableCell>{r.item_number}</TableCell>
+                            <TableCell>{r.correct_answer ?? "—"}</TableCell>
+                            <TableCell>{r.pct_correct}%</TableCell>
+                            <TableCell>{r.pct_wrong}%</TableCell>
+                            <TableCell>{r.pct_omitted}%</TableCell>
+                            <TableCell>{r.biserial_xc == null ? "—" : r.biserial_xc}</TableCell>
+                            <TableCell>{r.distractors.A}%</TableCell>
+                            <TableCell>{r.distractors.B}%</TableCell>
+                            <TableCell>{r.distractors.C}%</TableCell>
+                            <TableCell>{r.distractors.D}%</TableCell>
+                            <TableCell>{r.distractors.E}%</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+              )}
               {/* SNAPSHOT_NATIONAL_ANALYTICS_V1 */}
               {hasNational && (
                 <div className="space-y-4 pt-4 border-t border-[var(--border-color)]">
@@ -676,7 +777,7 @@ export default function CoursePedagogicalSummaryModal({
                   </div>
                   <div className="rounded-md border bg-[var(--bg-muted)] p-3 text-sm grid grid-cols-1 md:grid-cols-5 gap-2">
                     <div><strong>Nota 7.0 prom.</strong>: {national?.course_summary.average_note_7 ?? "—"}</div>
-                    <div><strong>Logro prom.</strong>: {national?.course_summary.average_logro_pct ?? 0}%</div>
+                    <div><strong>Logro prom.</strong>: {computeGlobalLogroPct(data) != null ? `${computeGlobalLogroPct(data)}%` : "—"}</div>
                     <div><strong>PAES prom.</strong>: {national?.course_summary.average_paes ?? 100}</div>
                     <div><strong>SIMCE prom.</strong>: {national?.course_summary.average_simce ?? 0}</div>
                     <div>
@@ -738,9 +839,25 @@ export default function CoursePedagogicalSummaryModal({
                     skill: pickPedagogicalLabel(x.skill),
                   })),
                 })
-                const heatMap = (data.question_heat_map ?? [])
-                  .map((a) => ({ ...a, logro_pct: Number(a.logro_pct ?? 0) }))
-                  .sort((a, b) => a.item_number - b.item_number)
+                const questionMetaByItem = new Map(
+                  (data.question_heat_map ?? []).map((q) => [
+                    q.item_number,
+                    { axis: q.axis ?? "—", skill: q.skill ?? "—" },
+                  ]),
+                )
+                const heatMap =
+                  (data.item_analysis_course ?? []).length > 0
+                    ? (data.item_analysis_course ?? [])
+                        .map((row) => ({
+                          item_number: row.item_number,
+                          logro_pct: Number(row.pct_correct ?? 0),
+                          axis: questionMetaByItem.get(row.item_number)?.axis ?? "—",
+                          skill: questionMetaByItem.get(row.item_number)?.skill ?? "—",
+                        }))
+                        .sort((a, b) => a.item_number - b.item_number)
+                    : (data.question_heat_map ?? [])
+                        .map((a) => ({ ...a, logro_pct: Number(a.logro_pct ?? 0) }))
+                        .sort((a, b) => a.item_number - b.item_number)
                 return (
                   <div className="space-y-6 pt-4 border-t border-[var(--border-color)]">
                     <h4 className="font-semibold text-[var(--text-accent)]">Diagnóstico pedagógico</h4>
@@ -769,7 +886,14 @@ export default function CoursePedagogicalSummaryModal({
                     {heatMap.length > 0 && (
                       <>
                         <h4 className="font-semibold text-[var(--text-accent)]">Mapa de calor de preguntas</h4>
-                        <QuestionHeatMap items={heatMap} />
+                        <QuestionHeatMap
+                          items={heatMap}
+                          totalQuestions={
+                            (data.item_analysis_course ?? []).length > 0
+                              ? Math.max(...(data.item_analysis_course ?? []).map((r) => r.item_number))
+                              : Math.max(0, ...(heatMap.map((h) => h.item_number)))
+                          }
+                        />
                       </>
                     )}
                   </div>
@@ -789,35 +913,42 @@ export default function CoursePedagogicalSummaryModal({
             <Button
               variant="outline"
               size="sm"
-              disabled={!hasNational}
+              disabled={!hasNational && itemAnalysisRows.length === 0}
               onClick={() => {
-                if (!national) return
                 const headers = [
-                  "Estudiante",
-                  "Nota 7.0",
-                  "Puntaje Obtenido",
-                  "Puntaje Maximo",
-                  "Logro %",
-                  "PAES",
-                  "SIMCE",
-                  "Nivel SIMCE",
+                  "Modo",
+                  "N Pregunta",
+                  "Respuesta Correcta",
+                  "% Correctas",
+                  "% Erradas",
+                  "% Omitidas",
+                  "XC Biserial",
+                  "% A",
+                  "% B",
+                  "% C",
+                  "% D",
+                  "% E",
                 ]
-                const rows = nationalRows.map((alumno) => [
-                  alumno.student,
-                  alumno.note === "N/A" ? "" : alumno.note,
-                  alumno.scoreObtained === "N/A" ? "" : alumno.scoreObtained,
-                  alumno.scoreMax === "N/A" ? "" : alumno.scoreMax,
-                  alumno.logro === "N/A" ? "" : alumno.logro.replace("%", ""),
-                  alumno.paes === "N/A" ? "" : alumno.paes,
-                  alumno.simce === "N/A" ? "" : alumno.simce,
-                  alumno.level === "N/A" ? "" : alumno.level,
+                const rows = itemAnalysisRows.map((r) => [
+                  analyticsModeLabel,
+                  r.item_number,
+                  r.correct_answer ?? "",
+                  r.pct_correct,
+                  r.pct_wrong,
+                  r.pct_omitted,
+                  r.biserial_xc ?? "",
+                  r.distractors.A,
+                  r.distractors.B,
+                  r.distractors.C,
+                  r.distractors.D,
+                  r.distractors.E,
                 ])
                 const safeName = (courseDisplayName || "curso")
                   .replace(/[^\w\u00C0-\u024F\s\-]/g, "")
                   .replace(/\s+/g, "_")
                   .slice(0, 60)
                 downloadCsvFile({
-                  filename: `libelia_analitica_nacional_${safeName}.csv`,
+                  filename: `libelia_analisis_items_${safeName}.csv`,
                   headers,
                   rows,
                   delimiter: ",",
@@ -825,7 +956,7 @@ export default function CoursePedagogicalSummaryModal({
               }}
             >
               <FileDown className="h-4 w-4 mr-2" />
-              Exportar CSV gestión
+              Exportar CSV (ítems técnicos)
             </Button>
           </div>
           <Button

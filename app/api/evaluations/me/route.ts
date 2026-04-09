@@ -18,11 +18,16 @@ export async function GET(req: NextRequest) {
 
   const { data: profile } = await supabase
     .from("profiles")
-    .select("school_id")
+    .select("school_id, teacher_id")
     .eq("user_id", user.id)
     .maybeSingle()
+  const teacher_id: string | null =
+    profile?.teacher_id != null && String(profile.teacher_id).trim() !== "" ? String(profile.teacher_id).trim() : null
   const school_id: string | null =
     profile?.school_id != null && String(profile.school_id).trim() !== "" ? String(profile.school_id).trim() : null
+  if (!school_id && !teacher_id) {
+    return NextResponse.json({ evaluations: [], message: "Completa tu perfil para ver historial del colegio." }, { status: 200 })
+  }
 
   const { searchParams } = new URL(req.url)
   const courseId = searchParams.get("courseId")?.trim() || undefined
@@ -35,6 +40,7 @@ export async function GET(req: NextRequest) {
     .order("evaluated_at", { ascending: false })
 
   if (school_id) query = query.eq("school_id", school_id)
+  else if (teacher_id) query = query.eq("teacher_id", teacher_id)
 
   if (courseId) query = query.eq("course_id", courseId)
   if (from) query = query.gte("evaluated_at", from)

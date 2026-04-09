@@ -23,8 +23,8 @@ export function projectPaesFromLogroPct(logroPct: number): number {
 
 export function projectSimceFromLogroPct(logroPct: number): number {
   const pct = Math.max(0, Math.min(100, logroPct))
-  /** Misma forma que el velocímetro institucional: 200 (0% logro) → 350 (100% logro). */
-  return Math.floor(200 + (pct / 100) * 150)
+  /** Escala SIMCE solicitada para gestión: 200 (0% logro) → 400 (100% logro). */
+  return Math.round(200 + (pct / 100) * 200)
 }
 
 export function simceLevelFromLogroPct(logroPct: number): SimceLevel {
