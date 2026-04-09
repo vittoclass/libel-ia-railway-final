@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
+import { canReadEvaluationInAppScope, profileScopeFromRow } from "@/app/lib/evaluation-read-scope"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
@@ -18,7 +19,7 @@ export async function GET(
     return NextResponse.json({ error: "id requerido" }, { status: 400 })
   }
 
-  const { user, profile } = await getOrCreateProfile()
+  const { user } = await getOrCreateProfile()
   if (!user) {
     return NextResponse.json({ error: "No autorizado" }, { status: 401 })
   }
@@ -28,9 +29,16 @@ export async function GET(
     return NextResponse.json({ error: "Supabase no configurado" }, { status: 503 })
   }
 
+  const { data: profileRow } = await supabase
+    .from("profiles")
+    .select("teacher_id, school_id")
+    .eq("user_id", user.id)
+    .maybeSingle()
+  const { teacher_id_used, school_id_used } = profileScopeFromRow(profileRow)
+
   const { data: evaluation, error: evalErr } = await supabase
     .from("evaluations")
-    .select("id, teacher_id, user_id")
+    .select("id, teacher_id, user_id, school_id")
     .eq("id", id)
     .maybeSingle()
 
@@ -41,10 +49,13 @@ export async function GET(
     )
   }
 
-  const teacherId = profile?.teacher_id ?? null
-  const isOwnerByTeacher = teacherId && evaluation.teacher_id === teacherId
-  const isOwnerByUser = evaluation.user_id && evaluation.user_id === user.id
-  if (!isOwnerByTeacher && !isOwnerByUser) {
+  const canRead = canReadEvaluationInAppScope({
+    userId: user.id,
+    evaluation: evaluation as { teacher_id?: string | null; user_id?: string | null; school_id?: string | null },
+    teacher_id_used,
+    school_id_used,
+  })
+  if (!canRead) {
     return NextResponse.json({ error: "No autorizado para esta evaluación" }, { status: 403 })
   }
 

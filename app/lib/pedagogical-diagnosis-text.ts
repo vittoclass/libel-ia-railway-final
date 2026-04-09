@@ -91,7 +91,7 @@ export function buildPedagogicalDiagnosis(input: DiagnosisInput): DiagnosisResul
   if (failedQ.length > 0) {
     evidenceLines.push("Preguntas:")
     failedQ.forEach((q) => {
-      evidenceLines.push(`  ${q.item_number} (${q.error_pct}% error)`)
+      evidenceLines.push(`  ${q.item_number} (${Math.min(100, Math.max(0, Number(q.error_pct)))}% error)`)
     })
     const axes = [...new Set(failedQ.map((q) => q.axis).filter(Boolean))]
     const skills = [...new Set(failedQ.map((q) => q.skill).filter(Boolean))]

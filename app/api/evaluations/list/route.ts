@@ -114,7 +114,21 @@ export async function GET(req: NextRequest) {
     )
   }
 
-  const list = (res.data ?? []) as Array<{ id: string; title: string | null; course_id: string | null; course_label: string | null; subject: string | null; evaluated_at: string | null; status?: string | null }>
+  const listRaw = (res.data ?? []) as Array<{
+    id: string
+    title: string | null
+    course_id: string | null
+    course_label: string | null
+    subject: string | null
+    evaluated_at: string | null
+    status?: string | null
+  }>
+
+  /** Solo filas con id UUID válido (evita 404 por ids huérfanos/mal formados en UI). Reversible: quitar este filtro. */
+  const list = listRaw.filter((e) => e.id != null && String(e.id).trim() !== "" && isUuid(String(e.id).trim()))
+  if (isDev && list.length !== listRaw.length) {
+    console.warn("[evaluations/list] omitidas filas sin id UUID válido", { total: listRaw.length, kept: list.length })
+  }
 
   const ids = list.map((e) => e.id)
   let summaries: Array<{ evaluation_id: string; grade_chile: number | null }> = []

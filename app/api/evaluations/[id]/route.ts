@@ -2,12 +2,18 @@
 // GET: detalle de una evaluación (metadata, items, summary, estudiantes). Solo del usuario autenticado.
 import { NextRequest, NextResponse } from "next/server"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
+import { canReadEvaluationInAppScope, profileScopeFromRow } from "@/app/lib/evaluation-read-scope"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
 
 const isDev = process.env.NODE_ENV !== "production"
+
+const EVAL_DETAIL_SELECT_FULL =
+  "id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id, batch_id, batch_student_index, scan_image_paths, capture_source"
+const EVAL_DETAIL_SELECT_BASE =
+  "id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id, batch_id, batch_student_index"
 
 export async function GET(
   _req: NextRequest,
@@ -22,11 +28,8 @@ export async function GET(
     )
   }
 
-  const { user, profile } = await getOrCreateProfile()
+  const { user } = await getOrCreateProfile()
   if (isDev) console.info("[API][EVAL_DETAIL] user", user?.id ?? null)
-  if (isDev) console.info("[API][EVAL_DETAIL] profile read", !!profile)
-  const teacherId = profile?.teacher_id ?? null
-  if (isDev) console.info("[API][EVAL_DETAIL] teacher_id", teacherId)
   if (!user) {
     return NextResponse.json(
       isDev ? { step: "auth", message: "No autorizado", debug: { hasUser: false } } : { error: "No autorizado" },
@@ -42,41 +45,95 @@ export async function GET(
     )
   }
 
-  const { data: evaluation, error: evalErr } = await supabase
-    .from("evaluations")
-    .select(
-      "id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id, batch_id, batch_student_index, scan_image_paths, capture_source",
-    )
-    .eq("id", id)
+  const { data: profileRow } = await supabase
+    .from("profiles")
+    .select("teacher_id, school_id")
+    .eq("user_id", user.id)
     .maybeSingle()
+  const { teacher_id_used, school_id_used } = profileScopeFromRow(profileRow)
+
+  let evaluation: Record<string, unknown> | null = null
+  let evalErr: { message: string } | null = null
+  {
+    const r1 = await supabase.from("evaluations").select(EVAL_DETAIL_SELECT_FULL).eq("id", id).maybeSingle()
+    if (!r1.error && r1.data) {
+      evaluation = r1.data as Record<string, unknown>
+    } else {
+      const r2 = await supabase.from("evaluations").select(EVAL_DETAIL_SELECT_BASE).eq("id", id).maybeSingle()
+      if (!r2.error && r2.data) {
+        evaluation = r2.data as Record<string, unknown>
+        evalErr = null
+        if (isDev && r1.error) console.info("[API][EVAL_DETAIL] fallback select sin columnas opcionales", r1.error.message)
+      } else {
+        evaluation = (r2.data ?? null) as Record<string, unknown> | null
+        evalErr = r2.error ?? r1.error
+      }
+    }
+  }
 
   if (isDev) console.info("[API][EVAL_DETAIL] evaluation found", !!evaluation)
   if (evalErr || !evaluation) {
     const step = evalErr ? "fetch_evaluation" : "not_found"
     const message = evalErr?.message ?? "Evaluación no encontrada"
     if (isDev) console.info("[API][EVAL_DETAIL] error/not found", step, message)
+    if (!evalErr && !evaluation) {
+      const userMessage = "Esta evaluación aún no tiene resultados procesados."
+      return NextResponse.json(
+        isDev
+          ? {
+              step: "not_found",
+              error: "Evaluación no encontrada",
+              message: userMessage,
+              code: "EVALUATION_NOT_FOUND",
+              debug: { id },
+            }
+          : {
+              error: "Evaluación no encontrada",
+              message: userMessage,
+              code: "EVALUATION_NOT_FOUND",
+            },
+        { status: 404 }
+      )
+    }
     return NextResponse.json(
       isDev ? { step, message, debug: { id, evalErr: evalErr?.message ?? null } } : { error: message },
       { status: evaluation ? 500 : 404 }
     )
   }
 
-  const isOwnerByTeacher = teacherId && evaluation.teacher_id === teacherId
-  const isOwnerByUser = evaluation.user_id && evaluation.user_id === user.id
-  if (isDev) console.info("[API][EVAL_DETAIL] ownership validated", { isOwnerByTeacher, isOwnerByUser })
-  if (!isOwnerByTeacher && !isOwnerByUser) {
+  const canRead = canReadEvaluationInAppScope({
+    userId: user.id,
+    evaluation: evaluation as { teacher_id?: string | null; user_id?: string | null; school_id?: string | null },
+    teacher_id_used,
+    school_id_used,
+  })
+  if (isDev)
+    console.info("[API][EVAL_DETAIL] ownership validated", {
+      canRead,
+      teacher_id_used: !!teacher_id_used,
+      school_id_used: !!school_id_used,
+    })
+  if (!canRead) {
     if (isDev) console.info("[API][EVAL_DETAIL] 403 forbidden")
     return NextResponse.json(
       isDev
         ? {
             step: "ownership",
             message: "No autorizado para esta evaluación",
-            debug: { evaluationTeacherId: evaluation.teacher_id, evaluationUserId: (evaluation as { user_id?: string }).user_id, profileTeacherId: teacherId, userId: user.id },
+            debug: {
+              evaluationTeacherId: evaluation.teacher_id,
+              evaluationUserId: (evaluation as { user_id?: string }).user_id,
+              teacher_id_used,
+              school_id_used,
+              userId: user.id,
+            },
           }
         : { error: "No autorizado para esta evaluación" },
       { status: 403 }
     )
   }
+
+  const ev = evaluation as Record<string, unknown>
 
   const [itemsRes, summaryRes, studentsRes] = await Promise.all([
     supabase
@@ -124,7 +181,7 @@ export async function GET(
     if (idf.length > 0 && !firstStudentIdentifier) firstStudentIdentifier = idf
   }
 
-  const rawPaths = (evaluation as { scan_image_paths?: unknown }).scan_image_paths
+  const rawPaths = ev.scan_image_paths
   const scanPaths = Array.isArray(rawPaths)
     ? rawPaths.filter((p): p is string => typeof p === "string" && p.length > 0)
     : []
@@ -139,19 +196,19 @@ export async function GET(
   return NextResponse.json(
     {
       evaluation: {
-        id: evaluation.id,
-        title: evaluation.title,
-        course_id: evaluation.course_id,
-        course_label: (evaluation as { course_label?: string | null }).course_label ?? undefined,
-        subject: evaluation.subject,
-        evaluated_at: evaluation.evaluated_at,
-        status: evaluation.status ?? "draft",
+        id: ev.id,
+        title: ev.title,
+        course_id: ev.course_id,
+        course_label: (ev.course_label as string | null | undefined) ?? undefined,
+        subject: ev.subject,
+        evaluated_at: ev.evaluated_at,
+        status: (ev.status as string | null | undefined) ?? "draft",
         student_name: firstStudentName,
         student_identifier: firstStudentIdentifier,
-        source_exam_id: (evaluation as { source_exam_id?: string | null }).source_exam_id ?? undefined,
-        batch_id: (evaluation as { batch_id?: string | null }).batch_id ?? undefined,
-        batch_student_index: (evaluation as { batch_student_index?: number | null }).batch_student_index ?? undefined,
-        capture_source: (evaluation as { capture_source?: string | null }).capture_source ?? undefined,
+        source_exam_id: (ev.source_exam_id as string | null | undefined) ?? undefined,
+        batch_id: (ev.batch_id as string | null | undefined) ?? undefined,
+        batch_student_index: (ev.batch_student_index as number | null | undefined) ?? undefined,
+        capture_source: (ev.capture_source as string | null | undefined) ?? undefined,
         scan_image_paths: scanPaths.length > 0 ? scanPaths : undefined,
         /** Primera ruta en Storage (bucket batch-scans); misma lista ordenada que scan_image_paths[0]. */
         scan_primary_storage_path: scanPaths[0] ?? undefined,

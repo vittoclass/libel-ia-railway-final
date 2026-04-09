@@ -177,6 +177,7 @@ function normalizeSummaryData(raw: SummaryData): SummaryData {
     })),
     most_failed_questions: (raw.most_failed_questions ?? []).map((q) => ({
       ...q,
+      error_pct: Math.min(100, Math.max(0, Number(q.error_pct ?? 0))),
       axis: pickPedagogicalLabel(q.axis),
       skill: pickPedagogicalLabel(q.skill),
     })),

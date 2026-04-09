@@ -5,6 +5,7 @@
  * Devuelve estados explícitos: has_source_exam, has_evaluation_items, has_source_exam_items, analysis_available, status_reason.
  */
 import { NextRequest, NextResponse } from "next/server"
+import { canReadEvaluationInAppScope, normUuid, profileScopeFromRow } from "@/app/lib/evaluation-read-scope"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { getSourceExamForEvaluation } from "@/app/lib/source-exam-db"
@@ -40,15 +41,22 @@ export async function GET(
     return NextResponse.json({ error: "Falta id de evaluación" }, { status: 400 })
   }
 
-  const { user, profile } = await getOrCreateProfile()
+  const { user } = await getOrCreateProfile()
   if (!user) return NextResponse.json({ error: "No autorizado" }, { status: 401 })
 
   const supabase = getSupabaseServer()
   if (!supabase) return NextResponse.json({ error: "Supabase no configurado" }, { status: 503 })
 
+  const { data: profileRow } = await supabase
+    .from("profiles")
+    .select("teacher_id, school_id")
+    .eq("user_id", user.id)
+    .maybeSingle()
+  const { teacher_id_used, school_id_used } = profileScopeFromRow(profileRow)
+
   const { data: evaluation, error: evErr } = await supabase
     .from("evaluations")
-    .select("id, teacher_id, user_id, course_id, evaluated_at, exam_type")
+    .select("id, teacher_id, user_id, school_id, course_id, evaluated_at, exam_type")
     .eq("id", evaluationId)
     .maybeSingle()
 
@@ -56,13 +64,19 @@ export async function GET(
     return NextResponse.json({ error: "Evaluación no encontrada" }, { status: 404 })
   }
 
-  const teacherId = profile?.teacher_id ?? null
-  const ev = evaluation as { teacher_id?: string; user_id?: string }
-  const isOwnerByTeacher = Boolean(teacherId && ev.teacher_id === teacherId)
-  const isOwnerByUser = Boolean(ev.user_id && ev.user_id === user.id)
-  if (!isOwnerByTeacher && !isOwnerByUser) {
+  const canRead = canReadEvaluationInAppScope({
+    userId: user.id,
+    evaluation: evaluation as { teacher_id?: string | null; user_id?: string | null; school_id?: string | null },
+    teacher_id_used,
+    school_id_used,
+  })
+  if (!canRead) {
     return NextResponse.json({ error: "No autorizado para esta evaluación" }, { status: 403 })
   }
+
+  /** Para agregados del curso (z-score): perfil o, en su defecto, profesor de la fila evaluada. */
+  const teacherIdForCourseStats =
+    teacher_id_used ?? normUuid((evaluation as { teacher_id?: string | null }).teacher_id ?? null)
 
   const examTypeRaw = (evaluation as { exam_type?: string | null }).exam_type ?? null
   const instrument_analytics_mode = getInstrumentAnalyticsModeFromExamType(examTypeRaw)
@@ -239,11 +253,11 @@ export async function GET(
     if (instrument_analytics_mode === "SIMCE") {
     const courseId = (evaluation as { course_id?: string | null }).course_id ?? null
     let zCourse: number | null = null
-    if (courseId) {
+    if (courseId && teacherIdForCourseStats) {
       const { data: courseEvaluations } = await supabase
         .from("evaluations")
         .select("id")
-        .eq("teacher_id", teacherId)
+        .eq("teacher_id", teacherIdForCourseStats)
         .eq("course_id", courseId)
       const courseEvalIds = (courseEvaluations ?? []).map((r) => String((r as { id: string }).id))
       if (courseEvalIds.length > 0) {

@@ -1369,6 +1369,67 @@ const EVALUATE_BATCH_PARALLEL_SIZE = 1
 const SEQUENTIAL_EVALUATION_DELAY_MS = 1200
 const MOBILE_BATCH_SYNC_TIMEOUT_MS = 15000
 
+/** Misma configuración de red para todo GET de detalle de evaluación (modal informe + historial). */
+const INFORME_DETAIL_FETCH_INIT: RequestInit = {
+  cache: "no-store",
+  credentials: "include",
+  headers: { Pragma: "no-cache", "Cache-Control": "no-cache" },
+}
+
+function informeHttpErrorKind(status: number | undefined): string {
+  if (status === 401) return "401_UNAUTHORIZED"
+  if (status === 403) return "403_FORBIDDEN"
+  if (status === 404) return "404_NOT_FOUND"
+  if (status != null && status >= 500) return "5XX_SERVER"
+  if (status != null) return `HTTP_${status}`
+  return "CLIENT_OR_NETWORK"
+}
+
+function logInformeFetchFailure(
+  step: string,
+  url: string,
+  res: Response | null,
+  bodyText: string,
+  parsed: unknown
+) {
+  console.error("[Informe] fetch falló", {
+    step,
+    url,
+    kind: informeHttpErrorKind(res?.status),
+    status: res?.status,
+    statusText: res?.statusText,
+    bodyLength: bodyText.length,
+    bodyText: bodyText.slice(0, 8000),
+    parsed,
+  })
+}
+
+async function fetchInformeDetailRaw(url: string): Promise<{
+  res: Response
+  bodyText: string
+  parsed: Record<string, unknown> | null
+}> {
+  const res = await fetch(url, INFORME_DETAIL_FETCH_INIT)
+  const bodyText = await res.text()
+  let parsed: Record<string, unknown> | null = null
+  try {
+    parsed = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : null
+  } catch {
+    parsed = null
+  }
+  return { res, bodyText, parsed }
+}
+
+/** Hint opcional desde la fila de lista (Evaluaciones/Cursos) para abrir el modal aunque falle el GET puntual. */
+type InformeRowHint = {
+  title?: string | null
+  subject?: string | null
+  course_id?: string | null
+  course_label?: string | null
+  evaluated_at?: string | null
+  grade_chile?: number | null
+}
+
 export default function EvaluatorClient() {
   const enablePedagogy = process.env.NEXT_PUBLIC_ENABLE_PEDAGOGY === "true"
   const [activeTab, setActiveTab] = useState("presentacion")
@@ -1782,26 +1843,143 @@ export default function EvaluatorClient() {
     if (!evaluacionesDetailId) return
     setEvaluacionesDetailLoading(true)
     setEvaluacionesDetailError(null)
+    const url = `/api/evaluations/${encodeURIComponent(evaluacionesDetailId)}`
     try {
-      const r = await fetch(`/api/evaluations/${evaluacionesDetailId}`, { cache: "no-store", credentials: "include" })
-      const j = await r.json()
-      if (r.ok && j.evaluation) {
+      const { res, bodyText, parsed } = await fetchInformeDetailRaw(url)
+      const j = parsed
+      if (res.ok && j?.evaluation) {
+        const rawItems = j.evaluation_items ?? j.items
+        const itemsArr = Array.isArray(rawItems) ? (rawItems as Array<Record<string, unknown>>) : []
         setEvaluacionesDetail({
-          evaluation: j.evaluation,
-          evaluation_items: j.evaluation_items ?? j.items ?? [],
-          evaluation_summaries: j.evaluation_summaries ?? j.summary ?? null,
+          evaluation: j.evaluation as Record<string, unknown>,
+          evaluation_items: itemsArr,
+          evaluation_summaries: (j.evaluation_summaries ?? j.summary ?? null) as Record<string, unknown> | null,
         })
         setEvaluacionesDetailItemsDraft(null)
         setEvaluacionesDetailError(null)
       } else {
-        setEvaluacionesDetailError(r.status === 403 ? "Completa tu perfil para ver esta evaluación." : "No se pudo cargar el informe")
+        logInformeFetchFailure("refetchEvaluacionDetail", url, res, bodyText, j ?? bodyText)
+        // Conservar el detalle ya visible; sin mensaje bloqueante (regla piloto / reversible).
+        setEvaluacionesDetailError(null)
       }
-    } catch {
-      setEvaluacionesDetailError("No se pudo cargar el informe")
+    } catch (e) {
+      logInformeFetchFailure("refetchEvaluacionDetail (excepción)", url, null, "", { error: e instanceof Error ? e.message : String(e) })
+      setEvaluacionesDetailError(null)
     } finally {
       setEvaluacionesDetailLoading(false)
     }
   }, [evaluacionesDetailId])
+
+  const informeHintFromListId = useCallback(
+    (evaluationId: string): InformeRowHint | null => {
+      const row = evaluacionesList.find((x) => x.id === evaluationId)
+      if (!row) return null
+      const r = row as { course_label?: string | null; course_display?: string | null }
+      return {
+        title: row.title,
+        subject: row.subject,
+        course_id: row.course_id,
+        course_label: r.course_label ?? null,
+        evaluated_at: row.evaluated_at,
+        grade_chile: row.grade_chile ?? null,
+      }
+    },
+    [evaluacionesList]
+  )
+
+  /** Misma URL que Análisis pedagógico por evaluación; hint opcional desde la fila de lista si el GET falla. */
+  const openEvaluationInforme = useCallback(async (evaluationId: string, rowHint?: InformeRowHint | null) => {
+    const id = String(evaluationId ?? "").trim()
+    if (!id) return
+    setEvaluacionesDetailId(id)
+    setEvaluacionesDetail(null)
+    setEvaluacionesDetailError(null)
+    setEvaluationStudents([])
+    setEvaluacionesDetailLoading(true)
+    if (process.env.NODE_ENV === "development") setVerDebug(null)
+    const detailUrl = `/api/evaluations/${encodeURIComponent(id)}`
+    const applyHintShell = () => {
+      const h = rowHint ?? {}
+      setEvaluacionesDetail({
+        evaluation: {
+          id,
+          title: h.title ?? "(Sin título)",
+          subject: h.subject ?? null,
+          course_id: h.course_id ?? null,
+          course_label: h.course_label ?? null,
+          evaluated_at: h.evaluated_at ?? null,
+          status: "draft",
+        },
+        evaluation_items: [],
+        evaluation_summaries:
+          h.grade_chile != null
+            ? { grade_chile: h.grade_chile, strengths: null, improvements: null, raw: null }
+            : null,
+      })
+      setEvaluacionesDetailError(null)
+    }
+    try {
+      const { res, bodyText, parsed: j } = await fetchInformeDetailRaw(detailUrl)
+      if (process.env.NODE_ENV === "development") {
+        console.info("[UI][VER] response status", res.status)
+        if (res.ok && j) {
+          console.info("[UI][VER] has evaluation", !!j.evaluation)
+          console.info("[UI][VER] items length", Array.isArray(j.items) ? j.items.length : -1)
+        } else {
+          setVerDebug({ evaluationId: id, status: res.status, error: (j?.error as string) ?? null, payload: j })
+        }
+      }
+      if (res.ok && j?.evaluation) {
+        const rawItems = j.evaluation_items ?? j.items
+        const itemsArr = Array.isArray(rawItems) ? (rawItems as Array<Record<string, unknown>>) : []
+        setEvaluacionesDetail({
+          evaluation: j.evaluation as Record<string, unknown>,
+          evaluation_items: itemsArr,
+          evaluation_summaries: (j.evaluation_summaries ?? j.summary ?? null) as Record<string, unknown> | null,
+        })
+        setEvaluacionesDetailError(null)
+      } else {
+        logInformeFetchFailure("openEvaluationInforme detalle", detailUrl, res, bodyText, j ?? bodyText)
+        if (res.status === 403) {
+          setEvaluacionesDetail(null)
+          setEvaluacionesDetailError("Completa tu perfil para ver esta evaluación.")
+        } else {
+          applyHintShell()
+        }
+      }
+      try {
+        const studentsUrl = `/api/evaluations/${encodeURIComponent(id)}/students`
+        const sOut = await fetchInformeDetailRaw(studentsUrl)
+        if (!sOut.res.ok) {
+          logInformeFetchFailure("openEvaluationInforme estudiantes", studentsUrl, sOut.res, sOut.bodyText, sOut.parsed ?? sOut.bodyText)
+        }
+        const rawS = sOut.res.ok ? sOut.parsed : null
+        const list =
+          rawS && typeof rawS === "object" && Array.isArray((rawS as { students?: unknown }).students)
+            ? (rawS as { students: Array<{ student_name: string; created_at: string | null }> }).students
+            : []
+        setEvaluationStudents(list)
+      } catch (se) {
+        logInformeFetchFailure(
+          "openEvaluationInforme estudiantes (excepción)",
+          `/api/evaluations/${encodeURIComponent(id)}/students`,
+          null,
+          "",
+          { error: se instanceof Error ? se.message : String(se) }
+        )
+        setEvaluationStudents([])
+      }
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e)
+      logInformeFetchFailure("openEvaluationInforme (excepción)", detailUrl, null, "", { error: errMsg })
+      if (process.env.NODE_ENV === "development") {
+        setVerDebug({ evaluationId: id, status: 0, error: errMsg, payload: null })
+      }
+      applyHintShell()
+    } finally {
+      setEvaluacionesDetailLoading(false)
+    }
+  }, [])
 
   /** Refresca perfil del estudiante si el modal está abierto (tras edición manual en informe). */
   const refetchStudentProfileIfOpen = useCallback(async () => {
@@ -6878,9 +7056,26 @@ h-4 w-4 animate-spin"
                             <TableCell>
                               <Button variant="ghost" size="sm" onClick={async () => {
                                 setHistorialDetailId(e.id)
-                                const r = await fetch(`/api/evaluations/${e.id}`)
-                                const j = await r.json()
-                                setHistorialDetail(j.evaluation ? { evaluation: j.evaluation, items: j.items ?? [], summary: j.summary } : null)
+                                const url = `/api/evaluations/${encodeURIComponent(e.id)}`
+                                try {
+                                  const { res, bodyText, parsed } = await fetchInformeDetailRaw(url)
+                                  const j = parsed
+                                  if (res.ok && j?.evaluation) {
+                                    setHistorialDetail({
+                                      evaluation: j.evaluation,
+                                      items: (j.items as unknown[]) ?? [],
+                                      summary: j.summary,
+                                    })
+                                  } else {
+                                    logInformeFetchFailure("historial Ver", url, res, bodyText, j ?? bodyText)
+                                    setHistorialDetail(null)
+                                  }
+                                } catch (err) {
+                                  logInformeFetchFailure("historial Ver (excepción)", url, null, "", {
+                                    error: err instanceof Error ? err.message : String(err),
+                                  })
+                                  setHistorialDetail(null)
+                                }
                               }}>Ver</Button>
                             </TableCell>
                           </TableRow>
@@ -6972,31 +7167,7 @@ h-4 w-4 animate-spin"
                             variant="outline"
                             size="sm"
                             onClick={() => {
-                              setEvaluacionesDetailId(lastSavedEvaluationId)
-                              setEvaluacionesDetail(null)
-                              setEvaluacionesDetailError(null)
-                              setEvaluationStudents([])
-                              setEvaluacionesDetailLoading(true)
-                              Promise.all([
-                                fetch(`/api/evaluations/${lastSavedEvaluationId}`),
-                                fetch(`/api/evaluations/${lastSavedEvaluationId}/students`),
-                              ])
-                                .then(([r, studentsRes]) => Promise.all([r.json(), studentsRes.json()]).then(([j, s]) => ({ j, s, ok: r.ok, status: r.status })))
-                                .then(({ j, s, ok, status }) => {
-                                  if (ok && j.evaluation) {
-                                    setEvaluacionesDetail({
-                                      evaluation: j.evaluation,
-                                      evaluation_items: j.evaluation_items ?? j.items ?? [],
-                                      evaluation_summaries: j.evaluation_summaries ?? j.summary ?? null,
-                                    })
-                                    setEvaluacionesDetailError(null)
-                                  } else {
-                                    setEvaluacionesDetailError(status === 403 ? "Completa tu perfil para ver esta evaluación." : "No se pudo cargar el informe")
-                                  }
-                                  setEvaluationStudents(s?.students ?? [])
-                                })
-                                .catch(() => setEvaluacionesDetailError("No se pudo cargar el informe"))
-                                .finally(() => setEvaluacionesDetailLoading(false))
+                              void openEvaluationInforme(lastSavedEvaluationId, informeHintFromListId(lastSavedEvaluationId))
                             }}
                           >
                             Abrir
@@ -7230,62 +7401,11 @@ h-4 w-4 animate-spin"
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  onClick={async () => {
-                                    const evaluationId = ev.id
+                                  onClick={() => {
                                     if (process.env.NODE_ENV === "development") {
-                                      console.info("[UI][VER] clicked", evaluationId)
+                                      console.info("[UI][VER] clicked", ev.id)
                                     }
-                                    setEvaluacionesDetailId(evaluationId)
-                                    setEvaluacionesDetail(null)
-                                    setEvaluacionesDetailError(null)
-                                    setEvaluationStudents([])
-                                    setEvaluacionesDetailLoading(true)
-                                    setVerDebug(null)
-                                    try {
-                                      const url = `/api/evaluations/${evaluationId}`
-                                      if (process.env.NODE_ENV === "development") {
-                                        console.info("[UI][VER] fetching", url)
-                                      }
-                                      const r = await fetch(url)
-                                      const j = await r.json()
-                                      if (process.env.NODE_ENV === "development") {
-                                        console.info("[UI][VER] response status", r.status)
-                                        if (r.ok) {
-                                          console.info("[UI][VER] payload keys", Object.keys(j || {}))
-                                          console.info("[UI][VER] has evaluation", !!j?.evaluation)
-                                          console.info("[UI][VER] items length", Array.isArray(j?.items) ? j.items.length : -1)
-                                          console.info("[UI][VER] has summary", !!j?.summary)
-                                        }
-                                      }
-                                      if (r.ok && j.evaluation) {
-                                        setEvaluacionesDetail({
-                                          evaluation: j.evaluation,
-                                          evaluation_items: j.evaluation_items ?? j.items ?? [],
-                                          evaluation_summaries: j.evaluation_summaries ?? j.summary ?? null,
-                                        })
-                                        setEvaluacionesDetailError(null)
-                                      } else {
-                                        if (process.env.NODE_ENV === "development") {
-                                          setVerDebug({ evaluationId, status: r.status, error: j?.error ?? null, payload: j })
-                                        }
-                                        setEvaluacionesDetailError(r.status === 403 ? "Completa tu perfil para ver esta evaluación." : "No se pudo cargar el informe")
-                                      }
-                                      try {
-                                        const sRes = await fetch(`/api/evaluations/${evaluationId}/students`)
-                                        const s = sRes.ok ? await sRes.json() : { students: [] }
-                                        setEvaluationStudents(s.students ?? [])
-                                      } catch {
-                                        setEvaluationStudents([])
-                                      }
-                                    } catch (e) {
-                                      const errMsg = e instanceof Error ? e.message : String(e)
-                                      if (process.env.NODE_ENV === "development") {
-                                        setVerDebug({ evaluationId, status: 0, error: errMsg, payload: null })
-                                      }
-                                      setEvaluacionesDetailError("No se pudo cargar el informe")
-                                    } finally {
-                                      setEvaluacionesDetailLoading(false)
-                                    }
+                                    void openEvaluationInforme(ev.id, informeHintFromListId(ev.id))
                                   }}
                                 >
                                   Ver
@@ -7382,241 +7502,6 @@ h-4 w-4 animate-spin"
                       </TableBody>
                     </Table>
                   </>
-                )}
-                {evaluacionesDetailId && (
-                  <div className="mt-6 p-4 border rounded-lg bg-[var(--bg-muted)]">
-                    <div className="flex justify-between items-center mb-4">
-                      <span className="font-medium text-[var(--text-accent)]">Detalle de la evaluación</span>
-                      <Button variant="ghost" size="sm" onClick={() => { setEvaluacionesDetailId(null); setEvaluacionesDetail(null); setEvaluacionesDetailError(null); setEvaluacionesDetailItemsDraft(null) }}>
-                        <X className="h-4 w-4" />
-                      </Button>
-                    </div>
-                    {evaluacionesDetailLoading && (
-                      <div className="flex items-center gap-2 text-[var(--text-muted)]">
-                        <Loader2 className="h-4 w-4 animate-spin" /> Cargando...
-                      </div>
-                    )}
-                    {!evaluacionesDetailLoading && evaluacionesDetailError && (
-                      <p className="text-sm text-red-600 dark:text-red-400">{evaluacionesDetailError}</p>
-                    )}
-                    {!evaluacionesDetailLoading && evaluacionesDetail && (
-                      <div className="space-y-4">
-                        <div className="grid gap-2 text-sm">
-                          <p><span className="font-medium">Nota final:</span> {(evaluacionesDetail.evaluation_summaries as { grade_chile?: number })?.grade_chile != null ? Number((evaluacionesDetail.evaluation_summaries as { grade_chile?: number }).grade_chile) : "—"}</p>
-                          <p><span className="font-medium">Fortalezas:</span> {(evaluacionesDetail.evaluation_summaries as { strengths?: string })?.strengths ?? "—"}</p>
-                          <p><span className="font-medium">Debilidades / Áreas de mejora:</span> {(evaluacionesDetail.evaluation_summaries as { improvements?: string })?.improvements ?? "—"}</p>
-                        </div>
-                        {Array.isArray((evaluacionesDetail.evaluation as { scan_image_signed_urls?: string[] }).scan_image_signed_urls) &&
-                        (evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.length > 0 ? (
-                          <div className="rounded-lg border border-[var(--border-color)] bg-[var(--bg-muted)] p-3 space-y-2">
-                            <p className="text-sm font-medium text-[var(--text-accent)]">Imágenes del lote (escaneo móvil)</p>
-                            <p className="text-xs text-[var(--text-muted)]">
-                              Enlaces firmados (~1 h). Origen:{" "}
-                              <span className="font-mono">
-                                {(evaluacionesDetail.evaluation as { capture_source?: string }).capture_source ?? "batch_scan"}
-                              </span>
-                            </p>
-                            <div className="flex flex-wrap gap-2">
-                              {(evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.map((url, i) => (
-                                <a
-                                  key={`${url}-${i}`}
-                                  href={url}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="block w-28 h-28 rounded-md border border-[var(--border-color)] overflow-hidden bg-black/5"
-                                >
-                                  <img src={url} alt={`Página ${i + 1}`} className="w-full h-full object-cover" />
-                                </a>
-                              ))}
-                            </div>
-                          </div>
-                        ) : null}
-                        <div>
-                          <p className="text-sm font-medium mb-1">Estudiantes</p>
-                          {evaluationStudents.length === 0 ? (
-                            <p className="text-sm text-[var(--text-muted)]">Sin estudiantes vinculados</p>
-                          ) : (
-                            <ul className="text-sm list-disc list-inside">
-                              {evaluationStudents.map((s, i) => (
-                                <li key={i}>{s.student_name || "—"}</li>
-                              ))}
-                            </ul>
-                          )}
-                        </div>
-                        <p className="text-sm font-medium">Preguntas evaluadas</p>
-                        {evaluacionesDetailItemsDraft == null ? (
-                          <>
-                            <Table>
-                              <TableHeader>
-                                <TableRow>
-                                  <TableHead>#</TableHead>
-                                  <TableHead>Respuesta estudiante</TableHead>
-                                  <TableHead>Correcta</TableHead>
-                                  <TableHead>Puntaje</TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {(evaluacionesDetail.evaluation_items as Array<{ question_number?: number; student_answer?: string; correct_answer?: string | null; is_correct?: boolean | null; score_obtained?: number; score_max?: number }>).map((item, i) => (
-                                  <TableRow key={i}>
-                                    <TableCell>{item.question_number ?? i + 1}</TableCell>
-                                    <TableCell>{item.student_answer ?? "—"}</TableCell>
-                                    <TableCell>{item.correct_answer != null ? item.correct_answer : (item.is_correct != null ? (item.is_correct ? "Sí" : "No") : "—")}</TableCell>
-                                    <TableCell>{item.score_obtained != null && item.score_max != null ? `${item.score_obtained}/${item.score_max}` : "—"}</TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              className="mt-2"
-                              onClick={() => {
-                                const items = (evaluacionesDetail.evaluation_items as Array<{ question_number?: number; student_answer?: string; correct_answer?: string; is_correct?: boolean; score_obtained?: number; score_max?: number }>).map((it) => ({
-                                  question_number: it.question_number ?? 0,
-                                  student_answer: it.student_answer ?? "",
-                                  correct_answer: it.correct_answer ?? "",
-                                  is_correct: it.is_correct ?? false,
-                                  score_obtained: it.score_obtained ?? 0,
-                                  score_max: it.score_max ?? 0,
-                                }))
-                                setEvaluacionesDetailItemsDraft(items)
-                              }}
-                            >
-                              <Pencil className="h-3 w-3 mr-1" /> Editar respuestas
-                            </Button>
-                          </>
-                        ) : (
-                          <>
-                            <Table>
-                              <TableHeader>
-                                <TableRow>
-                                  <TableHead>#</TableHead>
-                                  <TableHead>Respuesta</TableHead>
-                                  <TableHead>Correcta</TableHead>
-                                  <TableHead>Puntos (obt/máx)</TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {evaluacionesDetailItemsDraft.map((item, idx) => (
-                                  <TableRow key={idx}>
-                                    <TableCell>{item.question_number}</TableCell>
-                                    <TableCell>
-                                      <Input
-                                        className="h-8 text-sm"
-                                        value={item.student_answer ?? ""}
-                                        onChange={(e) => {
-                                          const next = [...evaluacionesDetailItemsDraft!]
-                                          next[idx] = { ...next[idx], student_answer: e.target.value }
-                                          const max = next[idx].score_max ?? 1
-                                          if (max === 1) {
-                                            next[idx].is_correct = (e.target.value?.trim().toUpperCase() === (next[idx].correct_answer ?? "").trim().toUpperCase())
-                                            next[idx].score_obtained = next[idx].is_correct ? 1 : 0
-                                          }
-                                          setEvaluacionesDetailItemsDraft(next)
-                                        }}
-                                      />
-                                    </TableCell>
-                                    <TableCell>
-                                      <Input
-                                        className="h-8 text-sm w-20"
-                                        value={item.correct_answer ?? ""}
-                                        onChange={(e) => {
-                                          const next = [...evaluacionesDetailItemsDraft!]
-                                          next[idx] = { ...next[idx], correct_answer: e.target.value }
-                                          const max = next[idx].score_max ?? 1
-                                          next[idx].is_correct = max === 1
-                                            ? (e.target.value?.trim().toUpperCase() === (next[idx].student_answer ?? "").trim().toUpperCase())
-                                            : next[idx].is_correct
-                                          if (max === 1) next[idx].score_obtained = next[idx].is_correct ? 1 : 0
-                                          setEvaluacionesDetailItemsDraft(next)
-                                        }}
-                                      />
-                                    </TableCell>
-                                    <TableCell>
-                                      <div className="flex items-center gap-1">
-                                        <Input
-                                          type="number"
-                                          min={0}
-                                          className="h-8 w-14 text-sm"
-                                          value={item.score_obtained ?? ""}
-                                          onChange={(e) => {
-                                            const next = [...evaluacionesDetailItemsDraft!]
-                                            next[idx] = { ...next[idx], score_obtained: e.target.value === "" ? undefined : Number(e.target.value) }
-                                            setEvaluacionesDetailItemsDraft(next)
-                                          }}
-                                        />
-                                        <span>/</span>
-                                        <Input
-                                          type="number"
-                                          min={0}
-                                          className="h-8 w-14 text-sm"
-                                          value={item.score_max ?? ""}
-                                          onChange={(e) => {
-                                            const next = [...evaluacionesDetailItemsDraft!]
-                                            next[idx] = { ...next[idx], score_max: e.target.value === "" ? undefined : Number(e.target.value) }
-                                            setEvaluacionesDetailItemsDraft(next)
-                                          }}
-                                        />
-                                      </div>
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                            <div className="flex gap-2 mt-2">
-                              <Button
-                                type="button"
-                                size="sm"
-                                disabled={evaluacionesDetailItemsSaving}
-                                onClick={async () => {
-                                  if (!evaluacionesDetailId || !evaluacionesDetailItemsDraft) return
-                                  setEvaluacionesDetailItemsSaving(true)
-                                  try {
-                                    const r = await fetch(`/api/evaluations/${evaluacionesDetailId}/items`, {
-                                      method: "PATCH",
-                                      headers: { "Content-Type": "application/json" },
-                                      credentials: "include",
-                                      body: JSON.stringify({
-                                        items: evaluacionesDetailItemsDraft.map((it) => ({
-                                          question_number: it.question_number,
-                                          student_answer: it.student_answer ?? "",
-                                          correct_answer: it.correct_answer ?? "",
-                                          is_correct: it.is_correct,
-                                          score_obtained: it.score_obtained,
-                                          score_max: it.score_max,
-                                        })),
-                                      }),
-                                    })
-                                    const j = await r.json().catch(() => ({}))
-                                    if (r.ok && j.ok) {
-                                      toast({ title: "Cambios guardados. Nota y datos derivados actualizados." })
-                                      await refetchEvaluacionDetail()
-                                      loadEvaluationsList()
-                                      loadStudentsList()
-                                      await refetchStudentProfileIfOpen()
-                                      await refetchCourseDiagnosisIfOpen()
-                                      setEvaluacionesDetailItemsDraft(null)
-                                    } else {
-                                      toast({ title: j?.error || "Error al guardar", variant: "destructive" })
-                                    }
-                                  } catch {
-                                    toast({ title: "Error al guardar cambios", variant: "destructive" })
-                                  } finally {
-                                    setEvaluacionesDetailItemsSaving(false)
-                                  }
-                                }}
-                              >
-                                {evaluacionesDetailItemsSaving ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : null}
-                                Guardar cambios
-                              </Button>
-                              <Button type="button" variant="outline" size="sm" onClick={() => setEvaluacionesDetailItemsDraft(null)}>Cancelar</Button>
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
                 )}
               </CardContent>
             </Card>
@@ -7884,46 +7769,15 @@ h-4 w-4 animate-spin"
                                   <TableCell>{e.title || "(Sin título)"}</TableCell>
                                   <TableCell>{e.grade_chile != null ? Number(e.grade_chile) : "—"}</TableCell>
                                   <TableCell>{e.student_count != null ? e.student_count : "—"}</TableCell>
-                                  <TableCell className="flex gap-1">
+                                  <TableCell className="flex gap-1 flex-wrap">
                                     <Button
                                       variant="outline"
                                       size="sm"
-                                      onClick={async () => {
-                                        setEvaluacionesDetailId(e.id)
-                                        setEvaluacionesDetail(null)
-                                        setEvaluacionesDetailError(null)
-                                        setEvaluationStudents([])
-                                        setEvaluacionesDetailLoading(true)
-                                        try {
-                                          const [r, studentsRes] = await Promise.all([
-                                            fetch(`/api/evaluations/${e.id}`),
-                                            fetch(`/api/evaluations/${e.id}/students`),
-                                          ])
-                                          const j = await r.json()
-                                          const s = await studentsRes.json()
-                                          if (r.ok && j.evaluation) {
-                                            setEvaluacionesDetail({
-                                              evaluation: j.evaluation,
-                                              evaluation_items: j.evaluation_items ?? j.items ?? [],
-                                              evaluation_summaries: j.evaluation_summaries ?? j.summary ?? null,
-                                            })
-                                            setEvaluacionesDetailError(null)
-                                          } else {
-                                            if (r.status === 403) {
-                                              setEvaluacionesDetailError("Completa tu perfil para ver esta evaluación.")
-                                            } else {
-                                              setEvaluacionesDetailError("No se pudo cargar el informe")
-                                            }
-                                          }
-                                          setEvaluationStudents(s?.students ?? [])
-                                        } catch {
-                                          setEvaluacionesDetailError("No se pudo cargar el informe")
-                                        } finally {
-                                          setEvaluacionesDetailLoading(false)
-                                        }
+                                      onClick={() => {
+                                        void openEvaluationInforme(e.id, informeHintFromListId(e.id))
                                       }}
                                     >
-                                      Ver / Abrir carpeta
+                                      <Eye className="h-3 w-3 mr-1" /> Ver informe
                                     </Button>
                                     <Button
                                       variant="outline"
@@ -7934,7 +7788,10 @@ h-4 w-4 animate-spin"
                                         setStudentsModalLoading(true)
                                         setStudentsModalList([])
                                         try {
-                                          const r = await fetch(`/api/evaluations/${e.id}/students`)
+                                          const r = await fetch(`/api/evaluations/${e.id}/students`, {
+                                            cache: "no-store",
+                                            credentials: "include",
+                                          })
                                           const j = await r.json()
                                           setStudentsModalList(j.students ?? [])
                                         } finally {
@@ -7998,42 +7855,15 @@ h-4 w-4 animate-spin"
                                     <TableCell>{e.title || "(Sin título)"}</TableCell>
                                     <TableCell>{e.grade_chile != null ? Number(e.grade_chile) : "—"}</TableCell>
                                     <TableCell>{e.student_count != null ? e.student_count : "—"}</TableCell>
-                                    <TableCell>
+                                    <TableCell className="flex gap-1 flex-wrap">
                                       <Button
                                         variant="outline"
                                         size="sm"
-                                        onClick={async () => {
-                                          setEvaluacionesDetailId(e.id)
-                                          setEvaluacionesDetail(null)
-                                          setEvaluacionesDetailError(null)
-                                          setEvaluationStudents([])
-                                          setEvaluacionesDetailLoading(true)
-                                          try {
-                                            const [r, studentsRes] = await Promise.all([
-                                              fetch(`/api/evaluations/${e.id}`),
-                                              fetch(`/api/evaluations/${e.id}/students`),
-                                            ])
-                                            const j = await r.json()
-                                            const s = await studentsRes.json()
-                                            if (r.ok && j.evaluation) {
-                                              setEvaluacionesDetail({
-                                                evaluation: j.evaluation,
-                                                evaluation_items: j.evaluation_items ?? j.items ?? [],
-                                                evaluation_summaries: j.evaluation_summaries ?? j.summary ?? null,
-                                              })
-                                              setEvaluacionesDetailError(null)
-                                            } else {
-                                              setEvaluacionesDetailError(r.status === 403 ? "Completa tu perfil para ver esta evaluación." : "No se pudo cargar el informe")
-                                            }
-                                            setEvaluationStudents(s?.students ?? [])
-                                          } catch {
-                                            setEvaluacionesDetailError("No se pudo cargar el informe")
-                                          } finally {
-                                            setEvaluacionesDetailLoading(false)
-                                          }
+                                        onClick={() => {
+                                          void openEvaluationInforme(e.id, informeHintFromListId(e.id))
                                         }}
                                       >
-                                        Ver / Abrir carpeta
+                                        <Eye className="h-3 w-3 mr-1" /> Ver informe
                                       </Button>
                                       <Button
                                         variant="outline"
@@ -8044,7 +7874,10 @@ h-4 w-4 animate-spin"
                                           setStudentsModalLoading(true)
                                           setStudentsModalList([])
                                           try {
-                                            const r = await fetch(`/api/evaluations/${e.id}/students`)
+                                            const r = await fetch(`/api/evaluations/${e.id}/students`, {
+                                              cache: "no-store",
+                                              credentials: "include",
+                                            })
                                             const j = await r.json()
                                             setStudentsModalList(j.students ?? [])
                                           } finally {
@@ -8265,401 +8098,6 @@ h-4 w-4 animate-spin"
                 </DialogFooter>
               </DialogContent>
             </Dialog>
-            {studentsModalEvalId && (
-              <Dialog open={!!studentsModalEvalId} onOpenChange={(open) => { if (!open) { setStudentsModalEvalId(null); setStudentsModalList([]); setStudentsModalSearch("") } }}>
-                <DialogContent className="max-w-md">
-                  <DialogHeader>
-                    <DialogTitle>Estudiantes</DialogTitle>
-                  </DialogHeader>
-                  <Input
-                    placeholder="Buscar por nombre..."
-                    value={studentsModalSearch}
-                    onChange={(e) => setStudentsModalSearch(e.target.value)}
-                    className="mb-3"
-                  />
-                  {studentsModalLoading ? (
-                    <p className="text-sm text-[var(--text-muted)] flex items-center gap-2">
-                      <Loader2 className="h-4 w-4 animate-spin" /> Cargando...
-                    </p>
-                  ) : studentsModalList.length === 0 ? (
-                    <p className="text-sm text-[var(--text-muted)]">Sin estudiantes registrados.</p>
-                  ) : (
-                    <ul className="max-h-60 overflow-y-auto space-y-1 text-sm mb-4">
-                      {studentsModalList
-                        .filter((s) => !studentsModalSearch.trim() || (s.student_name || "").toLowerCase().includes(studentsModalSearch.trim().toLowerCase()))
-                        .map((s, i) => (
-                          <li key={i}>{s.student_name || "—"}</li>
-                        ))}
-                    </ul>
-                  )}
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={async () => {
-                      const evalId = studentsModalEvalId
-                      if (!evalId) return
-                      setEvaluacionesDetailId(evalId)
-                      setEvaluacionesDetail(null)
-                      setEvaluacionesDetailError(null)
-                      setEvaluationStudents([])
-                      setEvaluacionesDetailLoading(true)
-                      setStudentsModalEvalId(null)
-                      setStudentsModalList([])
-                      try {
-                        const [r, studentsRes] = await Promise.all([
-                          fetch(`/api/evaluations/${evalId}`),
-                          fetch(`/api/evaluations/${evalId}/students`),
-                        ])
-                        const j = await r.json()
-                        const s = await studentsRes.json()
-                        if (r.ok && j.evaluation) {
-                          setEvaluacionesDetail({
-                            evaluation: j.evaluation,
-                            evaluation_items: j.evaluation_items ?? j.items ?? [],
-                            evaluation_summaries: j.evaluation_summaries ?? j.summary ?? null,
-                          })
-                          setEvaluacionesDetailError(null)
-                        } else {
-                          setEvaluacionesDetailError(r.status === 403 ? "Completa tu perfil para ver esta evaluación." : "No se pudo cargar el informe")
-                        }
-                        setEvaluationStudents(s?.students ?? [])
-                      } catch {
-                        setEvaluacionesDetailError("No se pudo cargar el informe")
-                      } finally {
-                        setEvaluacionesDetailLoading(false)
-                      }
-                    }}
-                  >
-                    Abrir informe
-                  </Button>
-                </DialogContent>
-              </Dialog>
-            )}
-            {evaluacionesDetailId && (
-              <Dialog
-                open={!!evaluacionesDetailId}
-                onOpenChange={(open) => {
-                  if (!open) {
-                    setEvaluacionesDetailId(null)
-                    setEvaluacionesDetail(null)
-                    setEvaluacionesDetailError(null)
-                    setEvaluationStudents([])
-                    setEvaluacionesDetailItemsDraft(null)
-                  }
-                }}
-              >
-                <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
-                  <DialogHeader>
-                    <DialogTitle>Detalle de evaluación</DialogTitle>
-                  </DialogHeader>
-                  {evaluacionesDetailLoading ? (
-                    <p className="flex items-center gap-2 text-sm text-[var(--text-muted)]"><Loader2 className="h-4 w-4 animate-spin" /> Cargando...</p>
-                  ) : evaluacionesDetailError ? (
-                    <div className="space-y-3">
-                      <p className="text-sm text-red-600 dark:text-red-400">{evaluacionesDetailError}</p>
-                      {evaluacionesDetailError.includes("Completa tu perfil") && (
-                        <Button variant="outline" size="sm" onClick={() => { setActiveTab("historial"); setEvaluacionesDetailId(null); setEvaluacionesDetail(null); setEvaluacionesDetailError(null); setEvaluationStudents([]) }}>
-                          Completar perfil
-                        </Button>
-                      )}
-                    </div>
-                  ) : evaluacionesDetail ? (
-                    <div className="space-y-4">
-                      <div>
-                        <p className="text-sm font-medium text-[var(--text-accent)]">{(evaluacionesDetail.evaluation as { title?: string }).title ?? "(Sin título)"}</p>
-                        <p className="text-xs text-[var(--text-muted)]">
-                          {(evaluacionesDetail.evaluation as { subject?: string }).subject && <span>Asignatura: {(evaluacionesDetail.evaluation as { subject: string }).subject}</span>}
-                          {(evaluacionesDetail.evaluation as { course_label?: string; course_id?: string }).course_label || (evaluacionesDetail.evaluation as { course_id?: string }).course_id
-                            ? <span> · Curso: {(evaluacionesDetail.evaluation as { course_label?: string; course_id?: string }).course_label ?? (evaluacionesDetail.evaluation as { course_id?: string }).course_id}</span>
-                            : null}
-                        </p>
-                        <p className="text-xs text-[var(--text-muted)]">{(evaluacionesDetail.evaluation as { evaluated_at?: string }).evaluated_at ? format(new Date((evaluacionesDetail.evaluation as { evaluated_at: string }).evaluated_at), "dd/MM/yyyy HH:mm") : ""}</p>
-                        {Array.isArray((evaluacionesDetail.evaluation as { scan_image_signed_urls?: string[] }).scan_image_signed_urls) &&
-                        (evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.length > 0 ? (
-                          <div className="mt-3 rounded-md border border-[var(--border-color)] bg-[var(--bg-muted)] p-2 space-y-2">
-                            <p className="text-xs font-medium text-[var(--text-accent)]">Imágenes del escaneo móvil</p>
-                            <div className="flex flex-wrap gap-2">
-                              {(evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.map((url, i) => (
-                                <a key={`dlg-${url}-${i}`} href={url} target="_blank" rel="noreferrer" className="block w-24 h-24 rounded border overflow-hidden">
-                                  <img src={url} alt="" className="w-full h-full object-cover" />
-                                </a>
-                              ))}
-                            </div>
-                          </div>
-                        ) : null}
-                        <div className="mt-2 flex flex-wrap items-center gap-2">
-                          <span className="text-xs text-[var(--text-muted)]">
-                            Prueba base: {(evaluacionesDetail.evaluation as { source_exam_id?: string | null }).source_exam_id ? "asociada" : "pendiente"}
-                          </span>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            onClick={() => {
-                              setSelectedSourceExamIdForAssociate("")
-                              setSelectedCourseIdForBulk("")
-                              setAssociateSourceExamOpen(true)
-                              fetch("/api/source-exams", { credentials: "include" })
-                                .then((r) => r.json())
-                                .then((j) => { if (j.source_exams) setSourceExamsForAssociate(j.source_exams.map((e: { id: string; title?: string | null }) => ({ id: e.id, title: e.title ?? null }))) })
-                                .catch(() => setSourceExamsForAssociate([]))
-                              fetch("/api/courses/list", { credentials: "include" })
-                                .then((r) => r.json())
-                                .then((j) => { if (j.courses) setCoursesForBulkAssociate(j.courses.map((c: { course_id: string; total_evaluations: number }) => ({ course_id: c.course_id, total_evaluations: c.total_evaluations }))) })
-                                .catch(() => setCoursesForBulkAssociate([]))
-                            }}
-                          >
-                            <BookOpen className="h-3 w-3 mr-1" /> {(evaluacionesDetail.evaluation as { source_exam_id?: string | null }).source_exam_id ? "Cambiar prueba base" : "Asociar a prueba base"}
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            onClick={() => {
-                              if (!evaluacionesDetailId) return
-                              const ev = evaluacionesDetail.evaluation as { title?: string | null; student_name?: string | null; course_id?: string | null; course_label?: string | null }
-                              const studentName = ev.student_name && String(ev.student_name).trim() ? ev.student_name : null
-                              setPedagogicalAnalysisEvalId(evaluacionesDetailId)
-                              setPedagogicalAnalysisEvalLabel(
-                                studentName ? (ev.title ? `${studentName} — ${ev.title}` : studentName) : (ev.title ?? null)
-                              )
-                              setPedagogicalAnalysisStudentName(studentName)
-                              setPedagogicalAnalysisCourseLabel(ev.course_label ?? ev.course_id ?? null)
-                            }}
-                            title="Análisis pedagógico (prueba base)"
-                          >
-                            <BookOpen className="h-3 w-3 mr-1" /> Análisis pedagógico
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => {
-                              const ev = evaluacionesDetail.evaluation as { course_id?: string | null; course_label?: string | null }
-                              const courseId = ev.course_id != null && String(ev.course_id).trim() !== "" ? String(ev.course_id).trim() : "Sin curso"
-                              const courseLabel = ev.course_label ?? ev.course_id ?? courseId
-                              openCoursePedagogicalSummary(courseId, courseLabel)
-                            }}
-                            title="Ver resumen pedagógico"
-                          >
-                            <FolderOpen className="h-3 w-3 mr-1" /> Ver resumen pedagógico
-                          </Button>
-                        </div>
-                      </div>
-                      {evaluacionesDetail.evaluation_summaries ? (
-                        <div className="rounded border border-[var(--border-color)] p-3 text-sm">
-                          <p><strong>Nota (Chile):</strong> {(evaluacionesDetail.evaluation_summaries as { grade_chile?: number }).grade_chile ?? "—"}</p>
-                          {(evaluacionesDetail.evaluation_summaries as { strengths?: string }).strengths && <p><strong>Fortalezas:</strong> {(evaluacionesDetail.evaluation_summaries as { strengths: string }).strengths}</p>}
-                          {(evaluacionesDetail.evaluation_summaries as { improvements?: string }).improvements && <p><strong>Áreas de mejora:</strong> {(evaluacionesDetail.evaluation_summaries as { improvements: string }).improvements}</p>}
-                        </div>
-                      ) : (
-                        <p className="text-sm text-[var(--text-muted)]">Aún no hay resumen disponible.</p>
-                      )}
-                      <div>
-                        <h4 className="text-sm font-semibold text-[var(--text-accent)] mb-2">Estudiantes</h4>
-                        {evaluationStudents.length > 0 ? (
-                          <ul className="list-disc list-inside text-sm text-[var(--text-secondary)]">
-                            {evaluationStudents.map((st, i) => (
-                              <li key={i}>{st.student_name}{st.created_at ? ` · ${format(new Date(st.created_at), "dd/MM/yyyy")}` : ""}</li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <p className="text-sm text-[var(--text-muted)]">No hay estudiantes registrados para esta evaluación.</p>
-                        )}
-                      </div>
-                      {(evaluacionesDetail.evaluation_items as unknown[])?.length > 0 ? (
-                        <div>
-                          <h4 className="text-sm font-semibold text-[var(--text-accent)] mb-2">Preguntas</h4>
-                          {evaluacionesDetailItemsDraft == null ? (
-                            <>
-                              <Table>
-                                <TableHeader>
-                                  <TableRow>
-                                    <TableHead>Pregunta</TableHead>
-                                    <TableHead>Respuesta</TableHead>
-                                    <TableHead>Correcta</TableHead>
-                                    <TableHead>Puntos</TableHead>
-                                  </TableRow>
-                                </TableHeader>
-                                <TableBody>
-                                  {(evaluacionesDetail.evaluation_items as Array<{ question_number?: number; student_answer?: string; correct_answer?: string; is_correct?: boolean; score_obtained?: number; score_max?: number }>).map((item, idx) => (
-                                    <TableRow key={idx}>
-                                      <TableCell>{item.question_number ?? idx + 1}</TableCell>
-                                      <TableCell>{item.student_answer ?? "—"}</TableCell>
-                                      <TableCell>{item.correct_answer ?? "—"}</TableCell>
-                                      <TableCell>{item.is_correct ? "Sí" : "No"}</TableCell>
-                                      <TableCell>{item.score_obtained != null ? `${item.score_obtained}/${item.score_max ?? ""}` : "—"}</TableCell>
-                                    </TableRow>
-                                  ))}
-                                </TableBody>
-                              </Table>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                className="mt-2"
-                                onClick={() => {
-                                  const items = (evaluacionesDetail.evaluation_items as Array<{ question_number?: number; student_answer?: string; correct_answer?: string; is_correct?: boolean; score_obtained?: number; score_max?: number }>).map((it) => ({
-                                    question_number: it.question_number ?? 0,
-                                    student_answer: it.student_answer ?? "",
-                                    correct_answer: it.correct_answer ?? "",
-                                    is_correct: it.is_correct ?? false,
-                                    score_obtained: it.score_obtained ?? 0,
-                                    score_max: it.score_max ?? 0,
-                                  }))
-                                  setEvaluacionesDetailItemsDraft(items)
-                                }}
-                              >
-                                <Pencil className="h-3 w-3 mr-1" /> Editar respuestas
-                              </Button>
-                            </>
-                          ) : (
-                            <>
-                              <Table>
-                                <TableHeader>
-                                  <TableRow>
-                                    <TableHead>Pregunta</TableHead>
-                                    <TableHead>Respuesta</TableHead>
-                                    <TableHead>Correcta</TableHead>
-                                    <TableHead>Puntos (obt/máx)</TableHead>
-                                  </TableRow>
-                                </TableHeader>
-                                <TableBody>
-                                  {evaluacionesDetailItemsDraft.map((item, idx) => (
-                                    <TableRow key={idx}>
-                                      <TableCell>{item.question_number}</TableCell>
-                                      <TableCell>
-                                        <Input
-                                          className="h-8 text-sm"
-                                          value={item.student_answer ?? ""}
-                                          onChange={(e) => {
-                                            const next = [...evaluacionesDetailItemsDraft!]
-                                            next[idx] = { ...next[idx], student_answer: e.target.value }
-                                            const max = next[idx].score_max ?? 1
-                                            if (max === 1) {
-                                              next[idx].is_correct = (e.target.value?.trim().toUpperCase() === (next[idx].correct_answer ?? "").trim().toUpperCase())
-                                              next[idx].score_obtained = next[idx].is_correct ? 1 : 0
-                                            }
-                                            setEvaluacionesDetailItemsDraft(next)
-                                          }}
-                                        />
-                                      </TableCell>
-                                      <TableCell>
-                                        <Input
-                                          className="h-8 text-sm w-20"
-                                          value={item.correct_answer ?? ""}
-                                          onChange={(e) => {
-                                            const next = [...evaluacionesDetailItemsDraft!]
-                                            next[idx] = { ...next[idx], correct_answer: e.target.value }
-                                            const max = next[idx].score_max ?? 1
-                                            next[idx].is_correct = max === 1
-                                              ? (e.target.value?.trim().toUpperCase() === (next[idx].student_answer ?? "").trim().toUpperCase())
-                                              : next[idx].is_correct
-                                            if (max === 1) next[idx].score_obtained = next[idx].is_correct ? 1 : 0
-                                            setEvaluacionesDetailItemsDraft(next)
-                                          }}
-                                        />
-                                      </TableCell>
-                                      <TableCell>
-                                        <div className="flex items-center gap-1">
-                                          <Input
-                                            type="number"
-                                            min={0}
-                                            className="h-8 w-14 text-sm"
-                                            value={item.score_obtained ?? ""}
-                                            onChange={(e) => {
-                                              const next = [...evaluacionesDetailItemsDraft!]
-                                              const v = e.target.value === "" ? undefined : Number(e.target.value)
-                                              next[idx] = { ...next[idx], score_obtained: v }
-                                              setEvaluacionesDetailItemsDraft(next)
-                                            }}
-                                          />
-                                          <span>/</span>
-                                          <Input
-                                            type="number"
-                                            min={0}
-                                            className="h-8 w-14 text-sm"
-                                            value={item.score_max ?? ""}
-                                            onChange={(e) => {
-                                              const next = [...evaluacionesDetailItemsDraft!]
-                                              next[idx] = { ...next[idx], score_max: e.target.value === "" ? undefined : Number(e.target.value) }
-                                              setEvaluacionesDetailItemsDraft(next)
-                                            }}
-                                          />
-                                        </div>
-                                      </TableCell>
-                                    </TableRow>
-                                  ))}
-                                </TableBody>
-                              </Table>
-                              <div className="flex gap-2 mt-2">
-                                <Button
-                                  type="button"
-                                  size="sm"
-                                  disabled={evaluacionesDetailItemsSaving}
-                                  onClick={async () => {
-                                    if (!evaluacionesDetailId || !evaluacionesDetailItemsDraft) return
-                                    setEvaluacionesDetailItemsSaving(true)
-                                    try {
-                                      const r = await fetch(`/api/evaluations/${evaluacionesDetailId}/items`, {
-                                        method: "PATCH",
-                                        headers: { "Content-Type": "application/json" },
-                                        credentials: "include",
-                                        body: JSON.stringify({
-                                          items: evaluacionesDetailItemsDraft.map((it) => ({
-                                            question_number: it.question_number,
-                                            student_answer: it.student_answer ?? "",
-                                            correct_answer: it.correct_answer ?? "",
-                                            is_correct: it.is_correct,
-                                            score_obtained: it.score_obtained,
-                                            score_max: it.score_max,
-                                          })),
-                                        }),
-                                      })
-                                      const j = await r.json().catch(() => ({}))
-                                      if (r.ok && j.ok) {
-                                        toast({ title: "Cambios guardados. Nota y datos derivados actualizados." })
-                                        await refetchEvaluacionDetail()
-                                        loadEvaluationsList()
-                                        loadStudentsList()
-                                        await refetchStudentProfileIfOpen()
-                                        await refetchCourseDiagnosisIfOpen()
-                                        setEvaluacionesDetailItemsDraft(null)
-                                      } else {
-                                        toast({ title: j.error || "Error al guardar", variant: "destructive" })
-                                      }
-                                    } catch {
-                                      toast({ title: "Error al guardar cambios", variant: "destructive" })
-                                    } finally {
-                                      setEvaluacionesDetailItemsSaving(false)
-                                    }
-                                  }}
-                                >
-                                  {evaluacionesDetailItemsSaving ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : null}
-                                  Guardar cambios
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => setEvaluacionesDetailItemsDraft(null)}
-                                >
-                                  Cancelar
-                                </Button>
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      ) : (
-                        <p className="text-sm text-[var(--text-muted)]">Aún no hay preguntas registradas.</p>
-                      )}
-                    </div>
-                  ) : null}
-                  <DialogFooter>
-                    <Button variant="outline" onClick={() => { setEvaluacionesDetailId(null); setEvaluacionesDetail(null); setEvaluacionesDetailError(null); setEvaluationStudents([]) }}>Cerrar</Button>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
-            )}
             {/* Modal: Asociar esta evaluación a una prueba base (capa aditiva; no modifica nota ni informe) */}
             <Dialog open={associateSourceExamOpen} onOpenChange={(open) => { setAssociateSourceExamOpen(open); if (!open) setSelectedSourceExamIdForAssociate("") }}>
               <DialogContent className="max-w-md">
@@ -9186,7 +8624,393 @@ h-4 w-4 animate-spin"
               </div>
             </Card>
           </TabsContent>
-</Tabs>
+        </Tabs>
+      {/* Informe de evaluación: fuera de TabsContent para que el portal no quede bajo un tab inactivo */}
+      {evaluacionesDetailId && (
+        <Dialog
+          open={!!evaluacionesDetailId}
+          onOpenChange={(open) => {
+            if (!open) {
+              setEvaluacionesDetailId(null)
+              setEvaluacionesDetail(null)
+              setEvaluacionesDetailError(null)
+              setEvaluationStudents([])
+              setEvaluacionesDetailItemsDraft(null)
+            }
+          }}
+        >
+          <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>Detalle de evaluación</DialogTitle>
+            </DialogHeader>
+            {evaluacionesDetailLoading ? (
+              <p className="flex items-center gap-2 text-sm text-[var(--text-muted)]"><Loader2 className="h-4 w-4 animate-spin" /> Cargando...</p>
+            ) : evaluacionesDetailError ? (
+              <div className="space-y-3">
+                <p className="text-sm text-red-600 dark:text-red-400">{evaluacionesDetailError}</p>
+                {evaluacionesDetailError.includes("Completa tu perfil") && (
+                  <Button variant="outline" size="sm" onClick={() => { setActiveTab("historial"); setEvaluacionesDetailId(null); setEvaluacionesDetail(null); setEvaluacionesDetailError(null); setEvaluationStudents([]) }}>
+                    Completar perfil
+                  </Button>
+                )}
+              </div>
+            ) : evaluacionesDetail ? (
+              <div className="space-y-4">
+                <div>
+                  <p className="text-sm font-medium text-[var(--text-accent)]">{(evaluacionesDetail.evaluation as { title?: string }).title ?? "(Sin título)"}</p>
+                  <p className="text-xs text-[var(--text-muted)]">
+                    {(evaluacionesDetail.evaluation as { subject?: string }).subject && <span>Asignatura: {(evaluacionesDetail.evaluation as { subject: string }).subject}</span>}
+                    {(evaluacionesDetail.evaluation as { course_label?: string; course_id?: string }).course_label || (evaluacionesDetail.evaluation as { course_id?: string }).course_id
+                      ? <span> · Curso: {(evaluacionesDetail.evaluation as { course_label?: string; course_id?: string }).course_label ?? (evaluacionesDetail.evaluation as { course_id?: string }).course_id}</span>
+                      : null}
+                  </p>
+                  <p className="text-xs text-[var(--text-muted)]">{(evaluacionesDetail.evaluation as { evaluated_at?: string }).evaluated_at ? format(new Date((evaluacionesDetail.evaluation as { evaluated_at: string }).evaluated_at), "dd/MM/yyyy HH:mm") : ""}</p>
+                  {Array.isArray((evaluacionesDetail.evaluation as { scan_image_signed_urls?: string[] }).scan_image_signed_urls) &&
+                  (evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.length > 0 ? (
+                    <div className="mt-3 rounded-md border border-[var(--border-color)] bg-[var(--bg-muted)] p-2 space-y-2">
+                      <p className="text-xs font-medium text-[var(--text-accent)]">Imágenes del escaneo móvil</p>
+                      <div className="flex flex-wrap gap-2">
+                        {(evaluacionesDetail.evaluation as { scan_image_signed_urls: string[] }).scan_image_signed_urls.map((url, i) => (
+                          <a key={`dlg-${url}-${i}`} href={url} target="_blank" rel="noreferrer" className="block w-24 h-24 rounded border overflow-hidden">
+                            <img src={url} alt="" className="w-full h-full object-cover" />
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <span className="text-xs text-[var(--text-muted)]">
+                      Prueba base: {(evaluacionesDetail.evaluation as { source_exam_id?: string | null }).source_exam_id ? "asociada" : "pendiente"}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setSelectedSourceExamIdForAssociate("")
+                        setSelectedCourseIdForBulk("")
+                        setAssociateSourceExamOpen(true)
+                        fetch("/api/source-exams", { credentials: "include" })
+                          .then((r) => r.json())
+                          .then((j) => { if (j.source_exams) setSourceExamsForAssociate(j.source_exams.map((e: { id: string; title?: string | null }) => ({ id: e.id, title: e.title ?? null }))) })
+                          .catch(() => setSourceExamsForAssociate([]))
+                        fetch("/api/courses/list", { credentials: "include" })
+                          .then((r) => r.json())
+                          .then((j) => { if (j.courses) setCoursesForBulkAssociate(j.courses.map((c: { course_id: string; total_evaluations: number }) => ({ course_id: c.course_id, total_evaluations: c.total_evaluations }))) })
+                          .catch(() => setCoursesForBulkAssociate([]))
+                      }}
+                    >
+                      <BookOpen className="h-3 w-3 mr-1" /> {(evaluacionesDetail.evaluation as { source_exam_id?: string | null }).source_exam_id ? "Cambiar prueba base" : "Asociar a prueba base"}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        if (!evaluacionesDetailId) return
+                        const ev = evaluacionesDetail.evaluation as { title?: string | null; student_name?: string | null; course_id?: string | null; course_label?: string | null }
+                        const studentName = ev.student_name && String(ev.student_name).trim() ? ev.student_name : null
+                        setPedagogicalAnalysisEvalId(evaluacionesDetailId)
+                        setPedagogicalAnalysisEvalLabel(
+                          studentName ? (ev.title ? `${studentName} — ${ev.title}` : studentName) : (ev.title ?? null)
+                        )
+                        setPedagogicalAnalysisStudentName(studentName)
+                        setPedagogicalAnalysisCourseLabel(ev.course_label ?? ev.course_id ?? null)
+                      }}
+                      title="Análisis pedagógico (prueba base)"
+                    >
+                      <BookOpen className="h-3 w-3 mr-1" /> Análisis pedagógico
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        const ev = evaluacionesDetail.evaluation as { course_id?: string | null; course_label?: string | null }
+                        const courseId = ev.course_id != null && String(ev.course_id).trim() !== "" ? String(ev.course_id).trim() : "Sin curso"
+                        const courseLabel = ev.course_label ?? ev.course_id ?? courseId
+                        openCoursePedagogicalSummary(courseId, courseLabel)
+                      }}
+                      title="Ver resumen pedagógico"
+                    >
+                      <FolderOpen className="h-3 w-3 mr-1" /> Ver resumen pedagógico
+                    </Button>
+                  </div>
+                </div>
+                {evaluacionesDetail.evaluation_summaries ? (
+                  <div className="rounded border border-[var(--border-color)] p-3 text-sm">
+                    <p><strong>Nota (Chile):</strong> {(evaluacionesDetail.evaluation_summaries as { grade_chile?: number }).grade_chile ?? "—"}</p>
+                    {(evaluacionesDetail.evaluation_summaries as { strengths?: string }).strengths && <p><strong>Fortalezas:</strong> {(evaluacionesDetail.evaluation_summaries as { strengths: string }).strengths}</p>}
+                    {(evaluacionesDetail.evaluation_summaries as { improvements?: string }).improvements && <p><strong>Áreas de mejora:</strong> {(evaluacionesDetail.evaluation_summaries as { improvements: string }).improvements}</p>}
+                  </div>
+                ) : (
+                  <p className="text-sm text-[var(--text-muted)]">Aún no hay resumen disponible.</p>
+                )}
+                <div>
+                  <h4 className="text-sm font-semibold text-[var(--text-accent)] mb-2">Estudiantes</h4>
+                  {evaluationStudents.length > 0 ? (
+                    <ul className="list-disc list-inside text-sm text-[var(--text-secondary)]">
+                      {evaluationStudents.map((st, i) => (
+                        <li key={i}>
+                          {st?.student_name != null && String(st.student_name).trim() !== "" ? st.student_name : "—"}
+                          {st?.created_at ? ` · ${format(new Date(st.created_at), "dd/MM/yyyy")}` : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-sm text-[var(--text-muted)]">No hay estudiantes registrados para esta evaluación.</p>
+                  )}
+                </div>
+                {Array.isArray(evaluacionesDetail.evaluation_items) && evaluacionesDetail.evaluation_items.length > 0 ? (
+                  <div>
+                    <h4 className="text-sm font-semibold text-[var(--text-accent)] mb-2">Preguntas</h4>
+                    {evaluacionesDetailItemsDraft == null ? (
+                      <>
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead>Pregunta</TableHead>
+                              <TableHead>Respuesta</TableHead>
+                              <TableHead>Correcta</TableHead>
+                              <TableHead>Puntos</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {(evaluacionesDetail.evaluation_items as Array<{ question_number?: number; student_answer?: string; correct_answer?: string; is_correct?: boolean; score_obtained?: number; score_max?: number }>).map((item, idx) => (
+                              <TableRow key={idx}>
+                                <TableCell>{item.question_number ?? idx + 1}</TableCell>
+                                <TableCell>{item.student_answer ?? "—"}</TableCell>
+                                <TableCell>{item.correct_answer ?? "—"}</TableCell>
+                                <TableCell>{item.is_correct ? "Sí" : "No"}</TableCell>
+                                <TableCell>{item.score_obtained != null ? `${item.score_obtained}/${item.score_max ?? ""}` : "—"}</TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="mt-2"
+                          onClick={() => {
+                            const src = Array.isArray(evaluacionesDetail.evaluation_items) ? evaluacionesDetail.evaluation_items : []
+                            const items = (src as Array<{ question_number?: number; student_answer?: string; correct_answer?: string; is_correct?: boolean; score_obtained?: number; score_max?: number }>).map((it) => ({
+                              question_number: it.question_number ?? 0,
+                              student_answer: it.student_answer ?? "",
+                              correct_answer: it.correct_answer ?? "",
+                              is_correct: it.is_correct ?? false,
+                              score_obtained: it.score_obtained ?? 0,
+                              score_max: it.score_max ?? 0,
+                            }))
+                            setEvaluacionesDetailItemsDraft(items)
+                          }}
+                        >
+                          <Pencil className="h-3 w-3 mr-1" /> Editar respuestas
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead>Pregunta</TableHead>
+                              <TableHead>Respuesta</TableHead>
+                              <TableHead>Correcta</TableHead>
+                              <TableHead>Puntos (obt/máx)</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {evaluacionesDetailItemsDraft.map((item, idx) => (
+                              <TableRow key={idx}>
+                                <TableCell>{item.question_number}</TableCell>
+                                <TableCell>
+                                  <Input
+                                    className="h-8 text-sm"
+                                    value={item.student_answer ?? ""}
+                                    onChange={(e) => {
+                                      const next = [...evaluacionesDetailItemsDraft!]
+                                      next[idx] = { ...next[idx], student_answer: e.target.value }
+                                      const max = next[idx].score_max ?? 1
+                                      if (max === 1) {
+                                        next[idx].is_correct = (e.target.value?.trim().toUpperCase() === (next[idx].correct_answer ?? "").trim().toUpperCase())
+                                        next[idx].score_obtained = next[idx].is_correct ? 1 : 0
+                                      }
+                                      setEvaluacionesDetailItemsDraft(next)
+                                    }}
+                                  />
+                                </TableCell>
+                                <TableCell>
+                                  <Input
+                                    className="h-8 text-sm w-20"
+                                    value={item.correct_answer ?? ""}
+                                    onChange={(e) => {
+                                      const next = [...evaluacionesDetailItemsDraft!]
+                                      next[idx] = { ...next[idx], correct_answer: e.target.value }
+                                      const max = next[idx].score_max ?? 1
+                                      next[idx].is_correct = max === 1
+                                        ? (e.target.value?.trim().toUpperCase() === (next[idx].student_answer ?? "").trim().toUpperCase())
+                                        : next[idx].is_correct
+                                      if (max === 1) next[idx].score_obtained = next[idx].is_correct ? 1 : 0
+                                      setEvaluacionesDetailItemsDraft(next)
+                                    }}
+                                  />
+                                </TableCell>
+                                <TableCell>
+                                  <div className="flex items-center gap-1">
+                                    <Input
+                                      type="number"
+                                      min={0}
+                                      className="h-8 w-14 text-sm"
+                                      value={item.score_obtained ?? ""}
+                                      onChange={(e) => {
+                                        const next = [...evaluacionesDetailItemsDraft!]
+                                        const v = e.target.value === "" ? undefined : Number(e.target.value)
+                                        next[idx] = { ...next[idx], score_obtained: v }
+                                        setEvaluacionesDetailItemsDraft(next)
+                                      }}
+                                    />
+                                    <span>/</span>
+                                    <Input
+                                      type="number"
+                                      min={0}
+                                      className="h-8 w-14 text-sm"
+                                      value={item.score_max ?? ""}
+                                      onChange={(e) => {
+                                        const next = [...evaluacionesDetailItemsDraft!]
+                                        next[idx] = { ...next[idx], score_max: e.target.value === "" ? undefined : Number(e.target.value) }
+                                        setEvaluacionesDetailItemsDraft(next)
+                                      }}
+                                    />
+                                  </div>
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                        <div className="flex gap-2 mt-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={evaluacionesDetailItemsSaving}
+                            onClick={async () => {
+                              if (!evaluacionesDetailId || !evaluacionesDetailItemsDraft) return
+                              setEvaluacionesDetailItemsSaving(true)
+                              try {
+                                const r = await fetch(`/api/evaluations/${evaluacionesDetailId}/items`, {
+                                  method: "PATCH",
+                                  headers: { "Content-Type": "application/json" },
+                                  credentials: "include",
+                                  body: JSON.stringify({
+                                    items: evaluacionesDetailItemsDraft.map((it) => ({
+                                      question_number: it.question_number,
+                                      student_answer: it.student_answer ?? "",
+                                      correct_answer: it.correct_answer ?? "",
+                                      is_correct: it.is_correct,
+                                      score_obtained: it.score_obtained,
+                                      score_max: it.score_max,
+                                    })),
+                                  }),
+                                })
+                                const j = await r.json().catch(() => ({}))
+                                if (r.ok && j.ok) {
+                                  toast({ title: "Cambios guardados. Nota y datos derivados actualizados." })
+                                  await refetchEvaluacionDetail()
+                                  loadEvaluationsList()
+                                  loadStudentsList()
+                                  await refetchStudentProfileIfOpen()
+                                  await refetchCourseDiagnosisIfOpen()
+                                  setEvaluacionesDetailItemsDraft(null)
+                                } else {
+                                  toast({ title: j.error || "Error al guardar", variant: "destructive" })
+                                }
+                              } catch {
+                                toast({ title: "Error al guardar cambios", variant: "destructive" })
+                              } finally {
+                                setEvaluacionesDetailItemsSaving(false)
+                              }
+                            }}
+                          >
+                            {evaluacionesDetailItemsSaving ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : null}
+                            Guardar cambios
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setEvaluacionesDetailItemsDraft(null)}
+                          >
+                            Cancelar
+                          </Button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-sm text-[var(--text-muted)]">Aún no hay preguntas registradas.</p>
+                )}
+              </div>
+            ) : null}
+            <DialogFooter>
+              <Button variant="outline" onClick={() => { setEvaluacionesDetailId(null); setEvaluacionesDetail(null); setEvaluacionesDetailError(null); setEvaluationStudents([]) }}>Cerrar</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+      {studentsModalEvalId && (
+        <Dialog
+          open={!!studentsModalEvalId}
+          onOpenChange={(open) => {
+            if (!open) {
+              setStudentsModalEvalId(null)
+              setStudentsModalList([])
+              setStudentsModalSearch("")
+            }
+          }}
+        >
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>Estudiantes</DialogTitle>
+            </DialogHeader>
+            <Input
+              placeholder="Buscar por nombre..."
+              value={studentsModalSearch}
+              onChange={(e) => setStudentsModalSearch(e.target.value)}
+              className="mb-3"
+            />
+            {studentsModalLoading ? (
+              <p className="text-sm text-[var(--text-muted)] flex items-center gap-2">
+                <Loader2 className="h-4 w-4 animate-spin" /> Cargando...
+              </p>
+            ) : studentsModalList.length === 0 ? (
+              <p className="text-sm text-[var(--text-muted)]">Sin estudiantes registrados.</p>
+            ) : (
+              <ul className="max-h-60 overflow-y-auto space-y-1 text-sm mb-4">
+                {studentsModalList
+                  .filter(
+                    (s) =>
+                      !studentsModalSearch.trim() ||
+                      (s.student_name || "").toLowerCase().includes(studentsModalSearch.trim().toLowerCase())
+                  )
+                  .map((s, i) => (
+                    <li key={i}>{s.student_name || "—"}</li>
+                  ))}
+              </ul>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                const evalId = studentsModalEvalId
+                if (!evalId) return
+                setStudentsModalEvalId(null)
+                setStudentsModalList([])
+                void openEvaluationInforme(evalId, informeHintFromListId(evalId))
+              }}
+            >
+              Abrir informe
+            </Button>
+          </DialogContent>
+        </Dialog>
+      )}
       {/* Modales de análisis pedagógico y resumen de curso: fuera de TabsContent para que abran desde cualquier pestaña (Estudiantes, Evaluaciones, Cursos). */}
       <PedagogicalAnalysisModal
         evaluationId={pedagogicalAnalysisEvalId}

@@ -110,6 +110,72 @@ function pearsonCorrelation(xs: number[], ys: number[]): number | null {
   return num / Math.sqrt(denX * denY)
 }
 
+/** Colapsa filas duplicadas (mismo evaluation_id + question_number) para no inflar totales ni %. */
+function dedupeEvaluationItemsForCourseAnalysis(
+  items: Array<{
+    evaluation_id: string
+    question_number: number | null
+    student_answer: string | null
+    correct_answer: string | null
+    is_correct: boolean | null
+  }>
+): Array<{
+  evaluation_id: string
+  question_number: number
+  student_answer: string | null
+  correct_answer: string | null
+  is_correct: boolean | null
+}> {
+  const map = new Map<
+    string,
+    {
+      evaluation_id: string
+      question_number: number
+      student_answer: string | null
+      correct_answer: string | null
+      is_correct: boolean | null
+    }
+  >()
+  for (const row of items) {
+    const qn = Number(row.question_number)
+    if (!Number.isFinite(qn) || qn <= 0) continue
+    const k = `${String(row.evaluation_id)}:${qn}`
+    const prev = map.get(k)
+    if (!prev) {
+      map.set(k, {
+        evaluation_id: String(row.evaluation_id),
+        question_number: qn,
+        student_answer: row.student_answer,
+        correct_answer: row.correct_answer,
+        is_correct: row.is_correct,
+      })
+      continue
+    }
+    const anyCorrect = prev.is_correct === true || row.is_correct === true
+    const mergedCorrect: boolean | null = anyCorrect
+      ? true
+      : prev.is_correct === false || row.is_correct === false
+        ? false
+        : null
+    const sa =
+      prev.student_answer != null && String(prev.student_answer).trim() !== ""
+        ? prev.student_answer
+        : row.student_answer
+    const ca =
+      prev.correct_answer != null && String(prev.correct_answer).trim() !== ""
+        ? prev.correct_answer
+        : row.correct_answer
+    map.set(k, {
+      evaluation_id: String(row.evaluation_id),
+      question_number: qn,
+      student_answer: sa,
+      correct_answer: ca,
+      is_correct: mergedCorrect,
+    })
+  }
+  return Array.from(map.values())
+}
+
 function computeCourseItemAnalysis(params: {
   items: Array<{
     evaluation_id: string
@@ -120,6 +186,7 @@ function computeCourseItemAnalysis(params: {
   }>
   totalScoreByEvaluation: Map<string, number>
 }): ItemAnalysisCourseRow[] {
+  const itemsDeduped = dedupeEvaluationItemsForCourseAnalysis(params.items)
   const byQuestion = new Map<
     number,
     {
@@ -128,9 +195,8 @@ function computeCourseItemAnalysis(params: {
     }
   >()
 
-  for (const row of params.items) {
-    const qn = Number(row.question_number)
-    if (!Number.isFinite(qn) || qn <= 0) continue
+  for (const row of itemsDeduped) {
+    const qn = row.question_number
     const correctOpt = normalizeOption(row.correct_answer)
     const studentOpt = normalizeOption(row.student_answer)
     const correct01 = row.is_correct === true ? 1 : 0
@@ -170,16 +236,16 @@ function computeCourseItemAnalysis(params: {
     out.push({
       item_number,
       correct_answer: majorityCorrectAnswer,
-      pct_correct: round1((correctCount / total) * 100),
-      pct_wrong: round1((wrongCount / total) * 100),
-      pct_omitted: round1((omitCount / total) * 100),
+      pct_correct: round1(Math.min(100, (correctCount / total) * 100)),
+      pct_wrong: round1(Math.min(100, (wrongCount / total) * 100)),
+      pct_omitted: round1(Math.min(100, (omitCount / total) * 100)),
       biserial_xc: biserial == null ? null : Math.round(biserial * 1000) / 1000,
       distractors: {
-        A: round1((dist.A / total) * 100),
-        B: round1((dist.B / total) * 100),
-        C: round1((dist.C / total) * 100),
-        D: round1((dist.D / total) * 100),
-        E: round1((dist.E / total) * 100),
+        A: round1(Math.min(100, (dist.A / total) * 100)),
+        B: round1(Math.min(100, (dist.B / total) * 100)),
+        C: round1(Math.min(100, (dist.C / total) * 100)),
+        D: round1(Math.min(100, (dist.D / total) * 100)),
+        E: round1(Math.min(100, (dist.E / total) * 100)),
       },
     })
   }
@@ -852,8 +918,9 @@ export async function GET(
   const byQuestionRef = firstWithQuestions?.by_question ?? []
   const most_failed_questions = courseSummary.questions_most_errors.map((q) => {
     const { axis, skill } = findAxisAndSkill(byQuestionRef, q.item_number)
-    const error_pct =
-      evaluationCount > 0 ? Math.round((q.error_count / evaluationCount) * 100) : 0
+    const denom = Math.max(evaluationCount, 1)
+    // (alumnos que fallaron u omitieron el ítem) / (total de evaluaciones en el curso) × 100; tope 100.
+    const error_pct = Math.min(100, Math.round((q.error_count / denom) * 100))
     return {
       item_number: q.item_number,
       axis,

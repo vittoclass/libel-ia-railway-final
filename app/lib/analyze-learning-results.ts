@@ -368,11 +368,28 @@ export function aggregateCourseSummary(
   const cognitiveAcc = new Map<string, { obtained: number; max: number; count: number }>()
   const questionErrors = new Map<number, number>()
 
+  // Una evaluación = un alumno en este flujo. Si hay varias filas by_question con el mismo
+  // item_number (duplicados en BD), no se deben sumar como varios errores: se toma el mejor
+  // logro_pct del ítem; error = omitido (null) o logro < 100. Así error_count ≤ evaluation_count.
   for (const a of analyses) {
+    const bestLogroByItem = new Map<number, number | null>()
     for (const q of a.by_question) {
-      const key = q.item_number
-      const prev = questionErrors.get(key) ?? 0
-      if (typeof q.logro_pct === "number" && q.logro_pct < 100) questionErrors.set(key, prev + 1)
+      const qn = q.item_number
+      const v = q.logro_pct
+      const prev = bestLogroByItem.get(qn)
+      if (prev === undefined) {
+        bestLogroByItem.set(qn, v)
+      } else if (prev === null || v === null) {
+        bestLogroByItem.set(qn, null)
+      } else {
+        bestLogroByItem.set(qn, Math.max(prev, v))
+      }
+    }
+    for (const [itemNumber, bestLogro] of bestLogroByItem) {
+      const failedOrOmitted = bestLogro == null || bestLogro < 100
+      if (failedOrOmitted) {
+        questionErrors.set(itemNumber, (questionErrors.get(itemNumber) ?? 0) + 1)
+      }
     }
     for (const x of a.by_axis) {
       const cur = axisAcc.get(x.dimension_value) ?? { obtained: 0, max: 0, count: 0 }
