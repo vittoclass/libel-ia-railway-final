@@ -41,6 +41,7 @@ import { QuestionHeatMap } from "@/app/components/QuestionHeatMap"
 import { downloadCsvFile } from "@/app/lib/csv-export"
 import { EXAM_TYPE_FILTER_OPTIONS } from "@/app/lib/exam-type-constants"
 import { projectPaesFromLogroPct, projectSimceFromLogroPct } from "@/app/lib/standard-scale-converters"
+import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
 
 type LogroRowChile = {
   dimension_value: string
@@ -153,12 +154,18 @@ function pickPedagogicalLabel(value: unknown, fallback = "N/A"): string {
   return toSafeText(value, fallback)
 }
 
+function formatPedagogyForDisplay(value: unknown, fallback = "N/A"): string {
+  const s = pickPedagogicalLabel(value, fallback)
+  if (s === fallback || s === "—") return s
+  return formatPedagogicalReadableText(s)
+}
+
 function normalizeSummaryData(raw: SummaryData): SummaryData {
   // SNAPSHOT_NATIONAL_ANALYTICS_V1: normalizacion de entrada para impedir objetos en render
   const mapDimensionRows = (rows: LogroRowChile[]) =>
     (rows ?? []).map((r) => ({
       ...r,
-      dimension_value: pickPedagogicalLabel(r.dimension_value),
+      dimension_value: formatPedagogyForDisplay(r.dimension_value),
     }))
 
   return {
@@ -169,22 +176,22 @@ function normalizeSummaryData(raw: SummaryData): SummaryData {
     by_cognitive_level: mapDimensionRows(raw.by_cognitive_level),
     weakest_skills: (raw.weakest_skills ?? []).map((s) => ({
       ...s,
-      skill: pickPedagogicalLabel(s.skill),
+      skill: formatPedagogyForDisplay(s.skill),
     })),
     weakest_axes: (raw.weakest_axes ?? []).map((a) => ({
       ...a,
-      axis: pickPedagogicalLabel(a.axis),
+      axis: formatPedagogyForDisplay(a.axis),
     })),
     most_failed_questions: (raw.most_failed_questions ?? []).map((q) => ({
       ...q,
       error_pct: Math.min(100, Math.max(0, Number(q.error_pct ?? 0))),
-      axis: pickPedagogicalLabel(q.axis),
-      skill: pickPedagogicalLabel(q.skill),
+      axis: formatPedagogyForDisplay(q.axis),
+      skill: formatPedagogyForDisplay(q.skill),
     })),
     question_heat_map: (raw.question_heat_map ?? []).map((q) => ({
       ...q,
-      axis: pickPedagogicalLabel(q.axis ?? "—"),
-      skill: pickPedagogicalLabel(q.skill ?? "—"),
+      axis: formatPedagogyForDisplay(q.axis ?? "—", "—"),
+      skill: formatPedagogyForDisplay(q.skill ?? "—", "—"),
     })),
     national_analytics: raw.national_analytics
       ? {

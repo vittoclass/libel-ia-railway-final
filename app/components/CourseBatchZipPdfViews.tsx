@@ -5,6 +5,7 @@
  * Solo exportación; no altera OMR ni APIs.
  */
 import * as React from "react"
+import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
 
 export type CourseZipNationalRow = {
   student_name?: string
@@ -162,7 +163,7 @@ export function CourseAnalisisPedagogicoZipBody({
           ) : (
             skills.slice(0, 40).map((r, i) => (
               <tr key={i}>
-                <td style={thtd}>{r.dimension_value}</td>
+                <td style={thtd}>{formatPedagogicalReadableText(r.dimension_value)}</td>
                 <td style={thtd}>{pct(r.logro_pct)}</td>
                 <td style={thtd}>{r.question_count}</td>
               </tr>
@@ -215,7 +216,7 @@ export function CourseAnalisisPedagogicoZipBody({
           ) : (
             weak.slice(0, 20).map((r, i) => (
               <tr key={i}>
-                <td style={thtd}>{r.skill}</td>
+                <td style={thtd}>{formatPedagogicalReadableText(r.skill)}</td>
                 <td style={thtd}>{pct(r.average_logro_pct)}</td>
               </tr>
             ))
@@ -244,8 +245,8 @@ export function CourseAnalisisPedagogicoZipBody({
             failed.slice(0, 25).map((r, i) => (
               <tr key={i}>
                 <td style={thtd}>{r.item_number}</td>
-                <td style={thtd}>{r.axis}</td>
-                <td style={thtd}>{r.skill}</td>
+                <td style={thtd}>{formatPedagogicalReadableText(r.axis)}</td>
+                <td style={thtd}>{formatPedagogicalReadableText(r.skill)}</td>
                 <td style={thtd}>{Math.round(r.error_pct)}%</td>
                 <td style={thtd}>{r.student_count}</td>
               </tr>

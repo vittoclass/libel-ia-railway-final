@@ -14,12 +14,12 @@ import {
   analyzeLearningResults,
   aggregateCourseSummary,
   normalizePedagogicalText,
-  formatPedagogicalDisplayText,
   type EvaluationItemRow,
   type SourceExamItemWithPedagogy,
   type LearningResultsAnalysis,
   type LogroByQuestion,
 } from "@/app/lib/analyze-learning-results"
+import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
 import {
   clampLogroPctFromScores,
   projectPaesFromLogroPct,
@@ -337,7 +337,7 @@ function buildAggregatesFromByQuestion(
   for (const q of byQuestion) {
     const fallback =
       dimension === "axis" ? "Sin eje" : dimension === "skill" ? "Sin habilidad" : "aplicar"
-    const raw = formatPedagogicalDisplayText(pickLabel(q[dimension], fallback))
+    const raw = formatPedagogicalReadableText(pickLabel(q[dimension], fallback))
     // DATA_NORMALIZATION_V2: llave normalizada para fusionar textos equivalentes.
     const key = normalizePedagogicalText(raw)
     const cur = acc.get(key) ?? { display: raw, obtained: 0, max: 0, count: 0 }

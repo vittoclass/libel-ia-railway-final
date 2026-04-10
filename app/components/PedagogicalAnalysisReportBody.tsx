@@ -17,7 +17,7 @@ import {
   ResponsiveContainer,
   Cell,
 } from "recharts"
-import { formatPedagogicalDisplayText } from "@/app/lib/analyze-learning-results"
+import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
 import type { PedagogicalAnalysisExportData } from "@/app/lib/pedagogical-analysis-export-types"
 
 export type PedagogicalAnalysisReportBodyProps = {
@@ -89,20 +89,27 @@ function buildStudentDiagnosis(data: PedagogicalAnalysisExportData) {
   const byCog = data.by_cognitive_level ?? []
   const strengthsAxis = byAxis
     .filter((r) => typeof r.logro_pct === "number" && r.logro_pct >= 70)
-    .map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
+    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
   const strengthsSkill = bySkill
     .filter((r) => typeof r.logro_pct === "number" && r.logro_pct >= 70)
-    .map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
+    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
   const weakAxis = byAxis
     .filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50)
-    .map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
+    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
   const weakSkill = bySkill
     .filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50)
-    .map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
+    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
   const weakCog = byCog
     .filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50)
-    .map((r) => ({ name: formatPedagogicalDisplayText(r.dimension_value), pct: Number(r.logro_pct) }))
-  const recommendations = [...weakSkill.map((s) => s.name), ...weakAxis.map((a) => a.name)].filter(Boolean).slice(0, 6)
+    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
+  const recMap = new Map<string, { name: string; pct: number }>()
+  for (const row of [...weakSkill, ...weakAxis]) {
+    const k = row.name.trim().toLowerCase()
+    if (!k) continue
+    const cur = recMap.get(k)
+    if (!cur || row.pct < cur.pct) recMap.set(k, { name: row.name, pct: row.pct })
+  }
+  const recommendations = [...recMap.values()].sort((a, b) => a.pct - b.pct).slice(0, 6).map((x) => x.name)
   return {
     strengthsAxis,
     strengthsSkill,
@@ -255,7 +262,7 @@ function PedagogicalAnalysisInner({
             <TableBody>
               {data.by_axis.map((r, i) => (
                 <TableRow key={i}>
-                  <TableCell>{formatPedagogicalDisplayText(r.dimension_value)}</TableCell>
+                  <TableCell>{formatPedagogicalReadableText(r.dimension_value)}</TableCell>
                   <TableCell>{r.score_obtained}</TableCell>
                   <TableCell>{r.score_max}</TableCell>
                   <TableCell>
@@ -288,7 +295,7 @@ function PedagogicalAnalysisInner({
             <TableBody>
               {data.by_skill.map((r, i) => (
                 <TableRow key={i}>
-                  <TableCell>{formatPedagogicalDisplayText(r.dimension_value)}</TableCell>
+                  <TableCell>{formatPedagogicalReadableText(r.dimension_value)}</TableCell>
                   <TableCell>{r.score_obtained}</TableCell>
                   <TableCell>{r.score_max}</TableCell>
                   <TableCell>
@@ -321,7 +328,7 @@ function PedagogicalAnalysisInner({
             <TableBody>
               {data.by_cognitive_level.map((r, i) => (
                 <TableRow key={i}>
-                  <TableCell>{formatPedagogicalDisplayText(r.dimension_value)}</TableCell>
+                  <TableCell>{formatPedagogicalReadableText(r.dimension_value)}</TableCell>
                   <TableCell>{r.score_obtained}</TableCell>
                   <TableCell>{r.score_max}</TableCell>
                   <TableCell>{formatPct(r.logro_pct)}</TableCell>
@@ -351,8 +358,8 @@ function PedagogicalAnalysisInner({
                 {data.by_question.map((q, i) => (
                   <TableRow key={i}>
                     <TableCell>{q.item_number}</TableCell>
-                    <TableCell className="max-w-[120px] truncate">{formatPedagogicalDisplayText(q.axis)}</TableCell>
-                    <TableCell className="max-w-[120px] truncate">{formatPedagogicalDisplayText(q.skill)}</TableCell>
+                    <TableCell className="max-w-[120px] truncate">{formatPedagogicalReadableText(q.axis)}</TableCell>
+                    <TableCell className="max-w-[120px] truncate">{formatPedagogicalReadableText(q.skill)}</TableCell>
                     <TableCell>{q.cognitive_level}</TableCell>
                     <TableCell>{q.score_obtained}</TableCell>
                     <TableCell>{q.score_max}</TableCell>
@@ -373,7 +380,7 @@ function PedagogicalAnalysisInner({
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart
                   data={data.by_axis.map((r) => ({
-                    name: formatPedagogicalDisplayText(r.dimension_value),
+                    name: formatPedagogicalReadableText(r.dimension_value),
                     logro: chartPct(r.logro_pct),
                   }))}
                   margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
@@ -404,7 +411,7 @@ function PedagogicalAnalysisInner({
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart
                   data={data.by_skill.map((r) => ({
-                    name: formatPedagogicalDisplayText(r.dimension_value),
+                    name: formatPedagogicalReadableText(r.dimension_value),
                     logro: chartPct(r.logro_pct),
                   }))}
                   margin={{ top: 8, right: 8, left: 8, bottom: 24 }}
@@ -435,7 +442,7 @@ function PedagogicalAnalysisInner({
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart
                   data={data.by_cognitive_level.map((r) => ({
-                    name: formatPedagogicalDisplayText(r.dimension_value),
+                    name: formatPedagogicalReadableText(r.dimension_value),
                     logro: chartPct(r.logro_pct),
                   }))}
                   margin={{ top: 8, right: 8, left: 8, bottom: 24 }}

@@ -3,6 +3,7 @@
  * Solo lectura. No modifica análisis, scoring ni evaluación.
  * Consume: by_axis, by_skill, by_cognitive_level, most_failed_questions.
  */
+import { formatPedagogicalReadableText, formatQuestionNumbersSpanish } from "@/app/lib/pedagogical-export-formatting"
 
 export type HeatMapItem = {
   item_number: number
@@ -57,16 +58,17 @@ export function buildPedagogicalDiagnosis(input: DiagnosisInput): DiagnosisResul
 
   if (weakestAxis) {
     diagnosisParagraphs.push(
-      `El curso presenta mayor dificultad en el eje "${weakestAxis.dimension_value}" (logro ${weakestAxis.logro_pct}%).`
+      `El curso presenta mayor dificultad en el eje "${formatPedagogicalReadableText(weakestAxis.dimension_value)}" (logro ${weakestAxis.logro_pct}%).`
     )
   }
 
   if (failedQ.length > 0) {
-    const nums = failedQ.map((q) => q.item_number).join(" y ")
+    const nums = formatQuestionNumbersSpanish(failedQ.map((q) => q.item_number))
     const skills = [...new Set(failedQ.map((q) => q.skill).filter(Boolean))]
-    const skillText = skills.length > 0 ? skills.join(", ") : "varias habilidades"
+    const skillText =
+      skills.length > 0 ? skills.map((sk) => formatPedagogicalReadableText(String(sk))).join(", ") : "varias habilidades"
     diagnosisParagraphs.push(
-      `Las preguntas con mayor porcentaje de error son ${nums}, asociadas a la(s) habilidad(es) ${skillText}.`
+      `Las preguntas con mayor porcentaje de error son: ${nums}, asociadas a la(s) habilidad(es) ${skillText}.`
     )
     diagnosisParagraphs.push(
       "Esto sugiere dificultades en tareas de interpretación y resolución de problemas que requieren reforzar."
@@ -75,7 +77,7 @@ export function buildPedagogicalDiagnosis(input: DiagnosisInput): DiagnosisResul
 
   if (weakestSkill && failedQ.length === 0) {
     diagnosisParagraphs.push(
-      `Se observan menores logros en la habilidad "${weakestSkill.dimension_value}" (${weakestSkill.logro_pct}%).`
+      `Se observan menores logros en la habilidad "${formatPedagogicalReadableText(weakestSkill.dimension_value)}" (${weakestSkill.logro_pct}%).`
     )
   }
 
@@ -83,7 +85,7 @@ export function buildPedagogicalDiagnosis(input: DiagnosisInput): DiagnosisResul
     const weakCog = by_cognitive_level.filter((c) => c.logro_pct < 70).sort((a, b) => a.logro_pct - b.logro_pct)
     if (weakCog[0]) {
       diagnosisParagraphs.push(
-        `En nivel cognitivo, el menor desempeño se da en "${weakCog[0].dimension_value}" (${weakCog[0].logro_pct}%).`
+        `En nivel cognitivo, el menor desempeño se da en "${formatPedagogicalReadableText(weakCog[0].dimension_value)}" (${weakCog[0].logro_pct}%).`
       )
     }
   }
@@ -95,8 +97,8 @@ export function buildPedagogicalDiagnosis(input: DiagnosisInput): DiagnosisResul
     })
     const axes = [...new Set(failedQ.map((q) => q.axis).filter(Boolean))]
     const skills = [...new Set(failedQ.map((q) => q.skill).filter(Boolean))]
-    if (axes.length > 0) evidenceLines.push("Eje:", ...axes.map((a) => `  ${a}`))
-    if (skills.length > 0) evidenceLines.push("Habilidad:", ...skills.map((s) => `  ${s}`))
+    if (axes.length > 0) evidenceLines.push("Eje:", ...axes.map((a) => `  ${formatPedagogicalReadableText(String(a))}`))
+    if (skills.length > 0) evidenceLines.push("Habilidad:", ...skills.map((s) => `  ${formatPedagogicalReadableText(String(s))}`))
   }
 
   const sameAxisCount = new Map<string, number>()
@@ -108,13 +110,13 @@ export function buildPedagogicalDiagnosis(input: DiagnosisInput): DiagnosisResul
   const axisWithPattern = [...sameAxisCount.entries()].find(([, count]) => count >= 2)
   const skillWithPattern = [...sameSkillCount.entries()].find(([, count]) => count >= 2)
   if (skillWithPattern) {
-    triangulationMessage = `Se observa un patrón consistente de error en la habilidad "${skillWithPattern[0]}", evidenciado en múltiples preguntas del curso.`
+    triangulationMessage = `Se observa un patrón consistente de error en la habilidad "${formatPedagogicalReadableText(skillWithPattern[0])}", evidenciado en múltiples preguntas del curso.`
   }
   if (axisWithPattern && !triangulationMessage) {
-    triangulationMessage = `Se observa un patrón consistente de error en el eje "${axisWithPattern[0]}", evidenciado en múltiples preguntas.`
+    triangulationMessage = `Se observa un patrón consistente de error en el eje "${formatPedagogicalReadableText(axisWithPattern[0])}", evidenciado en múltiples preguntas.`
   }
   if (axisWithPattern && skillWithPattern) {
-    triangulationMessage = `Se observa un patrón consistente de error en la habilidad "${skillWithPattern[0]}", evidenciado en múltiples preguntas del eje ${axisWithPattern[0]}.`
+    triangulationMessage = `Se observa un patrón consistente de error en la habilidad "${formatPedagogicalReadableText(skillWithPattern[0])}", evidenciado en múltiples preguntas del eje ${formatPedagogicalReadableText(axisWithPattern[0])}.`
   }
 
   return {
