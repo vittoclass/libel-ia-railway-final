@@ -1,12 +1,15 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
+import { flushSync } from "react-dom"
+import { exportUtpExecutiveFichaPdf } from "@/app/lib/export-utp-dashboard-pdf"
 import { useRouter } from "next/navigation"
 import { Trash2 } from "lucide-react"
 import { EvaluationLinkSelector } from "@/app/components/dashboard/utp/EvaluationLinkSelector"
 import { ResultsMirror } from "@/app/components/dashboard/utp/ResultsMirror"
 import { UtpAuditoriaJuezPanel } from "@/app/components/dashboard/utp/UtpAuditoriaJuezPanel"
 import { UtpPendingBatchReleasesPanel } from "@/app/components/dashboard/utp/UtpPendingBatchReleasesPanel"
+import { UtpExecutivePdfCapture } from "@/app/components/dashboard/utp/UtpExecutivePdfCapture"
 import {
   uiCoberturaBajada,
   uiCoberturaTitulo,
@@ -145,6 +148,92 @@ export default function DashboardUtpPage() {
   const [schoolAnalyticsLoading, setSchoolAnalyticsLoading] = useState(false)
   const [archivingInstrumentId, setArchivingInstrumentId] = useState<string | null>(null)
   const [archivingAllInstruments, setArchivingAllInstruments] = useState(false)
+
+  const utpPdfCaptureRef = useRef<HTMLDivElement>(null)
+  const [utpPdfExporting, setUtpPdfExporting] = useState(false)
+  const [utpInstitutionLabel, setUtpInstitutionLabel] = useState("")
+  const [utpPdfDateLabel, setUtpPdfDateLabel] = useState(() =>
+    new Intl.DateTimeFormat("es-CL", { dateStyle: "long", timeStyle: "short" }).format(new Date()),
+  )
+  /** Snapshot tras refetch explícito (misma query que pantalla) antes del PDF */
+  const [utpPdfBySkillOverride, setUtpPdfBySkillOverride] = useState<SchoolAnalyticsRow[] | null>(null)
+  const [utpPdfLogoSrc, setUtpPdfLogoSrc] = useState<string | null>(null)
+
+  useEffect(() => {
+    const h = document.querySelector("header h1")?.textContent?.trim()
+    if (h) setUtpInstitutionLabel(h)
+  }, [loading])
+
+  useEffect(() => {
+    const img = document.querySelector("header img")
+    if (img instanceof HTMLImageElement) {
+      const src = (img.currentSrc || img.src || "").trim()
+      setUtpPdfLogoSrc(src.length > 0 ? src : null)
+    } else {
+      setUtpPdfLogoSrc(null)
+    }
+  }, [loading])
+
+  async function handleUtpExportPdf() {
+    setUtpPdfExporting(true)
+    try {
+      const institution =
+        utpInstitutionLabel ||
+        (typeof document !== "undefined" ? document.querySelector("header h1")?.textContent?.trim() : null) ||
+        "Panel institucional"
+      const reportDateLabel = new Intl.DateTimeFormat("es-CL", { dateStyle: "long", timeStyle: "short" }).format(new Date())
+
+      const schoolId = (currentSchoolId ?? "").trim()
+      const sortedLots = [...evalLotGroups].sort((a, b) => {
+        const ta = a.evaluated_at ? new Date(a.evaluated_at).getTime() : 0
+        const tb = b.evaluated_at ? new Date(b.evaluated_at).getTime() : 0
+        return tb - ta
+      })
+      const latestBatchId = sortedLots.find((g) => g.batch_id)?.batch_id ?? null
+
+      async function fetchSchoolPedagogySkills(includeBatch: boolean): Promise<SchoolAnalyticsRow[]> {
+        const qs = new URLSearchParams()
+        if (schoolId) qs.set("school_id", schoolId)
+        if (includeBatch && latestBatchId) qs.set("batch_id", latestBatchId)
+        try {
+          const schoolRes = await fetch(`/api/dashboard/direccion/school-pedagogy?${qs.toString()}`, { cache: "no-store" })
+          if (!schoolRes.ok) return []
+          const sj = (await schoolRes.json()) as SchoolAnalyticsPayload
+          return Array.isArray(sj.by_skill) ? sj.by_skill : []
+        } catch {
+          return []
+        }
+      }
+
+      /** 1) Con lote reciente si existe; 2) sin batch_id = agregado histórico por colegio (misma API que pantalla). */
+      let bySkillForPdf = await fetchSchoolPedagogySkills(true)
+      if (bySkillForPdf.length === 0) {
+        bySkillForPdf = await fetchSchoolPedagogySkills(false)
+      }
+      if (bySkillForPdf.length === 0) {
+        bySkillForPdf = schoolAnalytics?.by_skill ?? []
+      }
+
+      flushSync(() => {
+        setUtpInstitutionLabel((prev) => (prev.trim() ? prev : institution))
+        setUtpPdfDateLabel(reportDateLabel)
+        setUtpPdfBySkillOverride(bySkillForPdf)
+      })
+
+      const r = await exportUtpExecutiveFichaPdf({
+        rootElement: utpPdfCaptureRef.current,
+        filename: `utp_dashboard_${new Date().toISOString().slice(0, 10)}.pdf`,
+      })
+      if (!r.ok) {
+        window.alert(r.error ?? "No se pudo generar el PDF.")
+      }
+    } finally {
+      flushSync(() => {
+        setUtpPdfBySkillOverride(null)
+      })
+      setUtpPdfExporting(false)
+    }
+  }
 
   function juezRootCause(content: Record<string, unknown>): { approval_risk_pct?: number } {
     const rc = content.root_cause
@@ -641,10 +730,24 @@ export default function DashboardUtpPage() {
   }
 
   return (
-    <section className="space-y-4">
+    <section className="space-y-4 utp-print-root">
+      <div className="utp-print-header border-b border-slate-300 pb-3 mb-1">
+        <h1 className="text-xl font-bold text-slate-900">{utpInstitutionLabel || "Panel institucional"}</h1>
+        <p className="text-sm text-slate-600">
+          Dashboard UTP · Impreso el {new Date().toLocaleString("es-CL", { dateStyle: "long", timeStyle: "short" })}
+        </p>
+      </div>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-xl font-semibold">Auditoría UTP</h2>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void handleUtpExportPdf()}
+            disabled={utpPdfExporting}
+            className="rounded-md border border-emerald-600 bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-900 hover:bg-emerald-100 disabled:opacity-60"
+          >
+            {utpPdfExporting ? "Generando PDF…" : "Descargar Reporte PDF"}
+          </button>
           <button
             type="button"
             onClick={() => void archiveAllBatches()}
@@ -663,6 +766,20 @@ export default function DashboardUtpPage() {
         </div>
       </div>
       <UtpPendingBatchReleasesPanel refreshTrigger={outcomesRefresh} />
+      <div className="utp-pdf-capture-host fixed -left-[12000px] top-0 pointer-events-none" aria-hidden>
+        <UtpExecutivePdfCapture
+          ref={utpPdfCaptureRef}
+          institutionName={utpInstitutionLabel || "Panel institucional"}
+          reportDateLabel={utpPdfDateLabel}
+          logoSrc={utpPdfLogoSrc}
+          omrLiveActive={omrLiveActive}
+          coberturaInstitucionalOmr={coberturaInstitucionalOmr}
+          semaforo={semaforo}
+          simceProyectadoOmr={simceProyectadoOmr}
+          paesProyectadoOmr={paesProyectadoOmr}
+          bySkill={utpPdfBySkillOverride ?? schoolAnalytics?.by_skill ?? []}
+        />
+      </div>
       {loading && <p className="text-sm text-[var(--text-muted)]">Cargando auditoría...</p>}
       {error && <p className="text-sm text-red-600">{error}</p>}
       <div className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm">

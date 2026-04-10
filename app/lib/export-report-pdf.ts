@@ -3,10 +3,9 @@
  * Solo cliente; no modifica backend ni análisis.
  */
 
-export async function exportElementToPdf(
-  element: HTMLElement,
-  filename: string
-): Promise<{ ok: boolean; error?: string }> {
+type JsPdfInstance = InstanceType<(typeof import("jspdf"))["default"]>
+
+async function elementToJsPdf(element: HTMLElement): Promise<{ ok: true; pdf: JsPdfInstance } | { ok: false; error: string }> {
   try {
     const html2canvas = (await import("html2canvas")).default
     const { jsPDF } = await import("jspdf")
@@ -44,11 +43,30 @@ export async function exportElementToPdf(
       }
     }
 
-    const safeName = filename.replace(/[^\w\u00C0-\u024F\-]/g, "_").slice(0, 120)
-    pdf.save(safeName.endsWith(".pdf") ? safeName : `${safeName}.pdf`)
-    return { ok: true }
+    return { ok: true, pdf }
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e)
     return { ok: false, error }
   }
+}
+
+export async function exportElementToPdf(
+  element: HTMLElement,
+  filename: string
+): Promise<{ ok: boolean; error?: string }> {
+  const r = await elementToJsPdf(element)
+  if (!r.ok) return { ok: false, error: r.error }
+  const safeName = filename.replace(/[^\w\u00C0-\u024F\-]/g, "_").slice(0, 120)
+  r.pdf.save(safeName.endsWith(".pdf") ? safeName : `${safeName}.pdf`)
+  return { ok: true }
+}
+
+/** Misma lógica que exportElementToPdf, sin descargar (p. ej. lote ZIP en cliente). */
+export async function exportElementToPdfBlob(
+  element: HTMLElement
+): Promise<{ ok: true; blob: Blob } | { ok: false; error: string }> {
+  const r = await elementToJsPdf(element)
+  if (!r.ok) return { ok: false, error: r.error }
+  const blob = r.pdf.output("blob")
+  return { ok: true, blob }
 }

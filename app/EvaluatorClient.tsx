@@ -49,6 +49,7 @@ import {
   FolderOpen,
   BookOpen,
   FileDown,
+  FileArchive,
 } from "lucide-react"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid, RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from "recharts"
 import { cn } from "@/lib/utils"
@@ -64,6 +65,7 @@ import {
   type EvaluationBaseSourceExamItemInput,
 } from "@/app/lib/evaluation-base"
 import PedagogicalAnalysisModal from "@/app/components/PedagogicalAnalysisModal"
+import { BatchPedagogicalZipDialog } from "@/app/components/BatchPedagogicalZipDialog"
 import CoursePedagogicalSummaryModal from "@/app/components/CoursePedagogicalSummaryModal"
 // PDF
 import {
@@ -1620,6 +1622,25 @@ export default function EvaluatorClient() {
   const [coursePedagogicalSummaryId, setCoursePedagogicalSummaryId] = useState<string | null>(null)
   const [coursePedagogicalSummaryLabel, setCoursePedagogicalSummaryLabel] = useState<string | null>(null)
 
+  const [batchZipDialogOpen, setBatchZipDialogOpen] = useState(false)
+  const [batchZipTargetId, setBatchZipTargetId] = useState<string | null>(null)
+  const [batchZipHistoryExamTitle, setBatchZipHistoryExamTitle] = useState<string | null>(null)
+  const [batchZipHistoryCourseLabel, setBatchZipHistoryCourseLabel] = useState<string | null>(null)
+  const [batchExportsRefreshKey, setBatchExportsRefreshKey] = useState(0)
+  const [batchExportsList, setBatchExportsList] = useState<
+    Array<{
+      id: string
+      batch_id: string
+      zip_filename: string
+      exam_title: string | null
+      course_label: string | null
+      evaluation_count: number
+      created_at: string
+    }>
+  >([])
+  const [batchExportsLoading, setBatchExportsLoading] = useState(false)
+  const [batchExportsError, setBatchExportsError] = useState<string | null>(null)
+
   /** Abre el resumen pedagógico del curso. Mismo handler en Cursos, Evaluaciones y detalle. */
   const openCoursePedagogicalSummary = useCallback((courseId: string, courseLabel?: string | null) => {
     const id = courseId != null && String(courseId).trim() !== "" ? String(courseId).trim() : "Sin curso"
@@ -2313,6 +2334,38 @@ export default function EvaluatorClient() {
     if (activeTab !== "estudiantes") return
     loadStudentsList()
   }, [activeTab, loadStudentsList, studentsListCourseFilter, studentsListSearch, studentsListFetchKey])
+  useEffect(() => {
+    if (activeTab !== "mis-archivos") return
+    let cancelled = false
+    setBatchExportsLoading(true)
+    setBatchExportsError(null)
+    fetch("/api/batch-exports", { credentials: "include", cache: "no-store" })
+      .then(async (r) => {
+        const j = (await r.json()) as {
+          exports?: Array<{
+            id: string
+            batch_id: string
+            zip_filename: string
+            exam_title: string | null
+            course_label: string | null
+            evaluation_count: number
+            created_at: string
+          }>
+          error?: string
+        }
+        if (!r.ok) throw new Error(j.error || "No se pudo cargar el historial")
+        if (!cancelled) setBatchExportsList(Array.isArray(j.exports) ? j.exports : [])
+      })
+      .catch((e) => {
+        if (!cancelled) setBatchExportsError(e instanceof Error ? e.message : "Error de red")
+      })
+      .finally(() => {
+        if (!cancelled) setBatchExportsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeTab, batchExportsRefreshKey])
   useEffect(() => {
     if (typeof window === "undefined" || !enablePedagogy) return
     const id = localStorage.getItem("dashboardEvaluationId")
@@ -4438,6 +4491,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               <Users className="mr-2 h-4 w-4 inline" />
               Estudiantes
             </TabsTrigger>
+            <TabsTrigger value="mis-archivos" className="shrink-0 whitespace-nowrap px-3 py-1.5 text-sm">
+              <Archive className="mr-2 h-4 w-4 inline" />
+              Mis archivos
+            </TabsTrigger>
             <TabsTrigger value="pruebas-base" className="shrink-0 whitespace-nowrap px-3 py-1.5 text-sm">
               <BookOpen className="mr-2 h-4 w-4 inline" />
               Pruebas base
@@ -5343,6 +5400,24 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         }}
                       >
                         Nuevo lote
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        className="text-xs shrink-0"
+                        disabled={!evaluationBatchIdUi}
+                        title={!evaluationBatchIdUi ? "Activa un lote (sube una hoja o fija UUID) para exportar." : undefined}
+                        onClick={() => {
+                          if (!evaluationBatchIdUi) return
+                          setBatchZipHistoryExamTitle(null)
+                          setBatchZipHistoryCourseLabel(null)
+                          setBatchZipTargetId(evaluationBatchIdUi)
+                          setBatchZipDialogOpen(true)
+                        }}
+                      >
+                        <FileArchive className="h-3.5 w-3.5 mr-1 inline" aria-hidden />
+                        Exportar lote a ZIP
                       </Button>
                     </div>
                   </div>
@@ -8587,6 +8662,73 @@ h-4 w-4 animate-spin"
               </Dialog>
             )}
           </TabsContent>
+          <TabsContent value="mis-archivos" className="mt-4 space-y-4">
+            <Card className="bg-[var(--bg-card)] border-[var(--border-color)]">
+              <CardHeader>
+                <CardTitle className="text-[var(--text-accent)]">Exportaciones ZIP de informes</CardTitle>
+                <CardDescription>
+                  Historial de lotes exportados. Puedes volver a generar el ZIP con los mismos datos actuales del lote (las evaluaciones deben seguir existiendo).
+                </CardDescription>
+                <Button type="button" variant="outline" size="sm" className="mt-2 w-fit" onClick={() => setBatchExportsRefreshKey((k) => k + 1)}>
+                  Recargar lista
+                </Button>
+              </CardHeader>
+              <CardContent>
+                {batchExportsLoading ? (
+                  <p className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
+                    <Loader2 className="h-4 w-4 animate-spin" /> Cargando…
+                  </p>
+                ) : batchExportsError ? (
+                  <p className="text-sm text-red-600 dark:text-red-400">{batchExportsError}</p>
+                ) : batchExportsList.length === 0 ? (
+                  <p className="text-sm text-[var(--text-muted)]">Aún no hay exportaciones registradas. Usa «Exportar lote a ZIP» en el Evaluador cuando tengas un lote activo.</p>
+                ) : (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Fecha</TableHead>
+                        <TableHead>Archivo</TableHead>
+                        <TableHead>Prueba / curso</TableHead>
+                        <TableHead className="text-right">Informes</TableHead>
+                        <TableHead className="text-right">Acción</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {batchExportsList.map((row) => (
+                        <TableRow key={row.id}>
+                          <TableCell className="text-sm whitespace-nowrap">
+                            {row.created_at ? format(new Date(row.created_at), "dd/MM/yyyy HH:mm") : "—"}
+                          </TableCell>
+                          <TableCell className="text-sm max-w-[200px] break-all">{row.zip_filename}</TableCell>
+                          <TableCell className="text-sm">
+                            <div>{row.exam_title ?? "—"}</div>
+                            <div className="text-[var(--text-muted)]">{row.course_label ?? "—"}</div>
+                          </TableCell>
+                          <TableCell className="text-right">{row.evaluation_count}</TableCell>
+                          <TableCell className="text-right">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                setBatchZipHistoryExamTitle(row.exam_title)
+                                setBatchZipHistoryCourseLabel(row.course_label)
+                                setBatchZipTargetId(row.batch_id)
+                                setBatchZipDialogOpen(true)
+                              }}
+                            >
+                              <FileArchive className="h-3.5 w-3.5 mr-1 inline" />
+                              Regenerar ZIP
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
           <TabsContent value="pruebas-base" className="mt-4 space-y-4">
             <SourceExamsSection />
           </TabsContent>
@@ -9012,6 +9154,23 @@ h-4 w-4 animate-spin"
         </Dialog>
       )}
       {/* Modales de análisis pedagógico y resumen de curso: fuera de TabsContent para que abran desde cualquier pestaña (Estudiantes, Evaluaciones, Cursos). */}
+      <BatchPedagogicalZipDialog
+        open={batchZipDialogOpen}
+        onOpenChange={(o) => {
+          setBatchZipDialogOpen(o)
+          if (!o) {
+            setBatchZipTargetId(null)
+            setBatchZipHistoryExamTitle(null)
+            setBatchZipHistoryCourseLabel(null)
+          }
+        }}
+        batchId={batchZipTargetId}
+        suggestedExamTitle={form.watch("nombrePrueba")}
+        suggestedCourseLabel={form.watch("curso")}
+        historyExamTitle={batchZipHistoryExamTitle}
+        historyCourseLabel={batchZipHistoryCourseLabel}
+        onRecorded={() => setBatchExportsRefreshKey((k) => k + 1)}
+      />
       <PedagogicalAnalysisModal
         evaluationId={pedagogicalAnalysisEvalId}
         evaluationLabel={pedagogicalAnalysisEvalLabel}

@@ -161,6 +161,8 @@ export function ResultsMirror({ auditReportId, refreshToken = 0 }: ResultsMirror
       </p>
       <StrategicNarrativePanel strategic={data.strategic_analysis ?? null} />
 
+      {/* id legado: el PDF UTP usa `schoolAnalytics.by_skill` + #utp-dashboard-pdf-capture-root (ficha HTML). */}
+      <div id="utp-dashboard-pdf-results-charts" className="space-y-6">
       <div className="grid gap-6 md:grid-cols-2">
         <div className="rounded-lg border border-slate-200 p-3 bg-white">
           <h4 className="text-sm font-semibold mb-1">{uiCoberturaPorHabilidadTitulo()}</h4>
@@ -225,6 +227,7 @@ export function ResultsMirror({ auditReportId, refreshToken = 0 }: ResultsMirror
             </ResponsiveContainer>
           </div>
         )}
+      </div>
       </div>
 
       <div className="rounded-lg border border-rose-200 bg-rose-50/50 p-3">

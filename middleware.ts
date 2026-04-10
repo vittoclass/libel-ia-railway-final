@@ -118,19 +118,12 @@ export async function middleware(req: NextRequest) {
     if (normalizedRole === "DOCENTE" || normalizedRole === "TEACHER") {
       normalizedRole = "TEACHER"
     }
-    const allowedForUtp =
-      normalizedRole === "UTP" ||
-      normalizedRole === "DIRECCION" ||
-      normalizedRole === "ADMIN_INSTITUCION" ||
-      normalizedRole === "ADMIN"
+    // TEMP (pre-push): /dashboard/utp accesible con cualquier sesión para probar UI (p. ej. PDF). REVERTIR: restaurar RBAC.
     const allowedForDireccion =
       normalizedRole === "DIRECCION" ||
       normalizedRole === "ADMIN_INSTITUCION" ||
       normalizedRole === "ADMIN" ||
       normalizedRole === "UTP"
-    if (path.startsWith("/dashboard/utp") && !allowedForUtp) {
-      return NextResponse.redirect(new URL("/", req.url))
-    }
     if (path.startsWith("/dashboard/direccion") && !allowedForDireccion) {
       return NextResponse.redirect(new URL("/", req.url))
     }

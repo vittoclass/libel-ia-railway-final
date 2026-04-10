@@ -1,0 +1,143 @@
+/**
+ * Estilos de impresión solo para /dashboard/utp (importados desde utp/layout.tsx).
+ * Reversible: quitar import del layout o eliminar este archivo.
+ */
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 8mm;
+  }
+
+  /* Nodo solo para captura PDF (off-screen); no imprimir */
+  #utp-dashboard-pdf-capture-root,
+  .utp-pdf-capture-host {
+    display: none !important;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* Vista UTP activa: ocultar cromo del panel (header, sidebar, footer global si existe) */
+  body:has(.utp-print-root) > div > header,
+  body:has(.utp-print-root) aside,
+  body:has(.utp-print-root) footer {
+    display: none !important;
+  }
+
+  body:has(.utp-print-root) .min-h-screen > div.mx-auto.max-w-7xl {
+    display: block !important;
+    max-width: 210mm !important;
+    margin: 0 auto !important;
+    padding: 10mm !important;
+  }
+
+  body:has(.utp-print-root) main {
+    width: 100% !important;
+    max-width: 100% !important;
+    padding: 0 !important;
+  }
+
+  .utp-print-root {
+    background: #ffffff !important;
+    font-size: 8.5pt !important;
+    line-height: 1.25 !important;
+    padding-top: 20px !important;
+    box-sizing: border-box !important;
+  }
+
+  .utp-print-root h1,
+  .utp-print-root h2,
+  .utp-print-root h3 {
+    font-size: inherit !important;
+    margin: 0.35em 0 !important;
+  }
+
+  .utp-print-root .rounded-xl,
+  .utp-print-root .rounded-lg {
+    padding: 0.5rem !important;
+  }
+
+  /* Controles e interacción */
+  .utp-print-root button,
+  .utp-print-root input,
+  .utp-print-root select,
+  .utp-print-root textarea,
+  .utp-no-print {
+    display: none !important;
+  }
+
+  .utp-print-root a[href] {
+    text-decoration: none !important;
+    color: inherit !important;
+  }
+
+  /* Modales superpuestos */
+  body:has(.utp-print-root) .fixed.inset-0 {
+    display: none !important;
+  }
+
+  .utp-print-header {
+    display: block !important;
+  }
+
+  /* Evitar cortes feos en tarjetas cuando el motor lo permite */
+  .utp-print-root article,
+  .utp-print-root .rounded-xl {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}
+
+/**
+ * En pantalla: ocultar solo el encabezado “fantasma” del dashboard (hijo directo).
+ * La ficha PDF (#utp-dashboard-pdf-capture-root) también usa .utp-print-header y debe permanecer visible en el host off-screen.
+ */
+.utp-print-root > .utp-print-header {
+  display: none;
+}
+
+/**
+ * Margen superior del panel informe (pantalla): respira respecto al borde del layout.
+ * La captura PDF usa además #utp-dashboard-pdf-capture-root con padding-top propio.
+ */
+.utp-print-root {
+  padding-top: 20px;
+  box-sizing: border-box;
+}
+
+/* Ficha PDF: margen de seguridad superior para que ascendentes del título no se corten al rasterizar */
+#utp-dashboard-pdf-capture-root {
+  margin-top: 0 !important;
+  padding-top: 20px !important;
+}
+
+#utp-dashboard-pdf-capture-root .utp-pdf-ficha-header-shell {
+  margin-top: 0;
+  padding-top: 0;
+}
+
+/* Fila 1: logo | nombre institución */
+#utp-dashboard-pdf-capture-root .utp-print-header.utp-pdf-header-row1 {
+  display: flex;
+  position: relative;
+  top: 0;
+  left: 0;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+}
+
+#utp-dashboard-pdf-capture-root .utp-pdf-institution-name {
+  line-height: 1.35;
+  overflow: visible;
+  text-overflow: clip;
+}
