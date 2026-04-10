@@ -23,6 +23,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import {
   Loader2,
   Sparkles,
   FileUp,
@@ -50,6 +56,7 @@ import {
   BookOpen,
   FileDown,
   FileArchive,
+  MoreHorizontal,
 } from "lucide-react"
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid, RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from "recharts"
 import { cn } from "@/lib/utils"
@@ -1796,6 +1803,49 @@ export default function EvaluatorClient() {
     })
     return courses
   }
+
+  /** Misma clave de agrupación que `groupByCourse` pero sobre filas crudas de /api/evaluations/list. */
+  function listEvalCourseTabKey(e: {
+    course_display?: string | null
+    course_label?: string | null
+    course_id?: string | null
+  }): string {
+    const d = e.course_display ?? e.course_label ?? e.course_id
+    return d != null && String(d).trim() !== "" ? String(d).trim() : "Sin curso"
+  }
+
+  const openCourseBatchZip = useCallback(
+    (courseTabKey: string) => {
+      const matching = evaluacionesList.filter((ev) => (ev.status ?? "draft") !== "archived" && listEvalCourseTabKey(ev) === courseTabKey)
+      const batches = matching
+        .map((ev) => String((ev as { batch_id?: string | null }).batch_id ?? "").trim())
+        .filter((b) => b.length > 0)
+      if (batches.length === 0) {
+        toast({
+          title: "Sin lote en este curso",
+          description:
+            "Las evaluaciones activas no tienen batch_id. Usa el Evaluador con un lote activo o vincula las evaluaciones a un lote antes de exportar.",
+          variant: "destructive",
+        })
+        return
+      }
+      const counts = new Map<string, number>()
+      for (const b of batches) counts.set(b, (counts.get(b) ?? 0) + 1)
+      let best = batches[0]!
+      let bestN = 0
+      counts.forEach((n, b) => {
+        if (n > bestN) {
+          bestN = n
+          best = b
+        }
+      })
+      setBatchZipHistoryExamTitle(null)
+      setBatchZipHistoryCourseLabel(courseTabKey)
+      setBatchZipTargetId(best)
+      setBatchZipDialogOpen(true)
+    },
+    [evaluacionesList, toast],
+  )
   const [evaluationStudents, setEvaluationStudents] = useState<Array<{ student_name: string; created_at: string | null }>>([])
 
   /** Una sola función de carga: lista de evaluaciones para Evaluaciones y Cursos. Se llama al entrar a la pestaña o al Recargar. */
@@ -5403,9 +5453,8 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                       </Button>
                       <Button
                         type="button"
-                        variant="secondary"
                         size="sm"
-                        className="text-xs shrink-0"
+                        className="text-xs shrink-0 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold shadow-sm"
                         disabled={!evaluationBatchIdUi}
                         title={!evaluationBatchIdUi ? "Activa un lote (sube una hoja o fija UUID) para exportar." : undefined}
                         onClick={() => {
@@ -5417,7 +5466,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         }}
                       >
                         <FileArchive className="h-3.5 w-3.5 mr-1 inline" aria-hidden />
-                        Exportar lote a ZIP
+                        Descarga completa (ZIP)
                       </Button>
                     </div>
                   </div>
@@ -7684,73 +7733,115 @@ h-4 w-4 animate-spin"
                         return <p className="text-sm text-[var(--text-muted)]">No hay evaluaciones en ningún curso. Guarda evaluaciones desde la pestaña Evaluaciones.</p>
                       }
                       return (
-                        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 overflow-hidden">
                           {courseEntries.map(([courseId, data]) => {
                             const total = data.active.length + data.archived.length
                             const archivedCount = data.archived.length
                             return (
                               <Card
                                 key={courseId}
-                                className="cursor-pointer border-[var(--border-color)] hover:bg-[var(--bg-muted)] transition-colors"
+                                className="cursor-pointer border-[var(--border-color)] hover:bg-[var(--bg-muted)] transition-colors min-w-0 h-auto overflow-hidden"
                                 onClick={() => setSelectedCourseId(courseId)}
                               >
-                                <CardContent className="pt-4">
-                                  <div className="font-medium text-[var(--text-accent)]">{courseId}</div>
+                                <CardContent className="pt-4 min-w-0 h-auto overflow-hidden">
+                                  <div className="font-medium text-[var(--text-accent)] break-words">{courseId}</div>
                                   <div className="mt-1 text-xs text-[var(--text-muted)]">
                                     {total} evaluación(es) · {archivedCount} archivada(s)
                                   </div>
-                                  <div className="mt-2 flex gap-2">
-                                    <Button size="sm" onClick={(e) => { e.stopPropagation(); setSelectedCourseId(courseId) }}>
+                                  <div
+                                    className="mt-3 flex flex-wrap gap-2 justify-end items-center w-full min-w-0"
+                                    onClick={(e) => e.stopPropagation()}
+                                    role="group"
+                                    aria-label="Acciones del curso"
+                                  >
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      className="shrink-0"
+                                      onClick={() => setSelectedCourseId(courseId)}
+                                    >
                                       Abrir
                                     </Button>
-                                    <Button
-                                      size="sm"
-                                      variant="outline"
-                                      onClick={async (e) => {
-                                        e.stopPropagation()
-                                        setCourseDiagnosisLabel(courseId)
-                                        setCourseDiagnosisOpen(true)
-                                        setCourseDiagnosisData(null)
-                                        setCourseDiagnosisRaw(null)
-                                        setShowDiagnosticoCrudo(false)
-                                        setCourseDiagnosisLoading(true)
-                                        try {
-                                          const r = await fetch(`/api/courses/${encodeURIComponent(courseId)}/diagnosis`)
-                                          const j = await r.json()
-                                          setCourseDiagnosisRaw(j)
-                                          if (r.ok && !j.error) {
-                                            setCourseDiagnosisData({
-                                              course_label: j.course_label ?? j.course ?? courseId,
-                                              students_count: j.students_count ?? 0,
-                                              evaluations_count: j.evaluations_count ?? 0,
-                                              axes: j.axes ?? [],
-                                              skills: j.skills ?? [],
-                                              strongest_skill: j.strongest_skill ?? null,
-                                              weakest_skill: j.weakest_skill ?? null,
-                                              summary: j.summary ? { strongest_axis: j.summary.strongest_axis ?? null, weakest_axis: j.summary.weakest_axis ?? null } : { strongest_axis: null, weakest_axis: null },
-                                            })
-                                          } else {
-                                            setCourseDiagnosisData({ course_label: courseId, students_count: 0, evaluations_count: 0, axes: [], skills: [], strongest_skill: null, weakest_skill: null, summary: { strongest_axis: null, weakest_axis: null } })
-                                          }
-                                        } catch {
-                                          setCourseDiagnosisData({ course_label: courseId, students_count: 0, evaluations_count: 0, axes: [], skills: [], strongest_skill: null, weakest_skill: null, summary: { strongest_axis: null, weakest_axis: null } })
-                                        } finally {
-                                          setCourseDiagnosisLoading(false)
-                                        }
-                                      }}
-                                    >
-                                      Ver diagnóstico
-                                    </Button>
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation()
-                                        openCoursePedagogicalSummary(courseId, courseId)
-                                      }}
-                                    >
-                                      <FolderOpen className="h-3.5 w-3.5 mr-1" /> Ver resumen pedagógico
-                                    </Button>
+                                    <DropdownMenu>
+                                      <DropdownMenuTrigger asChild>
+                                        <Button type="button" variant="outline" size="sm" className="shrink-0 h-8 text-xs">
+                                          <MoreHorizontal className="h-3.5 w-3.5 mr-1 shrink-0" aria-hidden />
+                                          Acciones
+                                        </Button>
+                                      </DropdownMenuTrigger>
+                                      <DropdownMenuContent align="end" className="w-56" onClick={(e) => e.stopPropagation()}>
+                                        <DropdownMenuItem
+                                          className="text-xs cursor-pointer"
+                                          onClick={async () => {
+                                            setCourseDiagnosisLabel(courseId)
+                                            setCourseDiagnosisOpen(true)
+                                            setCourseDiagnosisData(null)
+                                            setCourseDiagnosisRaw(null)
+                                            setShowDiagnosticoCrudo(false)
+                                            setCourseDiagnosisLoading(true)
+                                            try {
+                                              const r = await fetch(`/api/courses/${encodeURIComponent(courseId)}/diagnosis`)
+                                              const j = await r.json()
+                                              setCourseDiagnosisRaw(j)
+                                              if (r.ok && !j.error) {
+                                                setCourseDiagnosisData({
+                                                  course_label: j.course_label ?? j.course ?? courseId,
+                                                  students_count: j.students_count ?? 0,
+                                                  evaluations_count: j.evaluations_count ?? 0,
+                                                  axes: j.axes ?? [],
+                                                  skills: j.skills ?? [],
+                                                  strongest_skill: j.strongest_skill ?? null,
+                                                  weakest_skill: j.weakest_skill ?? null,
+                                                  summary: j.summary
+                                                    ? { strongest_axis: j.summary.strongest_axis ?? null, weakest_axis: j.summary.weakest_axis ?? null }
+                                                    : { strongest_axis: null, weakest_axis: null },
+                                                })
+                                              } else {
+                                                setCourseDiagnosisData({
+                                                  course_label: courseId,
+                                                  students_count: 0,
+                                                  evaluations_count: 0,
+                                                  axes: [],
+                                                  skills: [],
+                                                  strongest_skill: null,
+                                                  weakest_skill: null,
+                                                  summary: { strongest_axis: null, weakest_axis: null },
+                                                })
+                                              }
+                                            } catch {
+                                              setCourseDiagnosisData({
+                                                course_label: courseId,
+                                                students_count: 0,
+                                                evaluations_count: 0,
+                                                axes: [],
+                                                skills: [],
+                                                strongest_skill: null,
+                                                weakest_skill: null,
+                                                summary: { strongest_axis: null, weakest_axis: null },
+                                              })
+                                            } finally {
+                                              setCourseDiagnosisLoading(false)
+                                            }
+                                          }}
+                                        >
+                                          Ver diagnóstico
+                                        </DropdownMenuItem>
+                                        <DropdownMenuItem
+                                          className="text-xs cursor-pointer"
+                                          onClick={() => openCoursePedagogicalSummary(courseId, courseId)}
+                                        >
+                                          <FolderOpen className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                                          Resumen pedagógico
+                                        </DropdownMenuItem>
+                                        <DropdownMenuItem
+                                          className="text-xs cursor-pointer text-emerald-700 focus:text-emerald-800"
+                                          onClick={() => openCourseBatchZip(courseId)}
+                                        >
+                                          <FileArchive className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                                          Descarga ZIP del curso
+                                        </DropdownMenuItem>
+                                      </DropdownMenuContent>
+                                    </DropdownMenu>
                                   </div>
                                 </CardContent>
                               </Card>
@@ -7762,59 +7853,108 @@ h-4 w-4 animate-spin"
                   </>
                 ) : (
                   <>
-                    <div className="flex items-center gap-2 mb-4">
-                      <Button variant="ghost" size="sm" onClick={() => setSelectedCourseId(null)}>
+                    <div className="flex flex-wrap items-center gap-2 mb-4 min-w-0 overflow-hidden">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        type="button"
+                        className="shrink-0 h-8 text-xs"
+                        onClick={() => setSelectedCourseId(null)}
+                      >
                         ← Volver a cursos
                       </Button>
-                      <span className="font-medium text-[var(--text-accent)]">{selectedCourseId}</span>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={async () => {
-                          if (!selectedCourseId) return
-                          setCourseDiagnosisLabel(selectedCourseId)
-                          setCourseDiagnosisOpen(true)
-                          setCourseDiagnosisData(null)
-                          setCourseDiagnosisRaw(null)
-                          setShowDiagnosticoCrudo(false)
-                          setCourseDiagnosisLoading(true)
-                          try {
-                            const r = await fetch(`/api/courses/${encodeURIComponent(selectedCourseId)}/diagnosis`)
-                            const j = await r.json()
-                            setCourseDiagnosisRaw(j)
-                            if (r.ok && !j.error) {
-                              setCourseDiagnosisData({
-                                course_label: j.course_label ?? j.course ?? selectedCourseId,
-                                students_count: j.students_count ?? 0,
-                                evaluations_count: j.evaluations_count ?? 0,
-                                axes: j.axes ?? [],
-                                skills: j.skills ?? [],
-                                strongest_skill: j.strongest_skill ?? null,
-                                weakest_skill: j.weakest_skill ?? null,
-                                summary: j.summary ? { strongest_axis: j.summary.strongest_axis ?? null, weakest_axis: j.summary.weakest_axis ?? null } : { strongest_axis: null, weakest_axis: null },
-                              })
-                            } else {
-                              setCourseDiagnosisData({ course_label: selectedCourseId, students_count: 0, evaluations_count: 0, axes: [], skills: [], strongest_skill: null, weakest_skill: null, summary: { strongest_axis: null, weakest_axis: null } })
-                            }
-                          } catch {
-                            setCourseDiagnosisData({ course_label: selectedCourseId, students_count: 0, evaluations_count: 0, axes: [], skills: [], strongest_skill: null, weakest_skill: null, summary: { strongest_axis: null, weakest_axis: null } })
-                          } finally {
-                            setCourseDiagnosisLoading(false)
-                          }
-                        }}
-                      >
-                        Ver diagnóstico
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => {
-                          if (!selectedCourseId) return
-                          openCoursePedagogicalSummary(selectedCourseId, selectedCourseId)
-                        }}
-                      >
-                        <FolderOpen className="h-3 w-3 mr-1" /> Ver resumen pedagógico
-                      </Button>
+                      <span className="font-medium text-[var(--text-accent)] break-words min-w-0 flex-1 basis-full sm:basis-auto sm:flex-none">
+                        {selectedCourseId}
+                      </span>
+                      <div className="flex flex-wrap gap-2 justify-end items-center w-full sm:w-auto sm:ml-auto min-w-0">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button type="button" variant="outline" size="sm" className="h-8 text-xs shrink-0">
+                              <MoreHorizontal className="h-3.5 w-3.5 mr-1 shrink-0" aria-hidden />
+                              Acciones del curso
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="w-56">
+                            <DropdownMenuItem
+                              className="text-xs cursor-pointer"
+                              onClick={async () => {
+                                if (!selectedCourseId) return
+                                setCourseDiagnosisLabel(selectedCourseId)
+                                setCourseDiagnosisOpen(true)
+                                setCourseDiagnosisData(null)
+                                setCourseDiagnosisRaw(null)
+                                setShowDiagnosticoCrudo(false)
+                                setCourseDiagnosisLoading(true)
+                                try {
+                                  const r = await fetch(`/api/courses/${encodeURIComponent(selectedCourseId)}/diagnosis`)
+                                  const j = await r.json()
+                                  setCourseDiagnosisRaw(j)
+                                  if (r.ok && !j.error) {
+                                    setCourseDiagnosisData({
+                                      course_label: j.course_label ?? j.course ?? selectedCourseId,
+                                      students_count: j.students_count ?? 0,
+                                      evaluations_count: j.evaluations_count ?? 0,
+                                      axes: j.axes ?? [],
+                                      skills: j.skills ?? [],
+                                      strongest_skill: j.strongest_skill ?? null,
+                                      weakest_skill: j.weakest_skill ?? null,
+                                      summary: j.summary
+                                        ? { strongest_axis: j.summary.strongest_axis ?? null, weakest_axis: j.summary.weakest_axis ?? null }
+                                        : { strongest_axis: null, weakest_axis: null },
+                                    })
+                                  } else {
+                                    setCourseDiagnosisData({
+                                      course_label: selectedCourseId,
+                                      students_count: 0,
+                                      evaluations_count: 0,
+                                      axes: [],
+                                      skills: [],
+                                      strongest_skill: null,
+                                      weakest_skill: null,
+                                      summary: { strongest_axis: null, weakest_axis: null },
+                                    })
+                                  }
+                                } catch {
+                                  setCourseDiagnosisData({
+                                    course_label: selectedCourseId,
+                                    students_count: 0,
+                                    evaluations_count: 0,
+                                    axes: [],
+                                    skills: [],
+                                    strongest_skill: null,
+                                    weakest_skill: null,
+                                    summary: { strongest_axis: null, weakest_axis: null },
+                                  })
+                                } finally {
+                                  setCourseDiagnosisLoading(false)
+                                }
+                              }}
+                            >
+                              Ver diagnóstico
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              className="text-xs cursor-pointer"
+                              onClick={() => {
+                                if (!selectedCourseId) return
+                                openCoursePedagogicalSummary(selectedCourseId, selectedCourseId)
+                              }}
+                            >
+                              <FolderOpen className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                              Resumen pedagógico
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              className="text-xs cursor-pointer text-emerald-700 focus:text-emerald-800"
+                              onClick={() => {
+                                if (!selectedCourseId) return
+                                openCourseBatchZip(selectedCourseId)
+                              }}
+                            >
+                              <FileArchive className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                              Descarga ZIP del curso
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
                     </div>
                     {(() => {
                       const normalizedEvaluations = evaluacionesList.map(normalizeEvaluation)
@@ -8681,7 +8821,7 @@ h-4 w-4 animate-spin"
                 ) : batchExportsError ? (
                   <p className="text-sm text-red-600 dark:text-red-400">{batchExportsError}</p>
                 ) : batchExportsList.length === 0 ? (
-                  <p className="text-sm text-[var(--text-muted)]">Aún no hay exportaciones registradas. Usa «Exportar lote a ZIP» en el Evaluador cuando tengas un lote activo.</p>
+                  <p className="text-sm text-[var(--text-muted)]">Aún no hay exportaciones registradas. Usa «Descarga completa (ZIP)» en el Evaluador o en Cursos cuando tengas un lote.</p>
                 ) : (
                   <Table>
                     <TableHeader>

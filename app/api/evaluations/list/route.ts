@@ -76,7 +76,7 @@ export async function GET(req: NextRequest) {
 
   let query = supabase
     .from("evaluations")
-    .select("id, title, course_id, course_label, subject, evaluated_at, status")
+    .select("id, title, course_id, course_label, subject, evaluated_at, status, batch_id")
     .order("evaluated_at", { ascending: false })
 
   if (school_id_used) query = query.eq("school_id", school_id_used)
@@ -122,6 +122,7 @@ export async function GET(req: NextRequest) {
     subject: string | null
     evaluated_at: string | null
     status?: string | null
+    batch_id?: string | null
   }>
 
   /** Solo filas con id UUID válido (evita 404 por ids huérfanos/mal formados en UI). Reversible: quitar este filtro. */

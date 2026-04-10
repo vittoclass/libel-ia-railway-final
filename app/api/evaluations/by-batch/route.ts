@@ -39,7 +39,7 @@ export async function GET(req: NextRequest) {
 
   let query = supabase
     .from("evaluations")
-    .select("id, title, course_label, evaluated_at, batch_id")
+    .select("id, title, course_id, course_label, evaluated_at, batch_id")
     .eq("batch_id", batchId)
     .order("evaluated_at", { ascending: true })
 
@@ -55,6 +55,7 @@ export async function GET(req: NextRequest) {
   const listRaw = (rows ?? []) as Array<{
     id: string
     title: string | null
+    course_id: string | null
     course_label: string | null
     evaluated_at: string | null
     batch_id: string | null
@@ -83,6 +84,7 @@ export async function GET(req: NextRequest) {
   const evaluations = list.map((e) => ({
     id: e.id,
     title: e.title,
+    course_id: e.course_id,
     course_label: e.course_label,
     evaluated_at: e.evaluated_at,
     first_student_name: firstStudentNames.get(e.id) ?? null,
