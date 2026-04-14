@@ -13,7 +13,7 @@ import { enrichItemsWithPedagogy } from "@/app/lib/analyze-pedagogical-structure
 import { convertToNationalScore, nationalLevelLabel } from "@/app/lib/standard-scale/converters"
 import { mean, sampleStdDev, zScore } from "@/app/lib/pedagogical-intelligence/metrics"
 import { generateStrategicAnalysis } from "@/app/lib/pedagogical-intelligence/inference-engine"
-import { getInstrumentAnalyticsModeFromExamType } from "@/app/lib/assessment-category"
+import { getInstrumentAnalyticsModeFromEvaluationTags } from "@/app/lib/assessment-category"
 import {
   analyzeLearningResults,
   normalizePedagogicalText,
@@ -56,7 +56,7 @@ export async function GET(
 
   const { data: evaluation, error: evErr } = await supabase
     .from("evaluations")
-    .select("id, teacher_id, user_id, school_id, course_id, evaluated_at, exam_type")
+    .select("id, teacher_id, user_id, school_id, course_id, evaluated_at, exam_type, assessment_category")
     .eq("id", evaluationId)
     .maybeSingle()
 
@@ -79,7 +79,8 @@ export async function GET(
     teacher_id_used ?? normUuid((evaluation as { teacher_id?: string | null }).teacher_id ?? null)
 
   const examTypeRaw = (evaluation as { exam_type?: string | null }).exam_type ?? null
-  const instrument_analytics_mode = getInstrumentAnalyticsModeFromExamType(examTypeRaw)
+  const assessmentCategoryRaw = (evaluation as { assessment_category?: string | null }).assessment_category ?? null
+  const instrument_analytics_mode = getInstrumentAnalyticsModeFromEvaluationTags(examTypeRaw, assessmentCategoryRaw)
 
   const sourceExamId = await getSourceExamForEvaluation(supabase, evaluationId)
 

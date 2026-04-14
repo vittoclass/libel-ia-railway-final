@@ -13,6 +13,7 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.88.0",
     "@azure/ai-form-recognizer": "^5.1.0",
     "@azure/cognitiveservices-computervision": "^8.2.0",
     "@google-cloud/vision": "^5.3.3",

@@ -44,14 +44,16 @@ export async function getSourceExamItems(
 
 /**
  * Obtiene el source_exam_id asociado a una evaluación.
- * Origen: 1) tabla puente evaluation_source_exams, 2) evaluations.source_exam_id (compatibilidad).
- * Si la tabla puente no existe o falla, se usa solo evaluations.source_exam_id.
+ * Lee `evaluation_source_exams` y `evaluations.source_exam_id`.
+ * Si ambos existen y difieren, gana la columna `evaluations.source_exam_id` (la escriben persistencia y PATCH /meta;
+ * la puente obsoleta no debe ocultar el vínculo real del docente).
  * No modifica ningún documento.
  */
 export async function getSourceExamForEvaluation(
   supabase: SupabaseClient,
   evaluationId: string
 ): Promise<string | null> {
+  let bridgeId: string | null = null
   try {
     const { data: bridge, error: bridgeErr } = await supabase
       .from("evaluation_source_exams")
@@ -59,22 +61,35 @@ export async function getSourceExamForEvaluation(
       .eq("evaluation_id", evaluationId)
       .maybeSingle()
     if (!bridgeErr && bridge && (bridge as EvaluationSourceExamRow).source_exam_id) {
-      const id = (bridge as EvaluationSourceExamRow).source_exam_id
-      if (isDev) console.info("[source-exam-db] getSourceExamForEvaluation", { evaluationId, source: "evaluation_source_exams", source_exam_id: id })
-      return id
+      const raw = String((bridge as EvaluationSourceExamRow).source_exam_id).trim()
+      bridgeId = raw || null
     }
   } catch {
     if (isDev) console.warn("[source-exam-db] getSourceExamForEvaluation bridge read skipped (table may not exist)")
   }
+
   const { data: ev } = await supabase
     .from("evaluations")
     .select("source_exam_id")
     .eq("id", evaluationId)
     .maybeSingle()
-  const col = (ev as { source_exam_id?: string | null } | null)?.source_exam_id
-  const result = col ?? null
-  if (isDev) console.info("[source-exam-db] getSourceExamForEvaluation", { evaluationId, source: "evaluations.source_exam_id", source_exam_id: result })
-  return result
+  const colRaw = (ev as { source_exam_id?: string | null } | null)?.source_exam_id
+  const columnId = colRaw != null && String(colRaw).trim() !== "" ? String(colRaw).trim() : null
+
+  if (columnId && bridgeId && columnId !== bridgeId) {
+    if (isDev) {
+      console.warn("[source-exam-db] getSourceExamForEvaluation mismatch; using evaluations.source_exam_id", {
+        evaluationId,
+        evaluation_source_exams: bridgeId,
+        evaluations_column: columnId,
+      })
+    }
+    return columnId
+  }
+  if (bridgeId) {
+    return bridgeId
+  }
+  return columnId
 }
 
 /**

@@ -3,6 +3,7 @@
  * Usado por POST /api/pedagogy/calculate-projections y por persist-evaluation (service role).
  */
 import type { SupabaseClient } from "@supabase/supabase-js"
+import { ensureStudentRowForStudentProfile } from "@/app/lib/student-identity/repository"
 import {
   agencyLevelFromPct,
   getAgencyCuts,
@@ -45,12 +46,18 @@ async function resolveOrganizationIdForEvaluation(
   if (!teacherId) return null
   const { data } = await supabase
     .from("profiles")
-    .select("organization_id")
+    .select("organization_id, school_id, teacher_id")
     .eq("teacher_id", teacherId)
     .limit(1)
     .maybeSingle()
-  const oid = (data as { organization_id?: string | null } | null)?.organization_id
-  return oid != null && String(oid).trim() !== "" ? String(oid) : null
+  const row = data as {
+    organization_id?: string | null
+    school_id?: string | null
+    teacher_id?: string | null
+  } | null
+  // Mismo criterio que `current_scope_org_id()` y `getScopeOrganizationId` (pedagogical.ts)
+  const scope = row?.organization_id ?? row?.school_id ?? row?.teacher_id ?? null
+  return scope != null && String(scope).trim() !== "" ? String(scope) : null
 }
 
 async function resolveStudentIdForEvaluation(
@@ -72,7 +79,47 @@ async function resolveStudentIdForEvaluation(
     .eq("evaluation_id", evaluationId)
     .maybeSingle()
   sid = String((link as { student_id?: string | null } | null)?.student_id ?? "").trim()
-  return sid || null
+  if (sid) return sid
+
+  const { data: esRow } = await supabase
+    .from("evaluation_students")
+    .select("student_profile_id, student_name, course_label")
+    .eq("evaluation_id", evaluationId)
+    .not("student_profile_id", "is", null)
+    .limit(1)
+    .maybeSingle()
+  const profileId = String(
+    (esRow as { student_profile_id?: string | null } | null)?.student_profile_id ?? ""
+  ).trim()
+  if (!profileId) return null
+  const fullName =
+    String((esRow as { student_name?: string | null } | null)?.student_name ?? "").trim() || "Estudiante"
+  const courseLabel = (esRow as { course_label?: string | null } | null)?.course_label ?? null
+  const bridgeId = await ensureStudentRowForStudentProfile(supabase, {
+    student_profile_id: profileId,
+    full_name: fullName,
+    course_label: courseLabel,
+  })
+  if (!bridgeId) return null
+  await supabase
+    .from("evaluation_students")
+    .update({ student_id: bridgeId })
+    .eq("evaluation_id", evaluationId)
+    .eq("student_profile_id", profileId)
+  await supabase
+    .from("student_evaluations")
+    .upsert(
+      {
+        student_id: bridgeId,
+        evaluation_id: evaluationId,
+        course_label: courseLabel,
+        evaluated_at: new Date().toISOString(),
+      },
+      { onConflict: "evaluation_id" }
+    )
+    .select("id")
+    .maybeSingle()
+  return bridgeId
 }
 
 export async function upsertStudentProjectionFromEvaluation(

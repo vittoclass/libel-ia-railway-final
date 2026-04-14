@@ -9,6 +9,7 @@ import { zodResolver } from "@hookform/resolvers/zod"
 import dynamic from "next/dynamic"
 import { createClientComponentClient } from "@supabase/auth-helpers-nextjs"
 import { format } from "date-fns"
+import { MAX_BATCH_PHOTO_PAGE_SIZE } from "@/app/lib/docente/batch-photo-pagination"
 // UI (shadcn)
 import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form"
 import { Input } from "@/components/ui/input"
@@ -1377,6 +1378,10 @@ function mapSourceExamApiRowsToInputs(rows: unknown[]): EvaluationBaseSourceExam
 const EVALUATE_BATCH_PARALLEL_SIZE = 1
 const SEQUENTIAL_EVALUATION_DELAY_MS = 1200
 const MOBILE_BATCH_SYNC_TIMEOUT_MS = 15000
+/** Polling de respaldo cuando hay lote móvil (Realtime sigue siendo el disparador principal). */
+const MOBILE_BATCH_POLL_INTERVAL_MS = 13000
+/** Coalescer ráfagas INSERT (Realtime + BroadcastChannel) para no spamear sync. */
+const MOBILE_BATCH_REALTIME_DEBOUNCE_MS = 550
 
 /** Misma configuración de red para todo GET de detalle de evaluación (modal informe + historial). */
 const INFORME_DETAIL_FETCH_INIT: RequestInit = {
@@ -1555,6 +1560,8 @@ export default function EvaluatorClient() {
   const supabaseBrowser = React.useMemo(() => createClientComponentClient(), [])
   const mobileBatchSyncingRef = useRef(false)
   const mobileBatchSyncPendingRef = useRef(false)
+  /** En navegador `setTimeout` devuelve number; evita choque con tipo Node `Timeout`. */
+  const mobileBatchRealtimeDebounceRef = useRef<number | null>(null)
   const syncMobileBatchPhotosRef = useRef<() => Promise<void>>(async () => {})
   const {
     evaluate,
@@ -2801,38 +2808,6 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     }
     mobileBatchSyncingRef.current = true
     try {
-      const controller = new AbortController()
-      const timeoutId = window.setTimeout(() => controller.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
-      const r = await fetch(`/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}`, {
-        signal: controller.signal,
-      }).finally(() => window.clearTimeout(timeoutId))
-      const j = (await r.json().catch(() => ({}))) as {
-        error?: string
-        photos?: Array<{
-          id: string
-          student_index: number | null
-          page_index?: number | null
-          storage_path: string | null
-          evaluation_id: string | null
-          signed_url: string | null
-        }>
-        slots?: Array<{
-          evaluation_id: string
-          student_index: number | null
-          student_name: string | null
-          student_rut: string | null
-        }>
-      }
-      if (!r.ok) {
-        if (j?.error) {
-          toast({ title: "Sincronización del lote", description: j.error, variant: "destructive" })
-        }
-        return
-      }
-      const photos = j.photos ?? []
-      const slots = j.slots ?? []
-      const apiIds = new Set(photos.map((p) => p.id))
-
       const snapPre = evaluatorStep2FilesRef.current
       const knownMobilePhotoIds = new Set<string>()
       for (const g of snapPre.groups) {
@@ -2844,9 +2819,53 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         if (f.mobileBatchPhotoId) knownMobilePhotoIds.add(f.mobileBatchPhotoId)
       }
 
+      type PhotoRow = {
+        id: string
+        student_index: number | null
+        page_index?: number | null
+        storage_path: string | null
+        evaluation_id: string | null
+        signed_url: string | null
+      }
+      let slotsFromApi: MobileBatchSlot[] = []
+      const allPhotos: PhotoRow[] = []
+      const apiIds = new Set<string>()
+      let offset = 0
+      const pageSize = MAX_BATCH_PHOTO_PAGE_SIZE
+      let pages = 0
+      while (pages < 64) {
+        pages++
+        const controller = new AbortController()
+        const timeoutId = window.setTimeout(() => controller.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
+        const r = await fetch(
+          `/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}&offset=${offset}&limit=${pageSize}`,
+          { signal: controller.signal },
+        ).finally(() => window.clearTimeout(timeoutId))
+        const j = (await r.json().catch(() => ({}))) as {
+          error?: string
+          photos?: PhotoRow[]
+          slots?: MobileBatchSlot[]
+          meta?: { has_more?: boolean; next_offset?: number | null }
+        }
+        if (!r.ok) {
+          if (j?.error) {
+            toast({ title: "Sincronización del lote", description: j.error, variant: "destructive" })
+          }
+          return
+        }
+        const chunk = j.photos ?? []
+        if (offset === 0) slotsFromApi = j.slots ?? []
+        allPhotos.push(...chunk)
+        for (const p of chunk) apiIds.add(p.id)
+        const meta = j.meta
+        if (!meta?.has_more) break
+        offset = typeof meta.next_offset === "number" ? meta.next_offset : offset + chunk.length
+        await new Promise<void>((res) => window.setTimeout(res, 0))
+      }
+
       const placement: MobileBatchPlacement[] = []
 
-      for (const p of photos) {
+      for (const p of allPhotos) {
         if (!p.signed_url) continue
         if (knownMobilePhotoIds.has(p.id)) continue
         try {
@@ -2860,7 +2879,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           const ext = (p.storage_path?.split(".").pop() || "jpg").replace(/[^a-z0-9]/gi, "") || "jpg"
           const mime = blob.type || "image/jpeg"
           const file = new File([blob], `movil-${p.id}.${ext}`, { type: mime })
-          const dataUrl = await readFileAsDataUrl(file)
+          const storagePath = (p.storage_path ?? "").trim()
+          const dataUrl = storagePath === "" ? await readFileAsDataUrl(file) : ""
           const preview: FilePreview = {
             id: `mobile-${p.id}`,
             file,
@@ -2875,6 +2895,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             student_index: p.student_index,
             evaluation_id: p.evaluation_id,
           })
+          await new Promise<void>((res) => window.setTimeout(res, 0))
         } catch {
           /* una fila no debe tumbar el lote */
         }
@@ -2885,7 +2906,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         snap.groups,
         snap.unassigned,
         placement,
-        slots,
+        slotsFromApi,
         apiIds,
       )
       setStudentGroups(nextGroups)
@@ -2907,13 +2928,21 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   useEffect(() => {
     if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
     const t = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return
       void syncMobileBatchPhotos()
-    }, 5000)
+    }, MOBILE_BATCH_POLL_INTERVAL_MS)
     return () => window.clearInterval(t)
   }, [activeTab, evaluationBatchIdUi, syncMobileBatchPhotos])
 
   useEffect(() => {
     if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
+    const scheduleSyncFromRealtime = () => {
+      if (mobileBatchRealtimeDebounceRef.current) window.clearTimeout(mobileBatchRealtimeDebounceRef.current)
+      mobileBatchRealtimeDebounceRef.current = window.setTimeout(() => {
+        mobileBatchRealtimeDebounceRef.current = null
+        void syncMobileBatchPhotos()
+      }, MOBILE_BATCH_REALTIME_DEBOUNCE_MS)
+    }
     const ch = supabaseBrowser
       .channel(`evaluar-batch-photos-${evaluationBatchIdUi}`)
       .on(
@@ -2925,11 +2954,15 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           filter: `batch_id=eq.${evaluationBatchIdUi}`,
         },
         () => {
-          void syncMobileBatchPhotos()
+          scheduleSyncFromRealtime()
         },
       )
       .subscribe()
     return () => {
+      if (mobileBatchRealtimeDebounceRef.current) {
+        window.clearTimeout(mobileBatchRealtimeDebounceRef.current)
+        mobileBatchRealtimeDebounceRef.current = null
+      }
       void supabaseBrowser.removeChannel(ch)
     }
   }, [activeTab, evaluationBatchIdUi, supabaseBrowser, syncMobileBatchPhotos])
@@ -2957,7 +2990,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       }
       if (cur !== bid) return
       if (activeTabRef.current !== "evaluator") return
-      void syncMobileBatchPhotosRef.current()
+      if (mobileBatchRealtimeDebounceRef.current) window.clearTimeout(mobileBatchRealtimeDebounceRef.current)
+      mobileBatchRealtimeDebounceRef.current = window.setTimeout(() => {
+        mobileBatchRealtimeDebounceRef.current = null
+        void syncMobileBatchPhotosRef.current()
+      }, MOBILE_BATCH_REALTIME_DEBOUNCE_MS)
     }
     return () => {
       bc?.close()
@@ -2980,7 +3017,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       if (activeTabRef.current !== "evaluator") return
       evaluationBatchIdRef.current = v
       setEvaluationBatchIdUi(v)
-      void syncMobileBatchPhotosRef.current()
+      if (mobileBatchRealtimeDebounceRef.current) window.clearTimeout(mobileBatchRealtimeDebounceRef.current)
+      mobileBatchRealtimeDebounceRef.current = window.setTimeout(() => {
+        mobileBatchRealtimeDebounceRef.current = null
+        void syncMobileBatchPhotosRef.current()
+      }, MOBILE_BATCH_REALTIME_DEBOUNCE_MS)
     }
     window.addEventListener("storage", onStorage)
     return () => window.removeEventListener("storage", onStorage)

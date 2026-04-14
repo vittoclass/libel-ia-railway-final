@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
+import { parseBatchPhotoPageParams } from "@/app/lib/docente/batch-photo-pagination"
 import { getAuthUser, getSupabaseRouteClient } from "@/app/lib/supabase-route"
 
 export const dynamic = "force-dynamic"
@@ -18,6 +19,8 @@ export async function GET(req: NextRequest) {
   }
 
   const supabase = await getSupabaseRouteClient()
+  const { offset, limit } = parseBatchPhotoPageParams(req.nextUrl.searchParams)
+  const rangeEnd = offset + limit - 1
 
   const [photosRes, sessionRes] = await Promise.all([
     supabase
@@ -29,7 +32,7 @@ export async function GET(req: NextRequest) {
       .order("student_index", { ascending: true })
       .order("page_index", { ascending: true })
       .order("created_at", { ascending: true })
-      .limit(200),
+      .range(offset, rangeEnd),
     supabase
       .from("batch_scan_sessions")
       .select("expected_pages_per_student, source_exam_id")
@@ -45,6 +48,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
+  const pageRows = data ?? []
+  const hasMore = pageRows.length === limit
+  const nextOffset = hasMore ? offset + limit : offset + pageRows.length
+
   let expected_pages_per_student: number | null = null
   let source_exam_id: string | null = null
   if (!sessionRes.error && sessionRes.data) {
@@ -57,10 +64,17 @@ export async function GET(req: NextRequest) {
   }
 
   return NextResponse.json({
-    photos: data ?? [],
+    photos: pageRows,
     session: {
       expected_pages_per_student,
       source_exam_id,
+    },
+    meta: {
+      offset,
+      limit,
+      count: pageRows.length,
+      has_more: hasMore,
+      next_offset: hasMore ? nextOffset : null,
     },
   })
 }

@@ -50,6 +50,41 @@ export async function upsertStudentIdentity(
   return { student_id, rut_norm }
 }
 
+/**
+ * Fila estable en `public.students` cuando hay `student_profile` pero no RUT válido.
+ * `rut_norm` = `sp:<student_profile_id>` (no es un RUT real; evita colisión con identidad canónica por RUT).
+ * Necesario porque `student_projections.student_id` referencia `students.id`, no perfiles.
+ */
+export async function ensureStudentRowForStudentProfile(
+  supabase: SupabaseClient,
+  params: { student_profile_id: string; full_name: string; course_label?: string | null }
+): Promise<string | null> {
+  const pid = String(params.student_profile_id ?? "").trim()
+  if (!pid) return null
+  const rut_norm = `sp:${pid}`
+  const full_name = String(params.full_name ?? "").trim() || "Estudiante"
+  const { data, error } = await supabase
+    .from("students")
+    .upsert(
+      {
+        rut_raw: null,
+        rut_norm,
+        full_name,
+        course_label: params.course_label ?? null,
+        institution: null,
+      },
+      { onConflict: "rut_norm" }
+    )
+    .select("id")
+    .single()
+  if (data?.id) return String(data.id)
+  if (error) {
+    const { data: existing } = await supabase.from("students").select("id").eq("rut_norm", rut_norm).maybeSingle()
+    if (existing?.id) return String(existing.id)
+  }
+  return null
+}
+
 // PHASE_4_MEMORY_IDENTITY_V1
 export async function attachStudentIdToEvaluationArtifacts(
   supabase: SupabaseClient,

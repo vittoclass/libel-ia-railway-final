@@ -27,7 +27,7 @@ import {
   simceLevelFromLogroPct,
   type SimceLevel,
 } from "@/app/lib/standard-scale-converters"
-import { getInstrumentAnalyticsModeFromExamType, type InstrumentAnalyticsMode } from "@/app/lib/assessment-category"
+import { getInstrumentAnalyticsModeFromEvaluationTags, type InstrumentAnalyticsMode } from "@/app/lib/assessment-category"
 import { buildCourseQualityMetrics } from "@/app/lib/pedagogical-intelligence/metrics"
 import type { CourseStudentMetricInput } from "@/app/lib/pedagogical-intelligence/types"
 import type { SupabaseClient } from "@supabase/supabase-js"
@@ -519,7 +519,7 @@ function toNationalAnalyticsRows(params: {
   maxFallbackByEvaluation: Map<string, number>
   studentByEvaluation: Map<string, string>
   noteByEvaluation: Map<string, number>
-  examTypeByEvaluationId: Map<string, string | null>
+  instrumentModeByEvaluationId: Map<string, InstrumentAnalyticsMode>
 }): NationalAnalyticsRow[] {
   const rows: NationalAnalyticsRow[] = []
   const byEvaluationId = new Map(params.analyses.map((a) => [a.evaluation_id, a]))
@@ -535,7 +535,7 @@ function toNationalAnalyticsRows(params: {
     const score_max_fallback = params.maxFallbackByEvaluation.get(evaluationId) ?? 0
     const score_max = score_max_raw > 0 ? score_max_raw : score_max_fallback
     const logro_pct = score_max > 0 ? Math.round(clampLogroPctFromScores(score_obtained, score_max)) : null
-    const mode = getInstrumentAnalyticsModeFromExamType(params.examTypeByEvaluationId.get(evaluationId))
+    const mode = params.instrumentModeByEvaluationId.get(evaluationId) ?? "INSTITUTIONAL_OTHER"
     const lp = Number(logro_pct ?? 0)
     let paes_score: number | null = null
     let simce_score: number | null = null
@@ -613,7 +613,7 @@ export async function GET(
 
   let evaluationsQuery = supabase
     .from("evaluations")
-    .select("id, course_id, course_label, exam_type, subject, school_id")
+    .select("id, course_id, course_label, exam_type, assessment_category, subject, school_id")
     .order("evaluated_at", { ascending: false })
   if (canViewSchoolScope && schoolId) {
     evaluationsQuery = evaluationsQuery.eq("school_id", schoolId)
@@ -631,6 +631,7 @@ export async function GET(
     course_id: string | null
     course_label?: string | null
     exam_type?: string | null
+    assessment_category?: string | null
     subject?: string | null
     school_id?: string | null
   }>
@@ -683,7 +684,7 @@ export async function GET(
     },
   }
   const analyticsModeByEval = courseEvalsForSummary.map((e) =>
-    getInstrumentAnalyticsModeFromExamType(e.exam_type)
+    getInstrumentAnalyticsModeFromEvaluationTags(e.exam_type, e.assessment_category),
   )
   const analyticsMode: ExamMode =
     analyticsModeByEval.filter((m) => m === "PAES").length >=
@@ -962,9 +963,12 @@ export async function GET(
       const itemMax = Number(meta.evaluation_items_count) || 0
       maxFallbackByEvaluation.set(meta.id, sourceMax > 0 ? sourceMax : itemMax)
     }
-    const examTypeByEvaluationId = new Map<string, string | null>()
+    const instrumentModeByEvaluationId = new Map<string, InstrumentAnalyticsMode>()
     for (const e of courseEvalsForSummary) {
-      examTypeByEvaluationId.set(e.id, e.exam_type ?? null)
+      instrumentModeByEvaluationId.set(
+        e.id,
+        getInstrumentAnalyticsModeFromEvaluationTags(e.exam_type, e.assessment_category),
+      )
     }
     const byEvaluation = toNationalAnalyticsRows({
       analyses,
@@ -972,7 +976,7 @@ export async function GET(
       maxFallbackByEvaluation,
       studentByEvaluation,
       noteByEvaluation,
-      examTypeByEvaluationId,
+      instrumentModeByEvaluationId,
     })
     const count = byEvaluation.length
     const average_note_7 =
@@ -1027,7 +1031,8 @@ export async function GET(
   }
 
   const allInstitutionalOther = courseEvalsForSummary.every(
-    (e) => getInstrumentAnalyticsModeFromExamType(e.exam_type) === "INSTITUTIONAL_OTHER",
+    (e) =>
+      getInstrumentAnalyticsModeFromEvaluationTags(e.exam_type, e.assessment_category) === "INSTITUTIONAL_OTHER",
   )
   let by_axis_enriched = courseSummary.average_by_axis.map((r) => enrichAxisAggregateForChile(r))
   let by_skill_enriched = courseSummary.average_by_skill.map((r) => enrichSkillAggregateForChile(r, subjectModes))

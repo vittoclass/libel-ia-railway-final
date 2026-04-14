@@ -47,10 +47,17 @@ export type SourceExamItemRow = {
 type Props = {
   sourceExamId: string
   sourceExamTitle: string
+  /** Asignatura de la prueba base (listado); editable en el banco, aquí solo referencia. */
+  sourceExamSubject?: string | null
   onBack: () => void
 }
 
-export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, onBack }: Props) {
+export default function SourceExamItemsPanel({
+  sourceExamId,
+  sourceExamTitle,
+  sourceExamSubject,
+  onBack,
+}: Props) {
   const [items, setItems] = useState<SourceExamItemRow[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -264,7 +271,13 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
         <CardHeader>
           <CardTitle className="text-base">Ítems de la prueba base</CardTitle>
           <CardDescription>
-            {sourceExamTitle || "(Sin título)"} — Aquí se gestionan los ítems (preguntas) del instrumento en blanco. No son respuestas del estudiante.
+            {sourceExamTitle || "(Sin título)"}
+            {sourceExamSubject?.trim() ? (
+              <> · Asignatura: {sourceExamSubject.trim()}</>
+            ) : (
+              <> · Asignatura: sin definir (defínela en el listado del banco para mejorar Smart extract)</>
+            )}{" "}
+            — Aquí se gestionan los ítems (preguntas) del instrumento en blanco. No son respuestas del estudiante.
           </CardDescription>
           <div className="flex gap-2 mt-2">
             <Button variant="outline" size="sm" onClick={loadItems} disabled={loading}>
@@ -455,6 +468,7 @@ export default function SourceExamItemsPanel({ sourceExamId, sourceExamTitle, on
 
       <SourceExamItemsImportDialog
         sourceExamId={sourceExamId}
+        sourceExamTitle={sourceExamTitle}
         open={importDialogOpen}
         onOpenChange={setImportDialogOpen}
         onImported={loadItems}

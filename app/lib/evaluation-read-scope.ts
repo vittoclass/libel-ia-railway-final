@@ -48,3 +48,10 @@ export function profileScopeFromRow(row: { teacher_id?: string | null; school_id
     school_id_used: normUuid(row?.school_id ?? null),
   }
 }
+
+/** Alineado con `current_scope_org_id()` y columnas `organization_id` en proyecciones / auditoría. */
+export function institutionalTenantScopeFromProfile(
+  row: { organization_id?: string | null; school_id?: string | null; teacher_id?: string | null } | null | undefined
+): string | null {
+  return normUuid(row?.organization_id ?? null) ?? normUuid(row?.school_id ?? null) ?? normUuid(row?.teacher_id ?? null)
+}

@@ -117,6 +117,130 @@ function SourceExamTitleField({
   )
 }
 
+const SUBJECT_PRESETS = ["Matemática", "Lenguaje", "Ciencias", "Historia"] as const
+const SUBJECT_SEL_EMPTY = "_sin_asignatura"
+const SUBJECT_SEL_OTHER = "_otra"
+
+function SourceExamSubjectField({
+  row,
+  onSubjectSaved,
+}: {
+  row: SourceExamItem
+  onSubjectSaved: (id: string, subject: string | null) => void
+}) {
+  const current = row.subject?.trim() || null
+  const isPreset = current != null && SUBJECT_PRESETS.includes(current as (typeof SUBJECT_PRESETS)[number])
+  const [mode, setMode] = React.useState<string>(
+    current == null ? SUBJECT_SEL_EMPTY : isPreset ? current : SUBJECT_SEL_OTHER,
+  )
+  const [custom, setCustom] = React.useState(current != null && !isPreset ? current : "")
+  const [saving, setSaving] = React.useState(false)
+  const { toast } = useToast()
+
+  React.useEffect(() => {
+    const c = row.subject?.trim() || null
+    const p = c != null && SUBJECT_PRESETS.includes(c as (typeof SUBJECT_PRESETS)[number])
+    setMode(c == null ? SUBJECT_SEL_EMPTY : p ? c : SUBJECT_SEL_OTHER)
+    setCustom(c != null && !p ? c : "")
+  }, [row.id, row.subject])
+
+  const saveSubject = React.useCallback(
+    async (next: string | null) => {
+      const prev = row.subject?.trim() || null
+      if (next === prev) return
+      setSaving(true)
+      try {
+        const r = await fetch(`/api/source-exams/${encodeURIComponent(row.id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ subject: next }),
+        })
+        const j = await r.json().catch(() => ({}))
+        if (!r.ok) {
+          toast({
+            title: typeof j.error === "string" ? j.error : "No se pudo guardar la asignatura",
+            variant: "destructive",
+          })
+          return
+        }
+        const saved =
+          typeof j.source_exam?.subject === "string"
+            ? j.source_exam.subject.trim() || null
+            : j.source_exam?.subject === null
+              ? null
+              : next
+        onSubjectSaved(row.id, saved)
+        toast({ title: "Asignatura guardada." })
+      } catch {
+        toast({ title: "Error de conexión al guardar la asignatura", variant: "destructive" })
+      } finally {
+        setSaving(false)
+      }
+    },
+    [row.id, row.subject, onSubjectSaved, toast],
+  )
+
+  const commitCustom = React.useCallback(() => {
+    if (mode !== SUBJECT_SEL_OTHER) return
+    const t = custom.trim()
+    const next = t.length === 0 ? null : t.slice(0, 120)
+    void saveSubject(next)
+  }, [mode, custom, saveSubject])
+
+  return (
+    <div className="flex flex-col gap-1.5 min-w-[10rem] max-w-[min(20rem,100%)]">
+      <div className="flex items-center gap-2">
+        <Select
+          value={mode}
+          onValueChange={(v) => {
+            if (v === SUBJECT_SEL_OTHER) {
+              setMode(v)
+              return
+            }
+            setMode(v)
+            setCustom("")
+            const next = v === SUBJECT_SEL_EMPTY ? null : v
+            void saveSubject(next)
+          }}
+          disabled={saving}
+        >
+          <SelectTrigger className="h-8 text-sm" aria-label={`Asignatura de la prueba base ${row.id}`}>
+            <SelectValue placeholder="Asignatura" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={SUBJECT_SEL_EMPTY}>Sin definir</SelectItem>
+            {SUBJECT_PRESETS.map((s) => (
+              <SelectItem key={s} value={s}>
+                {s}
+              </SelectItem>
+            ))}
+            <SelectItem value={SUBJECT_SEL_OTHER}>Otra (texto libre)</SelectItem>
+          </SelectContent>
+        </Select>
+        {saving ? <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--text-muted)]" aria-hidden /> : null}
+      </div>
+      {mode === SUBJECT_SEL_OTHER ? (
+        <Input
+          value={custom}
+          onChange={(e) => setCustom(e.target.value)}
+          onBlur={() => void commitCustom()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault()
+              ;(e.currentTarget as HTMLInputElement).blur()
+            }
+          }}
+          placeholder="Ej. Artes, Inglés…"
+          disabled={saving}
+          className="h-8 text-sm"
+          maxLength={120}
+        />
+      ) : null}
+    </div>
+  )
+}
+
 export default function SourceExamsSection() {
   const [list, setList] = useState<SourceExamItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -127,8 +251,10 @@ export default function SourceExamsSection() {
   const [formCourseLabel, setFormCourseLabel] = useState("")
   const [formExamType, setFormExamType] = useState("")
   const [formPedagogyMode, setFormPedagogyMode] = useState("")
+  /** Prueba base “activa” en el banco: persiste al cerrar subdiálogos (p. ej. importar); solo se limpia con Volver del panel. */
   const [selectedSourceExamId, setSelectedSourceExamId] = useState<string | null>(null)
   const [selectedSourceExamTitle, setSelectedSourceExamTitle] = useState<string | null>(null)
+  const [selectedSourceExamSubject, setSelectedSourceExamSubject] = useState<string | null>(null)
   const { toast } = useToast()
 
   const loadList = React.useCallback(async () => {
@@ -160,6 +286,16 @@ export default function SourceExamsSection() {
       setSelectedSourceExamTitle(title)
     }
   }, [selectedSourceExamId])
+
+  const handleSubjectSaved = React.useCallback(
+    (id: string, subject: string | null) => {
+      setList((prev) => prev.map((x) => (x.id === id ? { ...x, subject } : x)))
+      if (selectedSourceExamId === id) {
+        setSelectedSourceExamSubject(subject)
+      }
+    },
+    [selectedSourceExamId],
+  )
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -210,7 +346,12 @@ export default function SourceExamsSection() {
         <SourceExamItemsPanel
           sourceExamId={selectedSourceExamId}
           sourceExamTitle={selectedSourceExamTitle}
-          onBack={() => { setSelectedSourceExamId(null); setSelectedSourceExamTitle(null) }}
+          sourceExamSubject={selectedSourceExamSubject}
+          onBack={() => {
+            setSelectedSourceExamId(null)
+            setSelectedSourceExamTitle(null)
+            setSelectedSourceExamSubject(null)
+          }}
         />
       ) : (
         <>
@@ -326,14 +467,20 @@ export default function SourceExamsSection() {
                     <TableCell className="align-middle py-2">
                       <SourceExamTitleField row={row} onTitleSaved={handleTitleSaved} />
                     </TableCell>
-                    <TableCell>{row.subject ?? "—"}</TableCell>
+                    <TableCell className="align-middle py-2">
+                      <SourceExamSubjectField row={row} onSubjectSaved={handleSubjectSaved} />
+                    </TableCell>
                     <TableCell>{row.course_label ?? "—"}</TableCell>
                     <TableCell>{row.exam_type ?? "—"}</TableCell>
                     <TableCell>
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => { setSelectedSourceExamId(row.id); setSelectedSourceExamTitle(row.title ?? "(Sin título)") }}
+                        onClick={() => {
+                          setSelectedSourceExamId(row.id)
+                          setSelectedSourceExamTitle(row.title ?? "(Sin título)")
+                          setSelectedSourceExamSubject(row.subject ?? null)
+                        }}
                       >
                         <List className="h-3 w-3 mr-1" /> Ver ítems
                       </Button>

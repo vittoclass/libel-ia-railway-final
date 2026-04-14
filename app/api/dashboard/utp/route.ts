@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
+import { institutionalTenantScopeFromProfile } from "@/app/lib/evaluation-read-scope"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
 import { isMasterEmail } from "@/app/lib/master-access"
@@ -37,14 +38,38 @@ export async function GET(_req: NextRequest) {
   const orgId = (profile as { organization_id?: string | null } | null)?.organization_id ?? null
   const schoolId = (profile as { school_id?: string | null } | null)?.school_id ?? null
   const teacherId = (profile as { teacher_id?: string | null } | null)?.teacher_id ?? null
+  const master = isMasterEmail(user.email)
+  const institutionalScopeId = institutionalTenantScopeFromProfile(
+    profile as {
+      organization_id?: string | null
+      school_id?: string | null
+      teacher_id?: string | null
+    } | null
+  )
   try {
-    let query = supabase
-      .from("evaluation_audit_logs")
-      .select("id, actor_id, action, target_id, target_type, metadata, created_at")
-      .order("created_at", { ascending: false })
-      .limit(200)
-    if (orgId) query = query.eq("organization_id", orgId)
-    const { data, error } = await query
+    let data: Array<Record<string, unknown>> | null = null
+    let error: { message: string } | null = null
+    if (master) {
+      const res = await supabase
+        .from("evaluation_audit_logs")
+        .select("id, actor_id, action, target_id, target_type, metadata, created_at")
+        .order("created_at", { ascending: false })
+        .limit(200)
+      data = res.data ?? null
+      error = res.error
+    } else if (institutionalScopeId) {
+      const res = await supabase
+        .from("evaluation_audit_logs")
+        .select("id, actor_id, action, target_id, target_type, metadata, created_at")
+        .eq("organization_id", institutionalScopeId)
+        .order("created_at", { ascending: false })
+        .limit(200)
+      data = res.data ?? null
+      error = res.error
+    } else {
+      data = []
+      error = null
+    }
     if (error) {
       return NextResponse.json({ items: [], warning: error.message }, { status: 200 })
     }
@@ -65,7 +90,10 @@ export async function GET(_req: NextRequest) {
       .eq("is_archived", false)
       .order("created_at", { ascending: false, nullsFirst: false })
       .limit(60)
-    if (schoolId) batchesQ = batchesQ.eq("school_id", schoolId)
+    const hasBatchScope = Boolean(schoolId) || Boolean(orgId) || Boolean(teacherId)
+    if (!master && !hasBatchScope) {
+      batchesQ = batchesQ.eq("school_id", "00000000-0000-0000-0000-000000000000")
+    } else if (schoolId) batchesQ = batchesQ.eq("school_id", schoolId)
     else if (orgId) {
       const { data: peers } = await supabase
         .from("profiles")
@@ -75,8 +103,11 @@ export async function GET(_req: NextRequest) {
       const tids = [...new Set((peers ?? []).map((p: { teacher_id?: string | null }) => p.teacher_id).filter(Boolean))] as string[]
       if (tids.length > 0) batchesQ = batchesQ.in("teacher_id", tids)
       else if (teacherId) batchesQ = batchesQ.eq("teacher_id", teacherId)
+      else if (!master) batchesQ = batchesQ.eq("school_id", "00000000-0000-0000-0000-000000000000")
     } else if (teacherId) {
       batchesQ = batchesQ.eq("teacher_id", teacherId)
+    } else if (!master) {
+      batchesQ = batchesQ.eq("school_id", "00000000-0000-0000-0000-000000000000")
     }
     const { data: batchSessions, error: batchSessionsErr } = await batchesQ
     const rawBatchSessions = (batchSessions ?? []) as Array<{
@@ -119,24 +150,26 @@ export async function GET(_req: NextRequest) {
         return tb - ta
       })
 
-    // PHASE_6_NORMATIVE_ENGINE_V1: incluir foco de riesgo desde student_projections
-    let projectionsQuery = supabase
-      .from("student_projections")
-      .select("id, organization_id, student_id, evaluation_id, logro_pct, simce_level_label, paes_estimated, risk_level, calculated_at")
-      .order("calculated_at", { ascending: false })
-      .limit(150)
-    if (orgId) projectionsQuery = projectionsQuery.eq("organization_id", orgId)
-    let { data: projections, error: projectionsErr } = await projectionsQuery
-    if (projectionsErr) {
-      const fallback = await supabase
+    // PHASE_6_NORMATIVE_ENGINE_V1: foco de riesgo desde student_projections (mismo scope que proyección al persistir).
+    let projections: Array<Record<string, unknown>> = []
+    let projectionsErr: { message: string } | null = null
+    if (master) {
+      const r = await supabase
         .from("student_projections")
-        .select(
-          "id, organization_id, student_id, evaluation_id, logro_pct, simce_level_label, paes_estimated, risk_level, calculated_at",
-        )
+        .select("id, organization_id, student_id, evaluation_id, logro_pct, simce_level_label, paes_estimated, risk_level, calculated_at")
         .order("calculated_at", { ascending: false })
         .limit(150)
-      projections = fallback.data ?? []
-      projectionsErr = fallback.error
+      projections = (r.data ?? []) as Array<Record<string, unknown>>
+      projectionsErr = r.error
+    } else if (institutionalScopeId) {
+      const r = await supabase
+        .from("student_projections")
+        .select("id, organization_id, student_id, evaluation_id, logro_pct, simce_level_label, paes_estimated, risk_level, calculated_at")
+        .eq("organization_id", institutionalScopeId)
+        .order("calculated_at", { ascending: false })
+        .limit(150)
+      projections = (r.data ?? []) as Array<Record<string, unknown>>
+      projectionsErr = r.error
     }
 
     const riskRows = ((projections ?? []) as Array<{
@@ -165,8 +198,9 @@ export async function GET(_req: NextRequest) {
         calculated_at: r.calculated_at ?? null,
       }))
 
-    const semaforo = (projections ?? []).reduce(
-      (acc, r: { simce_level_label?: string | null; logro_pct?: number | null }) => {
+    const semaforo = projections.reduce<{ insuficiente: number; elemental: number; adecuado: number }>(
+      (acc, row) => {
+        const r = row as { simce_level_label?: string | null; logro_pct?: number | null }
         const lvl = String(r.simce_level_label ?? "").toUpperCase()
         const logro = Number(r.logro_pct)
         if (lvl === "INSUFICIENTE" || (!lvl && Number.isFinite(logro) && logro < 50)) acc.insuficiente++

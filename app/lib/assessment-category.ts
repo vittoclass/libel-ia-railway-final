@@ -65,7 +65,7 @@ export function mergeFlatAssessmentType(
 
 /**
  * Marco de proyección en informes pedagógicos (exclusión cruzada SIMCE/PAES vs prueba propia).
- * Se deriva de `evaluations.exam_type` (mismo significado que instrument_type en producto).
+ * Para filas `evaluations` completas, preferir `getInstrumentAnalyticsModeFromEvaluationTags` (alinea con dashboard/direccion).
  */
 export type InstrumentAnalyticsMode = "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
 
@@ -73,6 +73,25 @@ export function getInstrumentAnalyticsModeFromExamType(raw: string | null | unde
   const flat = parseAssessmentTypeToFlat(raw)
   if (flat === "ENSAYO_SIMCE") return "SIMCE"
   if (flat === "ENSAYO_PAES") return "PAES"
+  return "INSTITUTIONAL_OTHER"
+}
+
+/**
+ * Misma regla que `app/api/dashboard/direccion/route.ts` al armar `evalTypeMap`:
+ * fusiona `exam_type` y `assessment_category` con `mergeFlatAssessmentType` (p. ej. vínculo UTP por lote solo rellena categoría).
+ */
+export function getInstrumentAnalyticsModeFromEvaluationTags(
+  examType: string | null | undefined,
+  assessmentCategory: string | null | undefined,
+): InstrumentAnalyticsMode {
+  let current: FlatAssessmentType | undefined
+  const flatExam = parseAssessmentTypeToFlat(String(examType ?? ""))
+  const flatCat = parseAssessmentTypeToFlat(String(assessmentCategory ?? ""))
+  for (const flat of [flatExam, flatCat].filter(Boolean) as FlatAssessmentType[]) {
+    current = mergeFlatAssessmentType(current, flat)
+  }
+  if (current === "ENSAYO_SIMCE") return "SIMCE"
+  if (current === "ENSAYO_PAES") return "PAES"
   return "INSTITUTIONAL_OTHER"
 }
 

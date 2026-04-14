@@ -13,6 +13,7 @@ import { evaluateSkillsFromEvaluation } from "@/app/lib/skill-evaluator"
 import { agencyFieldsFromSkillScores } from "@/app/lib/skill-result-agency"
 import {
   attachStudentIdToEvaluationArtifacts,
+  ensureStudentRowForStudentProfile,
   upsertStudentIdentity,
 } from "@/app/lib/student-identity/repository"
 import type { SupabaseClient } from "@supabase/supabase-js"
@@ -228,7 +229,9 @@ const isDev = process.env.NODE_ENV !== "production"
   }
 
   const safeTitle = opts.title != null && String(opts.title).trim() !== "" ? String(opts.title).trim() : "Evaluación sin título"
-  const safeSubject = opts.subject != null && String(opts.subject).trim() !== "" ? String(opts.subject).trim() : "Sin asignatura"
+  const subjectFromOpts =
+    opts.subject != null && String(opts.subject).trim() !== "" ? String(opts.subject).trim() : null
+  let safeSubject = subjectFromOpts ?? "Sin asignatura"
   const rawCourse = opts.course_id != null && String(opts.course_id).trim() !== "" ? String(opts.course_id).trim() : null
   const safeCourseLabel = rawCourse ?? "Sin curso"
   const evaluationCourseId = isValidUUID(rawCourse) ? rawCourse!.trim() : null
@@ -266,7 +269,6 @@ const isDev = process.env.NODE_ENV !== "production"
     teacher_id: effective_teacher_id,
     user_id: opts.user_id?.trim() || null,
     title: safeTitle,
-    subject: safeSubject,
     evaluated_at: new Date().toISOString(),
     status: "draft",
     course_label: safeCourseLabel,
@@ -281,7 +283,7 @@ const isDev = process.env.NODE_ENV !== "production"
     evaluationInsert.source_exam_id = sourceExamIdOpt
     const sourceExamRes = await supabase
       .from("source_exams")
-      .select("exam_type, pedagogy_mode, title, source_file_name")
+      .select("exam_type, pedagogy_mode, title, source_file_name, subject")
       .eq("id", sourceExamIdOpt)
       .maybeSingle()
     if (!sourceExamRes.error && sourceExamRes.data) {
@@ -290,6 +292,11 @@ const isDev = process.env.NODE_ENV !== "production"
         pedagogy_mode?: string | null
         title?: string | null
         source_file_name?: string | null
+        subject?: string | null
+      }
+      if (subjectFromOpts == null) {
+        const inheritedSubject = String(row.subject ?? "").trim()
+        if (inheritedSubject) safeSubject = inheritedSubject
       }
       const inheritedExamType = String(row.exam_type ?? "").trim()
       const inheritedPedagogyMode = String(row.pedagogy_mode ?? "").trim()
@@ -314,6 +321,8 @@ const isDev = process.env.NODE_ENV !== "production"
   if (examTypeOpt && !evaluationInsert.exam_type) {
     evaluationInsert.exam_type = examTypeOpt
   }
+
+  evaluationInsert.subject = safeSubject
 
   const { data: evaluation, error: evalError } = await supabase
     .from("evaluations")
@@ -544,6 +553,32 @@ const isDev = process.env.NODE_ENV !== "production"
             student_name: confirmedName,
             student_id: identity.student_id,
           })
+        } else if (profileId) {
+          const bridgeId = await ensureStudentRowForStudentProfile(supabase, {
+            student_profile_id: profileId,
+            full_name: confirmedName,
+            course_label: safeCourseLabel,
+          })
+          if (bridgeId) {
+            await attachStudentIdToEvaluationArtifacts(supabase, {
+              evaluation_id: evaluationId,
+              student_name: confirmedName,
+              student_id: bridgeId,
+            })
+            await supabase
+              .from("student_evaluations")
+              .upsert(
+                {
+                  student_id: bridgeId,
+                  evaluation_id: evaluationId,
+                  course_label: safeCourseLabel,
+                  evaluated_at: new Date().toISOString(),
+                },
+                { onConflict: "evaluation_id" }
+              )
+              .select("id")
+              .maybeSingle()
+          }
         }
       } catch (identityErr) {
         registerChildError(

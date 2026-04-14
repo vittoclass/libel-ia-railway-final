@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { SupabaseClient } from "@supabase/supabase-js"
 import { ImageIcon, Loader2, Users } from "lucide-react"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
+import { MAX_BATCH_PHOTO_PAGE_SIZE } from "@/app/lib/docente/batch-photo-pagination"
 import { broadcastBatchPhotoActivity } from "@/app/lib/docente/active-batch-id"
 import { cn } from "@/lib/utils"
 
@@ -105,17 +106,33 @@ export function BatchPhotoRealtimeGrid({
     setLoading(true)
     void (async () => {
       try {
-        const res = await fetch(`/api/docente/batch-photos?batch_id=${encodeURIComponent(batchId)}`)
-        const j = await res.json().catch(() => ({}))
-        if (cancelled) return
-        if (j?.warning) setHint(String(j.warning))
-        setRows(Array.isArray(j?.photos) ? j.photos : [])
-        const ep = j?.session?.expected_pages_per_student
-        if (typeof ep === "number" && Number.isFinite(ep)) {
-          setSessionExpectedPages(Math.max(1, Math.min(50, Math.floor(ep))))
-        } else {
-          setSessionExpectedPages(null)
+        const aggregated: BatchPhotoRow[] = []
+        let offset = 0
+        let sessionEp: number | null = null
+        for (let i = 0; i < 80; i++) {
+          const res = await fetch(
+            `/api/docente/batch-photos?batch_id=${encodeURIComponent(batchId)}&offset=${offset}&limit=${MAX_BATCH_PHOTO_PAGE_SIZE}`,
+          )
+          const j = await res.json().catch(() => ({}))
+          if (cancelled) return
+          if (j?.warning) setHint(String(j.warning))
+          const chunk = Array.isArray(j?.photos) ? (j.photos as BatchPhotoRow[]) : []
+          aggregated.push(...chunk)
+          if (sessionEp == null) {
+            const ep = j?.session?.expected_pages_per_student
+            if (typeof ep === "number" && Number.isFinite(ep)) {
+              sessionEp = Math.max(1, Math.min(50, Math.floor(ep)))
+            }
+          }
+          const meta = j?.meta as { has_more?: boolean; next_offset?: number | null } | undefined
+          if (!meta?.has_more) break
+          offset = typeof meta.next_offset === "number" ? meta.next_offset : offset + chunk.length
+          await new Promise<void>((r) => window.setTimeout(r, 0))
         }
+        if (cancelled) return
+        setRows(aggregated)
+        if (sessionEp != null) setSessionExpectedPages(sessionEp)
+        else setSessionExpectedPages(null)
       } catch {
         if (!cancelled) {
           setRows([])
@@ -134,12 +151,18 @@ export function BatchPhotoRealtimeGrid({
     let cancelled = false
     void (async () => {
       const next: Record<string, string> = {}
-      await Promise.all(
-        rowPaths.map(async (path) => {
-          const { data, error } = await supabase.storage.from(BATCH_SCANS_BUCKET).createSignedUrl(path, 240)
-          if (!error && data?.signedUrl) next[path] = data.signedUrl
-        }),
-      )
+      const chunkSize = 24
+      for (let i = 0; i < rowPaths.length; i += chunkSize) {
+        if (cancelled) return
+        const chunk = rowPaths.slice(i, i + chunkSize)
+        await Promise.all(
+          chunk.map(async (path) => {
+            const { data, error } = await supabase.storage.from(BATCH_SCANS_BUCKET).createSignedUrl(path, 240)
+            if (!error && data?.signedUrl) next[path] = data.signedUrl
+          }),
+        )
+        await new Promise<void>((r) => window.setTimeout(r, 0))
+      }
       if (!cancelled) setUrls((prev) => ({ ...prev, ...next }))
     })()
     return () => {

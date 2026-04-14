@@ -6,7 +6,7 @@
  * Por defecto reemplaza ítems existentes al importar (evita duplicados). Opción de solo añadir.
  */
 import * as React from "react"
-import { useState, useCallback, useRef } from "react"
+import { useState, useCallback, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -20,8 +20,9 @@ import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Loader2, FileUp, FileText, Plus, Trash2, ChevronDown } from "lucide-react"
+import { Loader2, FileUp, FileText, Plus, Trash2, ChevronDown, Sparkles, ShieldCheck } from "lucide-react"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useToast } from "@/hooks/use-toast"
 import { dedupeParsedLinesByItemNumber, parseBulkItemsText } from "@/app/lib/parse-bulk-items"
 import type { ParsedLine } from "@/app/lib/parse-bulk-items"
@@ -42,6 +43,44 @@ const EXAMPLE = `1 | Calcula el área del triángulo | Geometría | Resolución 
 -- O desarrollo: 15 | essay | 4 | Lectura | Argumentación | Explica el conflicto del texto`
 
 const MAX_LINES = 500
+/** Smart Import: evita spinner infinito si el modelo o la red tardan demasiado. */
+const SMART_EXTRACT_FETCH_MS = 360_000
+const VALIDATE_PRACTICE_FETCH_MS = 360_000
+
+type ValidatePracticeAlert = {
+  severity: string
+  code: string
+  item_number: number | null
+  detail: string
+  base_preview: string | null
+  real_preview: string | null
+}
+
+type ValidatePracticeSummary = {
+  base_alternative_count: number
+  real_alternative_count: number
+  missing_in_real_count: number
+  extra_in_real_count: number
+  key_mismatch_count: number
+  type_mismatch_count: number
+  text_very_different_count: number
+  order_unusual_in_real: boolean
+  key_missing_in_real_count: number
+}
+
+const SEP_PIPE = " | "
+
+/** Sincroniza el panel "Texto fuente" con el formato estándar (Nº | enunciado | eje | habilidad | competencia | dificultad). */
+function smartExtractRowsToStandardSourceText(rows: ParsedLine[]): string {
+  const esc = (s: string | null | undefined) => String(s ?? "").replace(/\|/g, "¦").trim()
+  return rows
+    .map((r) =>
+      [r.item_number, esc(r.item_text), esc(r.axis_label), esc(r.skill_label), esc(r.competence), esc(r.difficulty)].join(
+        SEP_PIPE,
+      ),
+    )
+    .join("\n")
+}
 
 function sanitizeEditorItemsForApi(rows: ParsedLine[]): ParsedLine[] {
   const emptyToNull = (s: string | null | undefined): string | null => {
@@ -148,6 +187,8 @@ type PdfOcrDebugSnapshot = {
 
 type Props = {
   sourceExamId: string
+  /** Título de la prueba base activa (banco); se muestra en banner para evitar ambigüedad. */
+  sourceExamTitle?: string
   open: boolean
   onOpenChange: (open: boolean) => void
   onImported: () => void
@@ -155,10 +196,13 @@ type Props = {
 
 export default function SourceExamItemsImportDialog({
   sourceExamId,
+  sourceExamTitle = "",
   open,
   onOpenChange,
   onImported,
 }: Props) {
+  const hasActiveBase = typeof sourceExamId === "string" && sourceExamId.trim().length > 0
+  const displayTitle = sourceExamTitle.trim() || "(Sin título)"
   const [text, setText] = useState("")
   const [pdfWarning, setPdfWarning] = useState<string | null>(null)
   const [suggestedTitle, setSuggestedTitle] = useState<string | null>(null)
@@ -178,11 +222,37 @@ export default function SourceExamItemsImportDialog({
   const [pdfOcrDebug, setPdfOcrDebug] = useState<PdfOcrDebugSnapshot | null>(null)
   const [pdfOcrPanelOpen, setPdfOcrPanelOpen] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [importTab, setImportTab] = useState<"manual" | "smart">("manual")
+  const [smartExtracting, setSmartExtracting] = useState(false)
+  const [validatePracticeLoading, setValidatePracticeLoading] = useState(false)
+  const [validatePracticeResult, setValidatePracticeResult] = useState<{
+    summary: ValidatePracticeSummary
+    alerts: ValidatePracticeAlert[]
+    meta?: Record<string, unknown>
+  } | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const smartFileInputRef = useRef<HTMLInputElement>(null)
+  const validatePracticeFileInputRef = useRef<HTMLInputElement>(null)
+  const previewTableRef = useRef<HTMLDivElement>(null)
   const { toast } = useToast()
+
+  useEffect(() => {
+    if (open) {
+      setValidatePracticeResult(null)
+    }
+  }, [open, sourceExamId])
 
   const handlePdfUpload = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (!hasActiveBase) {
+        toast({
+          title: "Sin prueba base activa",
+          description: "Cierre este diálogo, elija una prueba base en el banco y vuelva a abrir Importar ítems.",
+          variant: "destructive",
+        })
+        e.target.value = ""
+        return
+      }
       const file = e.target.files?.[0]
       if (!file) return
       const n = file.name?.toLowerCase() ?? ""
@@ -345,10 +415,18 @@ export default function SourceExamItemsImportDialog({
         if (fileInputRef.current) fileInputRef.current.value = ""
       }
     },
-    [sourceExamId, toast]
+    [sourceExamId, toast, hasActiveBase]
   )
 
   const handlePreview = useCallback(() => {
+    if (!hasActiveBase) {
+      toast({
+        title: "Sin prueba base activa",
+        description: "Abra Importar ítems desde una prueba base seleccionada en el banco.",
+        variant: "destructive",
+      })
+      return
+    }
     const result = parseBulkItemsText(text)
     const dev = parseDevelopmentBlocksFromText(text)
     const bulkFiltered = result.valid.filter(
@@ -386,9 +464,17 @@ export default function SourceExamItemsImportDialog({
         cognitive_level: p.cognitive_level ?? null,
       })),
     )
-  }, [text])
+  }, [text, hasActiveBase, toast])
 
   const handleImport = useCallback(async () => {
+    if (!hasActiveBase) {
+      toast({
+        title: "Sin prueba base activa",
+        description: "Abra Importar ítems desde una prueba base seleccionada en el banco.",
+        variant: "destructive",
+      })
+      return
+    }
     const result = parseBulkItemsText(text)
     const dev = parseDevelopmentBlocksFromText(text)
     const bulkFiltered = result.valid.filter(
@@ -491,7 +577,18 @@ export default function SourceExamItemsImportDialog({
       setImporting(false)
       queueMicrotask(() => setImporting(false))
     }
-  }, [text, instrumentTitle, replaceExistingItems, sourceExamId, onImported, onOpenChange, toast, editorItems, preview])
+  }, [
+    text,
+    instrumentTitle,
+    replaceExistingItems,
+    sourceExamId,
+    onImported,
+    onOpenChange,
+    toast,
+    editorItems,
+    preview,
+    hasActiveBase,
+  ])
 
   const onClose = useCallback(
     (open: boolean) => {
@@ -506,10 +603,315 @@ export default function SourceExamItemsImportDialog({
         setPdfWarning(null)
         setSuggestedTitle(null)
         setInstrumentTitle("")
+        setImportTab("manual")
+        setValidatePracticeResult(null)
+        setValidatePracticeLoading(false)
       }
       onOpenChange(open)
     },
     [importing, onOpenChange]
+  )
+
+  const handleSmartExtractUpload = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (!hasActiveBase) {
+        toast({
+          title: "Sin prueba base activa",
+          description: "Abra Importar ítems desde una prueba base seleccionada en el banco.",
+          variant: "destructive",
+        })
+        e.target.value = ""
+        return
+      }
+      const file = e.target.files?.[0]
+      if (!file) return
+      const n = file.name?.toLowerCase() ?? ""
+      const ok =
+        file.type === "application/pdf" ||
+        n.endsWith(".pdf") ||
+        file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+        n.endsWith(".docx")
+      if (!ok) {
+        toast({ title: "Use PDF o Word (.docx)", variant: "destructive" })
+        e.target.value = ""
+        return
+      }
+      setSmartExtracting(true)
+      const controller = new AbortController()
+      const timeoutId = window.setTimeout(() => controller.abort(), SMART_EXTRACT_FETCH_MS)
+      try {
+        const fd = new FormData()
+        fd.append("file", file)
+        fd.append("source_exam_id", sourceExamId)
+        const res = await fetch("/api/source-exams/smart-extract", {
+          method: "POST",
+          credentials: "include",
+          body: fd,
+          signal: controller.signal,
+        })
+
+        const ct = res.headers.get("content-type") ?? ""
+        let data: {
+          items?: Array<Record<string, unknown>>
+          error?: string
+          details?: string
+          warnings?: string[]
+          meta?: { items_returned?: number }
+          anthropic_status?: number | null
+          anthropic_type?: string | null
+        } = {}
+        let bodyParseNote: string | null = null
+        try {
+          if (ct.includes("application/json")) {
+            data = (await res.json()) as typeof data
+          } else {
+            const txt = await res.text()
+            bodyParseNote = txt ? `Respuesta no JSON (${res.status}): ${txt.slice(0, 280)}` : `Respuesta vacía (${res.status})`
+          }
+        } catch (parseErr) {
+          bodyParseNote = parseErr instanceof Error ? parseErr.message : String(parseErr)
+        }
+
+        if (process.env.NODE_ENV !== "production") {
+          console.log("[IA Smart Import] response", {
+            httpStatus: res.status,
+            ok: res.ok,
+            error: data.error,
+            itemsCount: Array.isArray(data.items) ? data.items.length : 0,
+            anthropic_status: data.anthropic_status,
+            bodyParseNote,
+          })
+        }
+
+        const showSmartFailure = (title: string, description?: string) => {
+          toast({ title, description, variant: "destructive", duration: 12_000 })
+        }
+
+        if (bodyParseNote) {
+          showSmartFailure("No se pudo leer la respuesta del servidor", bodyParseNote)
+          return
+        }
+
+        if (!res.ok) {
+          showSmartFailure(
+            data.error || `Error del servidor (${res.status})`,
+            [
+              data.details,
+              data.anthropic_status != null ? `Anthropic (upstream): HTTP ${data.anthropic_status}` : "",
+            ]
+              .filter(Boolean)
+              .join(" · ") || undefined,
+          )
+          return
+        }
+
+        const rawItems = Array.isArray(data.items) ? data.items : []
+        const itemsEffectivelyEmpty = rawItems.length === 0
+
+        if (itemsEffectivelyEmpty && typeof data.error === "string" && data.error.trim()) {
+          showSmartFailure(
+            data.error.trim(),
+            data.details?.trim() || data.warnings?.filter(Boolean).join(" ") || undefined,
+          )
+          return
+        }
+        const rows: ParsedLine[] = rawItems.map((it, idx) => {
+          const num = Number(it.item_number)
+          const item_number = Number.isFinite(num) && num >= 1 ? Math.floor(num) : idx + 1
+          const qt = typeof it.question_type === "string" ? it.question_type.trim().toLowerCase() : ""
+          const allowed = ["multiple_choice", "true_false", "short_answer", "essay", "completion"] as const
+          const question_type = (allowed as readonly string[]).includes(qt) ? qt : null
+          const ms = it.max_score
+          let max_score: number | null = null
+          if (typeof ms === "number" && Number.isFinite(ms)) max_score = Math.max(0, Math.floor(ms))
+          else if (ms != null) {
+            const x = parseInt(String(ms), 10)
+            if (!Number.isNaN(x) && x >= 0) max_score = x
+          }
+          return {
+            item_number,
+            item_text: String(it.item_text ?? "").trim(),
+            axis_label: typeof it.axis_label === "string" && it.axis_label.trim() ? it.axis_label.trim() : null,
+            skill_label: typeof it.skill_label === "string" && it.skill_label.trim() ? it.skill_label.trim() : null,
+            cognitive_level:
+              typeof it.cognitive_level === "string" && it.cognitive_level.trim() ? it.cognitive_level.trim() : null,
+            competence: typeof it.competence === "string" && it.competence.trim() ? it.competence.trim() : null,
+            difficulty: typeof it.difficulty === "string" && it.difficulty.trim() ? it.difficulty.trim() : null,
+            question_type: question_type as ParsedLine["question_type"],
+            correct_answer:
+              typeof it.correct_answer === "string" && it.correct_answer.trim()
+                ? it.correct_answer.trim().toUpperCase()
+                : null,
+            max_score,
+            rubric_text: typeof it.rubric_text === "string" && it.rubric_text.trim() ? it.rubric_text.trim() : null,
+          }
+        })
+        const merged = dedupeParsedLinesByItemNumber(rows).filter((r) => r.item_text.trim().length > 0)
+        const capped = merged.slice(0, MAX_LINES)
+        if (merged.length > MAX_LINES) {
+          toast({
+            title: "Límite de filas",
+            description: `Solo se cargaron las primeras ${MAX_LINES} ítems.`,
+            variant: "destructive",
+          })
+        }
+        if (capped.length === 0) {
+          showSmartFailure(
+            data.error?.trim() || "Sin ítems con confianza suficiente",
+            [
+              data.details?.trim(),
+              data.warnings?.filter(Boolean).join(" "),
+              "Si el servidor devolvió 200 sin ítems, revise logs [smart-extract], avisos JSON en la respuesta o el umbral en smart-base-parser.",
+            ]
+              .filter(Boolean)
+              .join(" ") || undefined,
+          )
+          return
+        }
+        const enriched = enrichItemsWithPedagogy(capped)
+        setPreview({ valid: enriched, invalid: [] })
+        setEditorItems(capped)
+        setSourcePanelOpen(false)
+        setUnrecognizedOpen(false)
+        setText(smartExtractRowsToStandardSourceText(capped))
+        const baseName = file.name?.replace(/\.(pdf|docx)$/i, "").replace(/[-_]+/g, " ").trim() || ""
+        setInstrumentTitle((prev) => (prev.trim() ? prev : baseName))
+        setImportTab("manual")
+        toast({
+          title: "Extracción IA completada",
+          description: `${capped.length} ítem(s) en la tabla (Eje, Habilidad, Clave y demás columnas). Revise y pulse Importar cuando esté listo.`,
+        })
+        if (data.warnings && data.warnings.length > 0) {
+          const structural = data.warnings.some(
+            (w) =>
+              w.includes('"items"') ||
+              w.includes("no es un arreglo") ||
+              w.includes("no contiene la clave") ||
+              w.includes("JSON no es válido") ||
+              w.includes("tabla de ítems"),
+          )
+          toast({
+            title: structural ? "Aviso: formato de salida de la IA" : "Avisos (Smart Import)",
+            description: data.warnings.join(" "),
+            variant: structural ? "destructive" : "default",
+            duration: structural ? 14_000 : 10_000,
+          })
+        }
+        window.setTimeout(() => {
+          previewTableRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+        }, 80)
+      } catch (err) {
+        const aborted = err instanceof DOMException && err.name === "AbortError"
+        const msg = err instanceof Error ? err.message : String(err)
+        if (process.env.NODE_ENV !== "production") {
+          console.error("[IA Smart Import] catch:", err)
+        }
+        toast({
+          title: aborted ? "Tiempo de espera agotado (IA)" : "Error de conexión (IA)",
+          description: aborted
+            ? `La petición superó ${Math.round(SMART_EXTRACT_FETCH_MS / 60_000)} minutos. Pruebe un archivo más pequeño o revise Railway/logs del servidor.`
+            : msg,
+          variant: "destructive",
+          duration: 12_000,
+        })
+      } finally {
+        window.clearTimeout(timeoutId)
+        setSmartExtracting(false)
+        e.target.value = ""
+        if (smartFileInputRef.current) smartFileInputRef.current.value = ""
+      }
+    },
+    [sourceExamId, toast, hasActiveBase],
+  )
+
+  const handleValidatePracticeUpload = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (!hasActiveBase) {
+        toast({
+          title: "Sin prueba base activa",
+          description: "Abra Importar ítems desde una prueba base seleccionada en el banco.",
+          variant: "destructive",
+        })
+        e.target.value = ""
+        return
+      }
+      const file = e.target.files?.[0]
+      if (!file) return
+      const n = file.name?.toLowerCase() ?? ""
+      const ok =
+        file.type === "application/pdf" ||
+        n.endsWith(".pdf") ||
+        file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+        n.endsWith(".docx")
+      if (!ok) {
+        toast({ title: "Use PDF o Word (.docx)", variant: "destructive" })
+        e.target.value = ""
+        return
+      }
+      setValidatePracticeLoading(true)
+      setValidatePracticeResult(null)
+      const controller = new AbortController()
+      const timeoutId = window.setTimeout(() => controller.abort(), VALIDATE_PRACTICE_FETCH_MS)
+      try {
+        const fd = new FormData()
+        fd.append("file", file)
+        const res = await fetch(`/api/source-exams/${sourceExamId}/validate-practice`, {
+          method: "POST",
+          credentials: "include",
+          body: fd,
+          signal: controller.signal,
+        })
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean
+          summary?: ValidatePracticeSummary
+          alerts?: ValidatePracticeAlert[]
+          meta?: Record<string, unknown>
+          error?: string
+          details?: string
+        }
+        if (process.env.NODE_ENV !== "production") {
+          console.log("[Validar prueba] response", { httpStatus: res.status, ok: data.ok, summary: data.summary })
+        }
+        if (!res.ok || data.ok === false) {
+          toast({
+            title: data.error || `Error (${res.status})`,
+            description: data.details,
+            variant: "destructive",
+            duration: 14_000,
+          })
+          return
+        }
+        if (data.summary && Array.isArray(data.alerts)) {
+          setValidatePracticeResult({
+            summary: data.summary,
+            alerts: data.alerts,
+            meta: data.meta,
+          })
+          toast({
+            title: "Validación completada",
+            description: `Base (alternativas): ${data.summary.base_alternative_count} · Detectadas en archivo: ${data.summary.real_alternative_count}. Revise alertas abajo; no se modificó la prueba base.`,
+            duration: 12_000,
+          })
+        }
+      } catch (err) {
+        const aborted = err instanceof DOMException && err.name === "AbortError"
+        toast({
+          title: aborted ? "Tiempo de espera (validación)" : "Error de conexión",
+          description: aborted
+            ? "La validación superó el tiempo máximo. Intente con un archivo más pequeño."
+            : err instanceof Error
+              ? err.message
+              : String(err),
+          variant: "destructive",
+        })
+      } finally {
+        window.clearTimeout(timeoutId)
+        setValidatePracticeLoading(false)
+        e.target.value = ""
+        if (validatePracticeFileInputRef.current) validatePracticeFileInputRef.current.value = ""
+      }
+    },
+    [sourceExamId, toast, hasActiveBase],
   )
 
   return (
@@ -520,10 +922,61 @@ export default function SourceExamItemsImportDialog({
             <FileUp className="h-5 w-5" /> Importar ítems
           </DialogTitle>
           <DialogDescription>
-            Pegue un listado, suba un <strong>PDF</strong> o un <strong>Word (.docx)</strong>. El texto extraído se muestra completo abajo; la tabla de ítems es opcional tras Previsualizar. Con Azure configurado se usa OCR estructurado (layout) para no perder tablas ni bloques.
+            <strong>Manual / PDF:</strong> pegue un listado o suba PDF/DOCX como siempre. <strong>IA Smart Import:</strong> opcional;
+            requiere <code className="text-xs">ANTHROPIC_API_KEY</code>. Revise la tabla antes de importar; no altera OMR ni el
+            guardado existente.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-3 overflow-auto flex-1 min-h-0">
+        <div
+          className={`rounded-md border px-3 py-2 text-sm shrink-0 ${hasActiveBase ? "border-primary/50 bg-primary/5" : "border-destructive/50 bg-destructive/10"}`}
+          role="status"
+        >
+          <span className="font-semibold text-foreground">Prueba base activa: </span>
+          {hasActiveBase ? (
+            <span className="text-foreground/90">{displayTitle}</span>
+          ) : (
+            <span className="text-destructive font-medium">
+              ninguna — cierre y elija una prueba en el banco antes de importar o validar.
+            </span>
+          )}
+          {hasActiveBase ? (
+            <span className="block text-[11px] text-muted-foreground font-mono mt-1 break-all">ID: {sourceExamId.trim()}</span>
+          ) : null}
+        </div>
+        {!hasActiveBase ? (
+          <p className="text-xs text-destructive m-0 shrink-0">
+            Importar, IA Smart Import y validar prueba subida están deshabilitados hasta tener una prueba base activa.
+          </p>
+        ) : null}
+        <div className="space-y-1.5 shrink-0">
+          <Label htmlFor="source-exam-instrument-title">Título del instrumento (se guarda al importar)</Label>
+          <Input
+            id="source-exam-instrument-title"
+            value={instrumentTitle}
+            onChange={(e) => setInstrumentTitle(e.target.value)}
+            placeholder="Ej. Prueba unidad 3 — 4° medio"
+            className="text-sm"
+          />
+          {suggestedTitle ? (
+            <p className="text-xs text-muted-foreground m-0">
+              Sugerencia según el texto o el PDF: <span className="text-foreground/90">{suggestedTitle}</span>
+            </p>
+          ) : null}
+        </div>
+        <Tabs
+          value={importTab}
+          onValueChange={(v) => setImportTab(v as "manual" | "smart")}
+          className="flex flex-col flex-1 min-h-0 gap-2"
+        >
+          <TabsList className="shrink-0 w-full max-w-lg justify-start">
+            <TabsTrigger value="manual">Manual / PDF</TabsTrigger>
+            <TabsTrigger value="smart" className="gap-1.5">
+              <Sparkles className="h-3.5 w-3.5 shrink-0" />
+              IA Smart Import
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="manual" className="flex-1 min-h-0 overflow-hidden mt-0 data-[state=inactive]:hidden">
+            <div className="space-y-3 overflow-auto max-h-[min(58vh,480px)] pr-1">
           <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-muted-foreground/40 p-3 bg-muted/30">
             <Label className="flex items-center gap-1.5 text-sm font-medium shrink-0">
               <FileText className="h-4 w-4" /> Subir archivo
@@ -539,7 +992,7 @@ export default function SourceExamItemsImportDialog({
               type="button"
               variant="outline"
               size="sm"
-              disabled={pdfExtracting}
+              disabled={pdfExtracting || !hasActiveBase}
               onClick={() => fileInputRef.current?.click()}
             >
               {pdfExtracting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
@@ -629,21 +1082,6 @@ export default function SourceExamItemsImportDialog({
               </CollapsibleContent>
             </Collapsible>
           )}
-          <div className="space-y-1.5">
-            <Label htmlFor="source-exam-instrument-title">Título del instrumento (se guarda al importar)</Label>
-            <Input
-              id="source-exam-instrument-title"
-              value={instrumentTitle}
-              onChange={(e) => setInstrumentTitle(e.target.value)}
-              placeholder="Ej. Prueba unidad 3 — 4° medio"
-              className="text-sm"
-            />
-            {suggestedTitle ? (
-              <p className="text-xs text-muted-foreground m-0">
-                Sugerencia según el texto o el PDF: <span className="text-foreground/90">{suggestedTitle}</span>
-              </p>
-            ) : null}
-          </div>
           {preview?.developmentWarnings && preview.developmentWarnings.length > 0 && (
             <div className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200">
               <span className="font-medium">Desarrollo detectado:</span>{" "}
@@ -666,7 +1104,10 @@ export default function SourceExamItemsImportDialog({
             </>
           )}
           {preview && (
-            <div className="border rounded-md overflow-auto max-h-[min(70vh,520px)]">
+            <div
+              ref={previewTableRef}
+              className="border rounded-md overflow-auto max-h-[min(70vh,520px)] scroll-mt-4"
+            >
               <div className="flex flex-wrap items-center justify-between gap-2 px-2 py-2 text-xs border-b bg-muted/30">
                 <span className="text-muted-foreground">
                   Modo híbrido: la tabla es lo que se importa. Añade o quita filas; el tipo (p. ej. desarrollo) y la clave se
@@ -808,7 +1249,20 @@ export default function SourceExamItemsImportDialog({
                           }
                         />
                       </TableCell>
-                      <TableCell className="truncate text-xs">{p.difficulty ?? "—"}</TableCell>
+                      <TableCell className="max-w-[100px] p-1">
+                        <Input
+                          className="h-8 text-xs"
+                          placeholder="Dificultad"
+                          value={p.difficulty ?? ""}
+                          onChange={(e) =>
+                            setEditorItems((prev) =>
+                              prev.map((row, idx) =>
+                                idx === i ? { ...row, difficulty: e.target.value.trim() || null } : row,
+                              ),
+                            )
+                          }
+                        />
+                      </TableCell>
                       <TableCell className="max-w-[220px]">
                         <textarea
                           className="w-full min-h-[52px] rounded border border-input bg-background px-2 py-1 text-xs"
@@ -906,7 +1360,104 @@ export default function SourceExamItemsImportDialog({
               </Collapsible>
             </div>
           )}
-          <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+            </div>
+          </TabsContent>
+          <TabsContent value="smart" className="mt-0 space-y-3 data-[state=inactive]:hidden overflow-auto max-h-[min(36vh,280px)] pr-1">
+            <p className="text-xs text-muted-foreground m-0 leading-relaxed">
+              Sube un PDF o DOCX: el servidor reutiliza el mismo extractor que en manual y envía el texto a{" "}
+              <strong>Claude</strong> (modelo según <code className="text-[10px]">ANTHROPIC_SMART_EXTRACT_MODEL</code> o
+              predeterminado). Los campos se filtran por confianza ≥ 75 % en el servidor; la tabla de previsualización muestra
+              Eje, Habilidad, Clave y el resto. Tras procesar, se abre la pestaña Manual para revisar y pulsar{" "}
+              <strong>Importar</strong>.
+            </p>
+            <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-muted-foreground/40 p-3 bg-muted/30">
+              <Label className="flex items-center gap-1.5 text-sm font-medium shrink-0">
+                <Sparkles className="h-4 w-4" /> Archivo
+              </Label>
+              <input
+                ref={smartFileInputRef}
+                type="file"
+                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                className="hidden"
+                onChange={handleSmartExtractUpload}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={smartExtracting || validatePracticeLoading || !hasActiveBase}
+                onClick={() => smartFileInputRef.current?.click()}
+              >
+                {smartExtracting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+                {smartExtracting ? "Procesando…" : "Elegir PDF o DOCX"}
+              </Button>
+              <span className="text-xs text-muted-foreground">Máx. 10 MB · misma autenticación que la prueba base actual.</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-primary/30 p-3 bg-muted/20">
+              <Label className="flex items-center gap-1.5 text-sm font-medium shrink-0">
+                <ShieldCheck className="h-4 w-4 text-primary" /> Validar prueba subida
+              </Label>
+              <input
+                ref={validatePracticeFileInputRef}
+                type="file"
+                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                className="hidden"
+                onChange={handleValidatePracticeUpload}
+              />
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={smartExtracting || validatePracticeLoading || !hasActiveBase}
+                onClick={() => validatePracticeFileInputRef.current?.click()}
+              >
+                {validatePracticeLoading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+                {validatePracticeLoading ? "Validando…" : "Comparar con la base (solo alternativas)"}
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                No importa ni cambia ítems: solo compara tu archivo con los ítems de alternativa múltiple ya guardados.
+              </span>
+            </div>
+            {validatePracticeResult ? (
+              <div className="rounded-md border border-border bg-background text-xs space-y-2 p-3 max-h-[220px] overflow-auto">
+                <p className="font-medium text-foreground m-0">Resumen</p>
+                <ul className="list-disc pl-4 m-0 space-y-0.5 text-muted-foreground">
+                  <li>Base (alternativas): {validatePracticeResult.summary.base_alternative_count}</li>
+                  <li>Detectadas en archivo: {validatePracticeResult.summary.real_alternative_count}</li>
+                  <li>Faltantes en archivo: {validatePracticeResult.summary.missing_in_real_count}</li>
+                  <li>Sobrantes en archivo: {validatePracticeResult.summary.extra_in_real_count}</li>
+                  <li>Clave distinta: {validatePracticeResult.summary.key_mismatch_count}</li>
+                  <li>Clave en base sin detectar en archivo: {validatePracticeResult.summary.key_missing_in_real_count}</li>
+                  <li>Tipo distinto: {validatePracticeResult.summary.type_mismatch_count}</li>
+                  <li>Texto muy distinto: {validatePracticeResult.summary.text_very_different_count}</li>
+                  <li>Orden inusual en extracción: {validatePracticeResult.summary.order_unusual_in_real ? "sí" : "no"}</li>
+                </ul>
+                {validatePracticeResult.alerts.length > 0 ? (
+                  <>
+                    <p className="font-medium text-foreground m-0 pt-1">Alertas ({validatePracticeResult.alerts.length})</p>
+                    <ul className="list-none m-0 space-y-2">
+                      {validatePracticeResult.alerts.slice(0, 40).map((a, i) => (
+                        <li key={`val-${a.code}-${a.item_number ?? "x"}-${i}`} className="border-b border-border/60 pb-2 last:border-0">
+                          <span className="text-[10px] uppercase text-muted-foreground">{a.code}</span>
+                          {a.item_number != null ? (
+                            <span className="text-[10px] text-muted-foreground"> · ítem {a.item_number}</span>
+                          ) : null}
+                          <p className="m-0 mt-0.5 text-foreground/90">{a.detail}</p>
+                        </li>
+                      ))}
+                    </ul>
+                    {validatePracticeResult.alerts.length > 40 ? (
+                      <p className="text-muted-foreground m-0">… y {validatePracticeResult.alerts.length - 40} más (ver logs servidor).</p>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="text-muted-foreground m-0">Sin alertas en esta corrida.</p>
+                )}
+              </div>
+            ) : null}
+          </TabsContent>
+        </Tabs>
+          <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 shrink-0">
             <Checkbox
               id="source-exam-replace-items"
               checked={replaceExistingItems}
@@ -918,21 +1469,26 @@ export default function SourceExamItemsImportDialog({
               existentes y puede repetirse el mismo número de ítem.
             </Label>
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button type="button" variant="outline" size="sm" onClick={handlePreview}>
+          <div className="flex flex-wrap gap-2 shrink-0">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handlePreview}
+              disabled={importTab === "smart" || !hasActiveBase}
+            >
               Previsualizar
             </Button>
             <Button
               type="button"
               size="sm"
               onClick={handleImport}
-              disabled={importing || (!text.trim() && !preview)}
+              disabled={importing || (!text.trim() && !preview) || !hasActiveBase}
             >
               {importing ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
               Importar ítems válidos
             </Button>
           </div>
-        </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onClose(false)} disabled={importing}>
             Cerrar

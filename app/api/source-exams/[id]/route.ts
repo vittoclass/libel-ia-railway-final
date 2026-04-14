@@ -28,25 +28,35 @@ export async function PATCH(
   const { id: sourceExamId } = await params
   if (!sourceExamId) return NextResponse.json({ error: "Falta id de prueba base" }, { status: 400 })
 
-  let body: { title?: unknown } = {}
+  const MAX_SUBJECT_LEN = 120
+
+  let body: { title?: unknown; subject?: unknown } = {}
   try {
     body = await req.json()
   } catch {
     return NextResponse.json({ error: "Body JSON inválido" }, { status: 400 })
   }
 
-  if (typeof body.title !== "string") {
-    return NextResponse.json({ error: "Se requiere title (string)" }, { status: 400 })
+  const titleString = typeof body.title === "string" ? body.title : undefined
+  const hasTitle = titleString !== undefined
+  const hasSubject = "subject" in body
+  if (!hasTitle && !hasSubject) {
+    return NextResponse.json(
+      { error: "Envíe title (string) y/o subject (string o null)" },
+      { status: 400 },
+    )
   }
 
-  const title = body.title.trim() === "" ? "Sin título" : body.title.trim()
+  if (hasSubject && body.subject !== null && typeof body.subject !== "string") {
+    return NextResponse.json({ error: "subject debe ser string o null" }, { status: 400 })
+  }
 
   const supabase = getSupabaseServer()
   if (!supabase) return NextResponse.json({ error: "Supabase no configurado" }, { status: 503 })
 
   const { data: existing, error: fetchErr } = await supabase
     .from("source_exams")
-    .select("id, teacher_id, title")
+    .select("id, teacher_id, title, subject")
     .eq("id", sourceExamId)
     .maybeSingle()
 
@@ -57,9 +67,31 @@ export async function PATCH(
     return NextResponse.json({ error: "Sin permiso sobre esta prueba base" }, { status: 403 })
   }
 
+  const ex = existing as { title?: string | null; subject?: string | null }
+
+  const title = hasTitle
+    ? titleString.trim() === ""
+      ? "Sin título"
+      : titleString.trim()
+    : (typeof ex.title === "string" && ex.title.trim() ? ex.title.trim() : "Sin título")
+
+  let subject: string | null
+  if (hasSubject) {
+    if (body.subject === null) {
+      subject = null
+    } else if (typeof body.subject === "string") {
+      const t = body.subject.trim()
+      subject = t.length === 0 ? null : t.slice(0, MAX_SUBJECT_LEN)
+    } else {
+      return NextResponse.json({ error: "subject debe ser string o null" }, { status: 400 })
+    }
+  } else {
+    subject = typeof ex.subject === "string" && ex.subject.trim() ? ex.subject.trim() : null
+  }
+
   const { data: updated, error: updateErr } = await supabase
     .from("source_exams")
-    .update({ title, updated_at: new Date().toISOString() })
+    .update({ title, subject, updated_at: new Date().toISOString() })
     .eq("id", sourceExamId)
     .select("id, title, subject, course_label, exam_type, pedagogy_mode, created_at")
     .single()

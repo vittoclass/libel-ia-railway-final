@@ -63,6 +63,12 @@ function retroalimentacionEjecutivaSoloAlternativas(): {
 
 /** Si la llamada HTTP a Mistral supera este tiempo, se asume IA/red colgada (logs Railway). */
 const MISTRAL_FETCH_TIMEOUT_MS = 25_000
+/** Pixtral / visión y payloads grandes: margen extra sin inflar texto plano. */
+const MISTRAL_FETCH_TIMEOUT_MS_VISION = 40_000
+
+function isMistralTimeoutError(e: unknown): boolean {
+  return e instanceof Error && e.message === "ERROR_MISTRAL_TIMEOUT"
+}
 
 function mergeAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
   const anyFn = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any
@@ -71,14 +77,19 @@ function mergeAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
 }
 
 /** Reintentos para 502/503/429 (overload/servicio no disponible). Timeout por intento: ERROR_MISTRAL_TIMEOUT. */
-async function fetchMistralWithRetry(url: string, init: RequestInit): Promise<Response> {
+async function fetchMistralWithRetry(
+  url: string,
+  init: RequestInit,
+  options?: { timeoutMs?: number },
+): Promise<Response> {
+  const timeoutMs = options?.timeoutMs ?? MISTRAL_FETCH_TIMEOUT_MS
   const maxRetries = 3
   const retryStatuses = [502, 503, 429]
   let lastError: Error | null = null
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const timeoutController = new AbortController()
-    const timeoutId = setTimeout(() => timeoutController.abort(), MISTRAL_FETCH_TIMEOUT_MS)
-    console.log("[evaluate][Mistral] ANTES fetch", { attempt, maxRetries, timeoutMs: MISTRAL_FETCH_TIMEOUT_MS })
+    const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs)
+    console.log("[evaluate][Mistral] ANTES fetch", { attempt, maxRetries, timeoutMs })
     try {
       const signal = init.signal
         ? mergeAbortSignals(init.signal, timeoutController.signal)
@@ -692,20 +703,24 @@ Responde ÚNICAMENTE con este JSON (sin markdown):
 
 Las claves de respuestas_desarrollo pueden ser P1, P2, P3, etc. según los ítems de desarrollo en la pauta. Asigna puntaje de 0 a máximo de cada ítem aplicando generosidad calibrada. Para respuestas_cerradas, usa exactamente los IDs: ${listaIdsAlternativas || "[]"}.`
 
-  const res = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+  const res = await fetchMistralWithRetry(
+    "https://api.mistral.ai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "mistral-large-latest",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        max_tokens: 8192,
+      }),
     },
-    body: JSON.stringify({
-      model: "mistral-large-latest",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      max_tokens: 8192,
-    }),
-  })
+    { timeoutMs: MISTRAL_FETCH_TIMEOUT_MS },
+  )
   if (!res.ok) {
     const err = await res.text()
     throw new Error(`Mistral (texto) error: ${res.status} - ${err}`)
@@ -803,20 +818,24 @@ Responde SOLO este JSON:
   content.push(mistralVisionImagePart(studentImageBase64))
   content.push({ type: "text", text: prompt })
 
-  const res = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+  const res = await fetchMistralWithRetry(
+    "https://api.mistral.ai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "pixtral-12b-2409",
+        messages: [{ role: "user", content }],
+        temperature: 0,
+        max_tokens: 2048,
+        response_format: { type: "json_object" },
+      }),
     },
-    body: JSON.stringify({
-      model: "pixtral-12b-2409",
-      messages: [{ role: "user", content }],
-      temperature: 0,
-      max_tokens: 2048,
-      response_format: { type: "json_object" },
-    }),
-  })
+    { timeoutMs: MISTRAL_FETCH_TIMEOUT_MS_VISION },
+  )
 
   if (!res.ok) throw new Error(`Mistral OMR error: ${res.status}`)
   const data = await res.json()
@@ -1064,26 +1083,30 @@ INSTRUCCIONES PARA PREGUNTAS DE DESARROLLO (si la prueba tiene desarrollo):
 4. En "correccion_detallada" cada elemento en "detalle" DEBE contener al menos una cita entre comillas del texto del estudiante.
 5. PROHIBIDO: No escribas "Sin respuesta", "no contestó", "no respondió" ni "no hay texto escrito por el estudiante" en desarrollo si hay CUALQUIER texto manuscrito en la zona de esa pregunta. Solo usa "Sin respuesta" cuando la zona está realmente en blanco.`
 
-  const response = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+  const response = await fetchMistralWithRetry(
+    "https://api.mistral.ai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      },
+      body: JSON.stringify({
+        // IMPORTANTE: Usar pixtral-12b-2409 que SI tiene vision
+        model: "pixtral-12b-2409",
+        messages: [
+          {
+            role: "user",
+            content: [mistralVisionImagePart(imageBase64), { type: "text", text: prompt }],
+          },
+        ],
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        max_tokens: 4096,
+      }),
     },
-    body: JSON.stringify({
-      // IMPORTANTE: Usar pixtral-12b-2409 que SI tiene vision
-      model: "pixtral-12b-2409",
-      messages: [
-        {
-          role: "user",
-          content: [mistralVisionImagePart(imageBase64), { type: "text", text: prompt }],
-        },
-      ],
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      max_tokens: 4096,
-    }),
-  })
+    { timeoutMs: MISTRAL_FETCH_TIMEOUT_MS_VISION },
+  )
 
   if (!response.ok) {
     const errorText = await response.text()
@@ -1145,23 +1168,27 @@ Responde ÚNICAMENTE con este JSON (cada texto_estudiante y cada detalle con cit
 }
 Las claves de respuestas_desarrollo pueden ser P1, P2, P39, P40, etc. según los números de pregunta que veas. texto_estudiante DEBE ser el texto real escrito por el estudiante, no un resumen.`
 
-  const res = await fetchMistralWithRetry("https://api.mistral.ai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+  const res = await fetchMistralWithRetry(
+    "https://api.mistral.ai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "pixtral-12b-2409",
+        messages: [{
+          role: "user",
+          content: [mistralVisionImagePart(imageBase64), { type: "text", text: prompt }],
+        }],
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        max_tokens: 8192,
+      }),
     },
-    body: JSON.stringify({
-      model: "pixtral-12b-2409",
-      messages: [{
-        role: "user",
-        content: [mistralVisionImagePart(imageBase64), { type: "text", text: prompt }],
-      }],
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      max_tokens: 8192,
-    }),
-  })
+    { timeoutMs: MISTRAL_FETCH_TIMEOUT_MS_VISION },
+  )
 
   if (!res.ok) throw new Error(`Mistral Development error: ${res.status}`)
   const data = await res.json()
@@ -1375,7 +1402,12 @@ function normalizeDetectedStudentName(raw: unknown): string {
  * Usa cookies/Auth del request actual de Next (misma invocación que el POST del batch).
  */
 export async function executeEvaluatePostBody(body: unknown): Promise<NextResponse> {
+  /** Si el fallo ocurre antes de completar una fase con estado OMR real, el catch no debe inventar flags. */
+  let omrDebugSnapshotForCatch: Record<string, unknown> | null = null
   try {
+    const evaluationWarnings: string[] = []
+    let evaluationDegraded = false
+
     if (!MISTRAL_API_KEY) {
       return NextResponse.json(
         { success: false, error: "MISTRAL_API_KEY no configurada en el servidor" },
@@ -1656,6 +1688,17 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           Number(flexibilidad) || 3,
           typeof nombreEstudianteBody === "string" ? nombreEstudianteBody.trim() || undefined : undefined
         )
+        omrDebugSnapshotForCatch = {
+          evaluationInputKind: "azure_document_text",
+          officialOmrNotApplicable: true,
+          teacherAnswersSource,
+          studentAnswersSource,
+          teacherClosedAnswersCount:
+            typeof answerKeyFromTemplate?.respuestas?.length === "number"
+              ? answerKeyFromTemplate.respuestas.length
+              : 0,
+          studentClosedAnswersCount: 0,
+        }
       } catch (e: any) {
         console.error("[evaluate] Rama Azure (PDF/Word):", e)
         let errMsg = e?.message || "Error al evaluar el documento (Azure/Mistral)."
@@ -1842,13 +1885,20 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           let extraidas: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
           const tryOfficialAzure =
             officialOmrIntegrationEnabled === true && officialOmrEngineSelected === "azure_layout_family"
-          const forceLegacyStableRouteForStructure =
-            hasClosedInventoryMismatch || hasClosedNumberSequenceMismatch
+          /** Solo inventario bloquea Azure; desajuste de secuencia pauta/base es soft (se intenta Azure y legacy solo si falla). */
+          const forceLegacyStableRouteForStructure = hasClosedInventoryMismatch
+          if (hasClosedNumberSequenceMismatch && !hasClosedInventoryMismatch) {
+            console.info("[trace][omr_official][soft_sequence_mismatch]", {
+              note: "sequence_mismatch_no_hard_legacy; azure_if_enabled_else_legacy",
+            })
+          }
           console.info("[trace][omr_official][engine_selector]", {
             tryOfficialAzure,
             forceLegacyStableRouteForStructure,
             hasClosedInventoryMismatch,
             hasClosedNumberSequenceMismatch,
+            legacyForcedBeforeAzure: hasClosedInventoryMismatch,
+            sequenceMismatchSoftOnly: hasClosedNumberSequenceMismatch && !hasClosedInventoryMismatch,
             officialOmrIntegrationEnabled,
             officialOmrEngineSelected,
             officialOmrAllowFallbackToLegacy,
@@ -2066,6 +2116,33 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           officialOmrFallbackReason = "[official_azure_layout_family] fallback total por fallas en todas las páginas"
         }
       }
+      omrDebugSnapshotForCatch = {
+        officialOmrIntegrationEnabled,
+        officialOmrEngineSelected,
+        officialOmrAllowFallbackToLegacy,
+        officialOmrEngineUsed,
+        officialOmrFallbackUsed,
+        officialOmrFallbackReason,
+        officialOmrPerQuestionRaw,
+        officialOmrDetectedAnswersPreview,
+        officialOmrQuestionCountFromPipeline,
+        officialOmrDetectedAnswersCount,
+        officialOmrDetectedVsPipelineMismatch,
+        officialOmrAdapterMode,
+        teacherAnswersSource,
+        studentAnswersSource,
+        teacherClosedAnswersCount:
+          typeof answerKeyFromTemplate?.respuestas?.length === "number"
+            ? answerKeyFromTemplate.respuestas.length
+            : 0,
+        studentClosedAnswersCount: respuestasCerradasDesdeOMR.length,
+      }
+      console.info("[evaluate] OMR phase completed", {
+        pages: imageBase64List.length,
+        studentClosedAnswersCount: respuestasCerradasDesdeOMR.length,
+        officialOmrEngineUsed,
+        officialOmrFallbackUsed,
+      })
     }
 
     // Procesar cada imagen (Mistral Vision + desarrollo dedicado), salvo solo_alternativas: solo OMR + pauta.
@@ -2089,18 +2166,37 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       for (let i = 0; i < imageBase64List.length; i++) {
         const imageBase64 = imageBase64List[i]
 
-        const analysis = await analyzeWithMistralVision(
-          imageBase64,
-          rubrica,
-          pauta,
-          pautaEstructurada,
-          pautaAlternativasFinal,
-          nivelEducativo,
-          areaConocimiento,
-          Number(puntajeTotal),
-          Number(porcentajeExigencia),
-          tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
-        )
+        let analysis: Awaited<ReturnType<typeof analyzeWithMistralVision>>
+        try {
+          analysis = await analyzeWithMistralVision(
+            imageBase64,
+            rubrica,
+            pauta,
+            pautaEstructurada,
+            pautaAlternativasFinal,
+            nivelEducativo,
+            areaConocimiento,
+            Number(puntajeTotal),
+            Number(porcentajeExigencia),
+            tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
+          )
+        } catch (e) {
+          if (!isMistralTimeoutError(e)) throw e
+          evaluationDegraded = true
+          evaluationWarnings.push(`mistral_vision_timeout_page_${i + 1}`)
+          console.warn("[evaluate] Mistral Vision timeout (degraded), continuing", { page: i + 1 })
+          analysis = {
+            respuestas_cerradas: [],
+            respuestas_desarrollo: {},
+            retroalimentacion: {
+              fortalezas:
+                "Lectura integrada de la hoja por visión no disponible (tiempo de espera del servicio). Si hay OMR dedicado, las alternativas cerradas provienen de esa lectura.",
+              areas_mejora: "",
+              correccion_detallada: [],
+            },
+            nombreEstudiante: null,
+          }
+        }
 
         // Combinar resultados
         if (analysis.nombreEstudiante && !combinedAnalysis.nombreEstudiante) {
@@ -2166,7 +2262,13 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               }
             }
           } catch (e) {
-            console.warn("[Evaluate] Análisis desarrollo dedicado falló", e)
+            if (isMistralTimeoutError(e)) {
+              evaluationDegraded = true
+              evaluationWarnings.push(`mistral_development_timeout_page_${i + 1}`)
+              console.error("[evaluate] development analysis timeout", { page: i + 1 })
+            } else {
+              console.warn("[Evaluate] Análisis desarrollo dedicado falló", e)
+            }
             pageMergedDev = collapseDevelopmentKeysToCanonical(
               (analysis.respuestas_desarrollo || {}) as Record<string, unknown>
             )
@@ -2353,6 +2455,10 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       Number(puntajeTotal),
       Number(porcentajeExigencia)
     )
+    console.info("[evaluate] closed scoring completed", {
+      nota: scores.nota,
+      puntaje: scores.puntaje,
+    })
 
     // Construir respuesta
     const retroForResult =
@@ -2418,6 +2524,9 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                   : null,
             },
           }
+        : {}),
+      ...(evaluationDegraded
+        ? { evaluation_degraded: true as const, evaluation_warnings: [...evaluationWarnings] }
         : {}),
     }
     console.info("[trace][omr_official][response_summary]", {
@@ -2577,19 +2686,15 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       msg = "El servicio de IA no está disponible en este momento. Espera unos minutos e intenta de nuevo."
     }
     const isPdfError = typeof msg === "string" && msg.includes("PDF") && msg.includes("solo acepta imágenes")
+    const omrPayload =
+      omrDebugSnapshotForCatch != null
+        ? omrDebugSnapshotForCatch
+        : { omrStateUnknownDueToEarlyFailure: true as const }
     return NextResponse.json(
       {
         success: false,
         error: msg,
-        officialOmrIntegrationEnabled: false,
-        officialOmrEngineSelected: "legacy",
-        officialOmrEngineUsed: "legacy",
-        officialOmrFallbackUsed: false,
-        officialOmrFallbackReason: null,
-        teacherAnswersSource: "teacher_key",
-        studentAnswersSource: "student_omr_read",
-        teacherClosedAnswersCount: 0,
-        studentClosedAnswersCount: 0,
+        ...omrPayload,
       },
       { status: isPdfError ? 400 : 500 }
     )
