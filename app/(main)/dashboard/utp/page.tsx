@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { exportUtpExecutiveFichaPdf } from "@/app/lib/export-utp-dashboard-pdf"
+import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { Trash2 } from "lucide-react"
 import { EvaluationLinkSelector } from "@/app/components/dashboard/utp/EvaluationLinkSelector"
@@ -24,6 +25,7 @@ import {
   uiTablaCoberturaCol,
   uiTablaEstandarAgenciaCol,
 } from "@/app/lib/pedagogic-ui-copy"
+import { formatDateTimeEsCl } from "@/app/lib/format-datetime-es-cl"
 
 type AuditRow = {
   id: string
@@ -54,6 +56,20 @@ type SchoolAnalyticsRow = {
 type SchoolAnalyticsPayload = {
   school_id: string | null
   evaluation_count: number
+  evaluation_count_total?: number
+  summary_available?: boolean
+  status_reason?: string
+  segmentation?: Array<{
+    subject_key: string
+    subject_display: string
+    instrument_family: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+    evaluation_count: number
+    evaluation_ids: string[]
+  }>
+  segment_auto_selected?: boolean
+  subject_filter?: string | null
+  instrument_family_filter?: string | null
+  course_filter?: string | null
   skill_result_rows?: number
   batch_id_filter?: string | null
   by_skill: SchoolAnalyticsRow[]
@@ -146,15 +162,39 @@ export default function DashboardUtpPage() {
   const [archivingAll, setArchivingAll] = useState(false)
   const [schoolAnalytics, setSchoolAnalytics] = useState<SchoolAnalyticsPayload | null>(null)
   const [schoolAnalyticsLoading, setSchoolAnalyticsLoading] = useState(false)
+  const [utpSchoolPedagogySubject, setUtpSchoolPedagogySubject] = useState("")
+  const [utpSchoolPedagogyFamily, setUtpSchoolPedagogyFamily] = useState<
+    "" | "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+  >("")
+  const [utpSchoolPedagogyCourse, setUtpSchoolPedagogyCourse] = useState("")
+
+  const reloadSchoolPedagogyOnly = useCallback(async () => {
+    const schoolId = (currentSchoolId ?? "").trim()
+    if (!schoolId) return
+    setSchoolAnalyticsLoading(true)
+    try {
+      const qs = new URLSearchParams({ school_id: schoolId })
+      if (utpSchoolPedagogySubject.trim()) qs.set("subject", utpSchoolPedagogySubject.trim())
+      if (utpSchoolPedagogyFamily) qs.set("instrument_family", utpSchoolPedagogyFamily)
+      if (utpSchoolPedagogyCourse.trim()) qs.set("course", utpSchoolPedagogyCourse.trim())
+      const schoolRes = await fetch(`/api/dashboard/direccion/school-pedagogy?${qs.toString()}`, { cache: "no-store" })
+      const sj = (await schoolRes.json()) as SchoolAnalyticsPayload
+      setSchoolAnalytics(schoolRes.ok ? sj : null)
+    } catch {
+      setSchoolAnalytics(null)
+    } finally {
+      setSchoolAnalyticsLoading(false)
+    }
+  }, [currentSchoolId, utpSchoolPedagogySubject, utpSchoolPedagogyFamily, utpSchoolPedagogyCourse])
   const [archivingInstrumentId, setArchivingInstrumentId] = useState<string | null>(null)
   const [archivingAllInstruments, setArchivingAllInstruments] = useState(false)
 
   const utpPdfCaptureRef = useRef<HTMLDivElement>(null)
   const [utpPdfExporting, setUtpPdfExporting] = useState(false)
   const [utpInstitutionLabel, setUtpInstitutionLabel] = useState("")
-  const [utpPdfDateLabel, setUtpPdfDateLabel] = useState(() =>
-    new Intl.DateTimeFormat("es-CL", { dateStyle: "long", timeStyle: "short" }).format(new Date()),
-  )
+  /** Solo cliente: evita mismatch SSR/CSR de Intl ("a las" vs ","). */
+  const [utpPrintedAtLabel, setUtpPrintedAtLabel] = useState("")
+  const [utpPdfDateLabel, setUtpPdfDateLabel] = useState("")
   /** Snapshot tras refetch explícito (misma query que pantalla) antes del PDF */
   const [utpPdfBySkillOverride, setUtpPdfBySkillOverride] = useState<SchoolAnalyticsRow[] | null>(null)
   const [utpPdfLogoSrc, setUtpPdfLogoSrc] = useState<string | null>(null)
@@ -174,6 +214,12 @@ export default function DashboardUtpPage() {
     }
   }, [loading])
 
+  useEffect(() => {
+    const label = formatDateTimeEsCl(new Date())
+    setUtpPrintedAtLabel(label)
+    setUtpPdfDateLabel((prev) => (prev.trim() ? prev : label))
+  }, [])
+
   async function handleUtpExportPdf() {
     setUtpPdfExporting(true)
     try {
@@ -181,20 +227,16 @@ export default function DashboardUtpPage() {
         utpInstitutionLabel ||
         (typeof document !== "undefined" ? document.querySelector("header h1")?.textContent?.trim() : null) ||
         "Panel institucional"
-      const reportDateLabel = new Intl.DateTimeFormat("es-CL", { dateStyle: "long", timeStyle: "short" }).format(new Date())
+      const reportDateLabel = formatDateTimeEsCl(new Date())
 
       const schoolId = (currentSchoolId ?? "").trim()
-      const sortedLots = [...evalLotGroups].sort((a, b) => {
-        const ta = a.evaluated_at ? new Date(a.evaluated_at).getTime() : 0
-        const tb = b.evaluated_at ? new Date(b.evaluated_at).getTime() : 0
-        return tb - ta
-      })
-      const latestBatchId = sortedLots.find((g) => g.batch_id)?.batch_id ?? null
 
-      async function fetchSchoolPedagogySkills(includeBatch: boolean): Promise<SchoolAnalyticsRow[]> {
+      async function fetchSchoolPedagogySkillsForPdf(): Promise<SchoolAnalyticsRow[]> {
         const qs = new URLSearchParams()
         if (schoolId) qs.set("school_id", schoolId)
-        if (includeBatch && latestBatchId) qs.set("batch_id", latestBatchId)
+        if (utpSchoolPedagogySubject.trim()) qs.set("subject", utpSchoolPedagogySubject.trim())
+        if (utpSchoolPedagogyFamily) qs.set("instrument_family", utpSchoolPedagogyFamily)
+        if (utpSchoolPedagogyCourse.trim()) qs.set("course", utpSchoolPedagogyCourse.trim())
         try {
           const schoolRes = await fetch(`/api/dashboard/direccion/school-pedagogy?${qs.toString()}`, { cache: "no-store" })
           if (!schoolRes.ok) return []
@@ -205,11 +247,8 @@ export default function DashboardUtpPage() {
         }
       }
 
-      /** 1) Con lote reciente si existe; 2) sin batch_id = agregado histórico por colegio (misma API que pantalla). */
-      let bySkillForPdf = await fetchSchoolPedagogySkills(true)
-      if (bySkillForPdf.length === 0) {
-        bySkillForPdf = await fetchSchoolPedagogySkills(false)
-      }
+      /** Misma agregación que la pantalla y Analítica colegio (sin filtrar por un solo batch_id). */
+      let bySkillForPdf = await fetchSchoolPedagogySkillsForPdf()
       if (bySkillForPdf.length === 0) {
         bySkillForPdf = schoolAnalytics?.by_skill ?? []
       }
@@ -399,7 +438,6 @@ export default function DashboardUtpPage() {
         if (schoolId) {
           setSchoolAnalyticsLoading(true)
           const qs = new URLSearchParams({ school_id: schoolId })
-          if (latestBatchId) qs.set("batch_id", latestBatchId)
           try {
             const schoolRes = await fetch(`/api/dashboard/direccion/school-pedagogy?${qs.toString()}`, { cache: "no-store" })
             const sj = (await schoolRes.json()) as SchoolAnalyticsPayload
@@ -734,11 +772,19 @@ export default function DashboardUtpPage() {
       <div className="utp-print-header border-b border-slate-300 pb-3 mb-1">
         <h1 className="text-xl font-bold text-slate-900">{utpInstitutionLabel || "Panel institucional"}</h1>
         <p className="text-sm text-slate-600">
-          Dashboard UTP · Impreso el {new Date().toLocaleString("es-CL", { dateStyle: "long", timeStyle: "short" })}
+          Dashboard UTP · Impreso el {utpPrintedAtLabel || "—"}
         </p>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-xl font-semibold">Auditoría UTP</h2>
+        <div className="flex flex-wrap items-center gap-3">
+          <h2 className="text-xl font-semibold">Auditoría UTP</h2>
+          <Link
+            href="/dashboard/utp/roster"
+            className="text-sm font-medium text-emerald-700 hover:underline"
+          >
+            Padrón SIGE
+          </Link>
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -887,7 +933,7 @@ export default function DashboardUtpPage() {
                         <td className="px-4 py-3 text-[var(--text-muted)]">{r.subject ?? "—"}</td>
                         <td className="px-4 py-3 text-[var(--text-muted)] text-xs">{r.file_name ?? "—"}</td>
                         <td className="px-4 py-3 text-[var(--text-muted)] whitespace-nowrap">
-                          {r.created_at ? new Date(r.created_at).toLocaleString("es-CL") : "—"}
+                          {formatDateTimeEsCl(r.created_at)}
                         </td>
                         <td className="px-4 py-3 text-right">
                           <button
@@ -996,18 +1042,136 @@ export default function DashboardUtpPage() {
         <div className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm">
           <h3 className="font-semibold">Analítica por Colegio (habilidades)</h3>
           <p className="text-xs text-[var(--text-muted)] mt-1">
-            Vista directa por <code>school_id</code> y último <code>batch_id</code> detectado (sin depender de aprobación de lote).
+            Misma agregación que <strong>Analítica colegio</strong> (Dirección): por <code>school_id</code>, sin acotar a un solo{" "}
+            <code>batch_id</code>, para que PAES y SIMCE en distintos lotes aparezcan en la segmentación.
           </p>
           {schoolAnalyticsLoading ? (
             <p className="text-sm text-[var(--text-muted)] mt-3">Cargando analítica…</p>
           ) : !schoolAnalytics || schoolAnalytics.by_skill.length === 0 ? (
-            <p className="text-sm text-[var(--text-muted)] mt-3">Sin datos de habilidades para el colegio/lote actual.</p>
+            <div className="mt-3 space-y-3 text-sm">
+              <div className="flex flex-wrap gap-2 items-end">
+                <label className="flex flex-col gap-0.5 text-xs text-[var(--text-muted)]">
+                  Asignatura
+                  <input
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-sm text-slate-900 min-w-[8rem]"
+                    value={utpSchoolPedagogySubject}
+                    onChange={(e) => setUtpSchoolPedagogySubject(e.target.value)}
+                    placeholder="Ej. Matemática"
+                  />
+                </label>
+                <label className="flex flex-col gap-0.5 text-xs text-[var(--text-muted)]">
+                  Familia
+                  <select
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-sm text-slate-900"
+                    value={utpSchoolPedagogyFamily}
+                    onChange={(e) =>
+                      setUtpSchoolPedagogyFamily(
+                        e.target.value as "" | "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER",
+                      )
+                    }
+                  >
+                    <option value="">—</option>
+                    <option value="SIMCE">SIMCE</option>
+                    <option value="PAES">PAES</option>
+                    <option value="INSTITUTIONAL_OTHER">Internas</option>
+                  </select>
+                </label>
+                <label className="flex flex-col gap-0.5 text-xs text-[var(--text-muted)]">
+                  Curso (opc.)
+                  <input
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-sm text-slate-900 w-28"
+                    value={utpSchoolPedagogyCourse}
+                    onChange={(e) => setUtpSchoolPedagogyCourse(e.target.value)}
+                    placeholder="Etiqueta"
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs font-medium text-sky-900 hover:bg-sky-100"
+                  onClick={() => void reloadSchoolPedagogyOnly()}
+                >
+                  Aplicar filtros
+                </button>
+              </div>
+              {schoolAnalytics?.status_reason === "requires_subject_and_instrument_family" &&
+              (schoolAnalytics.segmentation?.length ?? 0) > 0 ? (
+                <div className="space-y-2">
+                  <p className="text-amber-800">
+                    Varios segmentos en el alcance del lote: elija asignatura y familia para ver habilidades agregadas sin
+                    mezclar.
+                  </p>
+                  <div className="overflow-x-auto rounded border border-slate-200 text-xs">
+                    <table className="min-w-full">
+                      <thead>
+                        <tr className="bg-slate-50 text-left">
+                          <th className="px-2 py-1">Asignatura</th>
+                          <th className="px-2 py-1">Familia</th>
+                          <th className="px-2 py-1 text-right">N° eval.</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(schoolAnalytics.segmentation ?? []).map((s, i) => (
+                          <tr key={`${s.subject_key}-${s.instrument_family}-${i}`} className="border-t border-slate-100">
+                            <td className="px-2 py-1">{s.subject_display}</td>
+                            <td className="px-2 py-1">{s.instrument_family}</td>
+                            <td className="px-2 py-1 text-right">{s.evaluation_count}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-[var(--text-muted)]">Sin datos de habilidades para el colegio/lote actual.</p>
+              )}
+            </div>
           ) : (
             <div className="mt-3 space-y-2">
+              <div className="flex flex-wrap gap-2 items-end text-xs">
+                <label className="flex flex-col gap-0.5 text-[var(--text-muted)]">
+                  Asignatura
+                  <input
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-slate-900 min-w-[7rem]"
+                    value={utpSchoolPedagogySubject}
+                    onChange={(e) => setUtpSchoolPedagogySubject(e.target.value)}
+                  />
+                </label>
+                <label className="flex flex-col gap-0.5 text-[var(--text-muted)]">
+                  Familia
+                  <select
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-slate-900"
+                    value={utpSchoolPedagogyFamily}
+                    onChange={(e) =>
+                      setUtpSchoolPedagogyFamily(
+                        e.target.value as "" | "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER",
+                      )
+                    }
+                  >
+                    <option value="">—</option>
+                    <option value="SIMCE">SIMCE</option>
+                    <option value="PAES">PAES</option>
+                    <option value="INSTITUTIONAL_OTHER">Internas</option>
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  className="rounded border border-slate-300 bg-white px-2 py-1 font-medium text-slate-800 hover:bg-slate-50"
+                  onClick={() => void reloadSchoolPedagogyOnly()}
+                >
+                  Aplicar
+                </button>
+              </div>
               <p className="text-xs text-[var(--text-muted)]">
                 school_id: <strong>{schoolAnalytics.school_id ?? "—"}</strong> · batch_id:{" "}
-                <strong>{schoolAnalytics.batch_id_filter ?? "último disponible"}</strong> · filas:{" "}
+                <strong>{schoolAnalytics.batch_id_filter ?? "sin filtro (todo el colegio)"}</strong> · filas:{" "}
                 <strong>{schoolAnalytics.skill_result_rows ?? 0}</strong>
+                {schoolAnalytics.segment_auto_selected ? (
+                  <>
+                    {" "}
+                    · segmento automático: <strong>{schoolAnalytics.subject_filter ?? "—"}</strong> /{" "}
+                    <strong>{schoolAnalytics.instrument_family_filter ?? "—"}</strong>
+                  </>
+                ) : null}
               </p>
               <div className="grid gap-3 md:grid-cols-3">
                 {schoolAnalytics.by_skill.slice(0, 6).map((r, i) => (
@@ -1035,7 +1199,7 @@ export default function DashboardUtpPage() {
             {evalLotGroups.map((g) => {
               const key = g.batch_id ?? g.evaluation_ids[0] ?? "x"
               const open = Boolean(expandedEvalLots[key])
-              const dateStr = g.evaluated_at ? new Date(g.evaluated_at).toLocaleString("es-CL") : "—"
+              const dateStr = formatDateTimeEsCl(g.evaluated_at)
               return (
                 <div key={key} className="bg-white">
                   <div className="w-full px-4 py-3 flex flex-wrap items-center gap-2 hover:bg-slate-50">
@@ -1080,7 +1244,7 @@ export default function DashboardUtpPage() {
                           <span className="font-medium text-slate-800">{m.student_name ?? "Sin nombre"}</span>
                           <span className="font-mono text-[11px]">{m.id}</span>
                           <span className="text-xs">
-                            {m.evaluated_at ? new Date(m.evaluated_at).toLocaleString("es-CL") : "—"}
+                            {formatDateTimeEsCl(m.evaluated_at)}
                           </span>
                         </li>
                       ))}
@@ -1190,7 +1354,7 @@ export default function DashboardUtpPage() {
               ) : (
                 riskRows.map((row) => (
                   <tr key={row.id} className="border-t border-[var(--border-color)]">
-                    <td className="px-4 py-3">{row.calculated_at ? new Date(row.calculated_at).toLocaleString("es-CL") : "—"}</td>
+                    <td className="px-4 py-3">{formatDateTimeEsCl(row.calculated_at)}</td>
                     <td className="px-4 py-3">{row.student_id ?? "—"}</td>
                     <td className="px-4 py-3">{Math.round(row.logro_pct)}%</td>
                     <td className="px-4 py-3">{row.agency_level ?? "—"}</td>
@@ -1236,7 +1400,7 @@ export default function DashboardUtpPage() {
                     <p className="font-medium min-w-0 flex-1">{String(doc.analysis_summary ?? "")}</p>
                     <div className="flex items-center gap-2 shrink-0">
                       <span className="text-xs text-[var(--text-muted)] whitespace-nowrap">
-                        {r.created_at ? new Date(r.created_at).toLocaleString("es-CL") : "—"}
+                        {formatDateTimeEsCl(r.created_at)}
                       </span>
                       <button
                         type="button"
@@ -1399,7 +1563,7 @@ export default function DashboardUtpPage() {
               ) : (
                 rows.map((row) => (
                   <tr key={row.id} className="border-t border-[var(--border-color)]">
-                    <td className="px-4 py-3">{row.created_at ? new Date(row.created_at).toLocaleString("es-CL") : "—"}</td>
+                    <td className="px-4 py-3">{formatDateTimeEsCl(row.created_at)}</td>
                     <td className="px-4 py-3">{row.actor_name || "—"}</td>
                     <td className="px-4 py-3">{row.action || "—"}</td>
                     <td className="px-4 py-3">{row.student_or_course || "—"}</td>
