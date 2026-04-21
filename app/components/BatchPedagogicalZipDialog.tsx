@@ -28,6 +28,7 @@ import { CourseAnalisisPedagogicoZipBody, CourseResumenSimceZipBody } from "@/ap
 import type { CourseZipSummaryPayload } from "@/app/components/CourseBatchZipPdfViews"
 import { exportElementToPdfBlob } from "@/app/lib/export-report-pdf"
 import type { PedagogicalAnalysisExportData } from "@/app/lib/pedagogical-analysis-export-types"
+import { formatStudentDisplayName } from "@/app/lib/format-student-name"
 
 type BatchEvalRow = {
   id: string
@@ -204,7 +205,7 @@ function resolveBatchCourseId(rows: BatchEvalRow[]): { courseId: string } | { er
 }
 
 function individualPdfBaseName(row: BatchEvalRow): string {
-  const id = sanitizeZipPart(row.first_student_name, "")
+  const id = sanitizeZipPart(formatStudentDisplayName(row.first_student_name) || row.first_student_name, "")
   const short = row.id.replace(/-/g, "").slice(0, 8)
   const base = id || `eval_${short}` || "estudiante"
   return `${base}_Informe_Individual`
@@ -375,7 +376,9 @@ export function BatchPedagogicalZipDialog({
 
         const payload = await fetchAnalysisJson(row.id)
         if ("error" in payload) {
-          throw new Error(`Alumno ${i + 1} (${row.first_student_name ?? row.id}): ${payload.error}`)
+          throw new Error(
+            `Alumno ${i + 1} (${formatStudentDisplayName(row.first_student_name) || row.first_student_name || row.id}): ${payload.error}`,
+          )
         }
 
         const pdf = await dataUrlToPdfBlob(payload, {

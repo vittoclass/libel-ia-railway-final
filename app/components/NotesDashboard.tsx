@@ -4,6 +4,7 @@ import { useMemo } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { format } from "date-fns"
+import { formatStudentDisplayName } from "@/app/lib/format-student-name"
 
 interface StudentGroup {
   id: string
@@ -166,7 +167,9 @@ export default function NotesDashboard({ studentGroups, curso, fecha }: Props) {
                   return (
                     <TableRow key={group.id}>
                       <TableCell className="font-mono text-xs">{index + 1}</TableCell>
-                      <TableCell className="font-medium">{group.studentName}</TableCell>
+                      <TableCell className="font-medium">
+                        {formatStudentDisplayName(group.studentName) || group.studentName}
+                      </TableCell>
                       <TableCell className="text-center">{group.puntaje || "-"}</TableCell>
                       <TableCell className="text-center">
                         <span

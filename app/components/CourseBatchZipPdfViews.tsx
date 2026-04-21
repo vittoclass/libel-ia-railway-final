@@ -6,6 +6,7 @@
  */
 import * as React from "react"
 import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
+import { formatStudentDisplayName } from "@/app/lib/format-student-name"
 
 export type CourseZipNationalRow = {
   student_name?: string
@@ -110,7 +111,7 @@ export function CourseResumenSimceZipBody({
           ) : (
             rows.map((r, i) => (
               <tr key={i}>
-                <td style={thtd}>{r.student_name ?? "—"}</td>
+                <td style={thtd}>{formatStudentDisplayName(r.student_name) || r.student_name || "—"}</td>
                 <td style={thtd}>{pct(r.logro_pct)}</td>
                 <td style={thtd}>
                   {r.simce_score != null && Number.isFinite(Number(r.simce_score)) ? Math.round(Number(r.simce_score)) : "—"}

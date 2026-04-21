@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server"
 import {
   type FlatAssessmentType,
-  isPaesFamilyFlat,
+  type InstrumentAnalyticsMode,
+  getInstrumentAnalyticsModeFromEvaluationTags,
   isSimceFamilyFlat,
   mergeFlatAssessmentType,
   parseAssessmentTypeToFlat,
@@ -11,6 +12,7 @@ import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-re
 import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { approxGradeChileFromLogroPct, resolveStudentDisplayName } from "@/app/lib/student-display-name"
+import { normalizeSubjectKey } from "@/app/lib/pedagogy-segment-filters"
 import { projectPaesFromLogroPct, projectSimceFromLogroPct } from "@/app/lib/standard-scale-converters"
 
 export const dynamic = "force-dynamic"
@@ -42,6 +44,32 @@ function normText(v: string | null | undefined): string {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
+}
+
+/** Clave estable para agrupar cursos sin equivalencias “inteligentes”: limpieza básica + ordinales unificados. */
+function normalizeCourseKey(courseLabel: string | null | undefined): string {
+  let s = String(courseLabel ?? "").trim()
+  if (!s) return "sin_curso"
+  s = s
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+  s = s.replace(/[°º˚]/g, "")
+  s = s.replace(/\s+/g, " ").trim()
+  if (!s) return "sin_curso"
+  return s
+}
+
+function pickMostFrequentCourseDisplay(freq: Map<string, number>): string {
+  let bestLabel = "Sin curso"
+  let bestCount = -1
+  for (const [label, n] of freq) {
+    if (n > bestCount || (n === bestCount && label.localeCompare(bestLabel, "es") < 0)) {
+      bestCount = n
+      bestLabel = label
+    }
+  }
+  return bestLabel
 }
 
 type NationalExamIntent = "SIMCE" | "PAES" | "UNKNOWN"
@@ -110,6 +138,23 @@ export async function GET(_req: NextRequest) {
     warning: null as string | null,
     linked_evaluations_count: 0,
     last_batch_id: null as string | null,
+    segment_breakdown: [] as Array<{
+      subject_key: string
+      subject_display: string
+      instrument_family: InstrumentAnalyticsMode
+      evaluation_count: number
+      avg_logro_pct: number | null
+      simce_projection: number | null
+      paes_projection: number | null
+      course_breakdown: Array<{
+        course_key: string
+        course_display: string
+        evaluation_count: number
+        avg_logro_pct: number | null
+        simce_projection: number | null
+        paes_projection: number | null
+      }>
+    }>,
   }
 
   try {
@@ -164,13 +209,71 @@ export async function GET(_req: NextRequest) {
     let warning: string | null = null
 
     if (linkedEvalIds.length > 0) {
-      scopeEvalIds = linkedEvalIds.slice(0, 1000)
+      /** Vínculo UTP puede traer solo un subconjunto (p. ej. SIMCE). Se unen SIMCE/PAES canónicos del mismo
+       * alcance institucional para que PAES real del colegio no quede fuera del dashboard. */
+      const outLinkedNational: string[] = []
+      const seenLinkedNational = new Set<string>()
+      for (const id of linkedEvalIds) {
+        const eid = String(id).trim()
+        if (!eid || outLinkedNational.length >= 1000) break
+        if (!seenLinkedNational.has(eid)) {
+          seenLinkedNational.add(eid)
+          outLinkedNational.push(eid)
+        }
+      }
+      const pushNationalIds = (rows: Array<{ id: string; exam_type?: string | null; assessment_category?: string | null }>) => {
+        for (const e of rows) {
+          if (outLinkedNational.length >= 1000) break
+          const row = e as { exam_type?: string | null; assessment_category?: string | null }
+          const mode = getInstrumentAnalyticsModeFromEvaluationTags(row.exam_type, row.assessment_category)
+          if (mode !== "SIMCE" && mode !== "PAES") continue
+          const eid = String((e as { id: string }).id).trim()
+          if (!eid || seenLinkedNational.has(eid)) continue
+          seenLinkedNational.add(eid)
+          outLinkedNational.push(eid)
+        }
+      }
+      if (schoolId) {
+        const { data: evsNat } = await supabase
+          .from("evaluations")
+          .select("id, assessment_category, exam_type")
+          .eq("is_archived", false)
+          .eq("school_id", schoolId)
+          .order("evaluated_at", { ascending: false })
+          .limit(1000)
+        pushNationalIds((evsNat ?? []) as Array<{ id: string; exam_type?: string | null; assessment_category?: string | null }>)
+      } else if (orgId && !schoolId) {
+        const { data: peersNat } = await supabase
+          .from("profiles")
+          .select("teacher_id")
+          .eq("organization_id", orgId)
+          .not("teacher_id", "is", null)
+        const tidsNat = [
+          ...new Set(
+            (peersNat ?? [])
+              .map((p: { teacher_id?: string | null }) => p.teacher_id)
+              .filter(Boolean) as string[],
+          ),
+        ]
+        if (tidsNat.length > 0) {
+          const { data: evsNat } = await supabase
+            .from("evaluations")
+            .select("id, assessment_category, exam_type")
+            .eq("is_archived", false)
+            .in("teacher_id", tidsNat)
+            .order("evaluated_at", { ascending: false })
+            .limit(1000)
+          pushNationalIds((evsNat ?? []) as Array<{ id: string; exam_type?: string | null; assessment_category?: string | null }>)
+        }
+      }
+      scopeEvalIds = outLinkedNational
+      source_mode = "utp_linked_institutional_merge"
     } else {
       source_mode = "recent_evaluations_omr"
       const picked: string[] = []
 
       if (schoolId) {
-        // Sin vínculo UTP validado: priorizar universo SIMCE del colegio por filas individuales.
+        // Sin vínculo UTP validado: universo nacional (SIMCE + PAES) del colegio por filas individuales.
         const { data: evs } = await supabase
           .from("evaluations")
           .select("id, assessment_category, exam_type")
@@ -178,14 +281,13 @@ export async function GET(_req: NextRequest) {
           .eq("school_id", schoolId)
           .order("evaluated_at", { ascending: false })
           .limit(1000)
-        const simceRows = (evs ?? []).filter((e) => {
+        const nationalInstrumentRows = (evs ?? []).filter((e) => {
           const row = e as { assessment_category?: string | null; exam_type?: string | null }
-          const fromCategory = parseAssessmentTypeToFlat(String(row.assessment_category ?? ""))
-          const fromExamType = parseAssessmentTypeToFlat(String(row.exam_type ?? ""))
-          return fromCategory === "ENSAYO_SIMCE" || fromExamType === "ENSAYO_SIMCE"
+          const mode = getInstrumentAnalyticsModeFromEvaluationTags(row.exam_type, row.assessment_category)
+          return mode === "SIMCE" || mode === "PAES"
         })
-        for (const e of simceRows) picked.push(String((e as { id: string }).id))
-        if (simceRows.length > 0) source_mode = "school_simce_no_link"
+        for (const e of nationalInstrumentRows) picked.push(String((e as { id: string }).id))
+        if (nationalInstrumentRows.length > 0) source_mode = "school_simce_no_link"
       } else if (profileTeacherId) {
         const { data: evs } = await supabase
           .from("evaluations")
@@ -433,14 +535,15 @@ export async function GET(_req: NextRequest) {
     const hasBatchFocus = batchEvalIds.length > 0
 
     const evalIdsVisible = evalRows.map((e) => String(e.id))
-    const simceAll = evalIdsVisible.filter((id) => {
-      const t = evalTypeMap.get(String(id))
-      return t != null && isSimceFamilyFlat(t)
-    })
-    const paesAll = evalIdsVisible.filter((id) => {
-      const t = evalTypeMap.get(String(id))
-      return t != null && isPaesFamilyFlat(t)
-    })
+    const evalRowById = new Map(evalRows.map((e) => [String(e.id), e]))
+    /** KPIs nacionales: familia desde fila evaluations (exam_type + assessment_category), no solo evalTypeMap del informe UTP (puede sesgar SIMCE). */
+    const instrumentModeFromEvalRow = (id: string): InstrumentAnalyticsMode => {
+      const ev = evalRowById.get(String(id))
+      if (!ev) return "INSTITUTIONAL_OTHER"
+      return getInstrumentAnalyticsModeFromEvaluationTags(ev.exam_type, ev.assessment_category)
+    }
+    const simceAll = evalIdsVisible.filter((id) => instrumentModeFromEvalRow(id) === "SIMCE")
+    const paesAll = evalIdsVisible.filter((id) => instrumentModeFromEvalRow(id) === "PAES")
     const simcePool = hasBatchFocus ? simceAll.filter((id) => batchEvalIdSet.has(id)) : []
     const paesPool = hasBatchFocus ? paesAll.filter((id) => batchEvalIdSet.has(id)) : []
 
@@ -457,25 +560,10 @@ export async function GET(_req: NextRequest) {
       }
     }
 
-    let simceEffective: string[] = []
-    let paesEffective: string[] = []
-    if (!hasBatchFocus) {
-      // Sin lote reciente: usar histórico institucional etiquetado.
-      simceEffective = simceAll
-      paesEffective = paesAll
-    } else if (batchIntent === "SIMCE") {
-      // Limpieza de cuerdas: solo mueve SIMCE para este lote.
-      simceEffective = simcePool.length > 0 ? simcePool : batchEvalIds
-      paesEffective = []
-    } else if (batchIntent === "PAES") {
-      // Limpieza de cuerdas: solo mueve PAES para este lote.
-      simceEffective = []
-      paesEffective = paesPool.length > 0 ? paesPool : batchEvalIds
-    } else {
-      // Estado neutro: no proyectar nacional por lote ambiguo.
-      simceEffective = []
-      paesEffective = []
-    }
+    /** KPIs nacionales: mismo universo para SIMCE y PAES (todo `evalIds` canónico), sin privilegiar el último lote
+     * ni usar `batchEvalIds` crudos como proyección SIMCE. Así PAES en otro lote o fuera del vínculo parcial sigue contando. */
+    const simceEffective: string[] = simceAll
+    const paesEffective: string[] = paesAll
 
     const simceValues: number[] = []
     const paesValues: number[] = []
@@ -491,6 +579,157 @@ export async function GET(_req: NextRequest) {
     }
     const simcePromedio = simceValues.length ? Math.round(simceValues.reduce((a, b) => a + b, 0) / simceValues.length) : 0
     const paesPromedio = paesValues.length ? Math.round(paesValues.reduce((a, b) => a + b, 0) / paesValues.length) : 0
+
+    type SegmentAcc = {
+      subject_key: string
+      subject_display: string
+      instrument_family: InstrumentAnalyticsMode
+      ids: Set<string>
+    }
+    const segmentBucketMap = new Map<string, SegmentAcc>()
+    for (const e of evalRows) {
+      const eid = String(e.id)
+      const sk = normalizeSubjectKey(e.subject)
+      const fam = getInstrumentAnalyticsModeFromEvaluationTags(e.exam_type, e.assessment_category)
+      const disp = String(e.subject ?? "").trim() || "Sin asignatura"
+      const bkey = `${sk}\0${fam}`
+      let acc = segmentBucketMap.get(bkey)
+      if (!acc) {
+        acc = { subject_key: sk, subject_display: disp, instrument_family: fam, ids: new Set() }
+        segmentBucketMap.set(bkey, acc)
+      }
+      acc.ids.add(eid)
+    }
+    function segmentFamilyRank(f: InstrumentAnalyticsMode): number {
+      if (f === "SIMCE") return 0
+      if (f === "PAES") return 1
+      return 2
+    }
+
+    function resolvedCourseRawForEval(eid: string): string {
+      const ev = evalRowById.get(String(eid))
+      const st = stByEval.get(String(eid))
+      return String(st?.course_label ?? ev?.course_label ?? "").trim()
+    }
+
+    function buildCourseBreakdown(
+      bucketIds: Set<string>,
+      instrument_family: InstrumentAnalyticsMode,
+    ): Array<{
+      course_key: string
+      course_display: string
+      evaluation_count: number
+      avg_logro_pct: number | null
+      simce_projection: number | null
+      paes_projection: number | null
+    }> {
+      type CourseAcc = { ids: Set<string>; displayFreq: Map<string, number> }
+      const courseMap = new Map<string, CourseAcc>()
+      for (const eid of bucketIds) {
+        const raw = resolvedCourseRawForEval(eid)
+        const ck = normalizeCourseKey(raw)
+        const displaySeed = raw ? raw : "Sin curso"
+        let cacc = courseMap.get(ck)
+        if (!cacc) {
+          cacc = { ids: new Set(), displayFreq: new Map() }
+          courseMap.set(ck, cacc)
+        }
+        cacc.ids.add(eid)
+        cacc.displayFreq.set(displaySeed, (cacc.displayFreq.get(displaySeed) ?? 0) + 1)
+      }
+      const rows: Array<{
+        course_key: string
+        course_display: string
+        evaluation_count: number
+        avg_logro_pct: number | null
+        simce_projection: number | null
+        paes_projection: number | null
+      }> = []
+      for (const [course_key, cacc] of courseMap) {
+        const idList = [...cacc.ids]
+        const logros = idList
+          .map((id) => logroByEvalId.get(String(id)))
+          .filter((x): x is number => x != null && Number.isFinite(x))
+        const avg_logro_pct =
+          logros.length > 0 ? Math.round((logros.reduce((a, c) => a + c, 0) / logros.length) * 10) / 10 : null
+        let simce_projection: number | null = null
+        let paes_projection: number | null = null
+        if (instrument_family === "SIMCE") {
+          const vals: number[] = []
+          for (const eid of idList) {
+            const pct = logroByEvalId.get(String(eid))
+            if (pct == null || !Number.isFinite(pct)) continue
+            vals.push(projectSimceFromLogroPct(pct))
+          }
+          simce_projection = vals.length ? Math.round(vals.reduce((a, c) => a + c, 0) / vals.length) : null
+        } else if (instrument_family === "PAES") {
+          const vals: number[] = []
+          for (const eid of idList) {
+            const pct = logroByEvalId.get(String(eid))
+            if (pct == null || !Number.isFinite(pct)) continue
+            vals.push(projectPaesFromLogroPct(pct))
+          }
+          paes_projection = vals.length ? Math.round(vals.reduce((a, c) => a + c, 0) / vals.length) : null
+        }
+        rows.push({
+          course_key,
+          course_display: pickMostFrequentCourseDisplay(cacc.displayFreq),
+          evaluation_count: cacc.ids.size,
+          avg_logro_pct,
+          simce_projection,
+          paes_projection,
+        })
+      }
+      rows.sort((a, b) => {
+        if (b.evaluation_count !== a.evaluation_count) return b.evaluation_count - a.evaluation_count
+        return a.course_display.localeCompare(b.course_display, "es")
+      })
+      return rows
+    }
+
+    const segment_breakdown = [...segmentBucketMap.values()]
+      .map((b) => {
+        const idList = [...b.ids]
+        const logros = idList
+          .map((id) => logroByEvalId.get(String(id)))
+          .filter((x): x is number => x != null && Number.isFinite(x))
+        const avg_logro_pct =
+          logros.length > 0 ? Math.round((logros.reduce((a, c) => a + c, 0) / logros.length) * 10) / 10 : null
+        let simce_projection: number | null = null
+        let paes_projection: number | null = null
+        if (b.instrument_family === "SIMCE") {
+          const vals: number[] = []
+          for (const eid of idList) {
+            const pct = logroByEvalId.get(String(eid))
+            if (pct == null || !Number.isFinite(pct)) continue
+            vals.push(projectSimceFromLogroPct(pct))
+          }
+          simce_projection = vals.length ? Math.round(vals.reduce((a, c) => a + c, 0) / vals.length) : null
+        } else if (b.instrument_family === "PAES") {
+          const vals: number[] = []
+          for (const eid of idList) {
+            const pct = logroByEvalId.get(String(eid))
+            if (pct == null || !Number.isFinite(pct)) continue
+            vals.push(projectPaesFromLogroPct(pct))
+          }
+          paes_projection = vals.length ? Math.round(vals.reduce((a, c) => a + c, 0) / vals.length) : null
+        }
+        return {
+          subject_key: b.subject_key,
+          subject_display: b.subject_display,
+          instrument_family: b.instrument_family,
+          evaluation_count: b.ids.size,
+          avg_logro_pct,
+          simce_projection,
+          paes_projection,
+          course_breakdown: buildCourseBreakdown(b.ids, b.instrument_family),
+        }
+      })
+      .sort((a, b) => {
+        const rf = segmentFamilyRank(a.instrument_family) - segmentFamilyRank(b.instrument_family)
+        if (rf !== 0) return rf
+        return b.evaluation_count - a.evaluation_count
+      })
 
     const totalEvaluacionesMes = new Set(
       logroPerEval
@@ -575,12 +814,13 @@ export async function GET(_req: NextRequest) {
       logro_pct: r.logro_pct,
       evaluated_at: r.evaluated_at,
       grade_chile: resolvedGradeForEval(r.evaluation_id),
+      instrument_analytics_mode: instrumentModeFromEvalRow(r.evaluation_id),
     }))
 
     if (linkedEvalIds.length === 0 && simceTaggedIds.length === 0 && evalRows.length > 0) {
       warning =
         (warning ? `${warning} ` : "") +
-        "Semáforo y estándar agencia usan todas las evaluaciones en alcance (no hay vínculo UTP tipo ENSAYO_SIMCE). Vincule en UTP para filtrar solo ensayos SIMCE."
+        "Semáforo y estándar agencia usan todas las evaluaciones en alcance (no hay vínculo UTP a ensayos SIMCE/PAES). Vincule en UTP para acotar solo a instrumentos nacionales etiquetados."
     }
 
     return jsonNoStore({
@@ -616,6 +856,7 @@ export async function GET(_req: NextRequest) {
       semaforo_source: simceTaggedIds.length > 0 ? "ensayo_simce_linked" : "all_in_scope",
       last_batch_id: lastBatchId,
       national_batch_intent: batchIntent,
+      segment_breakdown,
     })
   } catch (e) {
     return jsonNoStore({

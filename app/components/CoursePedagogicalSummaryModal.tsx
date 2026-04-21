@@ -6,7 +6,7 @@
  * No modifica el diagnóstico actual del curso.
  */
 import * as React from "react"
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useMemo } from "react"
 import {
   Dialog,
   DialogContent,
@@ -39,7 +39,7 @@ import { useToast } from "@/hooks/use-toast"
 import { buildPedagogicalDiagnosis } from "@/app/lib/pedagogical-diagnosis-text"
 import { QuestionHeatMap } from "@/app/components/QuestionHeatMap"
 import { downloadCsvFile } from "@/app/lib/csv-export"
-import { EXAM_TYPE_FILTER_OPTIONS } from "@/app/lib/exam-type-constants"
+import { EXAM_TYPE_FILTER_OPTIONS_WITH_NATIONAL } from "@/app/lib/exam-type-constants"
 import { projectPaesFromLogroPct, projectSimceFromLogroPct } from "@/app/lib/standard-scale-converters"
 import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
 
@@ -89,6 +89,16 @@ type SummaryData = {
   }>
   exam_type_filter?: string | null
   chile_agency_cuts_note?: string | null
+  segmentation?: Array<{
+    subject_key: string
+    subject_display: string
+    instrument_family: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+    evaluation_count: number
+    evaluation_ids: string[]
+  }>
+  segment_auto_selected?: boolean
+  subject_filter?: string | null
+  instrument_family_filter?: string | null
   national_analytics?: {
     enabled: boolean
     by_evaluation: Array<{
@@ -250,13 +260,15 @@ function SummaryBlock({ data }: { data: SummaryData }) {
   const analyzable = data.evaluation_count_analyzable
   const hasNewFields = withSource !== undefined || analyzable !== undefined
   const avgLogro = computeGlobalLogroPct(data)
-  const mode = data.analytics_mode === "SIMCE" ? "SIMCE" : "PAES"
-  const estimatedScore =
+  const analyticsMode = data.analytics_mode
+  const estimatedNationalScore =
     avgLogro == null || !Number.isFinite(avgLogro)
       ? null
-      : mode === "SIMCE"
-        ? projectSimceFromLogroPct(avgLogro)
-        : projectPaesFromLogroPct(avgLogro)
+      : analyticsMode === "SIMCE"
+        ? { kind: "SIMCE" as const, value: projectSimceFromLogroPct(avgLogro) }
+        : analyticsMode === "PAES"
+          ? { kind: "PAES" as const, value: projectPaesFromLogroPct(avgLogro) }
+          : null
   return (
     <div className="rounded-md border bg-[var(--bg-muted)] p-3 space-y-2">
       <div className="font-medium text-[var(--text-accent)]">Resumen del curso</div>
@@ -272,15 +284,32 @@ function SummaryBlock({ data }: { data: SummaryData }) {
         {hasNewFields && analyzable !== undefined && ` ${analyzable} con análisis pedagógico disponible.`}
       </p>
       <div className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm">
-        <span className="font-semibold text-indigo-900">
-          Puntaje estimado del curso ({mode}):
-        </span>{" "}
-        <span className="text-indigo-800 font-bold">
-          {estimatedScore != null ? `${Math.round(estimatedScore)} puntos` : "—"}
-        </span>
-        {avgLogro != null && Number.isFinite(avgLogro) ? (
-          <span className="text-indigo-700"> · basado en logro promedio {Math.round(avgLogro)}%</span>
-        ) : null}
+        {estimatedNationalScore != null ? (
+          <>
+            <span className="font-semibold text-indigo-900">
+              Puntaje estimado del curso ({estimatedNationalScore.kind}):
+            </span>{" "}
+            <span className="text-indigo-800 font-bold">{`${Math.round(estimatedNationalScore.value)} puntos`}</span>
+            {avgLogro != null && Number.isFinite(avgLogro) ? (
+              <span className="text-indigo-700"> · basado en logro promedio {Math.round(avgLogro)}%</span>
+            ) : null}
+          </>
+        ) : (
+          <>
+            {avgLogro != null && Number.isFinite(avgLogro) ? (
+              <>
+                <span className="font-semibold text-indigo-900">Logro promedio (institucional):</span>{" "}
+                <span className="text-indigo-800 font-bold">{Math.round(avgLogro)}%</span>
+                <span className="text-indigo-700">
+                  {" "}
+                  · Sin proyección SIMCE/PAES en esta tarjeta (segmento institucional u otro modo).
+                </span>
+              </>
+            ) : (
+              <span className="text-indigo-800">Sin logro agregado para estimar.</span>
+            )}
+          </>
+        )}
       </div>
     </div>
   )
@@ -310,6 +339,21 @@ function NoSummaryMessage({ data }: { data: SummaryData }) {
       </p>
     )
   }
+  if (reason === "requires_subject_and_instrument_family") {
+    return (
+      <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
+        Este curso tiene evaluaciones en más de una combinación asignatura / familia de instrumento (SIMCE, PAES o internas).
+        Elija <strong>asignatura</strong> y <strong>familia</strong> arriba para ver un resumen sin mezclar segmentos.
+      </p>
+    )
+  }
+  if (reason === "no_evaluations_for_segment") {
+    return (
+      <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
+        No hay evaluaciones que coincidan con la asignatura y familia seleccionadas. Pruebe otra combinación.
+      </p>
+    )
+  }
   return (
     <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
       No hay datos suficientes para mostrar el resumen pedagógico en este curso.
@@ -332,7 +376,26 @@ export default function CoursePedagogicalSummaryModal({
   const [exportPdfLoading, setExportPdfLoading] = useState(false)
   const [showNationalAnalytics, setShowNationalAnalytics] = useState(true)
   const [examTypeFilter, setExamTypeFilter] = useState("")
+  const [segmentSubject, setSegmentSubject] = useState("")
+  const [segmentFamily, setSegmentFamily] = useState<"" | "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER">("")
   const { toast } = useToast()
+
+  const subjectOptions = useMemo(() => {
+    const seg = data?.segmentation
+    if (!seg?.length) return [] as Array<{ key: string; label: string }>
+    const m = new Map<string, string>()
+    for (const s of seg) {
+      if (!m.has(s.subject_key)) m.set(s.subject_key, s.subject_display)
+    }
+    return Array.from(m.entries()).map(([key, label]) => ({ key, label }))
+  }, [data?.segmentation])
+
+  useEffect(() => {
+    if (!open) {
+      setSegmentSubject("")
+      setSegmentFamily("")
+    }
+  }, [open])
 
   useEffect(() => {
     // SNAPSHOT_NATIONAL_ANALYTICS_V1: persistencia local del switch de proyecciones
@@ -370,6 +433,8 @@ export default function CoursePedagogicalSummaryModal({
     setData(null)
     const qs = new URLSearchParams()
     if (examTypeFilter.trim()) qs.set("exam_type", examTypeFilter.trim())
+    if (segmentSubject.trim()) qs.set("subject", segmentSubject.trim())
+    if (segmentFamily) qs.set("instrument_family", segmentFamily)
     const qstr = qs.toString()
     const url = `/api/courses/${encodeURIComponent(courseId)}/pedagogical-summary${qstr ? `?${qstr}` : ""}`
     fetch(url, { credentials: "include", cache: "no-store" })
@@ -387,7 +452,7 @@ export default function CoursePedagogicalSummaryModal({
         setData(null)
       })
       .finally(() => setLoading(false))
-  }, [open, courseId, examTypeFilter])
+  }, [open, courseId, examTypeFilter, segmentSubject, segmentFamily])
 
   useEffect(() => {
     if (typeof window !== "undefined" && process.env.NODE_ENV !== "production" && open && courseId) {
@@ -482,23 +547,87 @@ export default function CoursePedagogicalSummaryModal({
           )}
           {!loading && !error && data && (
             <>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-                <div className="text-xs text-muted-foreground shrink-0">
-                  <span className="font-medium text-[var(--text-accent)]">Tipo de prueba (filtro reporte)</span>
-                  <select
-                    className="ml-2 rounded-md border border-[var(--border-color)] bg-background px-2 py-1 text-sm"
-                    value={examTypeFilter}
-                    onChange={(e) => setExamTypeFilter(e.target.value)}
-                    aria-label="Filtrar por exam_type"
-                  >
-                    {EXAM_TYPE_FILTER_OPTIONS.map((o) => (
-                      <option key={o.value || "all"} value={o.value}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
+              <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end sm:justify-between">
+                <div className="text-xs text-muted-foreground shrink-0 space-y-1">
+                  <div>
+                    <span className="font-medium text-[var(--text-accent)]">Asignatura (filtro institucional)</span>
+                    <input
+                      list="pedagogy-subject-options"
+                      className="ml-2 rounded-md border border-[var(--border-color)] bg-background px-2 py-1 text-sm min-w-[10rem]"
+                      value={segmentSubject}
+                      onChange={(e) => setSegmentSubject(e.target.value)}
+                      placeholder="Ej. Matemática"
+                      aria-label="Filtrar por asignatura"
+                    />
+                    <datalist id="pedagogy-subject-options">
+                      {subjectOptions.map((o) => (
+                        <option key={o.key} value={o.label} />
+                      ))}
+                    </datalist>
+                  </div>
+                  <div>
+                    <span className="font-medium text-[var(--text-accent)]">Familia de instrumento</span>
+                    <select
+                      className="ml-2 rounded-md border border-[var(--border-color)] bg-background px-2 py-1 text-sm"
+                      value={segmentFamily}
+                      onChange={(e) =>
+                        setSegmentFamily(
+                          e.target.value as "" | "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER",
+                        )
+                      }
+                      aria-label="Familia SIMCE PAES o internas"
+                    >
+                      <option value="">— Elegir —</option>
+                      <option value="SIMCE">SIMCE</option>
+                      <option value="PAES">PAES</option>
+                      <option value="INSTITUTIONAL_OTHER">Internas (otras)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <span className="font-medium text-[var(--text-accent)]">Tipo de prueba (exam_type, opcional)</span>
+                    <select
+                      className="ml-2 rounded-md border border-[var(--border-color)] bg-background px-2 py-1 text-sm"
+                      value={examTypeFilter}
+                      onChange={(e) => setExamTypeFilter(e.target.value)}
+                      aria-label="Filtrar por exam_type"
+                    >
+                      {EXAM_TYPE_FILTER_OPTIONS_WITH_NATIONAL.map((o) => (
+                        <option key={o.value || "all"} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
               </div>
+              {data.segmentation && data.segmentation.length > 1 && (
+                <div className="rounded-md border border-[var(--border-color)] overflow-x-auto text-xs">
+                  <table className="min-w-full">
+                    <thead>
+                      <tr className="bg-[var(--bg-muted)] text-left">
+                        <th className="px-2 py-1.5">Asignatura</th>
+                        <th className="px-2 py-1.5">Familia</th>
+                        <th className="px-2 py-1.5 text-right">Evaluaciones</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.segmentation.map((s, i) => (
+                        <tr key={`${s.subject_key}-${s.instrument_family}-${i}`} className="border-t border-[var(--border-color)]">
+                          <td className="px-2 py-1">{safeText(s.subject_display)}</td>
+                          <td className="px-2 py-1">{s.instrument_family}</td>
+                          <td className="px-2 py-1 text-right">{s.evaluation_count}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {data.segment_auto_selected ? (
+                <p className="text-xs text-muted-foreground">
+                  Segmento único detectado: se muestra automáticamente{" "}
+                  <strong>{data.subject_filter ?? "—"}</strong> · <strong>{data.instrument_family_filter ?? "—"}</strong>.
+                </p>
+              ) : null}
               {data.chile_agency_cuts_note ? (
                 <p className="text-xs text-[var(--text-muted)] border border-dashed border-[var(--border-color)] rounded-md px-2 py-1.5">
                   {data.chile_agency_cuts_note}

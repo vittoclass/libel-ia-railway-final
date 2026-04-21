@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { useEffect, useState } from "react"
+import { Fragment, useEffect, useState } from "react"
 import {
   USE_NEW_PEDAGOGIC_LABELS,
   uiCoberturaBajada,
@@ -11,12 +11,73 @@ import {
   uiSemaforoBajada,
   uiSemaforoTitulo,
 } from "@/app/lib/pedagogic-ui-copy"
+import { formatStudentDisplayName } from "@/app/lib/format-student-name"
 
 type Kpis = {
   promedio_logro_institucional: number
   total_evaluaciones_mes: number
   simce_proyectado_promedio: number
   paes_proyectado_promedio: number
+}
+
+type CourseBreakdownRow = {
+  course_key: string
+  course_display: string
+  evaluation_count: number
+  avg_logro_pct: number | null
+  simce_projection: number | null
+  paes_projection: number | null
+}
+
+type SegmentBreakdownRow = {
+  subject_key: string
+  subject_display: string
+  instrument_family: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+  evaluation_count: number
+  avg_logro_pct: number | null
+  simce_projection: number | null
+  paes_projection: number | null
+  course_breakdown: CourseBreakdownRow[]
+}
+
+function parseCourseBreakdownFromApi(raw: unknown): CourseBreakdownRow[] {
+  if (!Array.isArray(raw)) return []
+  const out: CourseBreakdownRow[] = []
+  for (const c of raw) {
+    if (!c || typeof c !== "object") continue
+    const o = c as Record<string, unknown>
+    if (typeof o.course_key !== "string" || typeof o.course_display !== "string") continue
+    const n = Number(o.evaluation_count)
+    if (!Number.isFinite(n)) continue
+    const avgRaw = o.avg_logro_pct
+    const avg_logro_pct =
+      avgRaw == null ? null : Number.isFinite(Number(avgRaw)) ? Number(avgRaw) : null
+    const simRaw = o.simce_projection
+    const paesRaw = o.paes_projection
+    out.push({
+      course_key: o.course_key,
+      course_display: o.course_display,
+      evaluation_count: n,
+      avg_logro_pct,
+      simce_projection: simRaw != null && Number.isFinite(Number(simRaw)) ? Number(simRaw) : null,
+      paes_projection: paesRaw != null && Number.isFinite(Number(paesRaw)) ? Number(paesRaw) : null,
+    })
+  }
+  return out
+}
+
+function formatSegmentRowProjection(
+  instrument_family: SegmentBreakdownRow["instrument_family"],
+  simce_projection: number | null,
+  paes_projection: number | null,
+): string {
+  if (instrument_family === "SIMCE" && simce_projection != null && Number.isFinite(Number(simce_projection))) {
+    return `SIMCE ${Math.round(Number(simce_projection))} (200–350)`
+  }
+  if (instrument_family === "PAES" && paes_projection != null && Number.isFinite(Number(paes_projection))) {
+    return `PAES ${Math.round(Number(paes_projection))} (100–1000)`
+  }
+  return "—"
 }
 
 export default function DashboardDireccionPage() {
@@ -67,8 +128,10 @@ export default function DashboardDireccionPage() {
       logro_pct: number | null
       evaluated_at: string | null
       grade_chile: number | null
+      instrument_analytics_mode?: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
     }>
   >([])
+  const [segmentBreakdown, setSegmentBreakdown] = useState<SegmentBreakdownRow[]>([])
 
   async function loadDireccion() {
     setLoading(true)
@@ -79,6 +142,7 @@ export default function DashboardDireccionPage() {
       const json = await res.json()
       if (!res.ok) {
         setError(json?.error ?? "No se pudo cargar el resumen ejecutivo")
+        setSegmentBreakdown([])
       } else {
         setKpis(json?.kpis ?? {
           promedio_logro_institucional: 0,
@@ -109,9 +173,30 @@ export default function DashboardDireccionPage() {
             : null,
         )
         setRecentPreview(Array.isArray(json?.recent_evaluations_preview) ? json.recent_evaluations_preview : [])
+        const rawSeg = json?.segment_breakdown
+        setSegmentBreakdown(
+          Array.isArray(rawSeg)
+            ? (rawSeg as SegmentBreakdownRow[])
+                .filter(
+                  (r) =>
+                    r &&
+                    typeof r.subject_display === "string" &&
+                    (r.instrument_family === "SIMCE" ||
+                      r.instrument_family === "PAES" ||
+                      r.instrument_family === "INSTITUTIONAL_OTHER"),
+                )
+                .map((r) => ({
+                  ...r,
+                  course_breakdown: parseCourseBreakdownFromApi(
+                    (r as { course_breakdown?: unknown }).course_breakdown,
+                  ),
+                }))
+            : [],
+        )
       }
     } catch {
       setError("Error de red al cargar KPIs")
+      setSegmentBreakdown([])
     } finally {
       setLoading(false)
     }
@@ -222,13 +307,120 @@ export default function DashboardDireccionPage() {
           <p className="text-xs text-[var(--text-muted)] mt-1">Escala DEMRE (100-1000)</p>
         </article>
       </div>
+      {!loading && segmentBreakdown.length > 0 && (
+        <article className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm">
+          <h3 className="font-semibold text-slate-900">Desglose por asignatura y tipo de prueba</h3>
+          <p className="text-xs text-[var(--text-muted)] mt-1 max-w-3xl">
+            Basado en las mismas evaluaciones que el resumen superior. No mezcla SIMCE, PAES ni pruebas internas. Por curso se
+            agrupan etiquetas equivalentes (p. ej. ordinales) sin duplicar filas artificiales.
+          </p>
+          <div className="mt-3 overflow-x-auto">
+            <table className="min-w-full text-sm border border-slate-200 rounded-md overflow-hidden">
+              <thead className="bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-700">Asignatura</th>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-700">Tipo</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-700">Nº eval.</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-700">Logro %</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-700">Proyección</th>
+                </tr>
+              </thead>
+              <tbody>
+                {segmentBreakdown.map((row, i) => {
+                  const rowKey = `${row.subject_key}-${row.instrument_family}-${i}`
+                  const tipoLabel =
+                    row.instrument_family === "SIMCE"
+                      ? "SIMCE"
+                      : row.instrument_family === "PAES"
+                        ? "PAES"
+                        : "Interna"
+                  const proyeccion = formatSegmentRowProjection(
+                    row.instrument_family,
+                    row.simce_projection,
+                    row.paes_projection,
+                  )
+                  const courses = row.course_breakdown ?? []
+                  const courseTable = (
+                    <table className="w-full text-xs border border-slate-100 rounded-md overflow-hidden">
+                      <thead className="bg-slate-50/90">
+                        <tr>
+                          <th className="text-left px-2 py-1.5 font-semibold text-slate-600">Curso</th>
+                          <th className="text-right px-2 py-1.5 font-semibold text-slate-600">Nº eval.</th>
+                          <th className="text-right px-2 py-1.5 font-semibold text-slate-600">Logro %</th>
+                          <th className="text-right px-2 py-1.5 font-semibold text-slate-600">Proyección</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {courses.map((c) => (
+                          <tr key={c.course_key} className="border-t border-slate-100 bg-white">
+                            <td className="px-2 py-1.5 text-slate-800">{c.course_display}</td>
+                            <td className="px-2 py-1.5 text-right tabular-nums text-slate-800">{c.evaluation_count}</td>
+                            <td className="px-2 py-1.5 text-right tabular-nums text-slate-800">
+                              {c.avg_logro_pct != null && Number.isFinite(Number(c.avg_logro_pct))
+                                ? `${Number(c.avg_logro_pct).toFixed(1)}%`
+                                : "—"}
+                            </td>
+                            <td className="px-2 py-1.5 text-right text-slate-600">
+                              {formatSegmentRowProjection(
+                                row.instrument_family,
+                                c.simce_projection,
+                                c.paes_projection,
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )
+                  return (
+                    <Fragment key={rowKey}>
+                      <tr className="border-t border-slate-100">
+                        <td className="px-3 py-2 text-slate-900">{row.subject_display}</td>
+                        <td className="px-3 py-2 text-slate-700">{tipoLabel}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{row.evaluation_count}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">
+                          {row.avg_logro_pct != null && Number.isFinite(Number(row.avg_logro_pct))
+                            ? `${Number(row.avg_logro_pct).toFixed(1)}%`
+                            : "—"}
+                        </td>
+                        <td className="px-3 py-2 text-right text-slate-700 text-xs">{proyeccion}</td>
+                      </tr>
+                      {courses.length === 1 ? (
+                        <tr className="border-t border-slate-50 bg-slate-50/50">
+                          <td colSpan={5} className="px-3 py-2">
+                            {courseTable}
+                          </td>
+                        </tr>
+                      ) : null}
+                      {courses.length > 1 ? (
+                        <tr className="border-t border-slate-50 bg-slate-50/50">
+                          <td colSpan={5} className="px-3 py-2">
+                            <details className="group">
+                              <summary className="cursor-pointer text-slate-700 font-medium text-xs list-none flex items-center gap-2 [&::-webkit-details-marker]:hidden">
+                                <span className="text-slate-400 group-open:rotate-90 transition-transform inline-block">▸</span>
+                                Por curso ({courses.length})
+                              </summary>
+                              <div className="mt-2 pl-4 border-l-2 border-slate-200">{courseTable}</div>
+                            </details>
+                          </td>
+                        </tr>
+                      ) : null}
+                    </Fragment>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      )}
       <div className="grid gap-4 md:grid-cols-2">
         <article className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm">
           <h3 className="font-semibold">{uiSemaforoTitulo()}</h3>
           <p className="text-xs text-[var(--text-muted)] mb-1">{uiSemaforoBajada()}</p>
           <p className="text-xs text-[var(--text-muted)] mb-3">
-            Notas Chile (grade_chile): &lt; 4,0 Insuficiente · 4,0 a &lt; 5,5 Elemental · ≥ 5,5 Adecuado. Con vínculo SIMCE en UTP,
-            solo esas pruebas alimentan este bloque; si no, todas las evaluaciones en alcance.
+            Notas Chile (grade_chile): &lt; 4,0 Insuficiente · 4,0 a &lt; 5,5 Elemental · ≥ 5,5 Adecuado. Con vínculo UTP a
+            ensayos SIMCE o PAES, solo esas evaluaciones alimentan este bloque cuando aplica; si no hay vínculo, se usan
+            todas las evaluaciones en alcance.
           </p>
           <div className="space-y-2">
             <div className="flex items-center justify-between rounded-lg bg-rose-50 border border-rose-200 px-3 py-2">
@@ -318,7 +510,24 @@ export default function DashboardDireccionPage() {
           <ul className="text-sm space-y-2">
             {recentPreview.map((r) => (
               <li key={r.evaluation_id} className="border border-slate-100 rounded-md px-3 py-2 bg-slate-50/80">
-                <span className="font-medium">{r.title ?? r.subject ?? "Evaluación"}</span>
+                <span className="inline-flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{r.title ?? r.subject ?? "Evaluación"}</span>
+                  {r.instrument_analytics_mode === "SIMCE" ? (
+                    <span className="text-[10px] font-semibold uppercase tracking-wide rounded px-1.5 py-0.5 bg-sky-100 text-sky-800 border border-sky-200">
+                      SIMCE
+                    </span>
+                  ) : null}
+                  {r.instrument_analytics_mode === "PAES" ? (
+                    <span className="text-[10px] font-semibold uppercase tracking-wide rounded px-1.5 py-0.5 bg-indigo-100 text-indigo-800 border border-indigo-200">
+                      PAES
+                    </span>
+                  ) : null}
+                  {r.instrument_analytics_mode === "INSTITUTIONAL_OTHER" ? (
+                    <span className="text-[10px] font-semibold uppercase tracking-wide rounded px-1.5 py-0.5 bg-slate-100 text-slate-600 border border-slate-200">
+                      Interna
+                    </span>
+                  ) : null}
+                </span>
                 <span className="block text-xs text-[var(--text-muted)]">
                   {r.evaluated_at ? new Date(r.evaluated_at).toLocaleString("es-CL") : "—"} ·{" "}
                   {USE_NEW_PEDAGOGIC_LABELS ? "cobertura" : "logro"}{" "}
@@ -353,7 +562,7 @@ export default function DashboardDireccionPage() {
                 {criticalStudents.map((s) => (
                   <tr key={s.evaluation_id} className="border-t border-red-100">
                     <td className="px-3 py-2">
-                      <span className="block">{s.student_name}</span>
+                      <span className="block">{formatStudentDisplayName(s.student_name) || s.student_name}</span>
                       {s.student_name_raw ? (
                         <span className="block text-xs text-[var(--text-muted)]">raw: {s.student_name_raw}</span>
                       ) : null}

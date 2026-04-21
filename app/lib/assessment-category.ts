@@ -96,6 +96,40 @@ export function getInstrumentAnalyticsModeFromEvaluationTags(
 }
 
 /**
+ * Filtro del query `exam_type` alineado con la familia canónica (exam_type + assessment_category).
+ * Evita perder PAES cuando solo `assessment_category` trae ENSAYO_PAES. Conserva igualdad literal
+ * en `evaluations.exam_type` para valores libres (p. ej. "Ensayo", "Diagnóstico").
+ */
+export function evaluationMatchesExamTypeQueryParam(
+  examType: string | null | undefined,
+  assessmentCategory: string | null | undefined,
+  param: string,
+): boolean {
+  const raw = String(param ?? "").trim()
+  if (!raw) return true
+  const pl = raw.toLowerCase()
+  const canon = getInstrumentAnalyticsModeFromEvaluationTags(examType, assessmentCategory)
+
+  if (pl === "paes" || pl === "ensayo_paes") return canon === "PAES"
+  if (pl === "simce" || pl === "ensayo_simce") return canon === "SIMCE"
+  if (
+    pl === "institutional_other" ||
+    pl === "internas" ||
+    pl === "interna" ||
+    pl === "institucional"
+  ) {
+    return canon === "INSTITUTIONAL_OTHER"
+  }
+
+  const flatFromParam = parseAssessmentTypeToFlat(raw)
+  if (flatFromParam === "ENSAYO_PAES") return canon === "PAES"
+  if (flatFromParam === "ENSAYO_SIMCE") return canon === "SIMCE"
+  if (flatFromParam && isInstitutionalCommonFlat(flatFromParam)) return canon === "INSTITUTIONAL_OTHER"
+
+  return String(examType ?? "").trim().toLowerCase() === pl
+}
+
+/**
  * Inferencia desde título/nombre de archivo de prueba base (sin tocar OMR).
  * Prioridad PAES > SIMCE > ENSAYO genérico (→ MENSUAL).
  */

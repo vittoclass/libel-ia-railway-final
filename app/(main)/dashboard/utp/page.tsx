@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { Fragment, useCallback, useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { exportUtpExecutiveFichaPdf } from "@/app/lib/export-utp-dashboard-pdf"
 import Link from "next/link"
@@ -26,6 +26,7 @@ import {
   uiTablaEstandarAgenciaCol,
 } from "@/app/lib/pedagogic-ui-copy"
 import { formatDateTimeEsCl } from "@/app/lib/format-datetime-es-cl"
+import { formatStudentDisplayName } from "@/app/lib/format-student-name"
 
 type AuditRow = {
   id: string
@@ -51,6 +52,66 @@ type SchoolAnalyticsRow = {
   subject: string | null
   avg_logro_pct: number | null
   student_result_rows: number
+}
+
+type DireccionCourseBreakdownRow = {
+  course_key: string
+  course_display: string
+  evaluation_count: number
+  avg_logro_pct: number | null
+  simce_projection: number | null
+  paes_projection: number | null
+}
+
+type DireccionSegmentBreakdownRow = {
+  subject_key: string
+  subject_display: string
+  instrument_family: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+  evaluation_count: number
+  avg_logro_pct: number | null
+  simce_projection: number | null
+  paes_projection: number | null
+  course_breakdown: DireccionCourseBreakdownRow[]
+}
+
+function parseDireccionCourseBreakdownFromApi(raw: unknown): DireccionCourseBreakdownRow[] {
+  if (!Array.isArray(raw)) return []
+  const out: DireccionCourseBreakdownRow[] = []
+  for (const c of raw) {
+    if (!c || typeof c !== "object") continue
+    const o = c as Record<string, unknown>
+    if (typeof o.course_key !== "string" || typeof o.course_display !== "string") continue
+    const n = Number(o.evaluation_count)
+    if (!Number.isFinite(n)) continue
+    const avgRaw = o.avg_logro_pct
+    const avg_logro_pct =
+      avgRaw == null ? null : Number.isFinite(Number(avgRaw)) ? Number(avgRaw) : null
+    const simRaw = o.simce_projection
+    const paesRaw = o.paes_projection
+    out.push({
+      course_key: o.course_key,
+      course_display: o.course_display,
+      evaluation_count: n,
+      avg_logro_pct,
+      simce_projection: simRaw != null && Number.isFinite(Number(simRaw)) ? Number(simRaw) : null,
+      paes_projection: paesRaw != null && Number.isFinite(Number(paesRaw)) ? Number(paesRaw) : null,
+    })
+  }
+  return out
+}
+
+function formatDireccionSegmentProjection(
+  instrument_family: DireccionSegmentBreakdownRow["instrument_family"],
+  simce_projection: number | null,
+  paes_projection: number | null,
+): string {
+  if (instrument_family === "SIMCE" && simce_projection != null && Number.isFinite(Number(simce_projection))) {
+    return `SIMCE ${Math.round(Number(simce_projection))} (200–350)`
+  }
+  if (instrument_family === "PAES" && paes_projection != null && Number.isFinite(Number(paes_projection))) {
+    return `PAES ${Math.round(Number(paes_projection))} (100–1000)`
+  }
+  return "—"
 }
 
 type SchoolAnalyticsPayload = {
@@ -148,6 +209,7 @@ export default function DashboardUtpPage() {
   /** Mismos KPI que Panel Dirección (`/api/dashboard/direccion`). */
   const [simceProyectadoOmr, setSimceProyectadoOmr] = useState(0)
   const [paesProyectadoOmr, setPaesProyectadoOmr] = useState(0)
+  const [segmentBreakdown, setSegmentBreakdown] = useState<DireccionSegmentBreakdownRow[]>([])
   const [evalLotGroups, setEvalLotGroups] = useState<EvalLotGroup[]>([])
   const [evalOrphans, setEvalOrphans] = useState<EvalOrphanRow[]>([])
   const [expandedEvalLots, setExpandedEvalLots] = useState<Record<string, boolean>>({})
@@ -462,6 +524,7 @@ export default function DashboardUtpPage() {
       let cobertura: number | null = null
       let simceProy = 0
       let paesProy = 0
+      let segmentsFromDir: DireccionSegmentBreakdownRow[] = []
       try {
         if (dirRes && dirRes.ok) {
           const dj = (await dirRes.json()) as {
@@ -471,6 +534,7 @@ export default function DashboardUtpPage() {
               simce_proyectado_promedio?: number
               paes_proyectado_promedio?: number
             }
+            segment_breakdown?: DireccionSegmentBreakdownRow[]
           }
           if (dj?.semaforo && typeof dj.semaforo === "object") {
             omrSemaforo = {
@@ -486,16 +550,36 @@ export default function DashboardUtpPage() {
           const pa = Number(dj?.kpis?.paes_proyectado_promedio)
           if (Number.isFinite(s)) simceProy = s
           if (Number.isFinite(pa)) paesProy = pa
+          const rawSeg = dj?.segment_breakdown
+          if (Array.isArray(rawSeg)) {
+            segmentsFromDir = rawSeg
+              .filter(
+                (r) =>
+                  r &&
+                  typeof r.subject_display === "string" &&
+                  (r.instrument_family === "SIMCE" ||
+                    r.instrument_family === "PAES" ||
+                    r.instrument_family === "INSTITUTIONAL_OTHER"),
+              )
+              .map((r) => ({
+                ...r,
+                course_breakdown: parseDireccionCourseBreakdownFromApi(
+                  (r as { course_breakdown?: unknown }).course_breakdown,
+                ),
+              }))
+          }
         }
       } catch {
         omrSemaforo = null
         cobertura = null
         simceProy = 0
         paesProy = 0
+        segmentsFromDir = []
       }
 
       setSimceProyectadoOmr(simceProy)
       setPaesProyectadoOmr(paesProy)
+      setSegmentBreakdown(segmentsFromDir)
 
       const fallbackSemaforo = json?.semaforo ?? { insuficiente: 0, elemental: 0, adecuado: 0, total: 0 }
       const hasOmrSemaforoCounts =
@@ -533,6 +617,7 @@ export default function DashboardUtpPage() {
       setOmrLiveActive(false)
       setSimceProyectadoOmr(0)
       setPaesProyectadoOmr(0)
+      setSegmentBreakdown([])
       setEvalLotGroups([])
       setEvalOrphans([])
       setSchoolAnalytics(null)
@@ -1015,7 +1100,8 @@ export default function DashboardUtpPage() {
           <div>
             <h3 className="text-sm font-semibold text-slate-800">Proyección resultados nacionales</h3>
             <p className="text-xs text-[var(--text-muted)] mt-0.5 max-w-3xl">
-              Misma agregación que Panel Dirección (evaluaciones vinculadas por UTP o últimas en alcance institucional).
+              Misma agregación que Panel Dirección: proyección SIMCE y PAES desde evaluaciones reales en alcance (vínculo UTP
+              o universo institucional), usando la familia canónica por evaluación, sin mezclar internas en esas escalas.
             </p>
           </div>
           <div className="grid gap-4 md:grid-cols-2">
@@ -1038,12 +1124,120 @@ export default function DashboardUtpPage() {
           </div>
         </div>
       )}
+      {!loading && segmentBreakdown.length > 0 && (
+        <article className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm">
+          <h3 className="font-semibold text-slate-900">Desglose por asignatura y tipo de prueba</h3>
+          <p className="text-xs text-[var(--text-muted)] mt-1 max-w-3xl">
+            Basado en las mismas evaluaciones que el resumen superior. No mezcla SIMCE, PAES ni pruebas internas. Este desglose
+            corresponde al mismo alcance institucional mostrado en Dirección. Por curso se agrupan etiquetas equivalentes (p. ej.
+            ordinales) sin duplicar filas artificiales.
+          </p>
+          <div className="mt-3 overflow-x-auto">
+            <table className="min-w-full text-sm border border-slate-200 rounded-md overflow-hidden">
+              <thead className="bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-700">Asignatura</th>
+                  <th className="text-left px-3 py-2 font-semibold text-slate-700">Tipo</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-700">Nº eval.</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-700">Logro %</th>
+                  <th className="text-right px-3 py-2 font-semibold text-slate-700">Proyección</th>
+                </tr>
+              </thead>
+              <tbody>
+                {segmentBreakdown.map((row, i) => {
+                  const rowKey = `${row.subject_key}-${row.instrument_family}-${i}`
+                  const tipoLabel =
+                    row.instrument_family === "SIMCE"
+                      ? "SIMCE"
+                      : row.instrument_family === "PAES"
+                        ? "PAES"
+                        : "Interna"
+                  const proyeccion = formatDireccionSegmentProjection(
+                    row.instrument_family,
+                    row.simce_projection,
+                    row.paes_projection,
+                  )
+                  const courses = row.course_breakdown ?? []
+                  const courseTable = (
+                    <table className="w-full text-xs border border-slate-100 rounded-md overflow-hidden">
+                      <thead className="bg-slate-50/90">
+                        <tr>
+                          <th className="text-left px-2 py-1.5 font-semibold text-slate-600">Curso</th>
+                          <th className="text-right px-2 py-1.5 font-semibold text-slate-600">Nº eval.</th>
+                          <th className="text-right px-2 py-1.5 font-semibold text-slate-600">Logro %</th>
+                          <th className="text-right px-2 py-1.5 font-semibold text-slate-600">Proyección</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {courses.map((c) => (
+                          <tr key={c.course_key} className="border-t border-slate-100 bg-white">
+                            <td className="px-2 py-1.5 text-slate-800">{c.course_display}</td>
+                            <td className="px-2 py-1.5 text-right tabular-nums text-slate-800">{c.evaluation_count}</td>
+                            <td className="px-2 py-1.5 text-right tabular-nums text-slate-800">
+                              {c.avg_logro_pct != null && Number.isFinite(Number(c.avg_logro_pct))
+                                ? `${Number(c.avg_logro_pct).toFixed(1)}%`
+                                : "—"}
+                            </td>
+                            <td className="px-2 py-1.5 text-right text-slate-600">
+                              {formatDireccionSegmentProjection(
+                                row.instrument_family,
+                                c.simce_projection,
+                                c.paes_projection,
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )
+                  return (
+                    <Fragment key={rowKey}>
+                      <tr className="border-t border-slate-100">
+                        <td className="px-3 py-2 text-slate-900">{row.subject_display}</td>
+                        <td className="px-3 py-2 text-slate-700">{tipoLabel}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{row.evaluation_count}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">
+                          {row.avg_logro_pct != null && Number.isFinite(Number(row.avg_logro_pct))
+                            ? `${Number(row.avg_logro_pct).toFixed(1)}%`
+                            : "—"}
+                        </td>
+                        <td className="px-3 py-2 text-right text-slate-700 text-xs">{proyeccion}</td>
+                      </tr>
+                      {courses.length === 1 ? (
+                        <tr className="border-t border-slate-50 bg-slate-50/50">
+                          <td colSpan={5} className="px-3 py-2">
+                            {courseTable}
+                          </td>
+                        </tr>
+                      ) : null}
+                      {courses.length > 1 ? (
+                        <tr className="border-t border-slate-50 bg-slate-50/50">
+                          <td colSpan={5} className="px-3 py-2">
+                            <details className="group">
+                              <summary className="cursor-pointer text-slate-700 font-medium text-xs list-none flex items-center gap-2 [&::-webkit-details-marker]:hidden">
+                                <span className="text-slate-400 group-open:rotate-90 transition-transform inline-block">▸</span>
+                                Por curso ({courses.length})
+                              </summary>
+                              <div className="mt-2 pl-4 border-l-2 border-slate-200">{courseTable}</div>
+                            </details>
+                          </td>
+                        </tr>
+                      ) : null}
+                    </Fragment>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      )}
       {!loading && !error && (
         <div className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm">
           <h3 className="font-semibold">Analítica por Colegio (habilidades)</h3>
           <p className="text-xs text-[var(--text-muted)] mt-1">
             Misma agregación que <strong>Analítica colegio</strong> (Dirección): por <code>school_id</code>, sin acotar a un solo{" "}
-            <code>batch_id</code>, para que PAES y SIMCE en distintos lotes aparezcan en la segmentación.
+            <code>batch_id</code>. Si hay un único bloque SIMCE o PAES nacional (p. ej. solo PAES + evaluaciones internas), las
+            habilidades se cargan solas para ese bloque; si hay varios bloques nacionales, elija asignatura y familia abajo.
           </p>
           {schoolAnalyticsLoading ? (
             <p className="text-sm text-[var(--text-muted)] mt-3">Cargando analítica…</p>
@@ -1097,8 +1291,8 @@ export default function DashboardUtpPage() {
               (schoolAnalytics.segmentation?.length ?? 0) > 0 ? (
                 <div className="space-y-2">
                   <p className="text-amber-800">
-                    Varios segmentos en el alcance del lote: elija asignatura y familia para ver habilidades agregadas sin
-                    mezclar.
+                    Hay más de un bloque SIMCE o PAES por asignatura, o solo internas sin filtrar: elija asignatura y familia
+                    para ver habilidades agregadas sin mezclar.
                   </p>
                   <div className="overflow-x-auto rounded border border-slate-200 text-xs">
                     <table className="min-w-full">
@@ -1241,7 +1435,9 @@ export default function DashboardUtpPage() {
                     <ul className="pl-10 pr-4 pb-3 text-sm space-y-1 text-[var(--text-muted)]">
                       {g.members.map((m) => (
                         <li key={m.id} className="flex flex-wrap gap-x-2">
-                          <span className="font-medium text-slate-800">{m.student_name ?? "Sin nombre"}</span>
+                          <span className="font-medium text-slate-800">
+                            {formatStudentDisplayName(m.student_name) || m.student_name || "Sin nombre"}
+                          </span>
                           <span className="font-mono text-[11px]">{m.id}</span>
                           <span className="text-xs">
                             {formatDateTimeEsCl(m.evaluated_at)}
@@ -1263,7 +1459,9 @@ export default function DashboardUtpPage() {
               <ul className="space-y-2 text-sm">
                 {evalOrphans.map((o) => (
                   <li key={o.id} className="flex flex-wrap items-center gap-2 border border-amber-100 rounded-md px-2 py-2 bg-white">
-                    <span className="font-medium">{o.student_name ?? "Sin nombre"}</span>
+                    <span className="font-medium">
+                      {formatStudentDisplayName(o.student_name) || o.student_name || "Sin nombre"}
+                    </span>
                     <span className="text-xs text-[var(--text-muted)]">{o.title}</span>
                     <span className="text-xs">{o.course_label}</span>
                     {o.suggest_annex_to_batch_id ? (

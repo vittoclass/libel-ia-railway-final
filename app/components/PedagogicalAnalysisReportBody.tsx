@@ -18,6 +18,7 @@ import {
   Cell,
 } from "recharts"
 import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
+import { formatStudentDisplayName } from "@/app/lib/format-student-name"
 import type { PedagogicalAnalysisExportData } from "@/app/lib/pedagogical-analysis-export-types"
 
 export type PedagogicalAnalysisReportBodyProps = {
@@ -153,7 +154,7 @@ export function PedagogicalAnalysisReportBody({
       {(studentName || courseLabel || evaluationLabel) && (
         <div className="rounded-md border border-[var(--border-color)] bg-[var(--bg-muted)] p-3 text-xs space-y-1">
           <div className="font-semibold text-[var(--text-accent)]">Contexto</div>
-          {studentName && <div>Estudiante: {studentName}</div>}
+          {studentName && <div>Estudiante: {formatStudentDisplayName(studentName) || studentName}</div>}
           {courseLabel && <div>Curso: {courseLabel}</div>}
           {evaluationLabel && <div>Evaluación: {evaluationLabel}</div>}
         </div>

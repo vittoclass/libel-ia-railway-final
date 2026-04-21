@@ -1,8 +1,8 @@
 "use client"
 
 import Link from "next/link"
-import { useCallback, useEffect, useState } from "react"
-import { EXAM_TYPE_FILTER_OPTIONS } from "@/app/lib/exam-type-constants"
+import { useCallback, useEffect, useMemo, useState } from "react"
+import { EXAM_TYPE_FILTER_OPTIONS_WITH_NATIONAL } from "@/app/lib/exam-type-constants"
 
 type SkillRow = {
   skill_name: string
@@ -14,10 +14,27 @@ type SkillRow = {
   adecuado_pct: number
 }
 
+type SegmentRow = {
+  subject_key: string
+  subject_display: string
+  instrument_family: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
+  evaluation_count: number
+  evaluation_ids: string[]
+}
+
 type Payload = {
   school_id: string | null
   evaluation_count: number
+  evaluation_count_total?: number
+  summary_available?: boolean
+  status_reason?: string
+  segmentation?: SegmentRow[]
+  segment_auto_selected?: boolean
+  subject_filter?: string | null
+  instrument_family_filter?: string | null
   exam_type_filter: string | null
+  course_filter?: string | null
+  batch_id_filter?: string | null
   skill_result_rows?: number
   by_skill: SkillRow[]
   analisis_utp: string[]
@@ -26,9 +43,22 @@ type Payload = {
 
 export default function AnaliticaColegioPage() {
   const [examType, setExamType] = useState("")
+  const [subjectFilter, setSubjectFilter] = useState("")
+  const [instrumentFamily, setInstrumentFamily] = useState<"" | "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER">("")
+  const [courseFilter, setCourseFilter] = useState("")
   const [data, setData] = useState<Payload | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+
+  const subjectOptions = useMemo(() => {
+    const seg = data?.segmentation
+    if (!seg?.length) return [] as Array<{ key: string; label: string }>
+    const m = new Map<string, string>()
+    for (const s of seg) {
+      if (!m.has(s.subject_key)) m.set(s.subject_key, s.subject_display)
+    }
+    return Array.from(m.entries()).map(([key, label]) => ({ key, label }))
+  }, [data?.segmentation])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -36,6 +66,9 @@ export default function AnaliticaColegioPage() {
     try {
       const qs = new URLSearchParams()
       if (examType.trim()) qs.set("exam_type", examType.trim())
+      if (subjectFilter.trim()) qs.set("subject", subjectFilter.trim())
+      if (instrumentFamily) qs.set("instrument_family", instrumentFamily)
+      if (courseFilter.trim()) qs.set("course", courseFilter.trim())
       const res = await fetch(`/api/dashboard/direccion/school-pedagogy?${qs}`, { cache: "no-store" })
       const j = (await res.json()) as Payload
       if (!res.ok) {
@@ -50,7 +83,7 @@ export default function AnaliticaColegioPage() {
     } finally {
       setLoading(false)
     }
-  }, [examType])
+  }, [examType, subjectFilter, instrumentFamily, courseFilter])
 
   useEffect(() => {
     void load()
@@ -77,18 +110,43 @@ export default function AnaliticaColegioPage() {
 
       <div className="flex flex-wrap items-center gap-3 text-sm">
         <label className="flex items-center gap-2">
-          <span className="text-[var(--text-muted)]">exam_type</span>
+          <span className="text-[var(--text-muted)]">Asignatura</span>
+          <input
+            list="colegio-subject-options"
+            className="rounded-md border border-slate-300 bg-white px-2 py-1.5 min-w-[9rem]"
+            value={subjectFilter}
+            onChange={(e) => setSubjectFilter(e.target.value)}
+            placeholder="Ej. Lenguaje"
+          />
+          <datalist id="colegio-subject-options">
+            {subjectOptions.map((o) => (
+              <option key={o.key} value={o.label} />
+            ))}
+          </datalist>
+        </label>
+        <label className="flex items-center gap-2">
+          <span className="text-[var(--text-muted)]">Familia</span>
           <select
             className="rounded-md border border-slate-300 bg-white px-2 py-1.5"
-            value={examType}
-            onChange={(e) => setExamType(e.target.value)}
+            value={instrumentFamily}
+            onChange={(e) =>
+              setInstrumentFamily(e.target.value as "" | "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER")
+            }
           >
-            {EXAM_TYPE_FILTER_OPTIONS.map((o) => (
-              <option key={o.value || "all"} value={o.value}>
-                {o.label}
-              </option>
-            ))}
+            <option value="">— Elegir —</option>
+            <option value="SIMCE">SIMCE</option>
+            <option value="PAES">PAES</option>
+            <option value="INSTITUTIONAL_OTHER">Internas</option>
           </select>
+        </label>
+        <label className="flex items-center gap-2">
+          <span className="text-[var(--text-muted)]">Curso (opc.)</span>
+          <input
+            className="rounded-md border border-slate-300 bg-white px-2 py-1.5 w-36"
+            value={courseFilter}
+            onChange={(e) => setCourseFilter(e.target.value)}
+            placeholder="Etiqueta o id"
+          />
         </label>
         <button
           type="button"
@@ -98,6 +156,27 @@ export default function AnaliticaColegioPage() {
           Actualizar
         </button>
       </div>
+      <details className="text-sm border border-slate-200 rounded-md bg-slate-50/80 px-3 py-2 max-w-3xl">
+        <summary className="cursor-pointer font-medium text-slate-700">Filtros avanzados (exam_type legado)</summary>
+        <p className="text-xs text-[var(--text-muted)] mt-2 mb-2">
+          La familia del instrumento (SIMCE / PAES / internas) se resuelve con las etiquetas canónicas de cada evaluación.
+          Use exam_type solo si necesita acotar por valor crudo almacenado; no sustituye a la familia.
+        </p>
+        <label className="inline-flex items-center gap-2">
+          <span className="text-[var(--text-muted)]">exam_type</span>
+          <select
+            className="rounded-md border border-slate-300 bg-white px-2 py-1.5"
+            value={examType}
+            onChange={(e) => setExamType(e.target.value)}
+          >
+            {EXAM_TYPE_FILTER_OPTIONS_WITH_NATIONAL.map((o) => (
+              <option key={o.value || "all"} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </details>
 
       {loading && <p className="text-sm text-[var(--text-muted)]">Cargando…</p>}
       {error && <p className="text-sm text-red-600">{error}</p>}
@@ -117,7 +196,50 @@ export default function AnaliticaColegioPage() {
                 <strong>Filtro exam_type:</strong> {data.exam_type_filter}
               </p>
             ) : null}
+            {data.course_filter ? (
+              <p>
+                <strong>Filtro curso:</strong> {data.course_filter}
+              </p>
+            ) : null}
+            {data.status_reason === "requires_subject_and_instrument_family" ? (
+              <p className="text-amber-800">
+                Hay más de un bloque SIMCE o PAES por asignatura, o solo segmentos internos sin elegir. Elija{" "}
+                <strong>asignatura</strong> y <strong>familia</strong> arriba para ver habilidades agregadas sin mezclar
+                SIMCE, PAES ni internas.
+              </p>
+            ) : null}
+            {data.segment_auto_selected ? (
+              <p className="text-slate-600">
+                Vista aplicada automáticamente para un segmento determinado ({data.subject_filter ?? "—"} ·{" "}
+                {data.instrument_family_filter ?? "—"}). Incluye el caso de un único bloque SIMCE o PAES aunque existan
+                otras evaluaciones internas en el colegio.
+              </p>
+            ) : null}
           </div>
+
+          {data.segmentation && data.segmentation.length > 1 ? (
+            <div className="rounded-xl border border-[var(--border-color)] bg-white p-4 shadow-sm overflow-x-auto text-sm">
+              <h2 className="font-semibold mb-2">Segmentos detectados (sin mezclar)</h2>
+              <table className="min-w-full">
+                <thead>
+                  <tr className="bg-slate-50 border-b text-left">
+                    <th className="px-3 py-2">Asignatura</th>
+                    <th className="px-3 py-2">Familia</th>
+                    <th className="px-3 py-2 text-right">Evaluaciones</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.segmentation.map((s, i) => (
+                    <tr key={`${s.subject_key}-${s.instrument_family}-${i}`} className="border-t border-slate-100">
+                      <td className="px-3 py-2">{s.subject_display}</td>
+                      <td className="px-3 py-2">{s.instrument_family}</td>
+                      <td className="px-3 py-2 text-right">{s.evaluation_count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
 
           <article className="rounded-xl border border-indigo-200 bg-indigo-50/40 p-4 shadow-sm">
             <h2 className="font-semibold text-indigo-950 mb-2">Análisis IA (UTP)</h2>

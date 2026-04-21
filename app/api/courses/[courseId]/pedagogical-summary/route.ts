@@ -27,7 +27,18 @@ import {
   simceLevelFromLogroPct,
   type SimceLevel,
 } from "@/app/lib/standard-scale-converters"
-import { getInstrumentAnalyticsModeFromEvaluationTags, type InstrumentAnalyticsMode } from "@/app/lib/assessment-category"
+import {
+  evaluationMatchesExamTypeQueryParam,
+  getInstrumentAnalyticsModeFromEvaluationTags,
+  type InstrumentAnalyticsMode,
+} from "@/app/lib/assessment-category"
+import {
+  buildSegmentBuckets,
+  evalMatchesSubjectAndFamily,
+  parseInstrumentFamilyQueryParam,
+  resolveInstitutionalScope,
+  type EvalTagRow,
+} from "@/app/lib/pedagogy-segment-filters"
 import { buildCourseQualityMetrics } from "@/app/lib/pedagogical-intelligence/metrics"
 import type { CourseStudentMetricInput } from "@/app/lib/pedagogical-intelligence/types"
 import type { SupabaseClient } from "@supabase/supabase-js"
@@ -50,6 +61,8 @@ type StatusReason =
   | "no_evaluations_in_course"
   | "evaluations_found_but_none_associated"
   | "evaluations_associated_but_no_items"
+  | "requires_subject_and_instrument_family"
+  | "no_evaluations_for_segment"
 
 type NationalAnalyticsRow = {
   evaluation_id: string
@@ -255,9 +268,11 @@ function computeCourseItemAnalysis(params: {
 function dominantSubjectFromEvaluations(evals: Array<{ subject?: string | null }>): string {
   const m = new Map<string, number>()
   for (const e of evals) {
-    const s = String(e.subject ?? "").trim() || "Lenguaje"
+    const s = String(e.subject ?? "").trim()
+    if (!s) continue
     m.set(s, (m.get(s) ?? 0) + 1)
   }
+  if (m.size === 0) return "Lenguaje"
   let best = "Lenguaje"
   let c = 0
   for (const [k, v] of m) {
@@ -613,7 +628,7 @@ export async function GET(
 
   let evaluationsQuery = supabase
     .from("evaluations")
-    .select("id, course_id, course_label, exam_type, assessment_category, subject, school_id")
+    .select("id, course_id, course_label, exam_type, assessment_category, subject, school_id, source_exam_id")
     .order("evaluated_at", { ascending: false })
   if (canViewSchoolScope && schoolId) {
     evaluationsQuery = evaluationsQuery.eq("school_id", schoolId)
@@ -634,6 +649,7 @@ export async function GET(
     assessment_category?: string | null
     subject?: string | null
     school_id?: string | null
+    source_exam_id?: string | null
   }>
   const normalizeCourseKey = (v: unknown): string =>
     String(v ?? "")
@@ -658,16 +674,6 @@ export async function GET(
       ? filtered
       : all.filter((e) => e.course_id == null || String(e.course_id).trim() === "")
 
-  const examTypeParam = req.nextUrl.searchParams.get("exam_type")?.trim() ?? ""
-  const examNorm = examTypeParam.toLowerCase()
-  const courseEvalsForSummary = examNorm
-    ? filteredWithUrlFallback.filter(
-        (e) => String(e.exam_type ?? "").trim().toLowerCase() === examNorm
-      )
-    : filteredWithUrlFallback
-
-  const evaluationIds = courseEvalsForSummary.map((e) => e.id)
-  const subjectModes = dominantSubjectFromEvaluations(courseEvalsForSummary)
   const emptyNationalAnalytics = {
     enabled: ENABLE_NATIONAL_ANALYTICS,
     by_evaluation: [] as NationalAnalyticsRow[],
@@ -683,25 +689,162 @@ export async function GET(
       } as Record<SimceLevel, number>,
     },
   }
-  const analyticsModeByEval = courseEvalsForSummary.map((e) =>
-    getInstrumentAnalyticsModeFromEvaluationTags(e.exam_type, e.assessment_category),
-  )
-  const analyticsMode: ExamMode =
-    analyticsModeByEval.filter((m) => m === "PAES").length >=
-    analyticsModeByEval.filter((m) => m === "SIMCE").length
-      ? "PAES"
-      : "SIMCE"
+
+  const examTypeParam = req.nextUrl.searchParams.get("exam_type")?.trim() ?? ""
+
+  const sourceExamIds = [
+    ...new Set(
+      filteredWithUrlFallback
+        .map((e) => String(e.source_exam_id ?? "").trim())
+        .filter((id) => id.length > 0),
+    ),
+  ]
+  const sourceSubjectById = new Map<string, string>()
+  if (sourceExamIds.length > 0) {
+    const { data: srcRows, error: srcErr } = await supabase
+      .from("source_exams")
+      .select("id, subject")
+      .in("id", sourceExamIds)
+    if (!srcErr && srcRows) {
+      for (const r of srcRows as Array<{ id: string; subject?: string | null }>) {
+        const subj = String(r.subject ?? "").trim()
+        if (subj) sourceSubjectById.set(String(r.id), subj)
+      }
+    }
+  }
+
+  let evalsForScope = filteredWithUrlFallback.map((e) => {
+    const fromEval = String(e.subject ?? "").trim()
+    const seId = String(e.source_exam_id ?? "").trim()
+    const fromSrc = seId ? sourceSubjectById.get(seId) : undefined
+    const merged = fromEval || (fromSrc ? String(fromSrc).trim() : "") || null
+    return { ...e, subject: merged }
+  })
+
+  if (examTypeParam) {
+    evalsForScope = evalsForScope.filter((e) =>
+      evaluationMatchesExamTypeQueryParam(e.exam_type, e.assessment_category, examTypeParam),
+    )
+  }
+
+  const segments = buildSegmentBuckets(evalsForScope as EvalTagRow[])
+  const subjectParamRaw = req.nextUrl.searchParams.get("subject")?.trim() ?? ""
+  const familyFromQuery = parseInstrumentFamilyQueryParam(req.nextUrl.searchParams.get("instrument_family"))
+  const familyFromLegacyExam =
+    familyFromQuery == null && examTypeParam
+      ? getInstrumentAnalyticsModeFromEvaluationTags(examTypeParam, null)
+      : null
+  const effectiveFamily = familyFromQuery ?? familyFromLegacyExam
+
+  const scope = resolveInstitutionalScope({
+    segments,
+    subjectParam: subjectParamRaw,
+    familyParam: effectiveFamily,
+  })
+
+  const ambiguousAutoSinAsignatura =
+    scope.mode === "full" &&
+    scope.auto_selected &&
+    scope.subject_key === "sin_asignatura" &&
+    evalsForScope.length >= 2
+
+  if (ambiguousAutoSinAsignatura) {
+    return NextResponse.json(
+      {
+        course: normalizedCourse,
+        segmentation: segments,
+        segment_auto_selected: false,
+        subject_filter: null,
+        instrument_family_filter: null,
+        summary_available: false,
+        status_reason: "requires_subject_and_instrument_family" as StatusReason,
+        evaluation_count: 0,
+        evaluation_count_total: evalsForScope.length,
+        evaluation_count_with_source_exam: 0,
+        evaluation_count_analyzable: 0,
+        evaluation_count_without_source_exam: 0,
+        evaluation_count_without_items: 0,
+        student_count: 0,
+        by_axis: [],
+        by_skill: [],
+        by_cognitive_level: [],
+        weakest_skills: [],
+        weakest_axes: [],
+        most_failed_questions: [],
+        question_heat_map: [],
+        item_analysis_course: [],
+        analytics_mode: "INSTITUTIONAL_OTHER" as ExamMode,
+        national_analytics: emptyNationalAnalytics,
+        exam_type_filter: examTypeParam || null,
+        chile_agency_cuts_note:
+          "Nivel de logro (Agencia / estándar porcentual): <50% Insuficiente · 50–69% Elemental · ≥70% Adecuado.",
+      },
+      { status: 200, headers: { "Cache-Control": "no-store" } },
+    )
+  }
+
+  if (scope.mode === "segmentation_only" && evalsForScope.length > 0) {
+    return NextResponse.json(
+      {
+        course: normalizedCourse,
+        segmentation: segments,
+        segment_auto_selected: false,
+        subject_filter: null,
+        instrument_family_filter: null,
+        summary_available: false,
+        status_reason: "requires_subject_and_instrument_family" as StatusReason,
+        evaluation_count: 0,
+        evaluation_count_total: evalsForScope.length,
+        evaluation_count_with_source_exam: 0,
+        evaluation_count_analyzable: 0,
+        evaluation_count_without_source_exam: 0,
+        evaluation_count_without_items: 0,
+        student_count: 0,
+        by_axis: [],
+        by_skill: [],
+        by_cognitive_level: [],
+        weakest_skills: [],
+        weakest_axes: [],
+        most_failed_questions: [],
+        question_heat_map: [],
+        item_analysis_course: [],
+        analytics_mode: "INSTITUTIONAL_OTHER" as ExamMode,
+        national_analytics: emptyNationalAnalytics,
+        exam_type_filter: examTypeParam || null,
+        chile_agency_cuts_note:
+          "Nivel de logro (Agencia / estándar porcentual): <50% Insuficiente · 50–69% Elemental · ≥70% Adecuado.",
+      },
+      { status: 200, headers: { "Cache-Control": "no-store" } },
+    )
+  }
+
+  const courseEvalsForSummary =
+    scope.mode === "full"
+      ? evalsForScope.filter((e) =>
+          evalMatchesSubjectAndFamily(e as EvalTagRow, scope.subject_key, scope.family),
+        )
+      : []
+
+  const evaluationIds = courseEvalsForSummary.map((e) => e.id)
+  const subjectModes = dominantSubjectFromEvaluations(courseEvalsForSummary)
+  const analyticsMode: ExamMode = scope.mode === "full" ? scope.family : "INSTITUTIONAL_OTHER"
   if (evaluationIds.length === 0) {
+    const emptyReason: StatusReason =
+      evalsForScope.length === 0 ? "no_evaluations_in_course" : "no_evaluations_for_segment"
     const payload = {
       course: normalizedCourse,
+      segmentation: segments,
+      segment_auto_selected: scope.mode === "full" ? scope.auto_selected : false,
+      subject_filter: scope.mode === "full" ? scope.subject_key : null,
+      instrument_family_filter: scope.mode === "full" ? scope.family : null,
       evaluation_count: 0,
-      evaluation_count_total: 0,
+      evaluation_count_total: evalsForScope.length,
       evaluation_count_with_source_exam: 0,
       evaluation_count_analyzable: 0,
       evaluation_count_without_source_exam: 0,
       evaluation_count_without_items: 0,
       summary_available: false,
-      status_reason: "no_evaluations_in_course" as StatusReason,
+      status_reason: emptyReason,
       student_count: 0,
       by_axis: [],
       by_skill: [],
@@ -714,6 +857,8 @@ export async function GET(
       analytics_mode: analyticsMode,
       national_analytics: emptyNationalAnalytics,
       exam_type_filter: examTypeParam || null,
+      chile_agency_cuts_note:
+        "Nivel de logro (Agencia / estándar porcentual): <50% Insuficiente · 50–69% Elemental · ≥70% Adecuado.",
     }
     if (isDev) console.info("[pedagogical-summary]", { courseId, normalizedCourse, ...payload })
     return NextResponse.json(payload, { status: 200, headers: { "Cache-Control": "no-store" } })
@@ -1051,6 +1196,10 @@ export async function GET(
   return NextResponse.json(
     {
       course: normalizedCourse,
+      segmentation: segments,
+      segment_auto_selected: scope.mode === "full" ? scope.auto_selected : false,
+      subject_filter: scope.mode === "full" ? scope.subject_key : null,
+      instrument_family_filter: scope.mode === "full" ? scope.family : null,
       evaluation_count: courseSummary.evaluation_count,
       evaluation_count_total,
       evaluation_count_with_source_exam,

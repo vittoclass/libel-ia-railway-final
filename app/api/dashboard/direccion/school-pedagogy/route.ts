@@ -16,6 +16,17 @@ import type { ChileAgencyAchievementLevel } from "@/app/lib/chile-standards/agen
 import { agencyAchievementLevelFromLogroPct } from "@/app/lib/chile-standards/agency-level-cuts"
 import { resolveChileMinisterialSkillCode } from "@/app/lib/chile-standards/evaluation-dictionary"
 import { canonicalPedagogicalSkillDisplayLabel } from "@/app/lib/analyze-learning-results"
+import {
+  evaluationMatchesExamTypeQueryParam,
+  getInstrumentAnalyticsModeFromEvaluationTags,
+} from "@/app/lib/assessment-category"
+import {
+  buildSegmentBuckets,
+  evalMatchesSubjectAndFamily,
+  parseInstrumentFamilyQueryParam,
+  resolveInstitutionalScope,
+  type EvalTagRow,
+} from "@/app/lib/pedagogy-segment-filters"
 
 export const dynamic = "force-dynamic"
 
@@ -36,6 +47,14 @@ function jsonNoStore(data: unknown, init?: { status?: number }) {
 function isPlaceholderSchoolId(v: string): boolean {
   const s = String(v ?? "").trim().toLowerCase()
   return s === "00000000-0000-0000-0000-000000000000" || s === "0"
+}
+
+function normalizeCourseKey(v: unknown): string {
+  return String(v ?? "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
 }
 
 export async function GET(req: NextRequest) {
@@ -72,13 +91,14 @@ export async function GET(req: NextRequest) {
   }
 
   const examTypeParam = req.nextUrl.searchParams.get("exam_type")?.trim() ?? ""
-  const examNorm = examTypeParam.toLowerCase()
   const batchIdParam = req.nextUrl.searchParams.get("batch_id")?.trim() ?? ""
+  const courseParam = req.nextUrl.searchParams.get("course")?.trim() ?? ""
 
   let query = supabase
     .from("evaluations")
-    .select("id, subject, exam_type")
+    .select("id, subject, exam_type, assessment_category, course_id, course_label")
     .eq("school_id", schoolId)
+    .eq("is_archived", false)
     .order("evaluated_at", { ascending: false })
     .limit(800)
   if (batchIdParam) query = query.eq("batch_id", batchIdParam)
@@ -86,17 +106,89 @@ export async function GET(req: NextRequest) {
   const { data: evaluations, error: evErr } = await query
   if (evErr) return jsonNoStore({ error: evErr.message }, { status: 500 })
 
-  const evRows = (evaluations ?? []) as Array<{ id: string; subject?: string | null; exam_type?: string | null }>
-  const filteredEvals = examNorm
-    ? evRows.filter((e) => String(e.exam_type ?? "").trim().toLowerCase() === examNorm)
-    : evRows
-  const evaluationIds = filteredEvals.map((e) => String(e.id)).filter(Boolean)
-  if (evaluationIds.length === 0) {
+  const evRows = (evaluations ?? []) as Array<{
+    id: string
+    subject?: string | null
+    exam_type?: string | null
+    assessment_category?: string | null
+    course_id?: string | null
+    course_label?: string | null
+  }>
+
+  let evFiltered = evRows
+  if (courseParam) {
+    const ck = normalizeCourseKey(courseParam)
+    evFiltered = evFiltered.filter(
+      (e) =>
+        normalizeCourseKey(e.course_id) === ck ||
+        (e.course_label != null && normalizeCourseKey(e.course_label) === ck),
+    )
+  }
+  if (examTypeParam) {
+    evFiltered = evFiltered.filter((e) =>
+      evaluationMatchesExamTypeQueryParam(e.exam_type, e.assessment_category, examTypeParam),
+    )
+  }
+
+  const segments = buildSegmentBuckets(evFiltered as EvalTagRow[])
+  const subjectParamRaw = req.nextUrl.searchParams.get("subject")?.trim() ?? ""
+  const familyFromQuery = parseInstrumentFamilyQueryParam(req.nextUrl.searchParams.get("instrument_family"))
+  const familyFromLegacyExam =
+    familyFromQuery == null && examTypeParam
+      ? getInstrumentAnalyticsModeFromEvaluationTags(examTypeParam, null)
+      : null
+  const effectiveFamily = familyFromQuery ?? familyFromLegacyExam
+
+  const scope = resolveInstitutionalScope({
+    segments,
+    subjectParam: subjectParamRaw,
+    familyParam: effectiveFamily,
+    autoSelectSingleNationalAmongMixed: true,
+  })
+
+  if (scope.mode === "segmentation_only" && evFiltered.length > 0) {
     return jsonNoStore({
       school_id: schoolId,
+      summary_available: false,
+      status_reason: "requires_subject_and_instrument_family",
+      segmentation: segments,
+      segment_auto_selected: false,
+      subject_filter: null,
+      instrument_family_filter: null,
       evaluation_count: 0,
+      evaluation_count_total: evFiltered.length,
       exam_type_filter: examTypeParam || null,
       batch_id_filter: batchIdParam || null,
+      course_filter: courseParam || null,
+      by_skill: [] as SchoolSkillAggregateRow[],
+      analisis_utp: buildSchoolExecutiveNarrative({ school_id: schoolId, evaluation_count: 0, skill_rows: [] }),
+    })
+  }
+
+  const filteredEvals =
+    scope.mode === "full"
+      ? evFiltered.filter((e) =>
+          evalMatchesSubjectAndFamily(e as EvalTagRow, scope.subject_key, scope.family),
+        )
+      : []
+
+  const evaluationIds = filteredEvals.map((e) => String(e.id)).filter(Boolean)
+  if (evaluationIds.length === 0) {
+    const emptyReason =
+      evFiltered.length === 0 ? "no_evaluations_in_course" : "no_evaluations_for_segment"
+    return jsonNoStore({
+      school_id: schoolId,
+      summary_available: false,
+      status_reason: emptyReason,
+      segmentation: segments,
+      segment_auto_selected: scope.mode === "full" ? scope.auto_selected : false,
+      subject_filter: scope.mode === "full" ? scope.subject_key : null,
+      instrument_family_filter: scope.mode === "full" ? scope.family : null,
+      evaluation_count: 0,
+      evaluation_count_total: evFiltered.length,
+      exam_type_filter: examTypeParam || null,
+      batch_id_filter: batchIdParam || null,
+      course_filter: courseParam || null,
       by_skill: [] as SchoolSkillAggregateRow[],
       analisis_utp: buildSchoolExecutiveNarrative({ school_id: schoolId, evaluation_count: 0, skill_rows: [] }),
     })
@@ -200,9 +292,17 @@ export async function GET(req: NextRequest) {
 
   return jsonNoStore({
     school_id: schoolId,
+    summary_available: true,
+    status_reason: "ok",
+    segmentation: segments,
+    segment_auto_selected: scope.mode === "full" ? scope.auto_selected : false,
+    subject_filter: scope.mode === "full" ? scope.subject_key : null,
+    instrument_family_filter: scope.mode === "full" ? scope.family : null,
     evaluation_count: filteredEvals.length,
+    evaluation_count_total: evFiltered.length,
     exam_type_filter: examTypeParam || null,
     batch_id_filter: batchIdParam || null,
+    course_filter: courseParam || null,
     skill_result_rows: rows.length,
     by_skill,
     analisis_utp,

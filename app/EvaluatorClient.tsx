@@ -98,6 +98,16 @@ import {
   buildPedagogicalResumenFromGroup,
   countAlternativasSummary,
 } from "@/app/lib/pedagogical-feedback-from-group"
+import {
+  buildCorrectionReportGroupFromApiDetail,
+  MAX_CORRECTION_REPORTS_ZIP_PHASE1,
+  sanitizeCorrectionZipPart,
+  type CorrectionReportGroupForPdf,
+  type EvaluationDetailJsonForCorrectionZip,
+} from "@/app/lib/correction-report-from-evaluation-detail"
+import JSZip from "jszip"
+import { saveAs } from "file-saver"
+import { Progress } from "@/components/ui/progress"
 import OMRPreviewModal from "@/app/components/OMRPreviewModal"
 import AnswerKeyUploadModal from "../components/AnswerKeyUploadModal"
 import { RealtimeOMRModal } from "@/app/components/RealtimeOMRModal"
@@ -106,7 +116,9 @@ import { OMRSheetGeneratorModal } from "@/app/components/OMRSheetGeneratorModal"
 import { RobustLibeliaOMRModal } from "@/app/components/RobustLibeliaOMRModal"
 import ClosedAnswerOMRModal from "@/app/components/ClosedAnswerOMRModal"
 import DevAdminPanel from "@/app/components/DevAdminPanel"
+import { INTERNAL_SUPPORT_UI } from "@/app/lib/internal-support-ui"
 import { normalizeRutCanonical } from "@/app/lib/student-identity/rut"
+import { formatStudentDisplayName } from "@/app/lib/format-student-name"
 import {
   BATCH_PHOTO_ACTIVITY_CHANNEL,
   DOCENTE_ACTIVE_BATCH_ID_KEY,
@@ -510,7 +522,8 @@ const ReportDocument = ({ group, formData, logoPreview }: any) => {
           </View>
         </View>
         <Text style={styles.studentLine}>
-          Alumno: {pdfSafe(group.studentName)} · {cursoLabel}: {pdfSafe(formData.curso || "N/A")}
+          Alumno: {pdfSafe(formatStudentDisplayName(group.studentName))} · {cursoLabel}:{" "}
+          {pdfSafe(formData.curso || "N/A")}
         </Text>
         <View style={{ flexDirection: "row", gap: 6, marginTop: 6 }}>
           <View
@@ -1126,6 +1139,19 @@ interface StudentGroup {
   omrDebug?: any
 }
 
+/**
+ * Indica si el `StudentGroup` en memoria trae el mismo payload que usa «Descargar PDF»
+ * (`ReportDocument`). Si es true, el ZIP puede generar el PDF idéntico sin GET a la API.
+ */
+function studentGroupHasLocalPedagogicalReportPayload(g: StudentGroup): boolean {
+  if (!g.isEvaluated || g.error) return false
+  if (g.retroalimentacion != null) return true
+  const hasPuntaje = typeof g.puntaje === "string" && g.puntaje.includes("/")
+  const hasAlts = Array.isArray(g.alternativas_corregidas) && g.alternativas_corregidas.length > 0
+  const hasDev = g.detalle_desarrollo != null && Object.keys(g.detalle_desarrollo).length > 0
+  return hasPuntaje && (hasAlts || hasDev)
+}
+
 type MobileBatchPlacement = {
   preview: FilePreview
   student_index: number | null
@@ -1463,6 +1489,13 @@ export default function EvaluatorClient() {
   const [batchUtpObservations, setBatchUtpObservations] = useState<string | null>(null)
   const [submitBatchUtpLoading, setSubmitBatchUtpLoading] = useState(false)
   const [studentGroups, setStudentGroups] = useState<StudentGroup[]>([])
+  /** ZIP informes de corrección (Fase 1, solo cliente + GET /api/evaluations/[id]). */
+  const [correctionReportsZipBusy, setCorrectionReportsZipBusy] = useState(false)
+  const [correctionReportsZipProgress, setCorrectionReportsZipProgress] = useState<{
+    current: number
+    total: number
+    label: string
+  } | null>(null)
 
   useEffect(() => {
     const bid = evaluationBatchIdUi
@@ -2361,7 +2394,7 @@ export default function EvaluatorClient() {
     loadEvaluationsList()
   }, [activeTab, loadEvaluationsList])
   useEffect(() => {
-    if (process.env.NODE_ENV !== "production" && activeTab === "evaluaciones" && evaluacionesList.length >= 0) {
+    if (INTERNAL_SUPPORT_UI && activeTab === "evaluaciones" && evaluacionesList.length >= 0) {
       const rows = evaluacionesList.map((e) => ({
         id: e.id,
         status: e.status ?? null,
@@ -4020,7 +4053,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           })
           return [
             "<tr>",
-            "<td>" + escHtml(g.studentName || "N/A") + "</td>",
+            "<td>" + escHtml(formatStudentDisplayName(g.studentName) || "N/A") + "</td>",
             "<td>" + escHtml(String(g.puntaje || "N/A")) + "</td>",
             "<td>" + escHtml(String(g.nota ?? "N/A")) + "</td>",
             "<td>" + escHtml(rp.fortalezas || "N/A").replace(/\n/g, "<br>") + "</td>",
@@ -4068,6 +4101,200 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       setPreviewGroupId(groupId)
     }
   }
+
+  const handleDownloadCorrectionReportsZip = async () => {
+    const eligible = studentGroups.filter(
+      (g): g is StudentGroup & { evaluation_id: string } =>
+        Boolean(g.isEvaluated && !g.error && typeof g.evaluation_id === "string" && g.evaluation_id.trim() !== ""),
+    )
+    const evaluatedNoId = studentGroups.filter((g) => g.isEvaluated && !g.error && !g.evaluation_id).length
+
+    if (eligible.length === 0) {
+      toast({
+        variant: "destructive",
+        title: "No hay informes persistidos",
+        description:
+          "Solo se empaquetan evaluaciones ya guardadas con evaluation_id. Corrija o guarde las que falten.",
+      })
+      return
+    }
+
+    if (eligible.length > MAX_CORRECTION_REPORTS_ZIP_PHASE1) {
+      toast({
+        variant: "destructive",
+        title: "Demasiados estudiantes (fase 1)",
+        description: `Límite prudente: ${MAX_CORRECTION_REPORTS_ZIP_PHASE1} informes por ZIP en el navegador. Hay ${eligible.length} elegibles. Descargue por partes o reduzca el lote.`,
+      })
+      return
+    }
+
+    setCorrectionReportsZipBusy(true)
+    setCorrectionReportsZipProgress({ current: 0, total: eligible.length, label: "Iniciando…" })
+
+    const formValues = form.getValues()
+    const zip = new JSZip()
+    const folder = zip.folder("Informes_Evaluacion_Pedagogica")
+    if (!folder) {
+      setCorrectionReportsZipBusy(false)
+      setCorrectionReportsZipProgress(null)
+      toast({ variant: "destructive", title: "ZIP", description: "No se pudo crear la carpeta interna del ZIP." })
+      return
+    }
+
+    const failures: string[] = []
+    const warningsAll: string[] = []
+    let pdfFromApiCount = 0
+
+    for (let i = 0; i < eligible.length; i++) {
+      const g = eligible[i]!
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+      try {
+        let groupForPdf: StudentGroup | CorrectionReportGroupForPdf = g
+
+        if (studentGroupHasLocalPedagogicalReportPayload(g)) {
+          setCorrectionReportsZipProgress({
+            current: i,
+            total: eligible.length,
+            label: `PDF (mismo informe que en sesión): ${formatStudentDisplayName(g.studentName) || g.studentName || "N/A"}`,
+          })
+          groupForPdf = g
+        } else {
+          setCorrectionReportsZipProgress({
+            current: i,
+            total: eligible.length,
+            label: `Cargando persistido (API): ${formatStudentDisplayName(g.studentName) || g.studentName || "N/A"}`,
+          })
+          const res = await fetch(`/api/evaluations/${encodeURIComponent(g.evaluation_id)}`, {
+            credentials: "include",
+            cache: "no-store",
+          })
+          const j = (await res.json()) as Record<string, unknown>
+          if (!res.ok) {
+            const err =
+              typeof j.error === "string"
+                ? j.error
+                : typeof j.message === "string"
+                  ? j.message
+                  : `HTTP ${res.status}`
+            failures.push(`${formatStudentDisplayName(g.studentName) || g.studentName || "Estudiante"}: ${err}`)
+            continue
+          }
+
+          const built = buildCorrectionReportGroupFromApiDetail(j as EvaluationDetailJsonForCorrectionZip)
+          if (!built.ok) {
+            failures.push(`${formatStudentDisplayName(g.studentName) || g.studentName || "Estudiante"}: ${built.error}`)
+            continue
+          }
+          for (const w of built.warnings)
+            warningsAll.push(`${formatStudentDisplayName(g.studentName) || g.studentName || "Estudiante"}: ${w}`)
+          pdfFromApiCount++
+          groupForPdf = built.group
+        }
+
+        setCorrectionReportsZipProgress({
+          current: i,
+          total: eligible.length,
+          label: `Generando PDF: ${formatStudentDisplayName(g.studentName) || g.studentName || "N/A"}`,
+        })
+
+        const docEl = <ReportDocument group={groupForPdf} formData={formValues} logoPreview={logoPreview} />
+        const blob = await pdf(docEl).toBlob()
+        if (!blob || blob.size === 0) {
+          failures.push(`${formatStudentDisplayName(g.studentName) || g.studentName || "Estudiante"}: PDF vacío`)
+          continue
+        }
+
+        const shortId = g.evaluation_id.replace(/-/g, "").slice(0, 8)
+        const namePart = sanitizeCorrectionZipPart(formatStudentDisplayName(g.studentName) || g.studentName, "Estudiante")
+        const fileName = `${sanitizeCorrectionZipPart(`${namePart}_${shortId}`, "informe")}.pdf`
+        folder.file(fileName, await blob.arrayBuffer())
+
+        setCorrectionReportsZipProgress({
+          current: i + 1,
+          total: eligible.length,
+          label: `Listo: ${formatStudentDisplayName(g.studentName) || g.studentName || "N/A"}`,
+        })
+      } catch (e) {
+        failures.push(
+          `${formatStudentDisplayName(g.studentName) || g.studentName || "Estudiante"}: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+    }
+
+    setCorrectionReportsZipProgress({
+      current: eligible.length,
+      total: eligible.length,
+      label: "Comprimiendo…",
+    })
+
+    const successful = eligible.length - failures.length
+    if (successful === 0) {
+      setCorrectionReportsZipBusy(false)
+      setCorrectionReportsZipProgress(null)
+      toast({
+        variant: "destructive",
+        title: "No se generó el ZIP",
+        description:
+          failures.slice(0, 6).join("\n") + (failures.length > 6 ? `\n…y ${failures.length - 6} más.` : ""),
+      })
+      return
+    }
+
+    try {
+      const out = await zip.generateAsync({ type: "blob", compression: "DEFLATE" })
+      const titlePart = sanitizeCorrectionZipPart(formValues.nombrePrueba || "Evaluacion", "Evaluacion")
+      const zipName = `${titlePart}_InformesEstudiantes_PDF_${format(new Date(), "yyyyMMdd_HHmm")}.zip`
+      try {
+        saveAs(out, zipName)
+      } catch (saveErr) {
+        const url = URL.createObjectURL(out)
+        try {
+          const a = document.createElement("a")
+          a.href = url
+          a.download = zipName
+          a.rel = "noopener"
+          a.style.display = "none"
+          document.body.appendChild(a)
+          a.click()
+          document.body.removeChild(a)
+        } finally {
+          URL.revokeObjectURL(url)
+        }
+        if (process.env.NODE_ENV !== "production") console.warn("[correctionZIP] saveAs fallback:", saveErr)
+      }
+
+      const descParts: string[] = [`En el ZIP: ${successful} de ${eligible.length} PDF(s) (mismo informe que «Descargar PDF»).`]
+      if (pdfFromApiCount > 0) {
+        descParts.push(`${pdfFromApiCount} reconstruido(s) desde API (faltaban datos mínimos en esta pantalla).`)
+      } else if (successful > 0 && failures.length === 0) {
+        descParts.push("Fuente: datos de la sesión actual (mismo objeto que el PDF individual).")
+      }
+      if (evaluatedNoId > 0) {
+        descParts.push(`${evaluatedNoId} evaluado(s) sin evaluation_id no se incluyeron.`)
+      }
+      if (failures.length > 0) {
+        descParts.push(`Omitidos por error: ${failures.length}. Ej.: ${failures.slice(0, 2).join("; ")}`)
+      }
+      if (warningsAll.length > 0) {
+        descParts.push(`Avisos: ${warningsAll.slice(0, 2).join(" · ")}${warningsAll.length > 2 ? "…" : ""}`)
+      }
+      toast({
+        title: failures.length > 0 ? "ZIP parcial (revisar avisos)" : "ZIP descargado",
+        description: descParts.join(" "),
+      })
+    } catch (e) {
+      toast({
+        variant: "destructive",
+        title: "Error al comprimir",
+        description: e instanceof Error ? e.message : String(e),
+      })
+    } finally {
+      setCorrectionReportsZipBusy(false)
+      setCorrectionReportsZipProgress(null)
+    }
+  }
+
   const selectedNivel = form.watch("nivelEducativo")
   // ✅ CORRECCIÓN DE PESTAÑAS: Definición para ajustar etiquetas
   const isSuperior = ["Técnico Superior", "Universitario", "Postgrado"].includes(selectedNivel)
@@ -4148,13 +4375,13 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         </div>
       )}
 
-      {process.env.NODE_ENV === "development" && mainProfile && (
+      {INTERNAL_SUPPORT_UI && mainProfile && (
         <div className="mx-4 mb-2 rounded border border-dashed border-[var(--border-color)] bg-[var(--bg-muted)] px-3 py-2 text-xs font-mono text-[var(--text-muted)]">
           <span className="font-semibold">[DEV] Perfil:</span> userId={mainProfile.user?.id ?? "—"} | teacher_id={mainProfile.profile?.teacher_id ?? "null"} | school_id={mainProfile.profile?.school_id ?? "null"}
         </div>
       )}
 
-      {process.env.NODE_ENV === "development" && (
+      {INTERNAL_SUPPORT_UI && (
         <div className="mx-4 mb-2 rounded border border-amber-500/50 bg-[var(--bg-muted)] overflow-hidden">
           <button
             type="button"
@@ -4473,14 +4700,16 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         <div className="pdf-modal-backdrop" role="dialog" aria-modal="true">
           <div className="pdf-modal">
             <div className="pdf-modal-header">
-              <div className="font-semibold">Vista previa del informe — {previewGroup.studentName}</div>
+              <div className="font-semibold">
+                Vista previa del informe — {formatStudentDisplayName(previewGroup.studentName) || previewGroup.studentName}
+              </div>
 
               <div className="pdf-modal-actions">
                 <PDFDownloadLink
                   document={
                     <ReportDocument group={previewGroup} formData={form.getValues()} logoPreview={logoPreview} />
                   }
-                  fileName={`informe_${previewGroup.studentName.replace(/[^a-zA-Z0-9]/g, "_")}.pdf`}
+                  fileName={`informe_${(formatStudentDisplayName(previewGroup.studentName) || previewGroup.studentName).replace(/[^a-zA-Z0-9]/g, "_")}.pdf`}
                 >
                   {({ loading }) => (
                     <Button size="sm" disabled={loading}>
@@ -5253,7 +5482,9 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           className="flex items-center gap-2 w-full text-left px-2 py-2 rounded-lg hover:bg-[var(--bg-muted)] text-sm truncate border border-transparent hover:border-[var(--border-color)]"
                         >
                           {stateIcon}
-                          <span className="truncate">{group.studentName || "Sin nombre"}</span>
+                          <span className="truncate">
+                            {formatStudentDisplayName(group.studentName) || group.studentName || "Sin nombre"}
+                          </span>
                         </button>
                       )
                     })}
@@ -5949,12 +6180,52 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                   <CardHeader>
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <CardTitle className="text-[var(--text-accent)]">Paso 3: Resultados</CardTitle>
-                      {focusedGroupId && (
-                        <Button type="button" variant="outline" size="sm" onClick={() => setFocusedGroupId(null)}>
-                          Ver todos
-                        </Button>
-                      )}
+                      <div className="flex flex-wrap items-center gap-2">
+                        {studentGroups.some(
+                          (g) => g.isEvaluated && !g.error && typeof g.evaluation_id === "string" && g.evaluation_id.trim() !== "",
+                        ) && (
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            size="sm"
+                            disabled={correctionReportsZipBusy}
+                            title={`Mismo PDF que «Descargar PDF» por estudiante (informe de evaluación pedagógica). No es el ZIP pedagógico técnico de curso/lote. Máx. ${MAX_CORRECTION_REPORTS_ZIP_PHASE1} en fase 1. Sin RUT en el nombre del archivo.`}
+                            onClick={() => void handleDownloadCorrectionReportsZip()}
+                          >
+                            {correctionReportsZipBusy ? (
+                              <>
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                Generando ZIP…
+                              </>
+                            ) : (
+                              <>
+                                <FileArchive className="mr-2 h-4 w-4" />
+                                Descargar informes estudiantes (ZIP)
+                              </>
+                            )}
+                          </Button>
+                        )}
+                        {focusedGroupId && (
+                          <Button type="button" variant="outline" size="sm" onClick={() => setFocusedGroupId(null)}>
+                            Ver todos
+                          </Button>
+                        )}
+                      </div>
                     </div>
+                    {correctionReportsZipProgress && correctionReportsZipProgress.total > 0 && (
+                      <div className="mt-3 w-full max-w-md space-y-1">
+                        <Progress
+                          value={Math.min(
+                            100,
+                            Math.round((correctionReportsZipProgress.current / correctionReportsZipProgress.total) * 100),
+                          )}
+                        />
+                        <p className="text-xs text-[var(--text-secondary)]">
+                          {correctionReportsZipProgress.label} · {correctionReportsZipProgress.current}/
+                          {correctionReportsZipProgress.total}
+                        </p>
+                      </div>
+                    )}
                   </CardHeader>
                   <CardContent className="space-y-4">
                     {/* Panorama resumido por estudiante: tarjetas clicables para enfocar el detalle */}
@@ -6006,8 +6277,11 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                                   !isFocused && pendienteEvaluar && !group.error && "border-[var(--border-color)] bg-[var(--bg-card)] hover:border-[var(--text-accent)]/50",
                                 )}
                               >
-                                <p className="font-semibold text-sm truncate text-[var(--text-primary)]" title={group.studentName}>
-                                  {group.studentName || "Sin nombre"}
+                                <p
+                                  className="font-semibold text-sm truncate text-[var(--text-primary)]"
+                                  title={formatStudentDisplayName(group.studentName) || group.studentName}
+                                >
+                                  {formatStudentDisplayName(group.studentName) || group.studentName || "Sin nombre"}
                                 </p>
                                 <p className="text-xs text-[var(--text-secondary)] mt-0.5">
                                   {group.files.length} archivo{group.files.length !== 1 ? "s" : ""}
@@ -6056,7 +6330,10 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         return (
                           <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20 p-4 text-center">
                             <p className="text-[var(--text-primary)] font-medium">
-                              {focusedGroup?.studentName || "Este estudiante"} aún no tiene resultados.
+                              {formatStudentDisplayName(focusedGroup?.studentName) ||
+                                focusedGroup?.studentName ||
+                                "Este estudiante"}{" "}
+                              aún no tiene resultados.
                             </p>
                             <p className="text-sm text-[var(--text-secondary)] mt-1">
                               Evalúa para ver su detalle aquí o revisa en el paso 2.
@@ -6154,7 +6431,9 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                             } bg-[var(--bg-card)] shadow`}
                           >
                             <div className="flex justify-between items-center flex-wrap gap-2">
-                              <h3 className="font-bold text-xl text-[var(--text-accent)]">{group.studentName}</h3>
+                              <h3 className="font-bold text-xl text-[var(--text-accent)]">
+                                {formatStudentDisplayName(group.studentName) || group.studentName}
+                              </h3>
                               {group.isEvaluating && (
                                 <div className="flex items-center text-sm text-[var(--text-secondary)]">
                                   <Loader2
@@ -6178,7 +6457,7 @@ h-4 w-4 animate-spin"
                                         logoPreview={logoPreview}
                                       />
                                     }
-                                    fileName={`informe_${group.studentName.replace(/[^a-zA-Z0-9]/g, "_")}.pdf`}
+                                    fileName={`informe_${(formatStudentDisplayName(group.studentName) || group.studentName).replace(/[^a-zA-Z0-9]/g, "_")}.pdf`}
                                   >
                                     {({ loading }) => (
                                       <Button variant="ghost" size="sm" disabled={loading}>
@@ -6638,7 +6917,7 @@ h-4 w-4 animate-spin"
                                               <ImageMagnifier
                                                 key={idx}
                                                 src={file.previewUrl || "/placeholder.svg"}
-                                                alt={`Prueba ${group.studentName} - Página ${idx + 1}`}
+                                                alt={`Prueba ${formatStudentDisplayName(group.studentName) || group.studentName} - Página ${idx + 1}`}
                                               />
                                             ))}
                                           </div>
@@ -7287,7 +7566,7 @@ h-4 w-4 animate-spin"
                     <RefreshCw className={cn("h-4 w-4 mr-1", evaluacionesListLoading && "animate-spin")} />
                     Recargar
                   </Button>
-                  {process.env.NODE_ENV === "development" && (
+                  {INTERNAL_SUPPORT_UI && (
                     <Button
                       variant="outline"
                       size="sm"
@@ -7298,7 +7577,7 @@ h-4 w-4 animate-spin"
                           const url = lastSavedEvaluationId
                             ? `/api/debug/evaluations/full-check?evaluation_id=${encodeURIComponent(lastSavedEvaluationId)}`
                             : "/api/debug/evaluations/full-check"
-                          const r = await fetch(url)
+                          const r = await fetch(url, { credentials: "include" })
                           const j = await r.json()
                           setDiagnosisResult(j)
                         } catch (e) {
@@ -7337,7 +7616,7 @@ h-4 w-4 animate-spin"
                           >
                             Abrir
                           </Button>
-                      {process.env.NODE_ENV === "development" && (
+                      {INTERNAL_SUPPORT_UI && (
                         <Button
                           variant="outline"
                           size="sm"
@@ -7345,7 +7624,7 @@ h-4 w-4 animate-spin"
                             setDiagnosisResult(null)
                             setDiagnosisOpen(true)
                             try {
-                              const r = await fetch(`/api/debug/evaluations/full-check?evaluation_id=${encodeURIComponent(lastSavedEvaluationId)}`)
+                              const r = await fetch(`/api/debug/evaluations/full-check?evaluation_id=${encodeURIComponent(lastSavedEvaluationId)}`, { credentials: "include" })
                               const j = await r.json()
                               setDiagnosisResult(j)
                             } catch (e) {
@@ -7359,9 +7638,12 @@ h-4 w-4 animate-spin"
                     </>
                   )}
                 </div>
-                <p className="text-sm text-[var(--text-muted)] mb-3">
-                  teacher_id del perfil: {evaluacionesListDebug?.teacher_id_used ?? "—"} | evaluaciones encontradas: {evaluacionesList.length}
-                </p>
+                {INTERNAL_SUPPORT_UI ? (
+                  <p className="text-sm text-[var(--text-muted)] mb-3">
+                    teacher_id del perfil: {evaluacionesListDebug?.teacher_id_used ?? "—"} | evaluaciones encontradas:{" "}
+                    {evaluacionesList.length}
+                  </p>
+                ) : null}
                 {evaluacionesListError && (
                   <div className="mb-3 p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-700 dark:text-red-300 text-sm">
                     Error: {evaluacionesListError}
@@ -7384,7 +7666,7 @@ h-4 w-4 animate-spin"
                         <Button variant="outline" onClick={() => setActiveTab("historial")}>
                           Completar perfil
                         </Button>
-                        {process.env.NODE_ENV !== "production" && (
+                        {INTERNAL_SUPPORT_UI && (
                           <div className="pt-2">
                             <Button
                               variant="outline"
@@ -7392,7 +7674,7 @@ h-4 w-4 animate-spin"
                               className="text-amber-600 border-amber-500/50"
                               onClick={async () => {
                                 setFixTeacherIdResult(null)
-                                const r = await fetch("/api/debug/profile/fix-teacher-id", { method: "POST" })
+                                const r = await fetch("/api/debug/profile/fix-teacher-id", { method: "POST", credentials: "include" })
                                 const j = await r.json()
                                 setFixTeacherIdResult(j)
                                 if (j?.ok) loadEvaluationsList()
@@ -7409,14 +7691,14 @@ h-4 w-4 animate-spin"
                         )}
                       </>
                     )}
-                    {evaluacionesListReason !== "PROFILE_NOT_ONBOARDED" && evaluacionesListDebug?.teacher_id_used && process.env.NODE_ENV !== "production" && (
+                    {evaluacionesListReason !== "PROFILE_NOT_ONBOARDED" && evaluacionesListDebug?.teacher_id_used && INTERNAL_SUPPORT_UI && (
                       <div className="pt-2">
                         <Button
                           variant="outline"
                           size="sm"
                           className="text-amber-600 border-amber-500/50"
                           onClick={async () => {
-                            const r = await fetch("/api/debug/evaluations/relink-to-profile", { method: "POST" })
+                            const r = await fetch("/api/debug/evaluations/relink-to-profile", { method: "POST", credentials: "include" })
                             const j = await r.json()
                             if (j?.ok && j.updatedCount > 0) {
                               toast({ title: `Vinculadas ${j.updatedCount} evaluaciones a tu perfil.` })
@@ -7617,7 +7899,7 @@ h-4 w-4 animate-spin"
                                 >
                                   <FolderOpen className="mr-1 h-3.5 w-3.5" /> Ver resumen pedagógico
                                 </Button>
-                                {process.env.NODE_ENV === "development" && (() => {
+                                {INTERNAL_SUPPORT_UI && (() => {
                                   const canShowArchive = ev.status !== "archived"
                                   console.info("[UI][ARCHIVE] render", { evaluationId: ev.id, status: ev.status, activeTab, canShowArchive })
                                   return null
@@ -7628,12 +7910,12 @@ h-4 w-4 animate-spin"
                                   size="sm"
                                   title="Archivar"
                                   onClick={async () => {
-                                    if (process.env.NODE_ENV === "development") {
+                                    if (INTERNAL_SUPPORT_UI) {
                                       console.info("[UI][ARCHIVE] clicked", ev.id)
                                     }
                                     const r = await fetch(`/api/evaluations/${ev.id}/status`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "archived" }) })
                                     const j = await r.json().catch(() => ({}))
-                                    if (process.env.NODE_ENV === "development") {
+                                    if (INTERNAL_SUPPORT_UI) {
                                       console.info("[UI][ARCHIVE] response", r.status, j)
                                       setArchiveDebug((prev) => ({ ...(prev ?? { total: evaluacionesList.length, rows: evaluacionesList.map((x) => ({ id: x.id, status: x.status ?? null, canShowArchive: (x.status ?? "draft") !== "archived" })) }), lastClick: ev.id, lastResponse: { status: r.status, json: j } }))
                                     }
@@ -7738,7 +8020,7 @@ h-4 w-4 animate-spin"
                     <CardTitle className="text-[var(--text-accent)]">Cursos / Carpetas</CardTitle>
                     <CardDescription>Organiza evaluaciones por curso. Activas y archivadas por separado. Desde cada curso puedes abrir el <strong>resumen pedagógico</strong> (gráficos, logro por eje/habilidad, diagnóstico automático).</CardDescription>
                   </div>
-                  {process.env.NODE_ENV === "development" && (
+                  {INTERNAL_SUPPORT_UI && (
                     <Button
                       variant="outline"
                       size="sm"
@@ -7746,7 +8028,7 @@ h-4 w-4 animate-spin"
                         setDiagnosisResult(null)
                         setDiagnosisOpen(true)
                         try {
-                          const r = await fetch("/api/debug/evaluations/full-check")
+                          const r = await fetch("/api/debug/evaluations/full-check", { credentials: "include" })
                           const j = await r.json()
                           setDiagnosisResult(j)
                         } catch (e) {
@@ -8678,11 +8960,11 @@ h-4 w-4 animate-spin"
                 )}
               </CardContent>
             </Card>
-            {typeof process !== "undefined" && process.env.NODE_ENV !== "production" && (
+            {INTERNAL_SUPPORT_UI && (
               <Card className="bg-[var(--bg-card)] border-[var(--border-color)] border-dashed">
                 <CardHeader>
                   <CardTitle className="text-sm text-[var(--text-muted)]">Diagnóstico estudiantes</CardTitle>
-                  <CardDescription>Solo visible en desarrollo. Último sync y lista actual.</CardDescription>
+                  <CardDescription>Panel interno: Último sync y lista actual.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div>
@@ -9392,7 +9674,7 @@ h-4 w-4 animate-spin"
           setIsAnswerKeyModalOpen(false)
         }}
       />
-      <DevAdminPanel />
+      {INTERNAL_SUPPORT_UI ? <DevAdminPanel /> : null}
     </EvaluatorRootDiv>
   )
 }
