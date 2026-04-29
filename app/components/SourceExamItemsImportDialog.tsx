@@ -194,6 +194,25 @@ type Props = {
   onImported: () => void
 }
 
+type SmartExtractMeta = {
+  items_returned?: number
+  items_detected?: number
+  items_with_axis_label?: number
+  items_with_skill_label?: number
+  items_with_cognitive_level?: number
+  items_with_score_max?: number
+  smart_pass_1_ok?: boolean
+  smart_pass_2_ok?: boolean
+  smart_extract_enrich_parse_ok?: boolean
+  input_text_length?: number
+  input_text_hash_short?: string
+  duration_ms_total?: number
+  duration_ms_extraction_text?: number
+  duration_ms_ia_pass_1?: number
+  duration_ms_ia_pass_2?: number
+  warnings?: string[]
+}
+
 export default function SourceExamItemsImportDialog({
   sourceExamId,
   sourceExamTitle = "",
@@ -225,6 +244,7 @@ export default function SourceExamItemsImportDialog({
   const [importTab, setImportTab] = useState<"manual" | "smart">("manual")
   const [smartExtracting, setSmartExtracting] = useState(false)
   const [validatePracticeLoading, setValidatePracticeLoading] = useState(false)
+  const [smartExtractMeta, setSmartExtractMeta] = useState<SmartExtractMeta | null>(null)
   const [validatePracticeResult, setValidatePracticeResult] = useState<{
     summary: ValidatePracticeSummary
     alerts: ValidatePracticeAlert[]
@@ -606,10 +626,130 @@ export default function SourceExamItemsImportDialog({
         setImportTab("manual")
         setValidatePracticeResult(null)
         setValidatePracticeLoading(false)
+        setSmartExtractMeta(null)
       }
       onOpenChange(open)
     },
     [importing, onOpenChange]
+  )
+
+  const runSmartExtractForFile = useCallback(
+    async (file: File) => {
+      setSmartExtracting(true)
+      const controller = new AbortController()
+      const timeoutId = window.setTimeout(() => controller.abort(), SMART_EXTRACT_FETCH_MS)
+      try {
+        const fd = new FormData()
+        fd.append("file", file)
+        fd.append("source_exam_id", sourceExamId)
+        const res = await fetch("/api/source-exams/smart-extract", {
+          method: "POST",
+          credentials: "include",
+          body: fd,
+          signal: controller.signal,
+        })
+        const ct = res.headers.get("content-type") ?? ""
+        let data: {
+          items?: Array<Record<string, unknown>>
+          error?: string
+          details?: string
+          warnings?: string[]
+          meta?: SmartExtractMeta
+          anthropic_status?: number | null
+        } = {}
+        let bodyParseNote: string | null = null
+        try {
+          if (ct.includes("application/json")) data = (await res.json()) as typeof data
+          else {
+            const txt = await res.text()
+            bodyParseNote = txt ? `Respuesta no JSON (${res.status}): ${txt.slice(0, 280)}` : `Respuesta vacía (${res.status})`
+          }
+        } catch (parseErr) {
+          bodyParseNote = parseErr instanceof Error ? parseErr.message : String(parseErr)
+        }
+        const showSmartFailure = (title: string, description?: string) =>
+          toast({ title, description, variant: "destructive", duration: 12_000 })
+        if (bodyParseNote) return showSmartFailure("No se pudo leer la respuesta del servidor", bodyParseNote)
+        if (!res.ok) {
+          return showSmartFailure(
+            data.error || `Error del servidor (${res.status})`,
+            [data.details, data.anthropic_status != null ? `Anthropic (upstream): HTTP ${data.anthropic_status}` : ""]
+              .filter(Boolean)
+              .join(" · ") || undefined,
+          )
+        }
+        const rawItems = Array.isArray(data.items) ? data.items : []
+        if (rawItems.length === 0 && typeof data.error === "string" && data.error.trim()) {
+          return showSmartFailure(data.error.trim(), data.details?.trim() || data.warnings?.filter(Boolean).join(" ") || undefined)
+        }
+        const rows: ParsedLine[] = rawItems.map((it, idx) => {
+          const num = Number(it.item_number)
+          const item_number = Number.isFinite(num) && num >= 1 ? Math.floor(num) : idx + 1
+          const qt = typeof it.question_type === "string" ? it.question_type.trim().toLowerCase() : ""
+          const allowed = ["multiple_choice", "true_false", "short_answer", "essay", "completion"] as const
+          const question_type = (allowed as readonly string[]).includes(qt) ? qt : null
+          const ms = it.max_score
+          let max_score: number | null = null
+          if (typeof ms === "number" && Number.isFinite(ms)) max_score = Math.max(0, Math.floor(ms))
+          else if (ms != null) {
+            const x = parseInt(String(ms), 10)
+            if (!Number.isNaN(x) && x >= 0) max_score = x
+          }
+          return {
+            item_number,
+            item_text: String(it.item_text ?? "").trim(),
+            axis_label: typeof it.axis_label === "string" && it.axis_label.trim() ? it.axis_label.trim() : null,
+            skill_label: typeof it.skill_label === "string" && it.skill_label.trim() ? it.skill_label.trim() : null,
+            cognitive_level: typeof it.cognitive_level === "string" && it.cognitive_level.trim() ? it.cognitive_level.trim() : null,
+            competence: typeof it.competence === "string" && it.competence.trim() ? it.competence.trim() : null,
+            difficulty: typeof it.difficulty === "string" && it.difficulty.trim() ? it.difficulty.trim() : null,
+            question_type: question_type as ParsedLine["question_type"],
+            correct_answer: typeof it.correct_answer === "string" && it.correct_answer.trim() ? it.correct_answer.trim().toUpperCase() : null,
+            max_score,
+            rubric_text: typeof it.rubric_text === "string" && it.rubric_text.trim() ? it.rubric_text.trim() : null,
+          }
+        })
+        const merged = dedupeParsedLinesByItemNumber(rows).filter((r) => r.item_text.trim().length > 0)
+        const capped = merged.slice(0, MAX_LINES)
+        if (capped.length === 0) {
+          return showSmartFailure(
+            data.error?.trim() || "Sin ítems con confianza suficiente",
+            [data.details?.trim(), data.warnings?.filter(Boolean).join(" ")].filter(Boolean).join(" ") || undefined,
+          )
+        }
+        const enriched = enrichItemsWithPedagogy(capped)
+        setPreview({ valid: enriched, invalid: [] })
+        setEditorItems(capped)
+        setSmartExtractMeta({ ...(data.meta ?? {}), warnings: data.warnings ?? data.meta?.warnings ?? [] })
+        setSourcePanelOpen(false)
+        setUnrecognizedOpen(false)
+        setText(smartExtractRowsToStandardSourceText(capped))
+        const baseName = file.name?.replace(/\.(pdf|docx)$/i, "").replace(/[-_]+/g, " ").trim() || ""
+        setInstrumentTitle((prev) => (prev.trim() ? prev : baseName))
+        setImportTab("manual")
+        toast({
+          title: "Extracción IA completada",
+          description: `${capped.length} ítem(s) en la tabla. Revise y pulse Importar cuando esté listo.`,
+        })
+        window.setTimeout(() => previewTableRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 80)
+      } catch (err) {
+        const aborted = err instanceof DOMException && err.name === "AbortError"
+        toast({
+          title: aborted ? "Tiempo de espera agotado (IA)" : "Error de conexión (IA)",
+          description: aborted
+            ? `La petición superó ${Math.round(SMART_EXTRACT_FETCH_MS / 60_000)} minutos. Pruebe un archivo más pequeño o revise Railway/logs del servidor.`
+            : err instanceof Error
+              ? err.message
+              : String(err),
+          variant: "destructive",
+          duration: 12_000,
+        })
+      } finally {
+        window.clearTimeout(timeoutId)
+        setSmartExtracting(false)
+      }
+    },
+    [sourceExamId, toast],
   )
 
   const handleSmartExtractUpload = useCallback(
@@ -636,192 +776,11 @@ export default function SourceExamItemsImportDialog({
         e.target.value = ""
         return
       }
-      setSmartExtracting(true)
-      const controller = new AbortController()
-      const timeoutId = window.setTimeout(() => controller.abort(), SMART_EXTRACT_FETCH_MS)
-      try {
-        const fd = new FormData()
-        fd.append("file", file)
-        fd.append("source_exam_id", sourceExamId)
-        const res = await fetch("/api/source-exams/smart-extract", {
-          method: "POST",
-          credentials: "include",
-          body: fd,
-          signal: controller.signal,
-        })
-
-        const ct = res.headers.get("content-type") ?? ""
-        let data: {
-          items?: Array<Record<string, unknown>>
-          error?: string
-          details?: string
-          warnings?: string[]
-          meta?: { items_returned?: number }
-          anthropic_status?: number | null
-          anthropic_type?: string | null
-        } = {}
-        let bodyParseNote: string | null = null
-        try {
-          if (ct.includes("application/json")) {
-            data = (await res.json()) as typeof data
-          } else {
-            const txt = await res.text()
-            bodyParseNote = txt ? `Respuesta no JSON (${res.status}): ${txt.slice(0, 280)}` : `Respuesta vacía (${res.status})`
-          }
-        } catch (parseErr) {
-          bodyParseNote = parseErr instanceof Error ? parseErr.message : String(parseErr)
-        }
-
-        if (process.env.NODE_ENV !== "production") {
-          console.log("[IA Smart Import] response", {
-            httpStatus: res.status,
-            ok: res.ok,
-            error: data.error,
-            itemsCount: Array.isArray(data.items) ? data.items.length : 0,
-            anthropic_status: data.anthropic_status,
-            bodyParseNote,
-          })
-        }
-
-        const showSmartFailure = (title: string, description?: string) => {
-          toast({ title, description, variant: "destructive", duration: 12_000 })
-        }
-
-        if (bodyParseNote) {
-          showSmartFailure("No se pudo leer la respuesta del servidor", bodyParseNote)
-          return
-        }
-
-        if (!res.ok) {
-          showSmartFailure(
-            data.error || `Error del servidor (${res.status})`,
-            [
-              data.details,
-              data.anthropic_status != null ? `Anthropic (upstream): HTTP ${data.anthropic_status}` : "",
-            ]
-              .filter(Boolean)
-              .join(" · ") || undefined,
-          )
-          return
-        }
-
-        const rawItems = Array.isArray(data.items) ? data.items : []
-        const itemsEffectivelyEmpty = rawItems.length === 0
-
-        if (itemsEffectivelyEmpty && typeof data.error === "string" && data.error.trim()) {
-          showSmartFailure(
-            data.error.trim(),
-            data.details?.trim() || data.warnings?.filter(Boolean).join(" ") || undefined,
-          )
-          return
-        }
-        const rows: ParsedLine[] = rawItems.map((it, idx) => {
-          const num = Number(it.item_number)
-          const item_number = Number.isFinite(num) && num >= 1 ? Math.floor(num) : idx + 1
-          const qt = typeof it.question_type === "string" ? it.question_type.trim().toLowerCase() : ""
-          const allowed = ["multiple_choice", "true_false", "short_answer", "essay", "completion"] as const
-          const question_type = (allowed as readonly string[]).includes(qt) ? qt : null
-          const ms = it.max_score
-          let max_score: number | null = null
-          if (typeof ms === "number" && Number.isFinite(ms)) max_score = Math.max(0, Math.floor(ms))
-          else if (ms != null) {
-            const x = parseInt(String(ms), 10)
-            if (!Number.isNaN(x) && x >= 0) max_score = x
-          }
-          return {
-            item_number,
-            item_text: String(it.item_text ?? "").trim(),
-            axis_label: typeof it.axis_label === "string" && it.axis_label.trim() ? it.axis_label.trim() : null,
-            skill_label: typeof it.skill_label === "string" && it.skill_label.trim() ? it.skill_label.trim() : null,
-            cognitive_level:
-              typeof it.cognitive_level === "string" && it.cognitive_level.trim() ? it.cognitive_level.trim() : null,
-            competence: typeof it.competence === "string" && it.competence.trim() ? it.competence.trim() : null,
-            difficulty: typeof it.difficulty === "string" && it.difficulty.trim() ? it.difficulty.trim() : null,
-            question_type: question_type as ParsedLine["question_type"],
-            correct_answer:
-              typeof it.correct_answer === "string" && it.correct_answer.trim()
-                ? it.correct_answer.trim().toUpperCase()
-                : null,
-            max_score,
-            rubric_text: typeof it.rubric_text === "string" && it.rubric_text.trim() ? it.rubric_text.trim() : null,
-          }
-        })
-        const merged = dedupeParsedLinesByItemNumber(rows).filter((r) => r.item_text.trim().length > 0)
-        const capped = merged.slice(0, MAX_LINES)
-        if (merged.length > MAX_LINES) {
-          toast({
-            title: "Límite de filas",
-            description: `Solo se cargaron las primeras ${MAX_LINES} ítems.`,
-            variant: "destructive",
-          })
-        }
-        if (capped.length === 0) {
-          showSmartFailure(
-            data.error?.trim() || "Sin ítems con confianza suficiente",
-            [
-              data.details?.trim(),
-              data.warnings?.filter(Boolean).join(" "),
-              "Si el servidor devolvió 200 sin ítems, revise logs [smart-extract], avisos JSON en la respuesta o el umbral en smart-base-parser.",
-            ]
-              .filter(Boolean)
-              .join(" ") || undefined,
-          )
-          return
-        }
-        const enriched = enrichItemsWithPedagogy(capped)
-        setPreview({ valid: enriched, invalid: [] })
-        setEditorItems(capped)
-        setSourcePanelOpen(false)
-        setUnrecognizedOpen(false)
-        setText(smartExtractRowsToStandardSourceText(capped))
-        const baseName = file.name?.replace(/\.(pdf|docx)$/i, "").replace(/[-_]+/g, " ").trim() || ""
-        setInstrumentTitle((prev) => (prev.trim() ? prev : baseName))
-        setImportTab("manual")
-        toast({
-          title: "Extracción IA completada",
-          description: `${capped.length} ítem(s) en la tabla (Eje, Habilidad, Clave y demás columnas). Revise y pulse Importar cuando esté listo.`,
-        })
-        if (data.warnings && data.warnings.length > 0) {
-          const structural = data.warnings.some(
-            (w) =>
-              w.includes('"items"') ||
-              w.includes("no es un arreglo") ||
-              w.includes("no contiene la clave") ||
-              w.includes("JSON no es válido") ||
-              w.includes("tabla de ítems"),
-          )
-          toast({
-            title: structural ? "Aviso: formato de salida de la IA" : "Avisos (Smart Import)",
-            description: data.warnings.join(" "),
-            variant: structural ? "destructive" : "default",
-            duration: structural ? 14_000 : 10_000,
-          })
-        }
-        window.setTimeout(() => {
-          previewTableRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" })
-        }, 80)
-      } catch (err) {
-        const aborted = err instanceof DOMException && err.name === "AbortError"
-        const msg = err instanceof Error ? err.message : String(err)
-        if (process.env.NODE_ENV !== "production") {
-          console.error("[IA Smart Import] catch:", err)
-        }
-        toast({
-          title: aborted ? "Tiempo de espera agotado (IA)" : "Error de conexión (IA)",
-          description: aborted
-            ? `La petición superó ${Math.round(SMART_EXTRACT_FETCH_MS / 60_000)} minutos. Pruebe un archivo más pequeño o revise Railway/logs del servidor.`
-            : msg,
-          variant: "destructive",
-          duration: 12_000,
-        })
-      } finally {
-        window.clearTimeout(timeoutId)
-        setSmartExtracting(false)
-        e.target.value = ""
-        if (smartFileInputRef.current) smartFileInputRef.current.value = ""
-      }
+      await runSmartExtractForFile(file)
+      e.target.value = ""
+      if (smartFileInputRef.current) smartFileInputRef.current.value = ""
     },
-    [sourceExamId, toast, hasActiveBase],
+    [hasActiveBase, runSmartExtractForFile, toast],
   )
 
   const handleValidatePracticeUpload = useCallback(
@@ -1393,6 +1352,23 @@ export default function SourceExamItemsImportDialog({
               </Button>
               <span className="text-xs text-muted-foreground">Máx. 10 MB · misma autenticación que la prueba base actual.</span>
             </div>
+            {smartExtractMeta ? (
+              <div className="rounded-md border border-border bg-background text-xs p-3 space-y-1">
+                <p className="m-0 font-medium text-foreground">Métricas Smart IA (último intento)</p>
+                <p className="m-0 text-muted-foreground">
+                  ítems: {smartExtractMeta.items_detected ?? smartExtractMeta.items_returned ?? 0} · eje:{" "}
+                  {smartExtractMeta.items_with_axis_label ?? 0} · habilidad: {smartExtractMeta.items_with_skill_label ?? 0} ·
+                  nivel cognitivo: {smartExtractMeta.items_with_cognitive_level ?? 0} · puntaje:{" "}
+                  {smartExtractMeta.items_with_score_max ?? 0}
+                </p>
+                <p className="m-0 text-muted-foreground">
+                  pass1: {smartExtractMeta.smart_pass_1_ok ? "ok" : "no"} · pass2:{" "}
+                  {smartExtractMeta.smart_pass_2_ok ? "ok" : "no"} · enrich_parse:{" "}
+                  {smartExtractMeta.smart_extract_enrich_parse_ok ? "ok" : "no"} · hash:{" "}
+                  {smartExtractMeta.input_text_hash_short ?? "n/a"}
+                </p>
+              </div>
+            ) : null}
             <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-primary/30 p-3 bg-muted/20">
               <Label className="flex items-center gap-1.5 text-sm font-medium shrink-0">
                 <ShieldCheck className="h-4 w-4 text-primary" /> Validar prueba subida

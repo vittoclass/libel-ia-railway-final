@@ -36,32 +36,23 @@ function StatusMessage({ data }: { data: PedagogicalAnalysisExportData }) {
   const hasEvalItems = data.has_evaluation_items !== false
   const hasSourceItems = data.has_source_exam_items !== false
 
+  const wrap = (detail: string) => (
+    <div className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200 space-y-1">
+      <p className="font-semibold">No hay análisis pedagógico disponible para esta evaluación.</p>
+      <p className="text-sm">{detail}</p>
+    </div>
+  )
+
   if (reason === "missing_source_exam" || !hasSource) {
-    return (
-      <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
-        Esta evaluación aún no tiene prueba base asociada.
-      </p>
-    )
+    return wrap("Esta evaluación aún no tiene prueba base asociada.")
   }
   if (reason === "missing_evaluation_items" || !hasEvalItems) {
-    return (
-      <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
-        La evaluación tiene prueba base asociada, pero aún no tiene datos por pregunta suficientes.
-      </p>
-    )
+    return wrap("La evaluación tiene prueba base asociada, pero aún no tiene datos por pregunta suficientes.")
   }
   if (reason === "missing_source_exam_items" || !hasSourceItems) {
-    return (
-      <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
-        La prueba base asociada aún no tiene ítems cargados.
-      </p>
-    )
+    return wrap("La prueba base asociada aún no tiene ítems cargados.")
   }
-  return (
-    <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-amber-800 dark:text-amber-200">
-      No hay datos suficientes para mostrar el análisis pedagógico.
-    </p>
-  )
+  return wrap("No hay datos suficientes para generar el análisis pedagógico con la información actual.")
 }
 
 function formatPct(value: number | null | undefined): string {

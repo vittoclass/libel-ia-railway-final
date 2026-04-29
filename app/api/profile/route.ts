@@ -1,10 +1,11 @@
-import { NextResponse } from "next/server"
+import { NextRequest, NextResponse } from "next/server"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { DEFAULT_PROFILE_ROLE } from "@/app/lib/profile-defaults"
 import { resolvePilotSchool } from "@/app/lib/pilot-school"
 
 export const dynamic = "force-dynamic"
+const isPilotModeEnabled = () => String(process.env.PILOT_MODE ?? "").trim().toLowerCase() === "true"
 
 const PROFILE_COLUMNS = "user_id, teacher_id, school_id, department, role"
 
@@ -89,8 +90,9 @@ export async function GET() {
   }
 
   if (!profileRow) {
-    const pilot = await resolvePilotSchool(supabase)
+    const pilot = isPilotModeEnabled() ? await resolvePilotSchool(supabase) : null
     const { error: insertErr } = await supabase.from("profiles").insert({
+      id: user.id,
       user_id: user.id,
       role: DEFAULT_PROFILE_ROLE,
       ...(pilot ? { school_id: pilot.id } : {}),
@@ -148,7 +150,24 @@ export async function GET() {
   const roleNorm = String(finalProfile.role ?? "").toLowerCase()
   const onboarded = !!finalProfile.teacher_id
 
-  const pilotSchool = await resolvePilotSchool(supabase)
+  const pilotSchool = isPilotModeEnabled() ? await resolvePilotSchool(supabase) : null
+
+  let teacherDisplayName: string | null = null
+  if (onboarded && finalProfile.teacher_id) {
+    const { data: teacherRow, error: teacherErr } = await supabase
+      .from("teachers")
+      .select("name")
+      .eq("id", finalProfile.teacher_id)
+      .maybeSingle()
+    if (teacherErr && process.env.NODE_ENV === "development") {
+      console.warn("[API][PROFILE] teacher name lookup", teacherErr.message)
+    } else {
+      const raw = String((teacherRow as { name?: string | null } | null)?.name ?? "").trim()
+      teacherDisplayName = raw.length > 0 ? raw : null
+    }
+  }
+
+  const needs_teacher_display_name = onboarded && String(teacherDisplayName ?? "").trim().length < 2
 
   return NextResponse.json(
     {
@@ -156,11 +175,82 @@ export async function GET() {
       user: { id: user.id, email: user.email ?? null },
       isAdmin: roleNorm === "admin",
       onboarded,
+      teacher_display_name: teacherDisplayName,
+      needs_teacher_display_name,
       pilotSchool:
         pilotSchool != null
           ? { id: pilotSchool.id, name: pilotSchool.name, schoolNameLocked: true as const }
           : null,
     },
     { status: 200, headers: CACHE_HEADERS }
+  )
+}
+
+const DISPLAY_NAME_MIN = 2
+const DISPLAY_NAME_MAX = 200
+
+/**
+ * POST /api/profile — Solo nombre para identificación (docente ya onboarded).
+ * Actualiza public.teachers.name del teacher_id del perfil.
+ * Intenta actualizar profiles.full_name si la columna existe en el proyecto (ignora error si no).
+ */
+export async function POST(req: NextRequest) {
+  const user = await getAuthUser()
+  if (!user) {
+    return NextResponse.json({ error: "No autorizado" }, { status: 401, headers: CACHE_HEADERS })
+  }
+
+  let body: { display_name?: string }
+  try {
+    body = await req.json()
+  } catch {
+    return NextResponse.json({ error: "Cuerpo inválido" }, { status: 400, headers: CACHE_HEADERS })
+  }
+
+  const displayName =
+    typeof body.display_name === "string" ? body.display_name.trim().slice(0, DISPLAY_NAME_MAX) : ""
+  if (displayName.length < DISPLAY_NAME_MIN) {
+    return NextResponse.json(
+      { error: "El nombre debe tener al menos 2 caracteres" },
+      { status: 400, headers: CACHE_HEADERS },
+    )
+  }
+
+  const supabase = getSupabaseServer()
+  if (!supabase) {
+    return NextResponse.json({ error: "Supabase no configurado" }, { status: 503, headers: CACHE_HEADERS })
+  }
+
+  const { data: prof, error: profErr } = await supabase
+    .from("profiles")
+    .select("teacher_id")
+    .eq("user_id", user.id)
+    .maybeSingle()
+
+  if (profErr) {
+    return NextResponse.json({ error: profErr.message }, { status: 500, headers: CACHE_HEADERS })
+  }
+
+  const teacherId = (prof as { teacher_id?: string | null } | null)?.teacher_id ?? null
+  if (!teacherId) {
+    return NextResponse.json(
+      { error: "Completa primero tu perfil en /perfil antes de guardar el nombre." },
+      { status: 400, headers: CACHE_HEADERS },
+    )
+  }
+
+  const { error: teacherUpdErr } = await supabase.from("teachers").update({ name: displayName }).eq("id", teacherId)
+  if (teacherUpdErr) {
+    return NextResponse.json({ error: teacherUpdErr.message }, { status: 500, headers: CACHE_HEADERS })
+  }
+
+  const { error: fullNameErr } = await supabase.from("profiles").update({ full_name: displayName }).eq("user_id", user.id)
+  if (fullNameErr && process.env.NODE_ENV === "development") {
+    console.info("[API][PROFILE] POST profiles.full_name opcional:", fullNameErr.message)
+  }
+
+  return NextResponse.json(
+    { ok: true, message: "Nombre guardado." },
+    { status: 200, headers: CACHE_HEADERS },
   )
 }

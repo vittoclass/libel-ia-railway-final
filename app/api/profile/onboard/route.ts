@@ -6,6 +6,7 @@ import { resolvePilotSchool } from "@/app/lib/pilot-school"
 export const dynamic = "force-dynamic"
 
 const isDev = process.env.NODE_ENV !== "production"
+const isPilotModeEnabled = () => String(process.env.PILOT_MODE ?? "").trim().toLowerCase() === "true"
 
 /**
  * POST /api/profile/onboard
@@ -48,7 +49,7 @@ export async function POST(req: NextRequest) {
   const sName = typeof schoolName === "string" ? schoolName.trim() : ""
 
   try {
-    const pilot = await resolvePilotSchool(supabase)
+    const pilot = isPilotModeEnabled() ? await resolvePilotSchool(supabase) : null
 
     let schoolId: string
     if (pilot) {
@@ -128,6 +129,7 @@ export async function POST(req: NextRequest) {
       .from("profiles")
       .upsert(
         {
+          id: user.id,
           user_id: user.id,
           teacher_id: teacherId,
           school_id: schoolId,

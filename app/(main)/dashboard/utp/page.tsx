@@ -11,6 +11,9 @@ import { ResultsMirror } from "@/app/components/dashboard/utp/ResultsMirror"
 import { UtpAuditoriaJuezPanel } from "@/app/components/dashboard/utp/UtpAuditoriaJuezPanel"
 import { UtpPendingBatchReleasesPanel } from "@/app/components/dashboard/utp/UtpPendingBatchReleasesPanel"
 import { UtpExecutivePdfCapture } from "@/app/components/dashboard/utp/UtpExecutivePdfCapture"
+import { UtpDemoReportBlock } from "@/app/components/dashboard/utp/UtpDemoReportBlock"
+import { UtpByTeacherBlock } from "@/app/components/dashboard/utp/UtpByTeacherBlock"
+import { UtpChartsBlock } from "@/app/components/dashboard/utp/UtpChartsBlock"
 import {
   uiCoberturaBajada,
   uiCoberturaTitulo,
@@ -853,19 +856,19 @@ export default function DashboardUtpPage() {
   }
 
   return (
-    <section className="space-y-4 utp-print-root">
-      <div className="utp-print-header border-b border-slate-300 pb-3 mb-1">
-        <h1 className="text-xl font-bold text-slate-900">{utpInstitutionLabel || "Panel institucional"}</h1>
-        <p className="text-sm text-slate-600">
+    <section className="utp-print-root space-y-6 sm:space-y-8 bg-[#F7F9FB] px-3 py-6 sm:px-6 sm:py-8 -mx-3 sm:-mx-6 rounded-none">
+      <div className="utp-print-header border-b border-[#E5E7EB] pb-4 mb-2">
+        <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-[#111827]">{utpInstitutionLabel || "Panel institucional"}</h1>
+        <p className="text-sm text-[#6B7280] mt-1">
           Dashboard UTP · Impreso el {utpPrintedAtLabel || "—"}
         </p>
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-3">
-          <h2 className="text-xl font-semibold">Auditoría UTP</h2>
+          <h2 className="text-lg sm:text-xl font-semibold text-[#111827]">Auditoría UTP</h2>
           <Link
             href="/dashboard/utp/roster"
-            className="text-sm font-medium text-emerald-700 hover:underline"
+            className="text-sm font-medium text-[#047857] hover:underline"
           >
             Padrón SIGE
           </Link>
@@ -896,6 +899,10 @@ export default function DashboardUtpPage() {
           </button>
         </div>
       </div>
+      <p className="text-xs text-[#374151] rounded-xl border border-[#E5E7EB] bg-white px-4 py-3 leading-relaxed shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+        Los resultados reflejan el desempeño de los estudiantes en las evaluaciones aplicadas y tienen como propósito apoyar
+        la toma de decisiones pedagógicas.
+      </p>
       <UtpPendingBatchReleasesPanel refreshTrigger={outcomesRefresh} />
       <div className="utp-pdf-capture-host fixed -left-[12000px] top-0 pointer-events-none" aria-hidden>
         <UtpExecutivePdfCapture
@@ -1772,6 +1779,11 @@ export default function DashboardUtpPage() {
           </table>
         </div>
       )}
+      <div className="space-y-6 sm:space-y-8 max-w-[1600px] mx-auto pt-2">
+        <UtpDemoReportBlock />
+        <UtpChartsBlock />
+        <UtpByTeacherBlock />
+      </div>
     </section>
   )
 }

@@ -31,10 +31,8 @@ export async function POST(req: NextRequest) {
           .select("teacher_id, school_id")
           .eq("user_id", user.id)
           .maybeSingle()
-        if (profile?.teacher_id) {
-          teacher_id = profile.teacher_id
-          school_id = profile.school_id ?? school_id
-        }
+        teacher_id = profile?.teacher_id ?? null
+        school_id = profile?.school_id ?? null
       }
     }
 
@@ -49,6 +47,7 @@ export async function POST(req: NextRequest) {
         body.evaluation_batch_id != null && String(body.evaluation_batch_id).trim() !== ""
           ? String(body.evaluation_batch_id).trim()
           : undefined,
+      endpoint_origin: "/api/evaluations/retry-save",
     }
 
     const saveResult = await persistEvaluation(result, opts)

@@ -5,9 +5,33 @@ import { cookies } from "next/headers"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { DashboardSidebarNav } from "./dashboard-sidebar-nav"
 
 export const dynamic = "force-dynamic"
 const DEV_MASTER_EMAIL = (process.env.DEV_MASTER_EMAIL ?? "").trim().toLowerCase()
+
+/** Rol estable para RBAC de navegación (alineado con middleware). */
+function normalizeDashboardNavRole(raw: string): string {
+  const r = String(raw ?? "").trim().toUpperCase()
+  if (r === "DOCENTE" || r === "TEACHER") return "TEACHER"
+  return r
+}
+
+/** Visibilidad de enlaces del shell del dashboard (solo UX; middleware + APIs son la fuente de verdad). */
+function showDashboardShellLink(navRole: string, href: string): boolean {
+  const r = normalizeDashboardNavRole(navRole)
+  if (r === "ADMIN" || r === "ADMIN_INSTITUCION") return true
+  if (r === "TEACHER") {
+    return href === "/dashboard/docente" || href === "/dashboard/institucion"
+  }
+  if (r === "UTP") {
+    return href === "/dashboard/docente" || href === "/dashboard/institucion" || href === "/dashboard/utp"
+  }
+  if (r === "DIRECCION") {
+    return href === "/dashboard/direccion" || href === "/dashboard/institucion"
+  }
+  return href === "/dashboard/docente" || href === "/dashboard/institucion"
+}
 
 async function getOrganizationBranding() {
   try {
@@ -24,7 +48,7 @@ async function getOrganizationBranding() {
     const baseRole = String((profile as { role?: string | null } | null)?.role ?? "TEACHER")
       .trim()
       .toUpperCase()
-    let effectiveRole = baseRole
+    let effectiveRole = normalizeDashboardNavRole(baseRole)
     if (isMasterEmail(user.email)) {
       effectiveRole = "ADMIN_INSTITUCION"
     }
@@ -62,7 +86,7 @@ export default async function DashboardLayout({
   children: React.ReactNode
 }) {
   const branding = await getOrganizationBranding()
-  const role = String(branding.role ?? "TEACHER").toUpperCase()
+  const role = normalizeDashboardNavRole(String(branding.role ?? "TEACHER"))
   return (
     <div className="min-h-screen bg-[var(--bg-default)] text-[var(--text-primary)]">
       <header className="border-b border-[var(--border-color)] bg-white">
@@ -77,14 +101,31 @@ export default async function DashboardLayout({
             />
             <div>
               <h1 className="font-semibold">{branding.name}</h1>
-              <p className="text-xs text-[var(--text-muted)]">Panel Institucional</p>
+              <p className="text-xs text-[var(--text-muted)]">Panel institucional Libel-IA</p>
             </div>
           </div>
-          <nav className="flex items-center gap-3 text-sm">
-            <Link href="/dashboard/institucion" className="hover:underline">Institución</Link>
-            <Link href="/dashboard/utp" className="hover:underline">UTP</Link>
-            <Link href="/dashboard/direccion" className="hover:underline">Dirección</Link>
-            <span className="ml-2 rounded-full border px-2 py-0.5 text-xs text-[var(--text-muted)]">
+          <nav className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2 text-sm" aria-label="Acceso rápido a módulos">
+            {showDashboardShellLink(role, "/dashboard/docente") ? (
+              <Link href="/dashboard/docente" className="font-medium text-slate-900 hover:underline">
+                Panel Docente
+              </Link>
+            ) : null}
+            {showDashboardShellLink(role, "/dashboard/institucion") ? (
+              <Link href="/dashboard/institucion" className="font-medium text-slate-900 hover:underline">
+                Institución
+              </Link>
+            ) : null}
+            {showDashboardShellLink(role, "/dashboard/utp") ? (
+              <Link href="/dashboard/utp" className="font-medium text-slate-900 hover:underline">
+                UTP
+              </Link>
+            ) : null}
+            {showDashboardShellLink(role, "/dashboard/direccion") ? (
+              <Link href="/dashboard/direccion" className="font-medium text-slate-900 hover:underline">
+                Dirección
+              </Link>
+            ) : null}
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs text-[var(--text-muted)]">
               Rol: {role}
             </span>
           </nav>
@@ -92,18 +133,11 @@ export default async function DashboardLayout({
       </header>
       <div className="mx-auto max-w-7xl px-4 py-6 grid gap-4 md:grid-cols-[220px,1fr]">
         <aside className="rounded-xl border border-[var(--border-color)] bg-white p-3 h-fit">
-          <p className="text-xs text-[var(--text-muted)] uppercase tracking-wide mb-2">Sidebar</p>
-          <nav className="space-y-1">
-            <Link href="/dashboard/institucion" className="block rounded-md px-3 py-2 text-sm hover:bg-slate-50">
-              Panel Institución
-            </Link>
-            <Link href="/dashboard/utp" className="block rounded-md px-3 py-2 text-sm hover:bg-slate-50">
-              Panel UTP
-            </Link>
-            <Link href="/dashboard/direccion" className="block rounded-md px-3 py-2 text-sm hover:bg-slate-50">
-              Panel Dirección
-            </Link>
-          </nav>
+          <p className="text-xs font-semibold text-slate-700 uppercase tracking-wide mb-2">Módulos</p>
+          <p className="text-[11px] text-[var(--text-muted)] mb-3 leading-snug">
+            Los módulos visibles dependen de tu rol; el acceso real lo validan el servidor y las APIs.
+          </p>
+          <DashboardSidebarNav navRole={role} />
         </aside>
         <main>{children}</main>
       </div>

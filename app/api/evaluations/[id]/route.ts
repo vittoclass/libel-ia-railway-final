@@ -1,19 +1,21 @@
 // app/api/evaluations/[id]/route.ts
-// GET: detalle de una evaluación (metadata, items, summary, estudiantes). Solo del usuario autenticado.
+// GET: detalle de una evaluaci?n (metadata, items, summary, estudiantes). Solo del usuario autenticado.
 import { NextRequest, NextResponse } from "next/server"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 import { canReadEvaluationInAppScope, profileScopeFromRow } from "@/app/lib/evaluation-read-scope"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
+import { mergePedagogicalSummaryDisplayFields, resolveStudentDisplayName } from "@/app/lib/student-display-name"
 
 export const dynamic = "force-dynamic"
 
 const isDev = process.env.NODE_ENV !== "production"
 
+/** Sin columnas opcionales no desplegadas en todas las BD (p. ej. batch_student_index). */
 const EVAL_DETAIL_SELECT_FULL =
-  "id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id, batch_id, batch_student_index, scan_image_paths, capture_source"
+  "id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id, batch_id, scan_image_paths, capture_source"
 const EVAL_DETAIL_SELECT_BASE =
-  "id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id, batch_id, batch_student_index"
+  "id, title, course_id, course_label, subject, evaluated_at, status, teacher_id, school_id, user_id, source_exam_id, batch_id"
 
 export async function GET(
   _req: NextRequest,
@@ -74,21 +76,21 @@ export async function GET(
   if (isDev) console.info("[API][EVAL_DETAIL] evaluation found", !!evaluation)
   if (evalErr || !evaluation) {
     const step = evalErr ? "fetch_evaluation" : "not_found"
-    const message = evalErr?.message ?? "Evaluación no encontrada"
+    const message = evalErr?.message ?? "Evaluaci?n no encontrada"
     if (isDev) console.info("[API][EVAL_DETAIL] error/not found", step, message)
     if (!evalErr && !evaluation) {
-      const userMessage = "Esta evaluación aún no tiene resultados procesados."
+      const userMessage = "Esta evaluaci?n a?n no tiene resultados procesados."
       return NextResponse.json(
         isDev
           ? {
               step: "not_found",
-              error: "Evaluación no encontrada",
+              error: "Evaluaci?n no encontrada",
               message: userMessage,
               code: "EVALUATION_NOT_FOUND",
               debug: { id },
             }
           : {
-              error: "Evaluación no encontrada",
+              error: "Evaluaci?n no encontrada",
               message: userMessage,
               code: "EVALUATION_NOT_FOUND",
             },
@@ -119,7 +121,7 @@ export async function GET(
       isDev
         ? {
             step: "ownership",
-            message: "No autorizado para esta evaluación",
+            message: "No autorizado para esta evaluaci?n",
             debug: {
               evaluationTeacherId: evaluation.teacher_id,
               evaluationUserId: (evaluation as { user_id?: string }).user_id,
@@ -128,14 +130,14 @@ export async function GET(
               userId: user.id,
             },
           }
-        : { error: "No autorizado para esta evaluación" },
+        : { error: "No autorizado para esta evaluaci?n" },
       { status: 403 }
     )
   }
 
   const ev = evaluation as Record<string, unknown>
 
-  const [itemsRes, summaryRes, studentsRes] = await Promise.all([
+  const [itemsRes, summariesRes, studentsRes] = await Promise.all([
     supabase
       .from("evaluation_items")
       .select("question_number, student_answer, correct_answer, is_correct, score_obtained, score_max")
@@ -143,9 +145,9 @@ export async function GET(
       .order("question_number", { ascending: true }),
     supabase
       .from("evaluation_summaries")
-      .select("grade_chile, strengths, improvements, raw")
+      .select("id, grade_chile, strengths, improvements, raw, student_name_raw, created_at")
       .eq("evaluation_id", id)
-      .maybeSingle(),
+      .order("created_at", { ascending: true }),
     supabase
       .from("evaluation_students")
       .select("id, student_name, student_identifier, created_at")
@@ -154,7 +156,7 @@ export async function GET(
   ])
 
   const items = Array.isArray(itemsRes.data) ? itemsRes.data : []
-  const summary = summaryRes.data ?? null
+  const summaryRowsRaw = Array.isArray(summariesRes.data) ? summariesRes.data : []
   const studentsRaw = Array.isArray(studentsRes.data) ? studentsRes.data : []
   const students = [...studentsRaw].sort((a, b) => {
     const an = String((a as { student_name?: string | null }).student_name ?? "").trim()
@@ -165,20 +167,78 @@ export async function GET(
   })
   if (isDev) {
     if (itemsRes.error) console.info("[API][EVAL_DETAIL] evaluation_items error:", itemsRes.error.message)
-    if (summaryRes.error) console.info("[API][EVAL_DETAIL] evaluation_summaries error:", summaryRes.error.message)
+    if (summariesRes.error) console.info("[API][EVAL_DETAIL] evaluation_summaries error:", summariesRes.error.message)
     if (studentsRes.error) console.info("[API][EVAL_DETAIL] evaluation_students error:", studentsRes.error.message)
     console.info("[API][EVAL_DETAIL] items count", items.length)
-    console.info("[API][EVAL_DETAIL] summary found", !!summary)
+    console.info("[API][EVAL_DETAIL] summaries count", summaryRowsRaw.length)
     console.info("[API][EVAL_DETAIL] response 200")
   }
-  let firstStudentName: string | undefined
   let firstStudentIdentifier: string | undefined
   for (const st of students) {
-    const row = st as { student_name?: string | null; student_identifier?: string | null }
-    const n = row.student_name != null ? String(row.student_name).trim() : ""
-    if (n.length > 0 && !firstStudentName) firstStudentName = n
+    const row = st as { student_identifier?: string | null }
     const idf = row.student_identifier != null ? String(row.student_identifier).trim() : ""
     if (idf.length > 0 && !firstStudentIdentifier) firstStudentIdentifier = idf
+  }
+
+  type SummaryRow = {
+    id?: string
+    grade_chile?: unknown
+    strengths?: unknown
+    improvements?: unknown
+    raw?: unknown
+    student_name_raw?: string | null
+    created_at?: string | null
+  }
+  const summaryRows = summaryRowsRaw as SummaryRow[]
+
+  function mapSummaryToPayload(row: SummaryRow) {
+    const merged = mergePedagogicalSummaryDisplayFields({
+      strengths: row.strengths as string | null | undefined,
+      improvements: row.improvements as string | null | undefined,
+      raw: row.raw,
+    })
+    return {
+      id: row.id,
+      grade_chile: row.grade_chile,
+      strengths: merged.strengths,
+      improvements: merged.improvements,
+      raw: row.raw,
+      student_name_raw: row.student_name_raw ?? null,
+      created_at: row.created_at ?? null,
+    }
+  }
+
+  const summariesPayload = summaryRows.map(mapSummaryToPayload)
+  /** Una fila por alumno es posible; `summary` / `evaluation_summaries` siguen el resumen m?s reciente (compat). */
+  const summaryTyped = summaryRows.length > 0 ? summaryRows[summaryRows.length - 1]! : null
+  const mergedSummaryFields = summaryTyped
+    ? mergePedagogicalSummaryDisplayFields({
+        strengths: summaryTyped.strengths as string | null | undefined,
+        improvements: summaryTyped.improvements as string | null | undefined,
+        raw: summaryTyped.raw,
+      })
+    : { strengths: null as string | null, improvements: null as string | null }
+
+  let resolvedStudentName: string | undefined
+  for (const st of students) {
+    const row = st as { student_name?: string | null }
+    const n = resolveStudentDisplayName({
+      student_name: row.student_name,
+      student_name_raw: null,
+      raw: null,
+    }).trim()
+    if (n) {
+      resolvedStudentName = n
+      break
+    }
+  }
+  if (!resolvedStudentName && summaryTyped) {
+    const n = resolveStudentDisplayName({
+      student_name: null,
+      student_name_raw: summaryTyped.student_name_raw ?? null,
+      raw: summaryTyped.raw,
+    }).trim()
+    if (n) resolvedStudentName = n
   }
 
   const rawPaths = ev.scan_image_paths
@@ -203,11 +263,10 @@ export async function GET(
         subject: ev.subject,
         evaluated_at: ev.evaluated_at,
         status: (ev.status as string | null | undefined) ?? "draft",
-        student_name: firstStudentName,
+        student_name: resolvedStudentName,
         student_identifier: firstStudentIdentifier,
         source_exam_id: (ev.source_exam_id as string | null | undefined) ?? undefined,
         batch_id: (ev.batch_id as string | null | undefined) ?? undefined,
-        batch_student_index: (ev.batch_student_index as number | null | undefined) ?? undefined,
         capture_source: (ev.capture_source as string | null | undefined) ?? undefined,
         scan_image_paths: scanPaths.length > 0 ? scanPaths : undefined,
         /** Primera ruta en Storage (bucket batch-scans); misma lista ordenada que scan_image_paths[0]. */
@@ -215,22 +274,28 @@ export async function GET(
         scan_image_signed_urls: scan_image_signed_urls.length > 0 ? scan_image_signed_urls : undefined,
       },
       items,
-      summary: summary
+      summary: summaryTyped
         ? {
-            grade_chile: summary.grade_chile,
-            strengths: summary.strengths,
-            improvements: summary.improvements,
-            raw: summary.raw,
+            grade_chile: summaryTyped.grade_chile,
+            strengths: mergedSummaryFields.strengths,
+            improvements: mergedSummaryFields.improvements,
+            raw: summaryTyped.raw,
+            student_name_raw: summaryTyped.student_name_raw ?? null,
+            created_at: summaryTyped.created_at ?? null,
           }
         : null,
+      /** Todas las filas de resumen de esta evaluaci?n (p. ej. una por estudiante). */
+      summaries: summariesPayload,
       students,
       evaluation_items: items,
-      evaluation_summaries: summary
+      evaluation_summaries: summaryTyped
         ? {
-            grade_chile: summary.grade_chile,
-            strengths: summary.strengths,
-            improvements: summary.improvements,
-            raw: summary.raw,
+            grade_chile: summaryTyped.grade_chile,
+            strengths: mergedSummaryFields.strengths,
+            improvements: mergedSummaryFields.improvements,
+            raw: summaryTyped.raw,
+            student_name_raw: summaryTyped.student_name_raw ?? null,
+            created_at: summaryTyped.created_at ?? null,
           }
         : null,
     },
@@ -275,7 +340,7 @@ export async function DELETE(
 
   if (evalErr || !evaluation) {
     return NextResponse.json(
-      isDev ? { step: "fetch_evaluation", message: evalErr?.message ?? "Evaluación no encontrada", debug: { id } } : { error: "Evaluación no encontrada" },
+      isDev ? { step: "fetch_evaluation", message: evalErr?.message ?? "Evaluaci?n no encontrada", debug: { id } } : { error: "Evaluaci?n no encontrada" },
       { status: 404 }
     )
   }
@@ -287,10 +352,10 @@ export async function DELETE(
       isDev
         ? {
             step: "ownership",
-            message: "No autorizado para esta evaluación",
+            message: "No autorizado para esta evaluaci?n",
             debug: { evaluationTeacherId: evaluation.teacher_id, evaluationUserId: evaluation.user_id, profileTeacherId: teacherId, userId: user.id },
           }
-        : { error: "No autorizado para esta evaluación" },
+        : { error: "No autorizado para esta evaluaci?n" },
       { status: 403 }
     )
   }
@@ -300,7 +365,7 @@ export async function DELETE(
   const { error: deleteErr } = await supabase.from("evaluations").delete().eq("id", id)
   if (deleteErr) {
     return NextResponse.json(
-      isDev ? { step: "delete_evaluation", message: deleteErr.message, debug: { id } } : { error: "No se pudo eliminar la evaluación" },
+      isDev ? { step: "delete_evaluation", message: deleteErr.message, debug: { id } } : { error: "No se pudo eliminar la evaluaci?n" },
       { status: 500 }
     )
   }

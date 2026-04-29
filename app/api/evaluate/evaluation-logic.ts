@@ -1453,6 +1453,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       omrTemplateVariant: omrTemplateVariantIn,
       officialOmrAllowFallbackToLegacy: officialOmrAllowFallbackToLegacyIn,
       source_exam_id: sourceExamIdBody,
+      source_exam_context_active: sourceExamContextActiveBody,
     } = bodyObj as Record<string, any>
     const officialOmrIntegrationEnabled = true
     const officialOmrEngineSelected: "legacy" | "azure_layout_family" = "azure_layout_family"
@@ -1515,6 +1516,15 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
     }
 
     const supabaseForEval = getSupabaseServer()
+    const sourceExamIdTrimmed =
+      typeof sourceExamIdBody === "string" && sourceExamIdBody.trim() !== "" ? sourceExamIdBody.trim() : null
+    const hasSourceExamContextActive = sourceExamContextActiveBody === true
+    if (hasSourceExamContextActive && !sourceExamIdTrimmed) {
+      console.warn("[evaluate] Evaluación sin source_exam_id en contexto de prueba base", {
+        teacher_id: effectiveTeacherId,
+        school_id: effectiveSchoolId,
+      })
+    }
 
     // Memoria interna: si se envía templateId, cargar plantilla desde caché (Redis o memoria)
     let answerKeyFromTemplate = answerKeyFromBody
@@ -2589,6 +2599,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             typeof sourceExamIdBody === "string" && sourceExamIdBody.trim() !== ""
               ? sourceExamIdBody.trim()
               : null,
+          endpoint_origin: "/api/evaluate",
         })
         console.log("[evaluate] DESPUÉS persistEvaluation", { saved: saveResult.saved })
       } catch (e) {
@@ -2610,7 +2621,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
     const save_error: string | null =
       !saved && saveResult.error ? `${saveResult.error.step}: ${saveResult.error.message}` : null
     const save_reason: string | undefined = !saved && "reason" in saveResult ? (saveResult as { reason?: string }).reason : undefined
-    if (saved && !evaluationIdLooksUuid) {
+      if (saved && !evaluationIdLooksUuid) {
       console.error("[evaluate][SAVE_INVALID_EVALUATION_ID]", { evaluationId, status })
       return NextResponse.json(
         {
@@ -2633,6 +2644,13 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
     } else {
       console.info("[evaluate][SAVE_OK]", { evaluation_id: evaluationId, status })
     }
+    console.info("[evaluate][source_exam_link_observability]", {
+      evaluation_id: evaluationId,
+      teacher_id: effectiveTeacherId,
+      school_id: effectiveSchoolId,
+      source_exam_id: sourceExamIdTrimmed,
+      has_source_exam_link: !!sourceExamIdTrimmed,
+    })
 
     return NextResponse.json(
       {

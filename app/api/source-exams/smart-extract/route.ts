@@ -5,6 +5,7 @@
  */
 import { NextRequest, NextResponse } from "next/server"
 import Anthropic, { APIError } from "@anthropic-ai/sdk"
+import { createHash } from "node:crypto"
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { extractSourceDocumentStructured } from "@/app/lib/extract-document-structured"
@@ -17,7 +18,6 @@ import {
   getAxisHintsForSubject,
   getSmartExtractRawItemStats,
   mergePedagogyEnrichments,
-  resolveDocumentSubjectForEnrichment,
   sanitizePedagogyEnrichmentsParsed,
   truncateDocumentForLlm,
 } from "@/app/lib/smart-base-parser"
@@ -32,6 +32,7 @@ const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingm
 
 const DEFAULT_STAGE1_MAX_TOKENS = 16384
 const DEFAULT_STAGE2_MAX_TOKENS = 8192
+const SMART_EXTRACT_TEMPERATURE = 0.1
 
 function parseStageMaxTokens(stage: "1" | "2"): number {
   const key = stage === "1" ? "SMART_EXTRACT_STAGE1_MAX_TOKENS" : "SMART_EXTRACT_STAGE2_MAX_TOKENS"
@@ -49,6 +50,107 @@ function messageTextContent(msg: { content: Array<{ type: string; text?: string 
     .map((b) => ("text" in b && b.text ? b.text : ""))
     .join("\n")
     .trim()
+}
+
+function hasNonEmptyString(v: unknown): boolean {
+  return typeof v === "string" && v.trim().length > 0
+}
+
+function normalizeSubjectKey(v: string): string {
+  return v
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+}
+
+function toCanonicalSubjectLabel(v: string | null | undefined): string | null {
+  if (!v) return null
+  const key = normalizeSubjectKey(v)
+  if (!key) return null
+  if (/(^|[^a-z])(lenguaje|lengua)([^a-z]|$)/.test(key)) return "Lenguaje"
+  if (/matematica|matematicas|matem/.test(key)) return "Matemática"
+  if (/(^|[^a-z])historia([^a-z]|$)/.test(key)) return "Historia"
+  if (/ciencias?(\s+naturales)?|biolog|fisica|quimica/.test(key)) return "Ciencias"
+  if (/ingles|english/.test(key)) return "Inglés"
+  return null
+}
+
+function inferSubjectFromTextKeywords(text: string): string | null {
+  const sample = normalizeSubjectKey(text).slice(0, 40_000)
+  if (sample.length < 20) return null
+  const score = (keywords: readonly string[]): number =>
+    keywords.reduce((acc, kw) => (sample.includes(kw) ? acc + 1 : acc), 0)
+  const ranked = [
+    { subject: "Matemática" as const, score: score(["matematica", "matematicas", "algebra", "geometria", "fraccion", "ecuacion", "porcentaje"]) },
+    { subject: "Lenguaje" as const, score: score(["lenguaje", "lengua", "lectura", "comprension", "texto", "inferencia", "literatura"]) },
+    { subject: "Historia" as const, score: score(["historia", "independencia", "colonia", "republica", "siglo", "fuente historica"]) },
+    { subject: "Ciencias" as const, score: score(["ciencias", "biologia", "fisica", "quimica", "ecosistema", "experimento", "energia"]) },
+    { subject: "Inglés" as const, score: score(["ingles", "english", "reading", "grammar", "vocabulary", "listening"]) },
+  ].sort((a, b) => b.score - a.score)
+  if (ranked[0].score < 1) return null
+  if (ranked[1]?.score === ranked[0].score) return null
+  return ranked[0].subject
+}
+
+type SubjectSource = "source_exams" | "payload" | "title" | "filename" | "ocr" | "none"
+type EnrichmentPromptSubjectSource = "source_exams" | "metadata" | "heuristic" | "none"
+
+function toPromptSubjectSource(source: SubjectSource): EnrichmentPromptSubjectSource {
+  if (source === "source_exams") return "source_exams"
+  if (source === "none") return "none"
+  if (source === "payload" || source === "title" || source === "filename") return "metadata"
+  return "heuristic"
+}
+
+function resolveSubjectContext(args: {
+  sourceExamSubject: string | null
+  payloadSubject: string | null
+  sourceExamTitle: string | null
+  fileName: string
+  documentTextSample: string
+}): { subject: string | null; source: SubjectSource } {
+  const fromDb = toCanonicalSubjectLabel(args.sourceExamSubject)
+  if (fromDb) return { subject: fromDb, source: "source_exams" }
+
+  const fromPayload = toCanonicalSubjectLabel(args.payloadSubject)
+  if (fromPayload) return { subject: fromPayload, source: "payload" }
+
+  const fromTitle = toCanonicalSubjectLabel(args.sourceExamTitle)
+  if (fromTitle) return { subject: fromTitle, source: "title" }
+
+  const fromFilename = toCanonicalSubjectLabel(args.fileName)
+  if (fromFilename) return { subject: fromFilename, source: "filename" }
+
+  const fromOcr = inferSubjectFromTextKeywords(args.documentTextSample)
+  if (fromOcr) return { subject: fromOcr, source: "ocr" }
+
+  return { subject: null, source: "none" }
+}
+
+function getAxisHintsForResolvedSubject(subject: string | null): string[] {
+  if (!subject) return []
+  const fromBase = getAxisHintsForSubject(subject)
+  if (fromBase.length > 0) return fromBase
+  if (subject === "Historia") {
+    return ["Pensamiento temporal y espacial", "Análisis de fuentes históricas", "Formación ciudadana"]
+  }
+  if (subject === "Inglés") {
+    return ["Reading comprehension", "Vocabulary", "Grammar and language use"]
+  }
+  return []
+}
+
+function getControlledAxisHintsFallback(): string[] {
+  return ["Números y operaciones", "Comprensión lectora", "Análisis de fuentes históricas", "Biología", "Reading comprehension"]
+}
+
+function parseSmartExtractTemperature(): number {
+  const raw = process.env.SMART_EXTRACT_TEMPERATURE?.trim()
+  if (!raw) return SMART_EXTRACT_TEMPERATURE
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) return SMART_EXTRACT_TEMPERATURE
+  return Math.min(1, Math.max(0, parsed))
 }
 
 const NO_STORE = {
@@ -119,6 +221,7 @@ function mapAnthropicError(e: APIError) {
 }
 
 export async function POST(req: NextRequest) {
+  const startedAt = Date.now()
   const user = await getAuthUser()
   if (!user) return jsonNs({ error: "No autorizado" }, 401)
 
@@ -154,6 +257,14 @@ export async function POST(req: NextRequest) {
   const sourceExamSubject = access.subject
   const sourceExamTitle = access.title
   const sourceExamCourseLabel = access.course_label
+  void sourceExamCourseLabel
+
+  const payloadSubjectRaw =
+    formData.get("subject") ??
+    formData.get("source_exam_subject") ??
+    formData.get("sourceExamSubject") ??
+    formData.get("document_subject")
+  const payloadSubject = typeof payloadSubjectRaw === "string" ? payloadSubjectRaw.trim() || null : null
 
   const file = formData.get("file") ?? formData.get("pdf") ?? formData.get("document")
   if (!file || !(file instanceof Blob)) {
@@ -173,11 +284,14 @@ export async function POST(req: NextRequest) {
   }
 
   let structured: Awaited<ReturnType<typeof extractSourceDocumentStructured>>
+  const extractionStartedAt = Date.now()
+  let extractionFinishedAt = extractionStartedAt
   try {
     structured = await extractSourceDocumentStructured(buffer, {
       filename: name,
       mimeType: mime || (kind === "pdf" ? "application/pdf" : DOCX_MIME),
     })
+    extractionFinishedAt = Date.now()
   } catch (e) {
     return jsonNs(
       { error: "No se pudo extraer texto del documento", details: e instanceof Error ? e.message : String(e) },
@@ -222,16 +336,25 @@ export async function POST(req: NextRequest) {
 
     const maxTokensStage1 = parseStageMaxTokens("1")
     const maxTokensStage2 = parseStageMaxTokens("2")
+    const temperature = parseSmartExtractTemperature()
     const skipEnrich = process.env.SMART_EXTRACT_SKIP_ENRICH === "1"
+    const inputTextHashShort = createHash("sha256").update(rawText).digest("hex").slice(0, 12)
+    let pass1StartedAt = 0
+    let pass1FinishedAt = 0
+    let pass2StartedAt = 0
+    let pass2FinishedAt = 0
 
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
+    pass1StartedAt = Date.now()
     const msg1 = await anthropic.messages.create({
       model: MODEL,
       max_tokens: maxTokensStage1,
+      temperature,
       system: SMART_EXTRACT_STAGE1_SYSTEM_PROMPT,
       messages: [{ role: "user", content: userContent }],
     })
+    pass1FinishedAt = Date.now()
 
     const textOut1 = messageTextContent(msg1)
 
@@ -258,8 +381,10 @@ export async function POST(req: NextRequest) {
     }
 
     let parsed1: unknown
+    let pass1Ok = false
     try {
       parsed1 = extractJsonObjectFromModelText(textOut1)
+      pass1Ok = true
     } catch (parseErr) {
       console.log(
         "[smart-extract] AUDIT parseo pasada 1 falló:",
@@ -305,26 +430,38 @@ export async function POST(req: NextRequest) {
     let enrichParseOk = false
     let enrichmentContextMeta: {
       document_subject: string | null
-      subject_source: "source_exams" | "metadata" | "heuristic" | "none"
+      subject_source: SubjectSource
       axis_hints_count: number
+      subject_resolved: string | null
+      enrichment_context_ok: boolean
     } | null = null
 
     if (!skipEnrich && items.length > 0) {
-      const subjectResolved = resolveDocumentSubjectForEnrichment({
+      const subjectResolved = resolveSubjectContext({
         sourceExamSubject,
-        documentTextSample: docForLlm,
-        title: sourceExamTitle,
-        courseLabel: sourceExamCourseLabel,
+        payloadSubject,
+        sourceExamTitle,
+        fileName: name,
+        documentTextSample: rawText,
       })
-      const axisHints = getAxisHintsForSubject(subjectResolved.subject)
+      const axisHintsFromSubject = getAxisHintsForResolvedSubject(subjectResolved.subject)
+      const axisHints =
+        axisHintsFromSubject.length > 0
+          ? axisHintsFromSubject
+          : subjectResolved.subject == null
+            ? getControlledAxisHintsFallback()
+            : []
+      const enrichmentContextOk = Boolean(subjectResolved.subject) && axisHints.length > 0
       enrichmentContextMeta = {
         document_subject: subjectResolved.subject,
         subject_source: subjectResolved.source,
         axis_hints_count: axisHints.length,
+        subject_resolved: subjectResolved.subject,
+        enrichment_context_ok: enrichmentContextOk,
       }
       const enrichUser = buildEnrichmentUserJson(items, {
         document_subject: subjectResolved.subject,
-        subject_source: subjectResolved.source,
+        subject_source: toPromptSubjectSource(subjectResolved.source),
         axis_hints: axisHints,
       })
       console.log(
@@ -333,12 +470,15 @@ export async function POST(req: NextRequest) {
           subject: subjectResolved.subject,
           source: subjectResolved.source,
           axis_hints_count: axisHints.length,
+          enrichment_context_ok: enrichmentContextOk,
         }),
       )
       try {
+        pass2StartedAt = Date.now()
         msg2 = await anthropic.messages.create({
           model: MODEL,
           max_tokens: maxTokensStage2,
+          temperature,
           system: SMART_EXTRACT_ENRICH_SYSTEM_PROMPT,
           messages: [
             {
@@ -347,6 +487,7 @@ export async function POST(req: NextRequest) {
             },
           ],
         })
+        pass2FinishedAt = Date.now()
         textOut2 = messageTextContent(msg2)
         console.log(
           "[smart-extract] pasada 2 Anthropic:",
@@ -377,6 +518,7 @@ export async function POST(req: NextRequest) {
           }
         }
       } catch (e2) {
+        pass2FinishedAt = Date.now()
         console.log("[smart-extract] pasada 2 error:", e2 instanceof Error ? e2.message : String(e2))
       }
     }
@@ -424,9 +566,37 @@ export async function POST(req: NextRequest) {
       warnings.push("La pasada 2 truncó por max_tokens; revise metadatos pedagógicos.")
     }
 
+    const itemsDetected = items.length
+    const itemsWithCorrectAnswer = items.filter((it) => hasNonEmptyString(it.correct_answer)).length
+    const itemsWithAxisLabel = items.filter((it) => hasNonEmptyString(it.axis_label)).length
+    const itemsWithSkillLabel = items.filter((it) => hasNonEmptyString(it.skill_label)).length
+    const itemsWithCognitiveLevel = items.filter((it) => hasNonEmptyString(it.cognitive_level)).length
+    // Propuesta futura (NO aplicada): evaluar fallback max_score=1 solo si negocio lo autoriza explícitamente.
+    const itemsWithScoreMax = items.filter((it) => typeof it.max_score === "number" && Number.isFinite(it.max_score)).length
+    const smartPass2Ok = skipEnrich ? true : Boolean(msg2 && textOut2.trim().length > 0)
+    const metrics = {
+      input_text_length: rawText.length,
+      input_text_hash_short: inputTextHashShort,
+      items_detected: itemsDetected,
+      items_with_correct_answer: itemsWithCorrectAnswer,
+      items_with_axis_label: itemsWithAxisLabel,
+      items_with_skill_label: itemsWithSkillLabel,
+      items_with_cognitive_level: itemsWithCognitiveLevel,
+      items_with_score_max: itemsWithScoreMax,
+      smart_pass_1_ok: pass1Ok,
+      smart_pass_2_ok: smartPass2Ok,
+      smart_extract_enrich_parse_ok: enrichParseOk,
+      warnings,
+      duration_ms_total: Date.now() - startedAt,
+      duration_ms_extraction_text: Math.max(0, extractionFinishedAt - extractionStartedAt),
+      duration_ms_ia_pass_1: pass1StartedAt > 0 && pass1FinishedAt > 0 ? Math.max(0, pass1FinishedAt - pass1StartedAt) : 0,
+      duration_ms_ia_pass_2: pass2StartedAt > 0 && pass2FinishedAt > 0 ? Math.max(0, pass2FinishedAt - pass2StartedAt) : 0,
+    } as const
+
     console.log(
       "[smart-extract] AUDIT: esta ruta no escribe en BD; el cliente importa después (POST separado).",
     )
+    console.log("[smart-extract] métricas intento:", JSON.stringify(metrics, null, 2))
 
     const responseBody = {
       items,
@@ -439,6 +609,7 @@ export async function POST(req: NextRequest) {
         items_returned: items.length,
         smart_extract_stage1_max_tokens: maxTokensStage1,
         smart_extract_stage2_max_tokens: maxTokensStage2,
+        smart_extract_temperature: temperature,
         smart_extract_stage1_stop_reason: msg1.stop_reason,
         smart_extract_stage1_output_tokens: msg1.usage?.output_tokens ?? null,
         smart_extract_stage1_input_tokens: msg1.usage?.input_tokens ?? null,
@@ -449,8 +620,26 @@ export async function POST(req: NextRequest) {
         smart_extract_stage2_enriched_items: enrichmentsMergedCount,
         smart_extract_skip_enrich: skipEnrich,
         smart_extract_enrich_parse_ok: enrichParseOk,
+        input_text_length: metrics.input_text_length,
+        input_text_hash_short: metrics.input_text_hash_short,
+        items_detected: metrics.items_detected,
+        items_with_correct_answer: metrics.items_with_correct_answer,
+        items_with_axis_label: metrics.items_with_axis_label,
+        items_with_skill_label: metrics.items_with_skill_label,
+        items_with_cognitive_level: metrics.items_with_cognitive_level,
+        items_with_score_max: metrics.items_with_score_max,
+        smart_pass_1_ok: metrics.smart_pass_1_ok,
+        smart_pass_2_ok: metrics.smart_pass_2_ok,
+        duration_ms_total: metrics.duration_ms_total,
+        duration_ms_extraction_text: metrics.duration_ms_extraction_text,
+        duration_ms_ia_pass_1: metrics.duration_ms_ia_pass_1,
+        duration_ms_ia_pass_2: metrics.duration_ms_ia_pass_2,
         /** Contexto enviado a pasada 2 (útil para verificar asignatura y ejes en red/JSON). */
         smart_extract_enrichment_context: enrichmentContextMeta,
+        subject_resolved: enrichmentContextMeta?.subject_resolved ?? null,
+        subject_source: enrichmentContextMeta?.subject_source ?? "none",
+        axis_hints_count: enrichmentContextMeta?.axis_hints_count ?? 0,
+        enrichment_context_ok: enrichmentContextMeta?.enrichment_context_ok ?? false,
       },
     }
     console.log(

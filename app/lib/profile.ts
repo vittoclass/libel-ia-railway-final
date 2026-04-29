@@ -14,6 +14,7 @@ export type ProfileRow = {
 }
 
 const PROFILE_COLUMNS = "user_id, teacher_id, school_id, department, role"
+const isPilotModeEnabled = () => String(process.env.PILOT_MODE ?? "").trim().toLowerCase() === "true"
 
 /**
  * Obtiene el perfil del usuario logueado; si no existe fila en profiles, la crea (user_id, role docente por defecto).
@@ -73,8 +74,9 @@ export async function getOrCreateProfile(): Promise<{
   if (process.env.NODE_ENV === "development") {
     console.info("[profile][lib] no profile row, inserting")
   }
-  const pilot = await resolvePilotSchool(supabase)
+  const pilot = isPilotModeEnabled() ? await resolvePilotSchool(supabase) : null
   const { error: insertErr } = await supabase.from("profiles").insert({
+    id: user.id,
     user_id: user.id,
     role: DEFAULT_PROFILE_ROLE,
     ...(pilot ? { school_id: pilot.id } : {}),

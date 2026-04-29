@@ -4,6 +4,7 @@
  * Mapeo: evaluation_items.question_number = source_exam_items.item_number.
  */
 import type { PedagogicalMetadata } from "@/app/lib/analyze-pedagogical-structure"
+import { extractQuestionNumber } from "@/app/lib/extract-question-number"
 
 /** Ítem de evaluación (respuesta del estudiante por pregunta). */
 export interface EvaluationItemRow {
@@ -219,13 +220,13 @@ export function analyzeLearningResults(
 
   const sourceByNumber = new Map<number, SourceExamItemWithPedagogy>()
   for (const s of sourceExamItemsEnriched) {
-    const num = Number(s.item_number)
-    if (num >= 1) sourceByNumber.set(num, s)
+    const num = extractQuestionNumber(s.item_number)
+    if (num != null) sourceByNumber.set(num, s)
   }
 
   for (const ei of evaluationItems) {
-    const qn = Number(ei.question_number)
-    if (Number.isNaN(qn)) continue
+    const qn = extractQuestionNumber(ei.question_number)
+    if (qn == null) continue
     const source = sourceByNumber.get(qn)
     const axisRaw = source?.axis_label?.trim() || "Sin eje"
     const skillLabelDb = (source?.skill_label ?? "").trim()

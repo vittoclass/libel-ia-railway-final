@@ -105,6 +105,14 @@ import {
   type CorrectionReportGroupForPdf,
   type EvaluationDetailJsonForCorrectionZip,
 } from "@/app/lib/correction-report-from-evaluation-detail"
+import {
+  filterCorreccionDetalladaParaDesarrolloUnico,
+  formatDetalleDesarrolloPdf,
+  pdfSafe,
+  renderForWeb,
+  splitCorreccionForTwoPages,
+} from "@/app/lib/correction-report-pdf-helpers"
+import { CorrectionReportPdfDocument as ReportDocument } from "@/app/components/correction-report/CorrectionReportPdfDocument"
 import JSZip from "jszip"
 import { saveAs } from "file-saver"
 import { Progress } from "@/components/ui/progress"
@@ -260,549 +268,6 @@ align-items: center; border-bottom: 1px solid var(--border-color); }
     @media (max-width: 600px) { body { font-size: 12px; line-height: 1.4; } } 
   `}</style>
 )
-// ==== Estilos PDF ====
-const styles = StyleSheet.create({
-  page: { padding: 20, fontSize: 10, lineHeight: 1.25 },
-  header: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 8,
-    paddingBottom: 5,
-    borderBottomWidth: 1,
-    borderBottomColor: "#E5E7EB",
-  },
-  headerLeft: { flexDirection: "row", alignItems: "center" },
-  headerRight: { textAlign: "right" },
-  logoLibelia: { height: 30, width: 30, marginRight: 8, objectFit: "contain" },
-  logoColegio: { maxHeight: 30, maxWidth: 110, objectFit: "contain" },
-  title: { fontSize: 13, fontWeight: "bold", color: "#4F46E5" },
-  subtitle: { fontSize: 9, color: "#6B7280" },
-  infoText: { fontSize: 9, color: "#4B5563", marginVertical: 1 },
-  studentLine: { fontSize: 9, color: "#111827", marginTop: 5 },
-  sectionTitle: {
-    fontSize: 10,
-    fontWeight: "bold",
-    paddingBottom: 2,
-    borderBottomWidth: 1,
-    borderBottomColor: "#E5E7EB",
-    marginBottom: 5,
-    marginTop: 8,
-  },
-  feedbackGrid: { flexDirection: "row", gap: 8, marginTop: 8 },
-  feedbackCard: { padding: 6, borderRadius: 6, flex: 1 },
-  fortalezas: { backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#BBF7D0" },
-  areasMejora: { backgroundColor: "#FFFBEB", borderWidth: 1, borderColor: "#FDE68A" },
-  feedbackTitle: { fontSize: 9, fontWeight: "bold", color: "#166534", marginBottom: 3 },
-  feedbackImproveTitle: { fontSize: 9, fontWeight: "bold", color: "#854D0E", marginBottom: 3 },
-  feedbackText: { fontSize: 8, lineHeight: 1.15, flexWrap: "wrap" as any },
-  table: { width: "100%", borderStyle: "solid", borderWidth: 1, borderColor: "#E5E7EB", marginBottom: 6 },
-  tableRow: { margin: "auto", flexDirection: "row", borderBottomWidth: 1, borderColor: "#E5E7EB" },
-  tableColHeader: {
-    width: "35%",
-    borderStyle: "solid",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    backgroundColor: "#F9FAFB",
-    padding: 2,
-  },
-  tableColHeaderDetail: {
-    width: "65%",
-    borderStyle: "solid",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    backgroundColor: "#F9FAFB",
-    padding: 2,
-  },
-  tableCol: { width: "35%", borderStyle: "solid", borderWidth: 1, borderColor: "#E5E7EB", padding: 2 },
-  tableColDetail: { width: "65%", borderStyle: "solid", borderWidth: 1, borderColor: "#E5E7EB", padding: 2 },
-  col40: { width: "40%", borderStyle: "solid", borderWidth: 1, borderColor: "#E5E7EB", padding: 2 },
-  col30: { width: "30%", borderStyle: "solid", borderWidth: 1, borderColor: "#E5E7EB", padding: 2 },
-  habCol45: { width: "45%", borderStyle: "solid", borderWidth: 1, borderColor: "#E5E7EB", padding: 2 },
-  habCol18: {
-    width: "18%",
-    borderStyle: "solid",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    padding: 2,
-    textAlign: "center" as any,
-  },
-  habCol37: { width: "37%", borderStyle: "solid", borderWidth: 1, borderColor: "#E5E7EB", padding: 2 },
-  tableCellHeader: { margin: 1, fontSize: 8, fontWeight: "bold" },
-  tableCell: { margin: 1, fontSize: 8, textAlign: "left" as any },
-})
-// ----------------- Helpers safe render -----------------
-function renderForWeb(value: any): string {
-  if (value === null || value === undefined) return ""
-  const t = typeof value
-  if (t === "string" || t === "number" || t === "boolean") return String(value)
-  if (Array.isArray(value)) {
-    return value.map(v => renderForWeb(v)).join(", ")
-  }
-  try {
-    if (typeof value === "object" && value !== null) {
-      // Manejar objetos con estructura conocida (desarrollo: misma prioridad de cita que normalizeRespuestasDesarrollo)
-      if (
-        value.justificacion &&
-        ("puntaje" in value || "texto_estudiante" in value || "cita_estudiante" in value)
-      ) {
-        const q = pickStudentDesarrolloVisibleText(value as Record<string, unknown>)
-        const pRaw = (value as { puntaje?: unknown }).puntaje
-        const pStr =
-          pRaw != null && String(renderForWeb(pRaw)).trim() !== "" ? renderForWeb(pRaw) : "N/A"
-        return `Puntaje: ${pStr} - Respuesta: "${q}" - ${renderForWeb((value as { justificacion: unknown }).justificacion)}`
-      }
-      if (value.area && value.detalles) {
-        return `${value.area}: ${renderForWeb(value.detalles)}`
-      }
-      if (value.descripcion != null && value.descripcion !== "") return renderForWeb(value.descripcion)
-      if (value.detalle != null && value.detalle !== "") return renderForWeb(value.detalle)
-      if (value.detalles != null && value.detalles !== "") return renderForWeb(value.detalles)
-      if (value.texto != null && value.texto !== "") return renderForWeb(value.texto)
-      if (value.seccion) return `${value.seccion}: ${renderForWeb(value.detalle || value.detalles || "")}`
-      if (value.mensaje) return String(value.mensaje)
-      // Ultimo recurso: convertir entries a string
-      const entries = Object.entries(value)
-      if (entries.length > 0) {
-        return entries.map(([k, v]) => `${k}: ${renderForWeb(v)}`).join("; ")
-      }
-    }
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
-}
-function pdfSafe(value: any): string {
-  if (value === null || value === undefined) return ""
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value)
-  try {
-    if (Array.isArray(value)) {
-      const arr = value as any[]
-      if (arr.length > 0 && typeof arr[0] === "object" && arr[0] !== null && ("aspecto" in arr[0] || "detalle" in arr[0])) {
-        return arr
-          .map(
-            (x: any) =>
-              `• ${x.aspecto ?? x.seccion ?? "Item"}: ${pdfSafe(x.detalle ?? x.detalles ?? "")}`,
-          )
-          .join("\n")
-      }
-      return arr.map((v) => pdfSafe(v)).join(", ")
-    }
-    if (
-      typeof value === "object" &&
-      value !== null &&
-      value.justificacion &&
-      ("puntaje" in value || "texto_estudiante" in value || "cita_estudiante" in value)
-    ) {
-      const q = pickStudentDesarrolloVisibleText(value as Record<string, unknown>)
-      const pRaw = (value as { puntaje?: unknown }).puntaje
-      const pStr = pRaw != null && String(pdfSafe(pRaw)).trim() !== "" ? pdfSafe(pRaw) : "N/A"
-      return `Puntaje: ${pStr}
-Respuesta Estudiante: "${q}"
-Justificación: ${pdfSafe((value as { justificacion: unknown }).justificacion)}`
-    }
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
-}
-/** Convierte cualquier valor a string para evitar [object Object] en PDF/UI. */
-function safeStr(value: any): string {
-  if (value === null || value === undefined) return ""
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value)
-  if (typeof value === "object") return JSON.stringify(value)
-  return String(value)
-}
-const splitCorreccionForTwoPages = (lista: any[] | undefined) => {
-  if (!lista || lista.length === 0) return { first: [], rest: [] }
-  const MAX_P1 = Math.min(5, lista.length)
-  return { first: lista.slice(0, MAX_P1), rest: lista.slice(MAX_P1) }
-}
-
-/** PDF desarrollo: solo texto legible; nunca JSON.stringify. */
-function formatDetalleDesarrolloPdf(raw: any): string {
-  if (raw == null) return ""
-  if (typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean") return String(raw)
-  if (Array.isArray(raw)) return raw.map((x) => formatDetalleDesarrolloPdf(x)).filter(Boolean).join(" — ")
-  if (typeof raw !== "object") return String(raw)
-  const o = raw as Record<string, unknown>
-  const pVal = o.puntaje
-  const p =
-    pVal != null && String(pVal).trim() !== ""
-      ? `Puntaje: ${String(pVal).trim()}`
-      : ""
-  const txt = pickStudentDesarrolloVisibleText(o as Record<string, unknown>)
-  const txtPart = txt ? `Respuesta: "${txt.replace(/"/g, "'")}"` : ""
-  const jVal = o.justificacion
-  const j = jVal != null ? renderForWeb(jVal).trim() : ""
-  const jPart = j ? `Justificación: ${j}` : ""
-  const main = [p, txtPart, jPart].filter(Boolean).join("\n")
-  if (main) return main
-  const fallback = Object.entries(o)
-    .filter(([, v]) => v != null && typeof v !== "object" && typeof v !== "function")
-    .map(([k, v]) => `${k}: ${String(v)}`)
-    .join(" — ")
-  return fallback || "(Sin detalle estructurado disponible)"
-}
-
-/**
- * Regla estructural (sin heurísticas de texto): si existe al menos una clave en
- * detalle_desarrollo, el bloque de corrección detallada de desarrollo sale solo de ahí;
- * correccion_detallada no se mezcla en preview ni PDF.
- */
-function filterCorreccionDetalladaParaDesarrolloUnico(group: {
-  retroalimentacion?: { correccion_detallada?: any[] }
-  detalle_desarrollo?: Record<string, any>
-}): any[] {
-  const devKeys = Object.keys(group.detalle_desarrollo || {})
-  if (devKeys.length > 0) return []
-  return group.retroalimentacion?.correccion_detallada || []
-}
-
-const ReportDocument = ({ group, formData, logoPreview }: any) => {
-  const resumenPedagogico = buildPedagogicalResumenFromGroup({
-    alternativas_corregidas: group.alternativas_corregidas,
-    puntaje: group.puntaje,
-    puntosMaximos: group.puntosMaximos,
-    puntosAprobacion: group.puntosAprobacion,
-    detalle_desarrollo: group.detalle_desarrollo,
-  })
-  const puntaje = group.puntaje || "N/A"
-  const notaNum = Number(group.nota) || 0
-  const notaFinal = (notaNum + (group.decimasAdicionales || 0)).toFixed(1)
-  const devKeys = Object.keys(group.detalle_desarrollo || {})
-  const correccionSinDuplicarDesarrollo = filterCorreccionDetalladaParaDesarrolloUnico(group)
-  const correccionDesarrolloArray = devKeys.map((key) => {
-    const raw = group.detalle_desarrollo![key]
-    const detalle =
-      typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean"
-        ? String(raw)
-        : formatDetalleDesarrolloPdf(raw)
-    return {
-      seccion: `Pregunta Desarrollo: ${key.replace(/_/g, " ")}`,
-      detalle,
-    }
-  })
-  const correccionConDesarrollo = [...correccionSinDuplicarDesarrollo, ...correccionDesarrolloArray]
-  const { first: correccionP1, rest: correccionP2 } = splitCorreccionForTwoPages(correccionConDesarrollo)
-  const isSuperior = ["Técnico Superior", "Universitario", "Postgrado"].includes(formData.nivelEducativo)
-  const cursoLabel = isSuperior ? "Sección" : "Curso"
-  const departamentoLabel = isSuperior ? "Escuela/Carrera" : "Departamento"
-
-  // 🔥 INICIO - LÓGICA DEL VELOCÍMETRO PARA PDF
-  const puntosAprobacion = group.puntosAprobacion || 0
-  const puntajeMaximo = group.puntosMaximos || Number(group.puntaje?.split("/")[1]) || 0
-  const puntajeObtenido = Number(group.puntaje?.split("/")[0]) || 0
-  // Cálculo de porcentajes para el PDF
-  const porcentajeObtenido = Math.min(100, (puntajeObtenido / puntajeMaximo) * 100)
-  const porcentajeAprobacion = (puntosAprobacion / puntajeMaximo) * 100
-  const isAprobado = puntajeObtenido >= puntosAprobacion
-  // 🔥 FIN - LÓGICA DEL VELOCÍMETRO PARA PDF
-
-  return (
-    <Document>
-      <Page size="A4" style={styles.page}>
-        <View style={styles.header}>
-          <View style={styles.headerLeft}>
-            <PDFImage src={LIBELIA_LOGO_PNG_BASE64} style={styles.logoLibelia} />
-            <View>
-              <Text style={styles.title}>Libel-IA</Text>
-              <Text style={styles.subtitle}>Informe de Evaluación Pedagógica</Text>
-            </View>
-          </View>
-          <View style={styles.headerRight}>
-            {logoPreview && <PDFImage src={logoPreview} style={styles.logoColegio} />}
-            <Text style={styles.infoText}>Profesor: {pdfSafe(formData.nombreProfesor || "N/A")}</Text>
-            <Text style={styles.infoText}>Asignatura: {pdfSafe(formData.asignatura || "N/A")}</Text>
-            <Text style={styles.infoText}>
-              {departamentoLabel}: {pdfSafe(formData.departamento || "N/A")}
-            </Text>
-
-            <Text style={styles.infoText}>Evaluación: {pdfSafe(formData.nombrePrueba || "N/A")}</Text>
-            <Text style={styles.infoText}>Fecha: {pdfSafe(format(new Date(), "dd/MM/yyyy"))}</Text>
-          </View>
-        </View>
-        <Text style={styles.studentLine}>
-          Alumno: {pdfSafe(formatStudentDisplayName(group.studentName))} · {cursoLabel}:{" "}
-          {pdfSafe(formData.curso || "N/A")}
-        </Text>
-        <View style={{ flexDirection: "row", gap: 6, marginTop: 6 }}>
-          <View
-            style={{
-              flex: 1,
-              backgroundColor: "#F9FAFB",
-              borderWidth: 1,
-              borderColor: "#E5E7EB",
-              padding: 5,
-              borderRadius: 6,
-              textAlign: "center" as any,
-            }}
-          >
-            <Text style={{ fontSize: 8, fontWeight: "bold", color: "#4B5563", marginBottom: 2 }}>Puntaje</Text>
-            <Text style={{ fontSize: 11, fontWeight: "bold", color: "#4F46E5" }}>{pdfSafe(puntaje)}</Text>
-          </View>
-
-          <View
-            style={{
-              flex: 1,
-              backgroundColor: "#F9FAFB",
-              borderWidth: 1,
-              borderColor: "#E5E7EB",
-              padding: 5,
-              borderRadius: 6,
-              textAlign: "center" as any,
-            }}
-          >
-            <Text style={{ fontSize: 8, fontWeight: "bold", color: "#4B5563", marginBottom: 2 }}>Nota</Text>
-            <Text style={{ fontSize: 11, fontWeight: "bold", color: "#4F46E5" }}>{pdfSafe(notaFinal)}</Text>
-          </View>
-          <View
-            style={{
-              flex: 1,
-              backgroundColor: "#F9FAFB",
-              borderWidth: 1,
-              borderColor: "#E5E7EB",
-              padding: 5,
-              borderRadius: 6,
-              textAlign: "center" as any,
-            }}
-          >
-            <Text style={{ fontSize: 8, fontWeight: "bold", color: "#4B5563", marginBottom: 2 }}>Fecha</Text>
-            <Text style={{ fontSize: 11, fontWeight: "bold", color: "#4F46E5" }}>
-              {pdfSafe(format(new Date(), "dd/MM/yyyy"))}
-            </Text>
-          </View>
-        </View>
-
-        {/* 🔥 BLOQUE DE VELOCÍMETRO EN PDF (AGREGADO) */}
-        {puntajeMaximo > 0 && puntosAprobacion > 0 && (
-          <View
-            style={{
-              marginTop: 8,
-              padding: 5,
-              backgroundColor: "#F9FAFB",
-              borderWidth: 1,
-              borderColor: "#E5E7EB",
-              borderRadius: 6,
-            }}
-          >
-            <Text style={{ fontSize: 9, fontWeight: "bold", color: "#4B5563", marginBottom: 4 }}>
-              Rendimiento vs. Exigencia ({String(formData.porcentajeExigencia ?? "")}%)
-            </Text>
-            <View
-              style={{ height: 6, width: "100%", backgroundColor: "#E5E7EB", borderRadius: 3, position: "relative" }}
-            >
-              {/* Barra de progreso obtenida */}
-              <View
-                style={{
-                  width: `${porcentajeObtenido}%`,
-                  height: "100%",
-                  backgroundColor: isAprobado ? "#34D399" : "#EF4444", // Verde/Rojo para Aprobado/Reprobado
-                  borderRadius: 3,
-                }}
-              />
-              {/* Marcador de Nota 4.0 */}
-              <View
-                style={{
-                  position: "absolute",
-                  top: -5,
-                  left: `${porcentajeAprobacion}%`,
-                  width: 1.5,
-                  height: 16,
-                  backgroundColor: "#F59E0B", // Amarillo/Naranja
-                  transform: "translateX(-50%)",
-                }}
-              >
-                <Text
-                  style={{
-                    fontSize: 7,
-                    color: "#374151",
-                    position: "absolute",
-                    top: -10,
-                    left: -5,
-                    fontWeight: "bold",
-                  }}
-                >
-                  4.0
-                </Text>
-              </View>
-            </View>
-            <View
-              style={{
-                flexDirection: "row",
-                justifyContent: "space-between",
-                fontSize: 7,
-                color: "#6B7280",
-                marginTop: 4,
-              }}
-            >
-              <Text>0 pts</Text>
-              <Text>{puntajeMaximo} pts (100%)</Text>
-            </View>
-            <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 4, alignItems: "baseline" }}>
-              <Text style={{ fontSize: 8, fontWeight: "bold", color: "#4B5563" }}>
-                Puntos de Aprobación (4.0):{" "}
-              </Text>
-              <Text style={{ fontSize: 8, fontWeight: "bold", color: "#F59E0B" }}>{puntosAprobacion} pts</Text>
-            </View>
-          </View>
-        )}
-        {/* FIN - BLOQUE DE VELOCÍMETRO EN PDF */}
-
-        <View style={styles.feedbackGrid}>
-          <View
-            style={{
-              padding: 6,
-              borderRadius: 6,
-              flex: 1,
-              backgroundColor: "#F0FDF4",
-              borderWidth: 1,
-              borderColor: "#BBF7D0",
-            }}
-          >
-            <Text style={{ fontSize: 9, fontWeight: "bold", color: "#166534", marginBottom: 3 }}>
-              Fortalezas (según datos registrados)
-            </Text>
-            <Text style={styles.feedbackText}>{pdfSafe(resumenPedagogico.fortalezas)}</Text>
-          </View>
-          <View
-            style={{
-              padding: 6,
-              borderRadius: 6,
-              flex: 1,
-              backgroundColor: "#FFFBEB",
-              borderWidth: 1,
-              borderColor: "#FDE68A",
-            }}
-          >
-            <Text style={styles.feedbackImproveTitle}>Áreas de mejora (según datos registrados)</Text>
-            <Text style={styles.feedbackText}>{pdfSafe(resumenPedagogico.areas_mejora)}</Text>
-          </View>
-        </View>
-        {correccionP1.length > 0 && (
-          <View style={{ marginBottom: 6 }}>
-            <Text style={styles.sectionTitle}>Corrección Detallada</Text>
-
-            <View style={styles.table}>
-              <View style={[styles.tableRow, { backgroundColor: "#F9FAFB" }]}>
-                <View style={styles.tableColHeader}>
-                  <Text style={styles.tableCellHeader}>Sección</Text>
-                </View>
-                <View style={styles.tableColHeaderDetail}>
-                  <Text style={styles.tableCellHeader}>Detalle</Text>
-                </View>
-              </View>
-              {correccionP1.map((item: any, index: number) => (
-                <View key={String(index)} style={styles.tableRow}>
-                  <View style={styles.tableCol}>
-                    <Text style={styles.tableCell}>{pdfSafe(renderForWeb(item.seccion ?? ""))}</Text>
-                  </View>
-                  <View style={styles.tableColDetail}>
-                    <Text style={styles.tableCell}>
-                      {pdfSafe(renderForWeb(item.detalle ?? item.detalles ?? ""))}
-                    </Text>
-                  </View>
-                </View>
-              ))}
-            </View>
-          </View>
-        )}
-        {correccionP2.length > 0 && (
-          <View style={{ marginBottom: 6 }}>
-            <Text style={styles.sectionTitle}>Corrección Detallada (cont.)</Text>
-            <View style={styles.table}>
-              <View style={[styles.tableRow, { backgroundColor: "#F9FAFB" }]}>
-                <View style={styles.tableColHeader}>
-                  <Text style={styles.tableCellHeader}>Sección</Text>
-                </View>
-                <View style={styles.tableColHeaderDetail}>
-                  <Text style={styles.tableCellHeader}>Detalle</Text>
-                </View>
-              </View>
-              {correccionP2.map((item: any, index: number) => (
-                <View key={String(index)} style={styles.tableRow}>
-                  <View style={styles.tableCol}>
-                    <Text style={styles.tableCell}>{pdfSafe(renderForWeb(item.seccion ?? ""))}</Text>
-                  </View>
-                  <View style={styles.tableColDetail}>
-                    <Text style={styles.tableCell}>
-                      {pdfSafe(renderForWeb(item.detalle ?? item.detalles ?? ""))}
-                    </Text>
-                  </View>
-                </View>
-              ))}
-            </View>
-          </View>
-        )}
-        {group.retroalimentacion?.evaluacion_habilidades?.length > 0 && (
-          <View style={{ marginBottom: 6 }}>
-            <Text style={styles.sectionTitle}>Evaluación de Habilidades</Text>
-            <View style={styles.table}>
-              <View style={[styles.tableRow, { backgroundColor: "#F9FAFB" }]}>
-                <View style={styles.habCol45}>
-                  <Text style={styles.tableCellHeader}>Habilidad</Text>
-                </View>
-
-                <View style={styles.habCol18}>
-                  <Text style={styles.tableCellHeader}>Nivel</Text>
-                </View>
-                <View style={styles.habCol37}>
-                  <Text style={styles.tableCellHeader}>Evidencia</Text>
-                </View>
-              </View>
-              {group.retroalimentacion.evaluacion_habilidades.map((item: any, index: number) => (
-                <View key={String(index)} style={styles.tableRow}>
-                  <View style={styles.habCol45}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.habilidad)}</Text>
-                  </View>
-
-                  <View style={styles.habCol18}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.evaluacion)}</Text>
-                  </View>
-                  <View style={styles.habCol37}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.evidencia)}</Text>
-                  </View>
-                </View>
-              ))}
-            </View>
-          </View>
-        )}
-
-        {group.retroalimentacion?.retroalimentacion_alternativas?.length > 0 && (
-          <View style={{ marginBottom: 6 }}>
-            <Text style={styles.sectionTitle}>Respuestas Alternativas</Text>
-            <View style={styles.table}>
-              <View style={[styles.tableRow, { backgroundColor: "#F9FAFB" }]}>
-                <View style={styles.col40}>
-                  <Text style={styles.tableCellHeader}>Pregunta</Text>
-                </View>
-                <View style={styles.col30}>
-                  <Text style={styles.tableCellHeader}>Respuesta Estudiante</Text>
-                </View>
-                <View style={styles.col30}>
-                  <Text style={styles.tableCellHeader}>Respuesta Correcta</Text>
-                </View>
-              </View>
-              {group.retroalimentacion.retroalimentacion_alternativas.map((item: any, index: number) => (
-                <View key={String(index)} style={styles.tableRow}>
-                  <View style={styles.col40}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.pregunta)}</Text>
-                  </View>
-                  <View style={styles.col30}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.respuesta_estudiante)}</Text>
-                  </View>
-                  <View style={styles.col30}>
-                    <Text style={styles.tableCell}>{pdfSafe(item.respuesta_correcta)}</Text>
-                  </View>
-                </View>
-              ))}
-            </View>
-          </View>
-        )}
-      </Page>
-    </Document>
-  )
-}
-
 interface CorreccionDetallada {
   seccion: string
   detalle: string
@@ -1688,6 +1153,30 @@ export default function EvaluatorClient() {
   const [batchExportsLoading, setBatchExportsLoading] = useState(false)
   const [batchExportsError, setBatchExportsError] = useState<string | null>(null)
 
+  /** Deep link desde panel docente: /evaluar?tab=mis-archivos&batch=<uuid>&exam=&curso= */
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    try {
+      const params = new URLSearchParams(window.location.search)
+      if (params.get("tab") === "mis-archivos") {
+        setActiveTab("mis-archivos")
+      }
+      const batch = params.get("batch")?.trim() ?? ""
+      if (batch && uuidRe.test(batch)) {
+        setBatchZipTargetId(batch)
+        const exam = params.get("exam")
+        const curso = params.get("curso")
+        if (exam != null && exam !== "") setBatchZipHistoryExamTitle(exam)
+        if (curso != null && curso !== "") setBatchZipHistoryCourseLabel(curso)
+        setBatchZipDialogOpen(true)
+        setActiveTab("mis-archivos")
+      }
+    } catch {
+      /* URL inválida */
+    }
+  }, [])
+
   /** Abre el resumen pedagógico del curso. Mismo handler en Cursos, Evaluaciones y detalle. */
   const openCoursePedagogicalSummary = useCallback((courseId: string, courseLabel?: string | null) => {
     const id = courseId != null && String(courseId).trim() !== "" ? String(courseId).trim() : "Sin curso"
@@ -1744,6 +1233,7 @@ export default function EvaluatorClient() {
   } | null>(null)
   const [evaluatorSourceExamItemsLoading, setEvaluatorSourceExamItemsLoading] = useState(false)
   const [evaluatorInstrumentSource, setEvaluatorInstrumentSource] = useState<"manual" | "source_exam" | "both">("manual")
+  const lastActiveEvaluatorSourceExamIdRef = useRef<string>("")
   /** Solo development: diagnóstico flujo Ver informe */
   const [verDebug, setVerDebug] = useState<{ evaluationId: string; status: number; error: string | null; payload: unknown } | null>(null)
   /** Solo development: diagnóstico flujo Archivar */
@@ -2246,6 +1736,7 @@ export default function EvaluatorClient() {
     async (value: string) => {
       const id = value === "__none__" ? "" : value
       setSelectedEvaluatorSourceExamId(id)
+      if (id) lastActiveEvaluatorSourceExamIdRef.current = id
       if (!id) {
         setEvaluatorEvaluationBaseSnapshot(null)
         setEvaluatorLastSourceExamPayload(null)
@@ -3237,8 +2728,15 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     // forzamos el payload a usar la pauta derivada de esa fuente canónica.
     let pautaEstructuradaFinal = pautaEstructurada || ""
     let pautaCorrectaAlternativasFinal = pautaCorrectaAlternativas || ""
-    const hasSourceExamSelected = typeof selectedEvaluatorSourceExamId === "string" && selectedEvaluatorSourceExamId.trim().length > 0
-    if ((evaluatorInstrumentSource === "source_exam" || hasSourceExamSelected) && evaluatorEvaluationBaseSnapshot?.items?.length) {
+    const selectedSourceExamIdTrimmed =
+      typeof selectedEvaluatorSourceExamId === "string" ? selectedEvaluatorSourceExamId.trim() : ""
+    const sourceExamContextActive =
+      evaluatorInstrumentSource === "source_exam" ||
+      evaluatorInstrumentSource === "both" ||
+      !!evaluatorEvaluationBaseSnapshot?.items?.length
+    const resolvedSourceExamId =
+      selectedSourceExamIdTrimmed || (sourceExamContextActive ? lastActiveEvaluatorSourceExamIdRef.current.trim() : "")
+    if (sourceExamContextActive && evaluatorEvaluationBaseSnapshot?.items?.length) {
       const canonical = toCanonicalPautaFromEvaluationBaseItems(evaluatorEvaluationBaseSnapshot.items)
       console.log("CANONICAL PAYLOAD", {
         pautaEstructurada: canonical.pautaEstructurada,
@@ -3319,7 +2817,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
       omrTemplateVariant: selectedOmrTemplateVariant,
       evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
-      ...(hasSourceExamSelected ? { source_exam_id: selectedEvaluatorSourceExamId.trim() } : {}),
+      ...(resolvedSourceExamId ? { source_exam_id: resolvedSourceExamId } : {}),
+      source_exam_context_active: sourceExamContextActive,
     }
 
     const result = await evaluate(payload)
@@ -3566,14 +3065,20 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
     // canonicalize-on-payload (BATCH): aplicar la misma pauta canónica que SINGLE
     // para que /api/evaluate use la misma verdad (especialmente para answerKeyFromTemplate).
-    const hasSourceExamSelected =
-      typeof selectedEvaluatorSourceExamId === "string" && selectedEvaluatorSourceExamId.trim().length > 0
+    const selectedSourceExamIdTrimmed =
+      typeof selectedEvaluatorSourceExamId === "string" ? selectedEvaluatorSourceExamId.trim() : ""
+    const sourceExamContextActive =
+      evaluatorInstrumentSource === "source_exam" ||
+      evaluatorInstrumentSource === "both" ||
+      !!evaluatorEvaluationBaseSnapshot?.items?.length
+    const resolvedSourceExamId =
+      selectedSourceExamIdTrimmed || (sourceExamContextActive ? lastActiveEvaluatorSourceExamIdRef.current.trim() : "")
 
     let pautaEstructuradaFinal = pautaEstructurada
     let pautaCorrectaAlternativasFinal = pautaCorrectaAlternativas
 
     if (
-      (evaluatorInstrumentSource === "source_exam" || hasSourceExamSelected) &&
+      sourceExamContextActive &&
       evaluatorEvaluationBaseSnapshot?.items?.length
     ) {
       const canonical = toCanonicalPautaFromEvaluationBaseItems(evaluatorEvaluationBaseSnapshot.items)
@@ -3651,7 +3156,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               (tipoPrueba || "mixta") as any,
             ),
             evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
-            ...(hasSourceExamSelected ? { source_exam_id: selectedEvaluatorSourceExamId.trim() } : {}),
+            ...(resolvedSourceExamId ? { source_exam_id: resolvedSourceExamId } : {}),
+            source_exam_context_active: sourceExamContextActive,
           },
         }
       }),

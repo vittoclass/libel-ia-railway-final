@@ -41,6 +41,8 @@ export interface PersistEvaluationOpts {
   source_exam_id?: string | null
   /** Herencia opcional explícita del tipo de instrumento. */
   exam_type?: string | null
+  /** Etiqueta de endpoint para trazabilidad de guardado. */
+  endpoint_origin?: string | null
 }
 
 export interface EvaluationResultForPersist {
@@ -69,8 +71,6 @@ export type PersistResult =
   | { saved: false; success: false; error: { step: string; message: string }; reason?: string }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const FALLBACK_SCHOOL_NAME = "Escuela Local"
-const FALLBACK_TEACHER_NAME = "Profe Local"
 function isValidUUID(s: string | null | undefined): boolean {
   return typeof s === "string" && s.trim() !== "" && UUID_REGEX.test(s.trim())
 }
@@ -106,58 +106,10 @@ async function resolveBatchCourseContextFromPeers(
   return { course_id: firstCourseId, course_label: bestLabel }
 }
 
-async function ensureEmergencyTeacherAndSchool(
-  supabase: SupabaseClient
-): Promise<{ school_id: string | null; teacher_id: string | null }> {
-  let schoolId: string | null = null
-  let teacherId: string | null = null
-  const schoolRes = await supabase
-    .from("schools")
-    .select("id")
-    .eq("name", FALLBACK_SCHOOL_NAME)
-    .limit(1)
-    .maybeSingle()
-  if (!schoolRes.error && schoolRes.data?.id) {
-    schoolId = String((schoolRes.data as { id: string }).id)
-  } else {
-    const insSchool = await supabase
-      .from("schools")
-      .insert({ name: FALLBACK_SCHOOL_NAME })
-      .select("id")
-      .single()
-    if (!insSchool.error && insSchool.data?.id) {
-      schoolId = String((insSchool.data as { id: string }).id)
-    }
-  }
-  if (!schoolId) return { school_id: null, teacher_id: null }
-
-  const teacherRes = await supabase
-    .from("teachers")
-    .select("id")
-    .eq("name", FALLBACK_TEACHER_NAME)
-    .eq("school_id", schoolId)
-    .limit(1)
-    .maybeSingle()
-  if (!teacherRes.error && teacherRes.data?.id) {
-    teacherId = String((teacherRes.data as { id: string }).id)
-  } else {
-    const insTeacher = await supabase
-      .from("teachers")
-      .insert({ name: FALLBACK_TEACHER_NAME, school_id: schoolId })
-      .select("id")
-      .single()
-    if (!insTeacher.error && insTeacher.data?.id) {
-      teacherId = String((insTeacher.data as { id: string }).id)
-    }
-  }
-
-  return { school_id: schoolId, teacher_id: teacherId }
-}
-
 /**
  * Inserta una evaluación y sus ítems/resumen en Supabase (cliente SERVICE_ROLE).
- * NO usa profesor por defecto: teacher_id y school_id deben venir del perfil del usuario autenticado.
- * Si no se pasan teacher_id/school_id válidos, devuelve saved: false (reason: PROFILE_NOT_ONBOARDED o NO_SESSION).
+ * teacher_id y school_id deben venir del perfil del usuario autenticado.
+ * Si faltan o son inválidos, devuelve saved: false y no inventa fallbacks.
  */
 export async function persistEvaluation(
   result: EvaluationResultForPersist,
@@ -192,41 +144,57 @@ const isDev = process.env.NODE_ENV !== "production"
     return { saved: false, success: false, error: { step: "config", message: "Supabase client not available" } }
   }
 
-  let effective_school_id: string | null = opts.school_id?.trim() || null
-  let effective_teacher_id: string | null = opts.teacher_id?.trim() || null
-
-  if (!effective_teacher_id) {
-    const emergency = await ensureEmergencyTeacherAndSchool(supabase)
-    effective_teacher_id = emergency.teacher_id
-    effective_school_id = effective_school_id ?? emergency.school_id
-    if (isDev) {
-      console.warn("[save] teacher_id vacío; usando fallback local", {
-        fallback_teacher_id: effective_teacher_id,
-        fallback_school_id: effective_school_id,
-      })
+  const effective_school_id: string | null = opts.school_id?.trim() || null
+  const effective_teacher_id: string | null = opts.teacher_id?.trim() || null
+  if (!isValidUUID(effective_school_id) || !isValidUUID(effective_teacher_id)) {
+    const msg = "No se pudo guardar la evaluación porque el perfil docente no tiene school_id o teacher_id válido."
+    if (isDev) console.error("[save]", msg)
+    return {
+      saved: false,
+      success: false,
+      error: { step: "resolve_ids", message: msg },
+      reason: "PROFILE_NOT_ONBOARDED",
     }
   }
 
-  if (!effective_school_id) {
-    const { data: teacher } = await supabase
-      .from("teachers")
-      .select("school_id")
-      .eq("id", effective_teacher_id)
-      .single()
-    effective_school_id = teacher?.school_id ?? null
+  const { data: teacherSchoolRow, error: teacherSchoolErr } = await supabase
+    .from("teachers")
+    .select("school_id")
+    .eq("id", effective_teacher_id)
+    .maybeSingle()
+  if (teacherSchoolErr) {
+    const msg = String(teacherSchoolErr.message ?? "")
+    const missingSchoolColumn =
+      msg.includes("column") && msg.includes("school_id") && msg.includes("does not exist")
+    if (!missingSchoolColumn) {
+      return {
+        saved: false,
+        success: false,
+        error: { step: "resolve_ids", message: `No se pudo validar teacher.school_id: ${msg}` },
+      }
+    }
+  } else {
+    const teacherSchoolId = (teacherSchoolRow as { school_id?: string | null } | null)?.school_id ?? null
+    if (teacherSchoolId && teacherSchoolId !== effective_school_id) {
+      return {
+        saved: false,
+        success: false,
+        error: {
+          step: "resolve_ids",
+          message: "No se pudo guardar la evaluación porque el perfil docente no tiene school_id o teacher_id válido.",
+        },
+        reason: "PROFILE_SCHOOL_MISMATCH",
+      }
+    }
   }
 
-  if (!effective_school_id || !effective_teacher_id) {
-    const emergency = await ensureEmergencyTeacherAndSchool(supabase)
-    effective_teacher_id = effective_teacher_id ?? emergency.teacher_id
-    effective_school_id = effective_school_id ?? emergency.school_id
-  }
-
-  if (!effective_school_id || !effective_teacher_id) {
-    const msg = "Falta school_id o teacher_id (incluso con fallback)"
-    if (isDev) console.error("[save]", msg)
-    return { saved: false, success: false, error: { step: "resolve_ids", message: msg }, reason: "PROFILE_NOT_ONBOARDED" }
-  }
+  console.info("[persist][identity]", {
+    endpoint_origin: opts.endpoint_origin ?? "unknown",
+    user_id: opts.user_id?.trim() || null,
+    profile_teacher_id: effective_teacher_id,
+    profile_school_id: effective_school_id,
+    evaluation_school_id_final: effective_school_id,
+  })
 
   const safeTitle = opts.title != null && String(opts.title).trim() !== "" ? String(opts.title).trim() : "Evaluación sin título"
   const subjectFromOpts =

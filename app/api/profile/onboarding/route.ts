@@ -7,6 +7,7 @@ import { DEFAULT_PROFILE_ROLE } from "@/app/lib/profile-defaults"
 import { resolvePilotSchool } from "@/app/lib/pilot-school"
 
 export const dynamic = "force-dynamic"
+const isPilotModeEnabled = () => String(process.env.PILOT_MODE ?? "").trim().toLowerCase() === "true"
 
 export async function POST(req: NextRequest) {
   const user = await getAuthUser()
@@ -34,7 +35,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Supabase no configurado" }, { status: 503 })
   }
 
-  const pilot = await resolvePilotSchool(supabase)
+  const pilot = isPilotModeEnabled() ? await resolvePilotSchool(supabase) : null
 
   let schoolId: string
   if (pilot) {
@@ -110,6 +111,7 @@ export async function POST(req: NextRequest) {
 
   const { error: profileErr } = await supabase.from("profiles").upsert(
     {
+      id: user.id,
       user_id: user.id,
       teacher_id: teacherId,
       school_id: schoolId,
