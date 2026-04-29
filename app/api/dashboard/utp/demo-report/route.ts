@@ -8,6 +8,8 @@ import { resolveEvaluationPedagogy } from "@/app/lib/evaluation-pedagogy"
 
 export const dynamic = "force-dynamic"
 
+type SupabaseServerClient = NonNullable<ReturnType<typeof getSupabaseServer>>
+
 type EvalRow = {
   id: string
   course_label: string | null
@@ -345,7 +347,7 @@ function addPedagogyValueFromScores(
   map.set(safeKey, acc)
 }
 
-async function readEvaluationSkillResultsColumns(supabase: ReturnType<typeof getSupabaseServer>): Promise<SkillResultColumns> {
+async function readEvaluationSkillResultsColumns(supabase: SupabaseServerClient): Promise<SkillResultColumns> {
   const defaults: SkillResultColumns = {
     hasEvaluationId: false,
     hasAxisId: false,
@@ -379,7 +381,7 @@ async function readEvaluationSkillResultsColumns(supabase: ReturnType<typeof get
   }
 }
 
-async function readSourceExamItemsColumns(supabase: ReturnType<typeof getSupabaseServer>): Promise<SourceExamItemColumns> {
+async function readSourceExamItemsColumns(supabase: SupabaseServerClient): Promise<SourceExamItemColumns> {
   const defaults: SourceExamItemColumns = {
     hasSourceExamId: false,
     hasItemNumber: false,
@@ -513,7 +515,7 @@ export async function GET(_req: NextRequest) {
       if (skillErr) {
         skillRows = []
       } else {
-        skillRows = ((skillRowsRaw ?? []) as Array<Record<string, unknown>>).map((r) => ({
+        skillRows = ((skillRowsRaw ?? []) as unknown as Array<Record<string, unknown>>).map((r) => ({
           evaluation_id: String(r.evaluation_id ?? ""),
           axis_id: skillColumns.hasAxisId ? (r.axis_id != null ? String(r.axis_id) : null) : null,
           skill_id: skillColumns.hasSkillId ? (r.skill_id != null ? String(r.skill_id) : null) : null,

@@ -205,10 +205,10 @@ function parseAnalyticsSkills(raw: unknown): AnalyticsSkillsPayload | null {
         })
         .filter((s) => s.skill_name.length > 0)
       const statusRaw = String(r.status ?? "").trim()
-      const status =
-        statusRaw === "has_low_skills" || statusRaw === "no_low_skills" || statusRaw === "no_pedagogical_data"
-          ? statusRaw
-          : undefined
+      let status: "has_low_skills" | "no_low_skills" | "no_pedagogical_data" | undefined
+      if (statusRaw === "has_low_skills" || statusRaw === "no_low_skills" || statusRaw === "no_pedagogical_data") {
+        status = statusRaw
+      }
       return { course_label: String(r.course_label ?? ""), skills, status }
     })
     .filter((r) => r.course_label.length > 0)

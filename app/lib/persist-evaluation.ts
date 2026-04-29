@@ -453,7 +453,7 @@ const isDev = process.env.NODE_ENV !== "production"
       let profileId: string | null = null
       try {
         profileId = await ensureStudentProfile(supabase, {
-          teacher_id: effective_teacher_id,
+          teacher_id: effective_teacher_id!,
           school_id: effective_school_id,
           student_name: confirmedName,
           course_label: profileCourseLabel,
