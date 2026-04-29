@@ -2,7 +2,33 @@
  * Helpers compartidos para el PDF de informe de corrección (mismo criterio que el evaluador).
  * Solo presentación; no toca OMR ni persistencia.
  */
+import type { CorrectionReportGroupForPdf } from "@/app/lib/correction-report-from-evaluation-detail"
 import { pickStudentDesarrolloVisibleText } from "@/app/lib/pick-student-desarrollo-text"
+
+/** Adjuntos compatibles con `StudentGroup.files` / API; solo tipado para el PDF. */
+export type CorrectionReportPdfFileLike = {
+  id?: string
+  name?: string
+  filename?: string
+  fileName?: string
+  url?: string
+  previewUrl?: string
+  dataUrl?: string
+  size?: number
+  type?: string
+  mimeType?: string
+  file?: File
+  mobileBatchPhotoId?: string
+  fromMobileBatch?: boolean
+  batchScanStoragePath?: string | null
+}
+
+/**
+ * `group` aceptado por el documento PDF: `files` como arreglo (p. ej. FilePreview[]), no tupla `[]`.
+ */
+export type CorrectionReportPdfGroupInput = Omit<CorrectionReportGroupForPdf, "files"> & {
+  files?: Array<CorrectionReportPdfFileLike | unknown>
+}
 
 export function renderForWeb(value: unknown): string {
   if (value === null || value === undefined) return ""

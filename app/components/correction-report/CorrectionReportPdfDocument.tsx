@@ -2,16 +2,16 @@
 
 /**
  * Mismo layout de informe de corrección que usa el evaluador (react-pdf).
- * Entrada: group compatible con CorrectionReportGroupForPdf + formData parcial.
+ * Entrada: group compatible con CorrectionReportPdfGroupInput + formData parcial.
  */
 import { format } from "date-fns"
 import { Document, Page, Text, View, StyleSheet, Image as PDFImage } from "@react-pdf/renderer"
 import { buildPedagogicalResumenFromGroup } from "@/app/lib/pedagogical-feedback-from-group"
 import { formatStudentDisplayName } from "@/app/lib/format-student-name"
-import type { CorrectionReportGroupForPdf } from "@/app/lib/correction-report-from-evaluation-detail"
 import {
   filterCorreccionDetalladaParaDesarrolloUnico,
   formatDetalleDesarrolloPdf,
+  type CorrectionReportPdfGroupInput,
   pdfSafe,
   renderForWeb,
   splitCorreccionForTwoPages,
@@ -109,7 +109,7 @@ export function CorrectionReportPdfDocument({
   logoPreview,
   evaluatedAt,
 }: {
-  group: CorrectionReportGroupForPdf
+  group: CorrectionReportPdfGroupInput
   formData: CorrectionReportPdfFormData
   logoPreview?: string | null
   /** Fecha de evaluación (ISO); si falta, se usa hoy como en el evaluador histórico. */
