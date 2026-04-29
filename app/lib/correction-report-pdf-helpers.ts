@@ -2,8 +2,8 @@
  * Helpers compartidos para el PDF de informe de corrección (mismo criterio que el evaluador).
  * Solo presentación; no toca OMR ni persistencia.
  */
-import type { CorrectionReportGroupForPdf } from "@/app/lib/correction-report-from-evaluation-detail"
 import { pickStudentDesarrolloVisibleText } from "@/app/lib/pick-student-desarrollo-text"
+import type { AltRow } from "@/app/lib/pedagogical-feedback-from-group"
 
 /** Adjuntos compatibles con `StudentGroup.files` / API; solo tipado para el PDF. */
 export type CorrectionReportPdfFileLike = {
@@ -26,9 +26,33 @@ export type CorrectionReportPdfFileLike = {
 /**
  * `group` aceptado por el documento PDF: `files` como arreglo (p. ej. FilePreview[]), no tupla `[]`.
  */
-export type CorrectionReportPdfGroupInput = Omit<CorrectionReportGroupForPdf, "files" | "isEvaluated"> & {
-  files?: Array<CorrectionReportPdfFileLike | unknown>
+export type CorrectionReportPdfGroupInput = {
+  id?: string
+  name?: string
+  studentName?: string
+  course?: string
+  courseLabel?: string
+  subject?: string
+  evaluationName?: string
+  score?: number | string | null
+  grade?: number | string | null
+  feedback?: string | null
+  summary?: string | null
+  puntaje?: string
+  nota?: number | string | null
+  decimasAdicionales?: number | null
+  puntosMaximos?: number
+  puntosAprobacion?: number
+  alternativas_corregidas?: AltRow[]
+  detalle_desarrollo?: Record<string, unknown>
+  retroalimentacion?: {
+    correccion_detallada?: unknown[]
+    evaluacion_habilidades?: unknown[]
+    retroalimentacion_alternativas?: unknown[]
+  }
   isEvaluated?: boolean
+  isEvaluating?: boolean
+  files?: Array<CorrectionReportPdfFileLike | unknown>
 }
 
 export function renderForWeb(value: unknown): string {
