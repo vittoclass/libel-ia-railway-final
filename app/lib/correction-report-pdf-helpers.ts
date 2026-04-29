@@ -26,8 +26,9 @@ export type CorrectionReportPdfFileLike = {
 /**
  * `group` aceptado por el documento PDF: `files` como arreglo (p. ej. FilePreview[]), no tupla `[]`.
  */
-export type CorrectionReportPdfGroupInput = Omit<CorrectionReportGroupForPdf, "files"> & {
+export type CorrectionReportPdfGroupInput = Omit<CorrectionReportGroupForPdf, "files" | "isEvaluated"> & {
   files?: Array<CorrectionReportPdfFileLike | unknown>
+  isEvaluated?: boolean
 }
 
 export function renderForWeb(value: unknown): string {
