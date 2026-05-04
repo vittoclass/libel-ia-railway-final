@@ -21,6 +21,14 @@ import {
   sanitizePedagogyEnrichmentsParsed,
   truncateDocumentForLlm,
 } from "@/app/lib/smart-base-parser"
+import {
+  SUPPLEMENT_EXTRACT_SYSTEM_PROMPT,
+  augmentSupplementMapsFromText,
+  mergeOverlayToJsonRecord,
+  mergeSmartExtractWithSupplements,
+  supplementRowsToMaps,
+  type SupplementRow,
+} from "@/app/lib/source-exam-draft-merge"
 
 export const dynamic = "force-dynamic"
 
@@ -28,6 +36,7 @@ export const dynamic = "force-dynamic"
 const MODEL = process.env.ANTHROPIC_MODEL?.trim() || "claude-sonnet-4-6"
 const MAX_FILE_BYTES = 10 * 1024 * 1024
 const MAX_DOC_CHARS = 100_000
+const MAX_SUPPLEMENT_CHARS = 45_000
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" as const
 
 const DEFAULT_STAGE1_MAX_TOKENS = 16384
@@ -283,6 +292,21 @@ export async function POST(req: NextRequest) {
     return jsonNs({ error: `Archivo > ${MAX_FILE_BYTES / 1024 / 1024} MB` }, 400)
   }
 
+  async function readOptionalSupplement(fieldName: string): Promise<{ buffer: Buffer; name: string; mime: string } | null> {
+    const raw = formData.get(fieldName)
+    if (!raw || !(raw instanceof Blob) || raw.size === 0) return null
+    const buf = Buffer.from(await raw.arrayBuffer())
+    if (buf.length > MAX_FILE_BYTES) return null
+    const name = typeof (raw as File).name === "string" ? (raw as File).name : `${fieldName}.pdf`
+    const mime = raw.type || ""
+    if (!isAllowedFile(name, mime)) return null
+    return { buffer: buf, name, mime }
+  }
+
+  const supplementAkPromise = readOptionalSupplement("answer_key_file")
+  const supplementRfPromise = readOptionalSupplement("rubric_file")
+  const [supplementAk, supplementRf] = await Promise.all([supplementAkPromise, supplementRfPromise])
+
   let structured: Awaited<ReturnType<typeof extractSourceDocumentStructured>>
   const extractionStartedAt = Date.now()
   let extractionFinishedAt = extractionStartedAt
@@ -311,10 +335,6 @@ export async function POST(req: NextRequest) {
     // Reversible: si Anthropic exigiera org vía env, comentar estas dos líneas.
     delete process.env.ANTHROPIC_ORG_ID
     delete process.env.ANTHROPIC_ORGANIZATION
-
-    const key = process.env.ANTHROPIC_API_KEY || ""
-    console.log("KEY PREFIJO:", key.slice(0, 10))
-    console.log("KEY FINAL:", key.slice(-6))
 
     console.log(
       "[smart-extract] OCR/base antes de Anthropic:",
@@ -566,6 +586,81 @@ export async function POST(req: NextRequest) {
       warnings.push("La pasada 2 truncó por max_tokens; revise metadatos pedagógicos.")
     }
 
+    let merge_summary:
+      | {
+          answersCompletedFromPauta: number
+          scoresCompletedFromPautaOrRubric: number
+          rubricsAssociated: number
+          conflictsNeedReview: number
+        }
+      | null = null
+    let merge_draft_overlay: ReturnType<typeof mergeOverlayToJsonRecord> | null = null
+
+    if (items.length > 0 && (supplementAk || supplementRf)) {
+      try {
+        let pautaDoc = ""
+        let rubricDoc = ""
+        if (supplementAk) {
+          const exAk = await extractSourceDocumentStructured(supplementAk.buffer, {
+            filename: supplementAk.name,
+            mimeType:
+              supplementAk.mime ||
+              (supplementAk.name.toLowerCase().endsWith(".pdf") ? "application/pdf" : DOCX_MIME),
+          })
+          pautaDoc = truncateDocumentForLlm(exAk.raw_text ?? "", MAX_SUPPLEMENT_CHARS).text.trim()
+        }
+        if (supplementRf) {
+          const exRf = await extractSourceDocumentStructured(supplementRf.buffer, {
+            filename: supplementRf.name,
+            mimeType:
+              supplementRf.mime ||
+              (supplementRf.name.toLowerCase().endsWith(".pdf") ? "application/pdf" : DOCX_MIME),
+          })
+          rubricDoc = truncateDocumentForLlm(exRf.raw_text ?? "", MAX_SUPPLEMENT_CHARS).text.trim()
+        }
+        if (!pautaDoc && !rubricDoc) {
+          warnings.push("Los archivos de pauta/rúbrica no arrojaron texto extraíble; fusión omitida.")
+        } else {
+          const msgSup = await anthropic.messages.create({
+            model: MODEL,
+            max_tokens: Math.min(parseStageMaxTokens("2"), 8192),
+            temperature,
+            system: SUPPLEMENT_EXTRACT_SYSTEM_PROMPT,
+            messages: [
+              {
+                role: "user",
+                content: `PAUTA:\n\n${pautaDoc || "(sin texto)"}\n\n---\n\nRÚBRICA:\n\n${rubricDoc || "(sin texto)"}`,
+              },
+            ],
+          })
+          const textSup = messageTextContent(msgSup)
+          const parsedSup = extractJsonObjectFromModelText(textSup)
+          const obj =
+            parsedSup && typeof parsedSup === "object"
+              ? (parsedSup as { from_pauta?: unknown; from_rubric?: unknown })
+              : {}
+          const maps = supplementRowsToMaps({
+            from_pauta: Array.isArray(obj.from_pauta) ? (obj.from_pauta as SupplementRow[]) : [],
+            from_rubric: Array.isArray(obj.from_rubric) ? (obj.from_rubric as SupplementRow[]) : [],
+          })
+          augmentSupplementMapsFromText(pautaDoc, rubricDoc, maps.pauta, maps.rubric, items)
+          const mergedRes = mergeSmartExtractWithSupplements(items, maps.pauta, maps.rubric)
+          items = mergedRes.merged
+          merge_summary = mergedRes.summary
+          merge_draft_overlay = mergeOverlayToJsonRecord(mergedRes.overlayByItemNumber)
+          console.log(
+            "[smart-extract] fusión pauta/rúbrica aplicada:",
+            JSON.stringify(mergedRes.summary, null, 2),
+          )
+        }
+      } catch (mergeErr) {
+        console.log("[smart-extract] fusión pauta/rúbrica error:", mergeErr)
+        warnings.push(
+          `Fusión pauta/rúbrica omitida: ${mergeErr instanceof Error ? mergeErr.message : String(mergeErr)}`,
+        )
+      }
+    }
+
     const itemsDetected = items.length
     const itemsWithCorrectAnswer = items.filter((it) => hasNonEmptyString(it.correct_answer)).length
     const itemsWithAxisLabel = items.filter((it) => hasNonEmptyString(it.axis_label)).length
@@ -601,6 +696,8 @@ export async function POST(req: NextRequest) {
     const responseBody = {
       items,
       warnings,
+      ...(merge_summary ? { merge_summary } : {}),
+      ...(merge_draft_overlay ? { merge_draft_overlay } : {}),
       meta: {
         model: MODEL,
         document_truncated: truncated,

@@ -1246,6 +1246,10 @@ export default function DashboardUtpPage() {
             <code>batch_id</code>. Si hay un único bloque SIMCE o PAES nacional (p. ej. solo PAES + evaluaciones internas), las
             habilidades se cargan solas para ese bloque; si hay varios bloques nacionales, elija asignatura y familia abajo.
           </p>
+          <p className="mt-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-md px-3 py-2">
+            Fuente principal activa: <code>/api/dashboard/direccion/school-pedagogy</code>. Esta sección es la referencia
+            pedagógica prioritaria para habilidades, ejes y focos institucionales.
+          </p>
           {schoolAnalyticsLoading ? (
             <p className="text-sm text-[var(--text-muted)] mt-3">Cargando analítica…</p>
           ) : !schoolAnalytics || schoolAnalytics.by_skill.length === 0 ? (
@@ -1750,40 +1754,58 @@ export default function DashboardUtpPage() {
         </div>
       )}
       {!loading && !error && (
-        <div className="rounded-xl border border-[var(--border-color)] bg-white overflow-hidden">
-          <table className="min-w-full text-sm">
-            <thead className="bg-slate-50">
-              <tr>
-                <th className="text-left px-4 py-3 font-semibold">Fecha/Hora</th>
-                <th className="text-left px-4 py-3 font-semibold">Profesor</th>
-                <th className="text-left px-4 py-3 font-semibold">Acción</th>
-                <th className="text-left px-4 py-3 font-semibold">Alumno / Curso</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.length === 0 ? (
+        <>
+          <div className="rounded-xl border border-[var(--border-color)] bg-white overflow-hidden">
+            <table className="min-w-full text-sm">
+              <thead className="bg-slate-50">
                 <tr>
-                  <td colSpan={4} className="px-4 py-6 text-[var(--text-muted)]">Sin registros todavía.</td>
+                  <th className="text-left px-4 py-3 font-semibold">Fecha/Hora</th>
+                  <th className="text-left px-4 py-3 font-semibold">Profesor</th>
+                  <th className="text-left px-4 py-3 font-semibold">Acción</th>
+                  <th className="text-left px-4 py-3 font-semibold">Alumno / Curso</th>
                 </tr>
-              ) : (
-                rows.map((row) => (
-                  <tr key={row.id} className="border-t border-[var(--border-color)]">
-                    <td className="px-4 py-3">{formatDateTimeEsCl(row.created_at)}</td>
-                    <td className="px-4 py-3">{row.actor_name || "—"}</td>
-                    <td className="px-4 py-3">{row.action || "—"}</td>
-                    <td className="px-4 py-3">{row.student_or_course || "—"}</td>
+              </thead>
+              <tbody>
+                {rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-6 text-[var(--text-muted)]">Sin registros todavía.</td>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+                ) : (
+                  rows.map((row) => (
+                    <tr key={row.id} className="border-t border-[var(--border-color)]">
+                      <td className="px-4 py-3">{formatDateTimeEsCl(row.created_at)}</td>
+                      <td className="px-4 py-3">{row.actor_name || "—"}</td>
+                      <td className="px-4 py-3">{row.action || "—"}</td>
+                      <td className="px-4 py-3">{row.student_or_course || "—"}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+          <details className="rounded-xl border border-amber-200 bg-amber-50/40 p-4">
+            <summary className="cursor-pointer select-none text-sm font-semibold text-amber-900">
+              Vista experimental (bloques nuevos)
+            </summary>
+            <p className="mt-2 text-xs text-amber-900/90">
+              Estos bloques se mantienen visibles solo como referencia y no reemplazan la lectura pedagógica principal basada en
+              <code> school-pedagogy</code>.
+            </p>
+            <div className="space-y-6 sm:space-y-8 max-w-[1600px] mx-auto pt-3">
+              <UtpDemoReportBlock />
+              <UtpChartsBlock />
+              <UtpByTeacherBlock />
+            </div>
+          </details>
+        </>
+      )}
+      {!loading && error && (
+        <div className="space-y-6 sm:space-y-8 max-w-[1600px] mx-auto pt-2">
+          <UtpDemoReportBlock />
+          <UtpChartsBlock />
+          <UtpByTeacherBlock />
         </div>
       )}
-      <div className="space-y-6 sm:space-y-8 max-w-[1600px] mx-auto pt-2">
-        <UtpDemoReportBlock />
-        <UtpChartsBlock />
-        <UtpByTeacherBlock />
-      </div>
     </section>
   )
 }

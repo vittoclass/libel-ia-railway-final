@@ -6,7 +6,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
-import { Camera, Loader2, CheckCircle2, AlertCircle } from "lucide-react"
+import { Camera, Loader2, CheckCircle2, AlertCircle, X } from "lucide-react"
 import {
   MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT,
   MOBILE_CAPTURE_PAGE_CHOICES,
@@ -57,6 +57,10 @@ export function EstacionMovilClient({ batchId }: Props) {
   const [activatingCamera, setActivatingCamera] = useState(false)
   /** Stream activo: estado para enlazar <video> tras montar (el ref es null antes de scannerActive). */
   const [boundStream, setBoundStream] = useState<MediaStream | null>(null)
+  /** Foto tomada aún no enviada: solo estado local (misma `File` que recibirá `uploadFile`). */
+  const [pendingPreview, setPendingPreview] = useState<{ url: string; file: File } | null>(null)
+  /** Evita doble disparo del obturador justo después de capturar (UI). */
+  const [shutterCooldown, setShutterCooldown] = useState(false)
 
   const batchOk = UUID_REGEX.test(batchId.trim())
 
@@ -102,7 +106,7 @@ export function EstacionMovilClient({ batchId }: Props) {
     return () => {
       el.removeEventListener("loadedmetadata", tryPlay)
     }
-  }, [scannerActive, boundStream])
+  }, [scannerActive, boundStream, pendingPreview])
 
   const validateBatchGate = useCallback(async () => {
     if (!batchOk) {
@@ -175,6 +179,10 @@ export function EstacionMovilClient({ batchId }: Props) {
     (n: number) => {
       if (n < 1 || n > MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT) return
       stopStream()
+      setPendingPreview((prev) => {
+        if (prev?.url) URL.revokeObjectURL(prev.url)
+        return null
+      })
       setImagesPerStudent(n)
       setPageIndex(1)
       setPhase("scanner")
@@ -230,7 +238,7 @@ export function EstacionMovilClient({ batchId }: Props) {
   }, [stopStream])
 
   const uploadFile = useCallback(
-    async (file: File) => {
+    async (file: File): Promise<boolean> => {
       setUploading(true)
       setError(null)
       setLastOk(null)
@@ -245,10 +253,10 @@ export function EstacionMovilClient({ batchId }: Props) {
         const j = await res.json().catch(() => ({}))
         if (!res.ok) {
           setError(typeof j?.error === "string" ? j.error : "Error al subir")
-          return
+          return false
         }
 
-        setLastOk(`Alumno ${studentIndex} · Foto ${pageIndex} de ${imagesPerStudent}`)
+        setLastOk("Foto capturada correctamente. Ahora puedes pasar a la siguiente imagen.")
 
         if (pageIndex < imagesPerStudent) {
           setPageIndex((p) => p + 1)
@@ -256,8 +264,10 @@ export function EstacionMovilClient({ batchId }: Props) {
           setStudentIndex((s) => s + 1)
           setPageIndex(1)
         }
+        return true
       } catch (err) {
         setError(err instanceof Error ? err.message : "Error al subir")
+        return false
       } finally {
         setUploading(false)
       }
@@ -265,15 +275,34 @@ export function EstacionMovilClient({ batchId }: Props) {
     [batchId, studentIndex, pageIndex, imagesPerStudent],
   )
 
-  const captureAndUpload = useCallback(async () => {
+  const revokePreview = useCallback((url: string | undefined) => {
+    if (url) URL.revokeObjectURL(url)
+  }, [])
+
+  const discardPendingPreview = useCallback(() => {
+    if (uploading) {
+      const ok = window.confirm(
+        "La foto se está subiendo. Esto no cancela el envío al servidor. ¿Ocultar solo la previsualización?",
+      )
+      if (!ok) return
+    }
+    setPendingPreview((prev) => {
+      if (prev?.url) revokePreview(prev.url)
+      return null
+    })
+  }, [uploading, revokePreview])
+
+  const captureToPreview = useCallback(async () => {
     const video = videoRef.current
-    if (!video || !batchOk || batchGateOk !== true) return
+    if (!video || !batchOk || batchGateOk !== true || shutterCooldown) return
     const w = video.videoWidth
     const h = video.videoHeight
     if (w < 2 || h < 2) {
       setError("La cámara aún no tiene imagen. Espere un segundo e intente de nuevo.")
       return
     }
+
+    setError(null)
 
     const canvas = document.createElement("canvas")
     canvas.width = w
@@ -293,9 +322,32 @@ export function EstacionMovilClient({ batchId }: Props) {
       return
     }
 
+    setShutterCooldown(true)
+    window.setTimeout(() => setShutterCooldown(false), 1000)
+
     const file = new File([blob], `capture-${Date.now()}.jpg`, { type: "image/jpeg" })
-    await uploadFile(file)
-  }, [batchOk, batchGateOk, uploadFile])
+    const url = URL.createObjectURL(blob)
+    setPendingPreview((prev) => {
+      if (prev?.url) revokePreview(prev.url)
+      return { url, file }
+    })
+  }, [batchOk, batchGateOk, shutterCooldown, revokePreview])
+
+  const submitPendingPreview = useCallback(async () => {
+    if (!pendingPreview) return
+    const { file, url } = pendingPreview
+    const ok = await uploadFile(file)
+    if (ok) {
+      revokePreview(url)
+      setPendingPreview(null)
+    }
+  }, [pendingPreview, uploadFile, revokePreview])
+
+  useEffect(() => {
+    if (!lastOk) return
+    const t = window.setTimeout(() => setLastOk(null), 2600)
+    return () => window.clearTimeout(t)
+  }, [lastOk])
 
   const backToPages = useCallback(() => {
     stopStream()
@@ -303,6 +355,10 @@ export function EstacionMovilClient({ batchId }: Props) {
     setCameraActivationError(null)
     setCameraErrorName(null)
     setError(null)
+    setPendingPreview((prev) => {
+      if (prev?.url) URL.revokeObjectURL(prev.url)
+      return null
+    })
   }, [stopStream])
 
   if (!batchOk) {
@@ -422,26 +478,45 @@ export function EstacionMovilClient({ batchId }: Props) {
               </>
             ) : (
               <>
-                <p className="text-center text-sm font-medium text-indigo-200">Paso 3: Dispara la foto.</p>
+                <p className="text-center text-sm font-medium text-indigo-200">
+                  {pendingPreview
+                    ? "Revisa la foto. Enviála o descartala con la X."
+                    : "Paso 3: Dispara la foto."}
+                </p>
                 <div className="relative w-full overflow-hidden rounded-lg border border-slate-700 bg-black aspect-[3/4] max-h-[55vh]">
-                  {/* playsInline + muted + autoPlay: iOS/Android suelen bloquear reproducción sin esto */}
-                  <video
-                    ref={videoRef}
-                    className="h-full w-full object-cover"
-                    playsInline
-                    muted
-                    autoPlay
-                  />
+                  {pendingPreview ? (
+                    <div className="relative h-full w-full">
+                      {/* eslint-disable-next-line @next/next/no-img-element -- blob: URL local de previsualización */}
+                      <img src={pendingPreview.url} alt="" className="h-full w-full object-cover" />
+                      <button
+                        type="button"
+                        className="absolute top-2 right-2 z-10 flex h-11 w-11 min-h-[44px] min-w-[44px] items-center justify-center rounded-full bg-black/75 text-white shadow-lg ring-1 ring-white/25 active:bg-black/90"
+                        onClick={discardPendingPreview}
+                        aria-label="Descartar foto"
+                      >
+                        <X className="h-6 w-6" strokeWidth={2.5} aria-hidden />
+                      </button>
+                    </div>
+                  ) : (
+                    /* playsInline + muted + autoPlay: iOS/Android suelen bloquear reproducción sin esto */
+                    <video
+                      ref={videoRef}
+                      className="h-full w-full object-cover"
+                      playsInline
+                      muted
+                      autoPlay
+                    />
+                  )}
                 </div>
                 <Button
                   type="button"
                   size="lg"
                   className="w-full h-14 text-lg gap-2 bg-indigo-600 hover:bg-indigo-500"
-                  disabled={uploading}
-                  onClick={() => void captureAndUpload()}
+                  disabled={uploading || (!pendingPreview && shutterCooldown)}
+                  onClick={() => void (pendingPreview ? submitPendingPreview() : captureToPreview())}
                 >
                   {uploading ? <Loader2 className="h-6 w-6 animate-spin" aria-hidden /> : <Camera className="h-6 w-6" aria-hidden />}
-                  {uploading ? "Subiendo…" : "Disparar foto"}
+                  {uploading ? "Subiendo…" : pendingPreview ? "Enviar foto" : "Disparar foto"}
                 </Button>
               </>
             )}
@@ -451,9 +526,13 @@ export function EstacionMovilClient({ batchId }: Props) {
             </Button>
 
             {lastOk ? (
-              <div className="flex items-center justify-center gap-2 text-sm text-emerald-400">
-                <CheckCircle2 className="h-4 w-4 shrink-0" aria-hidden />
-                {lastOk}
+              <div
+                className="flex items-center justify-center gap-2 rounded-lg border border-emerald-500/35 bg-emerald-950/45 px-3 py-3 text-sm text-emerald-200 shadow-sm"
+                role="status"
+                aria-live="polite"
+              >
+                <CheckCircle2 className="h-6 w-6 shrink-0 text-emerald-400" aria-hidden />
+                <span className="text-center font-medium leading-snug">{lastOk}</span>
               </div>
             ) : null}
 

@@ -12,7 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Camera, Loader2, CheckCircle2, AlertCircle } from "lucide-react"
+import { Camera, Loader2, CheckCircle2, AlertCircle, X } from "lucide-react"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 import { MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT, MOBILE_CAPTURE_PAGE_CHOICES } from "@/app/lib/docente/mobile-scan-constants"
 
@@ -41,6 +41,8 @@ export function MovilScanClient({ initialBatchId }: Props) {
   const [uploading, setUploading] = useState(false)
   const [lastOk, setLastOk] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [pendingPreview, setPendingPreview] = useState<{ url: string; file: File } | null>(null)
+  const [shutterCooldown, setShutterCooldown] = useState(false)
 
   const loadProfile = useCallback(async () => {
     setProfileError(null)
@@ -69,10 +71,34 @@ export function MovilScanClient({ initialBatchId }: Props) {
   const batchOk = UUID_REGEX.test(batchId)
 
   const openCamera = () => {
+    if (shutterCooldown || pendingPreview) return
     setError(null)
     setLastOk(null)
     fileRef.current?.click()
   }
+
+  const revokePreview = useCallback((url: string | undefined) => {
+    if (url) URL.revokeObjectURL(url)
+  }, [])
+
+  const discardPendingPreview = useCallback(() => {
+    if (uploading) {
+      const ok = window.confirm(
+        "La foto se está subiendo. Esto no cancela el envío al servidor. ¿Ocultar solo la previsualización?",
+      )
+      if (!ok) return
+    }
+    setPendingPreview((prev) => {
+      if (prev?.url) revokePreview(prev.url)
+      return null
+    })
+  }, [uploading, revokePreview])
+
+  useEffect(() => {
+    if (!lastOk) return
+    const t = window.setTimeout(() => setLastOk(null), 2600)
+    return () => window.clearTimeout(t)
+  }, [lastOk])
 
   const optimizeCaptureForUpload = useCallback(async (file: File): Promise<File> => {
     if (!file.type.startsWith("image/")) return file
@@ -146,7 +172,7 @@ export function MovilScanClient({ initialBatchId }: Props) {
     [sleep, supabase],
   )
 
-  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     e.target.value = ""
     if (!file || !profile || !batchOk) return
@@ -154,11 +180,24 @@ export function MovilScanClient({ initialBatchId }: Props) {
       setError("Seleccione un archivo de imagen.")
       return
     }
+    setError(null)
+    setLastOk(null)
+    setShutterCooldown(true)
+    window.setTimeout(() => setShutterCooldown(false), 1000)
+    const url = URL.createObjectURL(file)
+    setPendingPreview((prev) => {
+      if (prev?.url) revokePreview(prev.url)
+      return { url, file }
+    })
+  }
+
+  const submitPendingUpload = async () => {
+    if (!pendingPreview || !profile || !batchOk) return
+    const { file, url } = pendingPreview
 
     setUploading(true)
     setError(null)
-    // ACK inmediato: la UI responde al instante y la subida sigue en segundo plano.
-    setLastOk(`Captura recibida (alumno ${studentIndex}, foto ${pageIndex}). Subiendo...`)
+    setLastOk(null)
 
     try {
       const optimizedFile = await optimizeCaptureForUpload(file)
@@ -169,7 +208,6 @@ export function MovilScanClient({ initialBatchId }: Props) {
       const uploadErr = await uploadWithRetry(storagePath, optimizedFile)
       if (uploadErr) {
         setError(uploadErr)
-        setUploading(false)
         return
       }
 
@@ -191,11 +229,12 @@ export function MovilScanClient({ initialBatchId }: Props) {
       const insertErr = await insertRowWithRetry(row)
       if (insertErr) {
         setError(insertErr)
-        setUploading(false)
         return
       }
 
-      setLastOk(`Guardado: alumno ${studentIndex}, foto ${pageIndex} de ${imagesPerStudent}`)
+      setLastOk("Foto capturada correctamente. Ahora puedes pasar a la siguiente imagen.")
+      revokePreview(url)
+      setPendingPreview(null)
 
       if (pageIndex < imagesPerStudent) {
         setPageIndex((p) => p + 1)
@@ -245,6 +284,10 @@ export function MovilScanClient({ initialBatchId }: Props) {
               if (n >= 1 && n <= MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT) {
                 setImagesPerStudent(n)
                 setPageIndex(1)
+                setPendingPreview((prev) => {
+                  if (prev?.url) URL.revokeObjectURL(prev.url)
+                  return null
+                })
               }
             }}
           >
@@ -268,30 +311,61 @@ export function MovilScanClient({ initialBatchId }: Props) {
           <p className="text-sm text-indigo-100">
             Ahora: <strong>Alumno {studentIndex}</strong> · Foto <strong>{pageIndex}</strong> de <strong>{imagesPerStudent}</strong>
           </p>
+          {pendingPreview ? (
+            <div className="relative mx-auto w-full max-w-[280px] overflow-hidden rounded-lg border border-slate-700 bg-black aspect-[3/4]">
+              {/* eslint-disable-next-line @next/next/no-img-element -- blob: URL local de previsualización */}
+              <img src={pendingPreview.url} alt="" className="h-full w-full object-cover" />
+              <button
+                type="button"
+                className="absolute top-2 right-2 z-10 flex h-11 w-11 min-h-[44px] min-w-[44px] items-center justify-center rounded-full bg-black/75 text-white shadow-lg ring-1 ring-white/25 active:bg-black/90"
+                onClick={discardPendingPreview}
+                aria-label="Descartar foto"
+              >
+                <X className="h-6 w-6" strokeWidth={2.5} aria-hidden />
+              </button>
+            </div>
+          ) : null}
           <input
             ref={fileRef}
             type="file"
             accept="image/*"
             capture="environment"
             className="hidden"
-            onChange={(ev) => void onFile(ev)}
+            onChange={onFileSelected}
           />
-          <Button
-            type="button"
-            size="lg"
-            className="w-full gap-2 bg-indigo-600 hover:bg-indigo-500"
-            disabled={!batchOk || !profile || uploading}
-            onClick={openCamera}
-          >
-            {uploading ? <Loader2 className="h-5 w-5 animate-spin" aria-hidden /> : <Camera className="h-5 w-5" aria-hidden />}
-            {uploading ? "Subiendo…" : "Tomar foto"}
-          </Button>
+          {pendingPreview ? (
+            <Button
+              type="button"
+              size="lg"
+              className="w-full gap-2 bg-indigo-600 hover:bg-indigo-500"
+              disabled={!batchOk || !profile || uploading}
+              onClick={() => void submitPendingUpload()}
+            >
+              {uploading ? <Loader2 className="h-5 w-5 animate-spin" aria-hidden /> : <Camera className="h-5 w-5" aria-hidden />}
+              {uploading ? "Subiendo…" : "Enviar foto"}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              size="lg"
+              className="w-full gap-2 bg-indigo-600 hover:bg-indigo-500"
+              disabled={!batchOk || !profile || uploading || shutterCooldown}
+              onClick={openCamera}
+            >
+              {uploading ? <Loader2 className="h-5 w-5 animate-spin" aria-hidden /> : <Camera className="h-5 w-5" aria-hidden />}
+              {uploading ? "Subiendo…" : "Tomar foto"}
+            </Button>
+          )}
         </section>
 
         {lastOk ? (
-          <div className="flex items-center gap-2 text-sm text-emerald-400">
-            <CheckCircle2 className="h-4 w-4 shrink-0" aria-hidden />
-            {lastOk}
+          <div
+            className="flex items-center gap-2 rounded-lg border border-emerald-500/35 bg-emerald-950/45 px-3 py-3 text-sm text-emerald-200 shadow-sm"
+            role="status"
+            aria-live="polite"
+          >
+            <CheckCircle2 className="h-6 w-6 shrink-0 text-emerald-400" aria-hidden />
+            <span className="font-medium leading-snug">{lastOk}</span>
           </div>
         ) : null}
 

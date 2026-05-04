@@ -3,6 +3,7 @@
 import { createClientComponentClient } from "@supabase/auth-helpers-nextjs"
 import Link from "next/link"
 import { useCallback, useEffect, useMemo, useState } from "react"
+import { GuidedSessionStationSummary } from "@/app/components/teacher-wizard/GuidedSessionStationSummary"
 import { BatchMobileSyncPanel } from "@/app/components/docente/station/BatchMobileSyncPanel"
 import { BatchPhotoRealtimeGrid } from "@/app/components/docente/station/BatchPhotoRealtimeGrid"
 import { SourceExamQuickPicker, type SourceExamPick } from "@/app/components/docente/station/SourceExamQuickPicker"
@@ -194,6 +195,7 @@ export function DocenteEstacionClient() {
 
       <section className="space-y-4">
         <h2 className="text-lg font-semibold text-slate-900 px-1">2. Sincronización móvil</h2>
+        <GuidedSessionStationSummary />
         {batchSessionError ? (
           <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
             <strong>QR no válido en el celular hasta corregir esto:</strong> {batchSessionError}

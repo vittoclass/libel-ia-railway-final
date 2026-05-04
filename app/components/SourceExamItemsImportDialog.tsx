@@ -4,9 +4,11 @@
  * Diálogo para importación masiva de ítems de prueba base (source_exam_items).
  * Permite pegar un listado o subir un PDF; extrae texto, previsualiza e importa solo líneas válidas.
  * Por defecto reemplaza ítems existentes al importar (evita duplicados). Opción de solo añadir.
+ *
+ * Reversión rápida (UX Paso 2 / puntaje masivo): `git checkout -- app/components/SourceExamItemsImportDialog.tsx`
  */
 import * as React from "react"
-import { useState, useCallback, useRef, useEffect } from "react"
+import { useState, useCallback, useRef, useEffect, useMemo } from "react"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -20,7 +22,34 @@ import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Loader2, FileUp, FileText, Plus, Trash2, ChevronDown, Sparkles, ShieldCheck } from "lucide-react"
+import {
+  Loader2,
+  FileUp,
+  FileText,
+  Plus,
+  Trash2,
+  ChevronDown,
+  Sparkles,
+  ListChecks,
+  Files,
+  Pencil,
+} from "lucide-react"
+import {
+  buildDraftFromParsedLines,
+  buildDraftFromParsedLinesWithSmartMeta,
+  confirmDraftItem,
+  draftRowToParsedLine,
+  draftsApplyMergeOverlay,
+  draftsToParsedLines,
+  isDraftRowCompleteForBulkConfirm,
+  mergeParsedLineIntoDraft,
+  summarizeDraftsForImport,
+  teacherFacingRowStatus,
+  type MergeDraftOverlayByItem,
+  type SourceExamItemDraft,
+  type TeacherFacingRowStatus,
+} from "@/app/lib/source-exam-validation-draft"
+import { mergeOverlayFromJsonRecord } from "@/app/lib/source-exam-draft-merge"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useToast } from "@/hooks/use-toast"
@@ -30,6 +59,27 @@ import type { ItemWithPedagogy } from "@/app/lib/analyze-pedagogical-structure"
 import { inferSuggestedInstrumentTitle, normalizeSourceExamText } from "@/app/lib/normalize-source-exam-text"
 import { parseDevelopmentBlocksFromText } from "@/app/lib/parse-development-blocks"
 import { enrichItemsWithPedagogy } from "@/app/lib/analyze-pedagogical-structure"
+import { cn } from "@/lib/utils"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+
+/** Misma regla que `assignOnePointToMissingMaxScores` en el borrador; puntos configurables (solo cliente). */
+function assignPointsToMissingMaxScores(drafts: SourceExamItemDraft[], points: number): SourceExamItemDraft[] {
+  const p = Math.max(0, Math.floor(Number(points)) || 0)
+  return drafts.map((d) => {
+    if (d.max_score.value != null && Number.isFinite(d.max_score.value)) return d
+    return { ...d, max_score: { value: p, status: "edited_by_user" } }
+  })
+}
 
 const FORMAT_HELP = `Formatos aceptados (una línea por ítem):
 
@@ -45,30 +95,40 @@ const EXAMPLE = `1 | Calcula el área del triángulo | Geometría | Resolución 
 const MAX_LINES = 500
 /** Smart Import: evita spinner infinito si el modelo o la red tardan demasiado. */
 const SMART_EXTRACT_FETCH_MS = 360_000
-const VALIDATE_PRACTICE_FETCH_MS = 360_000
-
-type ValidatePracticeAlert = {
-  severity: string
-  code: string
-  item_number: number | null
-  detail: string
-  base_preview: string | null
-  real_preview: string | null
-}
-
-type ValidatePracticeSummary = {
-  base_alternative_count: number
-  real_alternative_count: number
-  missing_in_real_count: number
-  extra_in_real_count: number
-  key_mismatch_count: number
-  type_mismatch_count: number
-  text_very_different_count: number
-  order_unusual_in_real: boolean
-  key_missing_in_real_count: number
-}
 
 const SEP_PIPE = " | "
+
+/** Separa enunciado y bloque A/B/C… para columnas legibles (alternativas siguen en item_text al importar). */
+function splitStemAndAlternatives(itemText: string): { stem: string; altBlock: string } {
+  const lines = String(itemText ?? "").split(/\r?\n/)
+  let firstAlt = -1
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i]?.trim() ?? ""
+    if (/^[A-Ea-e]\s*[\)\.\:]\s*\S/.test(t)) {
+      firstAlt = i
+      break
+    }
+  }
+  if (firstAlt <= 0) return { stem: String(itemText ?? "").trim(), altBlock: "" }
+  return {
+    stem: lines.slice(0, firstAlt).join("\n").trim(),
+    altBlock: lines.slice(firstAlt).join("\n").trim(),
+  }
+}
+
+function teacherStatusTextClass(s: TeacherFacingRowStatus): string {
+  switch (s) {
+    case "Completo":
+      return "text-emerald-800 dark:text-emerald-200"
+    case "Falta revisar":
+      return "text-amber-800 dark:text-amber-200"
+    case "Sin puntaje":
+    case "Sin respuesta":
+      return "text-destructive"
+    default:
+      return ""
+  }
+}
 
 /** Sincroniza el panel "Texto fuente" con el formato estándar (Nº | enunciado | eje | habilidad | competencia | dificultad). */
 function smartExtractRowsToStandardSourceText(rows: ParsedLine[]): string {
@@ -93,9 +153,14 @@ function sanitizeEditorItemsForApi(rows: ParsedLine[]): ParsedLine[] {
     let max_score: number | null = null
     const ms = it.max_score
     if (ms != null) {
-      const x =
-        typeof ms === "number" && Number.isFinite(ms) ? Math.floor(ms) : parseInt(String(ms), 10)
-      if (!Number.isNaN(x) && x >= 0) max_score = x
+      if (typeof ms === "number" && Number.isFinite(ms)) max_score = Math.max(0, Math.floor(ms))
+      else {
+        const s = String(ms).trim()
+        if (s.length > 0) {
+          const n = Number(s.replace(",", "."))
+          if (!Number.isNaN(n) && n >= 0) max_score = Math.floor(n)
+        }
+      }
     }
     return {
       ...it,
@@ -194,25 +259,6 @@ type Props = {
   onImported: () => void
 }
 
-type SmartExtractMeta = {
-  items_returned?: number
-  items_detected?: number
-  items_with_axis_label?: number
-  items_with_skill_label?: number
-  items_with_cognitive_level?: number
-  items_with_score_max?: number
-  smart_pass_1_ok?: boolean
-  smart_pass_2_ok?: boolean
-  smart_extract_enrich_parse_ok?: boolean
-  input_text_length?: number
-  input_text_hash_short?: string
-  duration_ms_total?: number
-  duration_ms_extraction_text?: number
-  duration_ms_ia_pass_1?: number
-  duration_ms_ia_pass_2?: number
-  warnings?: string[]
-}
-
 export default function SourceExamItemsImportDialog({
   sourceExamId,
   sourceExamTitle = "",
@@ -236,6 +282,9 @@ export default function SourceExamItemsImportDialog({
   } | null>(null)
   /** Única fuente de verdad de la tabla tras Previsualizar; es lo que se envía en `parsed_items`. */
   const [editorItems, setEditorItems] = useState<ParsedLine[]>([])
+  /** Borrador local con field_status (solo cliente; no se envía al servidor). */
+  const [itemDrafts, setItemDrafts] = useState<SourceExamItemDraft[] | null>(null)
+  const reviewRowRefs = useRef<Array<HTMLTableRowElement | null>>([])
   const [sourcePanelOpen, setSourcePanelOpen] = useState(true)
   const [unrecognizedOpen, setUnrecognizedOpen] = useState(true)
   const [pdfOcrDebug, setPdfOcrDebug] = useState<PdfOcrDebugSnapshot | null>(null)
@@ -243,24 +292,78 @@ export default function SourceExamItemsImportDialog({
   const [importing, setImporting] = useState(false)
   const [importTab, setImportTab] = useState<"manual" | "smart">("manual")
   const [smartExtracting, setSmartExtracting] = useState(false)
-  const [validatePracticeLoading, setValidatePracticeLoading] = useState(false)
-  const [smartExtractMeta, setSmartExtractMeta] = useState<SmartExtractMeta | null>(null)
-  const [validatePracticeResult, setValidatePracticeResult] = useState<{
-    summary: ValidatePracticeSummary
-    alerts: ValidatePracticeAlert[]
-    meta?: Record<string, unknown>
-  } | null>(null)
+  const [answerKeyFileLabel, setAnswerKeyFileLabel] = useState<string | null>(null)
+  const [rubricFileLabel, setRubricFileLabel] = useState<string | null>(null)
+  const [answerKeyFile, setAnswerKeyFile] = useState<File | null>(null)
+  const [rubricFile, setRubricFile] = useState<File | null>(null)
+  /** Archivo de prueba elegido antes de pulsar “Analizar y completar”. */
+  const [pendingSmartMainFile, setPendingSmartMainFile] = useState<File | null>(null)
+  const [pendingSmartMainLabel, setPendingSmartMainLabel] = useState<string | null>(null)
+  const [expandedReviewRow, setExpandedReviewRow] = useState<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const smartFileInputRef = useRef<HTMLInputElement>(null)
-  const validatePracticeFileInputRef = useRef<HTMLInputElement>(null)
+  const lastSmartMainFileRef = useRef<File | null>(null)
+  const answerKeySmartInputRef = useRef<HTMLInputElement>(null)
+  const rubricSmartInputRef = useRef<HTMLInputElement>(null)
   const previewTableRef = useRef<HTMLDivElement>(null)
+  const importCtaRef = useRef<HTMLButtonElement>(null)
   const { toast } = useToast()
 
-  useEffect(() => {
-    if (open) {
-      setValidatePracticeResult(null)
+  /** UX Paso 2: tras “Confirmar todo”, mensaje visible + siguiente paso (importar). */
+  const [showReadyToImportBanner, setShowReadyToImportBanner] = useState(false)
+  const [emphasizeImportCta, setEmphasizeImportCta] = useState(false)
+  const [postConfirmImportPromptOpen, setPostConfirmImportPromptOpen] = useState(false)
+  const [massScorePopoverOpen, setMassScorePopoverOpen] = useState(false)
+  const [massScorePointsInput, setMassScorePointsInput] = useState("1")
+
+  const resetImportReadyHints = useCallback(() => {
+    setShowReadyToImportBanner(false)
+    setEmphasizeImportCta(false)
+    setPostConfirmImportPromptOpen(false)
+  }, [])
+
+  const validationRows: ParsedLine[] = useMemo(() => {
+    if (preview && itemDrafts?.length) return draftsToParsedLines(itemDrafts)
+    return editorItems
+  }, [preview, itemDrafts, editorItems])
+
+  const compactImportSummary = useMemo(() => {
+    if (!itemDrafts?.length) return null
+    const s = summarizeDraftsForImport(itemDrafts)
+    return `${s.total} ítems · ${s.sinPuntaje} sin puntaje · ${s.sinRespuestaCorrecta} sin respuesta registrada`
+  }, [itemDrafts])
+
+  const updateRowAt = useCallback((index: number, partial: Partial<ParsedLine>) => {
+    setItemDrafts((prev) => {
+      if (!prev || index < 0 || index >= prev.length) return prev
+      const base = draftRowToParsedLine(prev[index])
+      const line: ParsedLine = { ...base, ...partial }
+      return prev.map((d, i) => (i === index ? mergeParsedLineIntoDraft(d, line) : d))
+    })
+  }, [])
+
+  const confirmAllCompleteDraftRows = useCallback(() => {
+    let hadConfirmable = false
+    setItemDrafts((prev) => {
+      if (!prev) return null
+      hadConfirmable = prev.some((d) => isDraftRowCompleteForBulkConfirm(d))
+      return prev.map((d) => (isDraftRowCompleteForBulkConfirm(d) ? confirmDraftItem(d) : d))
+    })
+    if (!hadConfirmable) {
+      toast({
+        title: "Nada que confirmar aún",
+        description: "Complete enunciado, eje, habilidad y (si aplica) clave o puntaje según el tipo de ítem.",
+        variant: "default",
+      })
+      return
     }
-  }, [open, sourceExamId])
+    setShowReadyToImportBanner(true)
+    setEmphasizeImportCta(true)
+    queueMicrotask(() => {
+      importCtaRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })
+    })
+    window.setTimeout(() => setPostConfirmImportPromptOpen(true), 480)
+  }, [toast])
 
   const handlePdfUpload = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -355,7 +458,9 @@ export default function SourceExamItemsImportDialog({
             console.log("[ImportDialog PDF] normalized_text length:", normalized.normalized_text?.length ?? 0)
           }
           setText(normalized.normalized_text)
+          resetImportReadyHints()
           setPreview(null)
+          setItemDrafts(null)
           if (data.extraction && typeof data.extraction.method === "string") {
             const sl = Array.isArray(data.structured_lines) ? data.structured_lines : []
             const bl = Array.isArray(data.blocks) ? data.blocks : []
@@ -435,7 +540,7 @@ export default function SourceExamItemsImportDialog({
         if (fileInputRef.current) fileInputRef.current.value = ""
       }
     },
-    [sourceExamId, toast, hasActiveBase]
+    [sourceExamId, toast, hasActiveBase, resetImportReadyHints]
   )
 
   const handlePreview = useCallback(() => {
@@ -447,6 +552,7 @@ export default function SourceExamItemsImportDialog({
       })
       return
     }
+    resetImportReadyHints()
     const result = parseBulkItemsText(text)
     const dev = parseDevelopmentBlocksFromText(text)
     const bulkFiltered = result.valid.filter(
@@ -469,22 +575,22 @@ export default function SourceExamItemsImportDialog({
       invalid: invalidFiltered,
       developmentWarnings: dev.warnings.length > 0 ? dev.warnings : undefined,
     })
-    setEditorItems(
-      validMerged.map((p) => ({
-        item_number: p.item_number,
-        item_text: p.item_text,
-        axis_label: p.axis_label ?? null,
-        skill_label: p.skill_label ?? null,
-        competence: p.competence ?? null,
-        difficulty: p.difficulty ?? null,
-        question_type: p.question_type ?? null,
-        correct_answer: p.correct_answer ?? null,
-        max_score: p.max_score ?? null,
-        rubric_text: p.rubric_text ?? null,
-        cognitive_level: p.cognitive_level ?? null,
-      })),
-    )
-  }, [text, hasActiveBase, toast])
+    const rowsForEditor = validMerged.map((p) => ({
+      item_number: p.item_number,
+      item_text: p.item_text,
+      axis_label: p.axis_label ?? null,
+      skill_label: p.skill_label ?? null,
+      competence: p.competence ?? null,
+      difficulty: p.difficulty ?? null,
+      question_type: p.question_type ?? null,
+      correct_answer: p.correct_answer ?? null,
+      max_score: p.max_score ?? null,
+      rubric_text: p.rubric_text ?? null,
+      cognitive_level: p.cognitive_level ?? null,
+    }))
+    setEditorItems(rowsForEditor)
+    setItemDrafts(buildDraftFromParsedLines(rowsForEditor))
+  }, [text, hasActiveBase, toast, resetImportReadyHints])
 
   const handleImport = useCallback(async () => {
     if (!hasActiveBase) {
@@ -501,8 +607,10 @@ export default function SourceExamItemsImportDialog({
       (p) => !dev.items.some((d) => p.item_text === `Pregunta ${d.item_number}`)
     )
     const validFromParsed = dedupeParsedLinesByItemNumber([...bulkFiltered, ...dev.items])
+    const tableLines =
+      preview !== null && itemDrafts?.length ? draftsToParsedLines(itemDrafts) : editorItems
     const editedFiltered = dedupeParsedLinesByItemNumber(
-      sanitizeEditorItemsForApi(editorItems).filter(
+      sanitizeEditorItemsForApi(tableLines).filter(
         (it) => Number(it.item_number) >= 1 && String(it.item_text || "").trim().length > 0,
       ),
     )
@@ -565,6 +673,7 @@ export default function SourceExamItemsImportDialog({
           setText("")
           setPreview(null)
           setEditorItems([])
+          setItemDrafts(null)
           setSourcePanelOpen(true)
           setUnrecognizedOpen(true)
           setInstrumentTitle("")
@@ -608,14 +717,19 @@ export default function SourceExamItemsImportDialog({
     editorItems,
     preview,
     hasActiveBase,
+    itemDrafts,
   ])
 
   const onClose = useCallback(
     (open: boolean) => {
       if (!open && !importing) {
         setText("")
+        resetImportReadyHints()
+        setMassScorePopoverOpen(false)
+        setMassScorePointsInput("1")
         setPreview(null)
         setEditorItems([])
+        setItemDrafts(null)
         setSourcePanelOpen(true)
         setUnrecognizedOpen(true)
         setPdfOcrDebug(null)
@@ -624,24 +738,32 @@ export default function SourceExamItemsImportDialog({
         setSuggestedTitle(null)
         setInstrumentTitle("")
         setImportTab("manual")
-        setValidatePracticeResult(null)
-        setValidatePracticeLoading(false)
-        setSmartExtractMeta(null)
+        setAnswerKeyFile(null)
+        setRubricFile(null)
+        setAnswerKeyFileLabel(null)
+        setRubricFileLabel(null)
+        lastSmartMainFileRef.current = null
+        setPendingSmartMainFile(null)
+        setPendingSmartMainLabel(null)
+        setExpandedReviewRow(null)
       }
       onOpenChange(open)
     },
-    [importing, onOpenChange]
+    [importing, onOpenChange, resetImportReadyHints]
   )
 
   const runSmartExtractForFile = useCallback(
-    async (file: File) => {
+    async (file: File, opts?: { answerKey?: File | null; rubric?: File | null }) => {
       setSmartExtracting(true)
+      lastSmartMainFileRef.current = file
       const controller = new AbortController()
       const timeoutId = window.setTimeout(() => controller.abort(), SMART_EXTRACT_FETCH_MS)
       try {
         const fd = new FormData()
         fd.append("file", file)
         fd.append("source_exam_id", sourceExamId)
+        if (opts?.answerKey) fd.append("answer_key_file", opts.answerKey)
+        if (opts?.rubric) fd.append("rubric_file", opts.rubric)
         const res = await fetch("/api/source-exams/smart-extract", {
           method: "POST",
           credentials: "include",
@@ -654,8 +776,9 @@ export default function SourceExamItemsImportDialog({
           error?: string
           details?: string
           warnings?: string[]
-          meta?: SmartExtractMeta
+          meta?: Record<string, unknown>
           anthropic_status?: number | null
+          merge_draft_overlay?: Record<string, MergeDraftOverlayByItem>
         } = {}
         let bodyParseNote: string | null = null
         try {
@@ -692,8 +815,18 @@ export default function SourceExamItemsImportDialog({
           let max_score: number | null = null
           if (typeof ms === "number" && Number.isFinite(ms)) max_score = Math.max(0, Math.floor(ms))
           else if (ms != null) {
-            const x = parseInt(String(ms), 10)
-            if (!Number.isNaN(x) && x >= 0) max_score = x
+            const s = String(ms).trim()
+            if (s.length > 0) {
+              const n = Number(s.replace(",", "."))
+              if (!Number.isNaN(n) && n >= 0) max_score = Math.floor(n)
+            }
+          }
+          let correct_answer: string | null = null
+          const caRaw = it.correct_answer
+          if (caRaw != null && caRaw !== "") {
+            const u = String(caRaw).trim().toUpperCase()
+            if (/^[A-E]$/.test(u)) correct_answer = u
+            else if (u === "V" || u === "F") correct_answer = u
           }
           return {
             item_number,
@@ -704,7 +837,7 @@ export default function SourceExamItemsImportDialog({
             competence: typeof it.competence === "string" && it.competence.trim() ? it.competence.trim() : null,
             difficulty: typeof it.difficulty === "string" && it.difficulty.trim() ? it.difficulty.trim() : null,
             question_type: question_type as ParsedLine["question_type"],
-            correct_answer: typeof it.correct_answer === "string" && it.correct_answer.trim() ? it.correct_answer.trim().toUpperCase() : null,
+            correct_answer,
             max_score,
             rubric_text: typeof it.rubric_text === "string" && it.rubric_text.trim() ? it.rubric_text.trim() : null,
           }
@@ -718,19 +851,25 @@ export default function SourceExamItemsImportDialog({
           )
         }
         const enriched = enrichItemsWithPedagogy(capped)
+        resetImportReadyHints()
         setPreview({ valid: enriched, invalid: [] })
         setEditorItems(capped)
-        setSmartExtractMeta({ ...(data.meta ?? {}), warnings: data.warnings ?? data.meta?.warnings ?? [] })
+        let drafts = buildDraftFromParsedLinesWithSmartMeta(capped, rawItems)
+        if (data.merge_draft_overlay && typeof data.merge_draft_overlay === "object") {
+          drafts = draftsApplyMergeOverlay(drafts, mergeOverlayFromJsonRecord(data.merge_draft_overlay))
+        }
+        setItemDrafts(drafts)
         setSourcePanelOpen(false)
         setUnrecognizedOpen(false)
         setText(smartExtractRowsToStandardSourceText(capped))
         const baseName = file.name?.replace(/\.(pdf|docx)$/i, "").replace(/[-_]+/g, " ").trim() || ""
         setInstrumentTitle((prev) => (prev.trim() ? prev : baseName))
-        setImportTab("manual")
+        setImportTab("smart")
         toast({
-          title: "Extracción IA completada",
-          description: `${capped.length} ítem(s) en la tabla. Revise y pulse Importar cuando esté listo.`,
+          title: "Análisis listo",
+          description: `${capped.length} preguntas detectadas. Revise la tabla y pulse Importar prueba base.`,
         })
+        setPendingSmartMainLabel(file.name)
         window.setTimeout(() => previewTableRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 80)
       } catch (err) {
         const aborted = err instanceof DOMException && err.name === "AbortError"
@@ -749,11 +888,11 @@ export default function SourceExamItemsImportDialog({
         setSmartExtracting(false)
       }
     },
-    [sourceExamId, toast],
+    [sourceExamId, toast, resetImportReadyHints],
   )
 
-  const handleSmartExtractUpload = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSmartMainFileSelected = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
       if (!hasActiveBase) {
         toast({
           title: "Sin prueba base activa",
@@ -776,114 +915,48 @@ export default function SourceExamItemsImportDialog({
         e.target.value = ""
         return
       }
-      await runSmartExtractForFile(file)
+      setPendingSmartMainFile(file)
+      setPendingSmartMainLabel(file.name)
       e.target.value = ""
       if (smartFileInputRef.current) smartFileInputRef.current.value = ""
     },
-    [hasActiveBase, runSmartExtractForFile, toast],
+    [hasActiveBase, toast],
   )
 
-  const handleValidatePracticeUpload = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      if (!hasActiveBase) {
-        toast({
-          title: "Sin prueba base activa",
-          description: "Abra Importar ítems desde una prueba base seleccionada en el banco.",
-          variant: "destructive",
-        })
-        e.target.value = ""
-        return
-      }
-      const file = e.target.files?.[0]
-      if (!file) return
-      const n = file.name?.toLowerCase() ?? ""
-      const ok =
-        file.type === "application/pdf" ||
-        n.endsWith(".pdf") ||
-        file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-        n.endsWith(".docx")
-      if (!ok) {
-        toast({ title: "Use PDF o Word (.docx)", variant: "destructive" })
-        e.target.value = ""
-        return
-      }
-      setValidatePracticeLoading(true)
-      setValidatePracticeResult(null)
-      const controller = new AbortController()
-      const timeoutId = window.setTimeout(() => controller.abort(), VALIDATE_PRACTICE_FETCH_MS)
-      try {
-        const fd = new FormData()
-        fd.append("file", file)
-        const res = await fetch(`/api/source-exams/${sourceExamId}/validate-practice`, {
-          method: "POST",
-          credentials: "include",
-          body: fd,
-          signal: controller.signal,
-        })
-        const data = (await res.json().catch(() => ({}))) as {
-          ok?: boolean
-          summary?: ValidatePracticeSummary
-          alerts?: ValidatePracticeAlert[]
-          meta?: Record<string, unknown>
-          error?: string
-          details?: string
-        }
-        if (process.env.NODE_ENV !== "production") {
-          console.log("[Validar prueba] response", { httpStatus: res.status, ok: data.ok, summary: data.summary })
-        }
-        if (!res.ok || data.ok === false) {
-          toast({
-            title: data.error || `Error (${res.status})`,
-            description: data.details,
-            variant: "destructive",
-            duration: 14_000,
-          })
-          return
-        }
-        if (data.summary && Array.isArray(data.alerts)) {
-          setValidatePracticeResult({
-            summary: data.summary,
-            alerts: data.alerts,
-            meta: data.meta,
-          })
-          toast({
-            title: "Validación completada",
-            description: `Base (alternativas): ${data.summary.base_alternative_count} · Detectadas en archivo: ${data.summary.real_alternative_count}. Revise alertas abajo; no se modificó la prueba base.`,
-            duration: 12_000,
-          })
-        }
-      } catch (err) {
-        const aborted = err instanceof DOMException && err.name === "AbortError"
-        toast({
-          title: aborted ? "Tiempo de espera (validación)" : "Error de conexión",
-          description: aborted
-            ? "La validación superó el tiempo máximo. Intente con un archivo más pequeño."
-            : err instanceof Error
-              ? err.message
-              : String(err),
-          variant: "destructive",
-        })
-      } finally {
-        window.clearTimeout(timeoutId)
-        setValidatePracticeLoading(false)
-        e.target.value = ""
-        if (validatePracticeFileInputRef.current) validatePracticeFileInputRef.current.value = ""
-      }
-    },
-    [sourceExamId, toast, hasActiveBase],
-  )
+  const handleAnalyzeSmartClick = useCallback(async () => {
+    if (!hasActiveBase) {
+      toast({
+        title: "Sin prueba base activa",
+        description: "Abra Importar ítems desde una prueba base seleccionada en el banco.",
+        variant: "destructive",
+      })
+      return
+    }
+    const main = pendingSmartMainFile
+    if (!main) {
+      toast({
+        title: "Falta la prueba",
+        description: "Elija el archivo PDF o Word de la prueba antes de analizar.",
+        variant: "destructive",
+      })
+      return
+    }
+    await runSmartExtractForFile(main, {
+      answerKey: answerKeyFile ?? undefined,
+      rubric: rubricFile ?? undefined,
+    })
+  }, [answerKeyFile, hasActiveBase, pendingSmartMainFile, rubricFile, runSmartExtractForFile, toast])
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="max-w-[min(96vw,72rem)] max-h-[90vh] overflow-hidden flex flex-col">
+      <DialogContent className="flex h-[min(92vh,960px)] max-h-[92vh] w-[min(98vw,92rem)] max-w-[98vw] flex-col gap-0 overflow-hidden p-4 sm:p-6">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <FileUp className="h-5 w-5" /> Importar ítems
           </DialogTitle>
-          <DialogDescription>
-            <strong>Manual / PDF:</strong> pegue un listado o suba PDF/DOCX como siempre. <strong>IA Smart Import:</strong> opcional;
-            requiere <code className="text-xs">ANTHROPIC_API_KEY</code>. Revise la tabla antes de importar; no altera OMR ni el
-            guardado existente.
+          <DialogDescription className="text-sm">
+            <strong>Manual:</strong> pegue o suba un documento. <strong>IA:</strong> suba prueba (y pauta si tiene) y analice. Revise
+            la tabla y pulse importar. Requiere clave de IA en el servidor.
           </DialogDescription>
         </DialogHeader>
         <div
@@ -903,9 +976,7 @@ export default function SourceExamItemsImportDialog({
           ) : null}
         </div>
         {!hasActiveBase ? (
-          <p className="text-xs text-destructive m-0 shrink-0">
-            Importar, IA Smart Import y validar prueba subida están deshabilitados hasta tener una prueba base activa.
-          </p>
+          <p className="text-xs text-destructive m-0 shrink-0">Seleccione una prueba base en el banco para continuar.</p>
         ) : null}
         <div className="space-y-1.5 shrink-0">
           <Label htmlFor="source-exam-instrument-title">Título del instrumento (se guarda al importar)</Label>
@@ -925,7 +996,7 @@ export default function SourceExamItemsImportDialog({
         <Tabs
           value={importTab}
           onValueChange={(v) => setImportTab(v as "manual" | "smart")}
-          className="flex flex-col flex-1 min-h-0 gap-2"
+          className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden"
         >
           <TabsList className="shrink-0 w-full max-w-lg justify-start">
             <TabsTrigger value="manual">Manual / PDF</TabsTrigger>
@@ -934,8 +1005,8 @@ export default function SourceExamItemsImportDialog({
               IA Smart Import
             </TabsTrigger>
           </TabsList>
-          <TabsContent value="manual" className="flex-1 min-h-0 overflow-hidden mt-0 data-[state=inactive]:hidden">
-            <div className="space-y-3 overflow-auto max-h-[min(58vh,480px)] pr-1">
+          <TabsContent value="manual" className="mt-0 flex min-h-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden">
+            <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pr-1">
           <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-muted-foreground/40 p-3 bg-muted/30">
             <Label className="flex items-center gap-1.5 text-sm font-medium shrink-0">
               <FileText className="h-4 w-4" /> Subir archivo
@@ -1062,230 +1133,441 @@ export default function SourceExamItemsImportDialog({
               <div className="text-xs text-muted-foreground whitespace-pre-wrap">{FORMAT_HELP}</div>
             </>
           )}
-          {preview && (
-            <div
-              ref={previewTableRef}
-              className="border rounded-md overflow-auto max-h-[min(70vh,520px)] scroll-mt-4"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2 px-2 py-2 text-xs border-b bg-muted/30">
-                <span className="text-muted-foreground">
-                  Modo híbrido: la tabla es lo que se importa. Añade o quita filas; el tipo (p. ej. desarrollo) y la clave se
-                  respetan al guardar.
-                </span>
+            </div>
+          </TabsContent>
+          <TabsContent value="smart" className="mt-0 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-1 data-[state=inactive]:hidden">
+            <div className="rounded-lg border border-primary/25 bg-primary/5 px-4 py-3 text-sm leading-relaxed text-foreground">
+              <span className="font-semibold">Paso 1 · Subir documentos.</span>{" "}
+              Suba la prueba y, si tiene, la pauta o la rúbrica. La IA completará respuestas, puntajes y habilidades. Revise la
+              tabla antes de importar.
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="rounded-lg border border-border bg-muted/20 p-4">
+                <Label className="flex items-center gap-2 text-sm font-semibold">
+                  <FileText className="h-4 w-4 shrink-0" /> Archivo de la prueba
+                </Label>
+                <p className="mt-1 text-xs text-muted-foreground m-0">PDF o Word · máx. 10 MB</p>
+                <input
+                  ref={smartFileInputRef}
+                  type="file"
+                  accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  className="hidden"
+                  onChange={handleSmartMainFileSelected}
+                />
                 <Button
                   type="button"
-                  variant="secondary"
-                  size="sm"
-                  className="shrink-0 h-8"
-                  onClick={() =>
-                    setEditorItems((prev) => [...prev, createEmptyParsedLine(nextItemNumber(prev))])
-                  }
+                  variant="outline"
+                  className="mt-3 w-full sm:w-auto"
+                  disabled={smartExtracting || !hasActiveBase}
+                  onClick={() => smartFileInputRef.current?.click()}
                 >
-                  <Plus className="h-3.5 w-3.5 mr-1" />
-                  Añadir ítem
+                  Elegir archivo
                 </Button>
-              </div>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="w-12">Nº</TableHead>
-                    <TableHead>Texto</TableHead>
-                    <TableHead className="w-[8.5rem]">Tipo</TableHead>
-                    <TableHead className="w-14">Puntaje</TableHead>
-                    <TableHead className="w-28">Eje</TableHead>
-                    <TableHead className="w-28">Habilidad</TableHead>
-                    <TableHead className="w-24">Nivel cognitivo</TableHead>
-                    <TableHead className="w-20">Dificultad</TableHead>
-                    <TableHead className="w-28 max-w-[180px]">Rúbrica</TableHead>
-                    <TableHead className="w-20">Clave</TableHead>
-                    <TableHead className="w-12 text-center">—</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {editorItems.length === 0 && (
-                    <TableRow>
-                      <TableCell colSpan={11} className="text-center text-xs text-muted-foreground py-6">
-                        No hay filas todavía. Use &quot;Añadir ítem&quot; o pulse Previsualizar de nuevo tras pegar el listado.
-                      </TableCell>
-                    </TableRow>
-                  )}
-                  {editorItems.map((p, i) => (
-                    <TableRow key={`v-${i}-${p.item_number}`}>
-                      <TableCell>
-                        <Input
-                          className="h-8 w-16"
-                          value={String(p.item_number)}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) =>
-                                idx === i ? { ...row, item_number: Math.max(1, parseInt(e.target.value || "1", 10) || 1) } : row,
-                              ),
-                            )
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="max-w-[300px]">
-                        <textarea
-                          className="w-full min-h-[52px] rounded border border-input bg-background px-2 py-1 text-xs"
-                          value={p.item_text}
-                          onChange={(e) =>
-                            setEditorItems((prev) => prev.map((row, idx) => (idx === i ? { ...row, item_text: e.target.value } : row)))
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="text-xs">
-                        <select
-                          className="h-8 rounded border border-input bg-background px-1 text-xs"
-                          value={p.question_type ?? ""}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) => (idx === i ? { ...row, question_type: e.target.value || null } : row)),
-                            )
-                          }
-                        >
-                          <option value="">— (automático solo si vacío)</option>
-                          <option value="multiple_choice">Alternativas</option>
-                          <option value="true_false">Verdadero / falso</option>
-                          <option value="short_answer">Respuesta corta</option>
-                          <option value="essay">Desarrollo (essay)</option>
-                          <option value="completion">Completar (completion)</option>
-                        </select>
-                      </TableCell>
-                      <TableCell>
-                        <Input
-                          className="h-8 w-16"
-                          value={p.max_score ?? ""}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) =>
-                                idx === i
-                                  ? { ...row, max_score: e.target.value === "" ? null : Math.max(0, parseInt(e.target.value || "0", 10) || 0) }
-                                  : row,
-                              ),
-                            )
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="max-w-[120px] p-1">
-                        <Input
-                          className="h-8 text-xs"
-                          placeholder="Eje"
-                          value={p.axis_label ?? ""}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) =>
-                                idx === i ? { ...row, axis_label: e.target.value.trim() || null } : row,
-                              ),
-                            )
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="max-w-[120px] p-1">
-                        <Input
-                          className="h-8 text-xs"
-                          placeholder="Habilidad"
-                          value={p.skill_label ?? ""}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) =>
-                                idx === i ? { ...row, skill_label: e.target.value.trim() || null } : row,
-                              ),
-                            )
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="max-w-[100px] p-1">
-                        <Input
-                          className="h-8 text-xs"
-                          placeholder="Nivel cognitivo"
-                          value={p.cognitive_level ?? ""}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) =>
-                                idx === i ? { ...row, cognitive_level: e.target.value.trim() || null } : row,
-                              ),
-                            )
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="max-w-[100px] p-1">
-                        <Input
-                          className="h-8 text-xs"
-                          placeholder="Dificultad"
-                          value={p.difficulty ?? ""}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) =>
-                                idx === i ? { ...row, difficulty: e.target.value.trim() || null } : row,
-                              ),
-                            )
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="max-w-[220px]">
-                        <textarea
-                          className="w-full min-h-[52px] rounded border border-input bg-background px-2 py-1 text-xs"
-                          value={p.rubric_text ?? ""}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) => (idx === i ? { ...row, rubric_text: e.target.value || null } : row)),
-                            )
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="text-xs">
-                        <Input
-                          className="h-8 w-16"
-                          placeholder="A/B/..."
-                          value={p.correct_answer ?? ""}
-                          onChange={(e) =>
-                            setEditorItems((prev) =>
-                              prev.map((row, idx) =>
-                                idx === i ? { ...row, correct_answer: e.target.value.trim().toUpperCase() || null } : row,
-                              ),
-                            )
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="p-1 text-center">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                          title="Quitar ítem de la importación"
-                          onClick={() => setEditorItems((prev) => prev.filter((_, idx) => idx !== i))}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-              {editorItems.length > MAX_LINES && (
-                <p className="text-xs text-muted-foreground px-2 py-1 border-t">
-                  Hay {editorItems.length} filas; el máximo por importación es {MAX_LINES}.
+                <p className="mt-2 text-xs font-medium text-foreground m-0 break-all">
+                  {pendingSmartMainLabel ?? "Ningún archivo elegido"}
                 </p>
-              )}
+              </div>
+              <div className="rounded-lg border border-border bg-muted/20 p-4">
+                <Label className="flex items-center gap-2 text-sm font-semibold">
+                  <Files className="h-4 w-4 shrink-0" /> Pauta o rúbrica (opcional)
+                </Label>
+                <p className="mt-1 text-xs text-muted-foreground m-0">
+                  Mejoran respuestas correctas y puntajes. Puede subir solo uno o ambos.
+                </p>
+                <input
+                  ref={answerKeySmartInputRef}
+                  type="file"
+                  accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0]
+                    if (f) {
+                      setAnswerKeyFile(f)
+                      setAnswerKeyFileLabel(f.name)
+                    }
+                    e.target.value = ""
+                  }}
+                />
+                <input
+                  ref={rubricSmartInputRef}
+                  type="file"
+                  accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0]
+                    if (f) {
+                      setRubricFile(f)
+                      setRubricFileLabel(f.name)
+                    }
+                    e.target.value = ""
+                  }}
+                />
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={smartExtracting || !hasActiveBase}
+                    onClick={() => answerKeySmartInputRef.current?.click()}
+                  >
+                    Subir pauta
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={smartExtracting || !hasActiveBase}
+                    onClick={() => rubricSmartInputRef.current?.click()}
+                  >
+                    Subir rúbrica
+                  </Button>
+                </div>
+                <p className="mt-2 text-xs text-muted-foreground m-0 break-all">
+                  Pauta: {answerKeyFileLabel ?? "—"} · Rúbrica: {rubricFileLabel ?? "—"}
+                </p>
+              </div>
             </div>
-          )}
-          {preview && (
-            <div className="space-y-2">
+            <Button
+              type="button"
+              size="lg"
+              className="h-12 w-full text-base font-semibold sm:max-w-xl"
+              disabled={smartExtracting || !hasActiveBase || !pendingSmartMainFile}
+              onClick={() => void handleAnalyzeSmartClick()}
+            >
+              {smartExtracting ? <Loader2 className="mr-2 h-5 w-5 animate-spin" /> : <Sparkles className="mr-2 h-5 w-5" />}
+              {smartExtracting ? "Analizando…" : "Analizar y completar prueba base"}
+            </Button>
+            {pendingSmartMainLabel && preview ? (
+              <p className="text-xs text-muted-foreground m-0">
+                Analizado: <span className="font-medium text-foreground">{pendingSmartMainLabel}</span>. Revise el{" "}
+                <strong className="text-foreground">Paso 2</strong> debajo de las pestañas.
+              </p>
+            ) : null}
+          </TabsContent>
+        </Tabs>
+        {preview && (
+          <>
+            <div
+              ref={previewTableRef}
+              className="mt-3 flex min-h-[min(70vh,640px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-sm scroll-mt-4"
+            >
+              <div className="shrink-0 border-b border-border bg-muted/30 px-4 py-3">
+                <h3 className="m-0 text-base font-semibold text-foreground">Paso 2 · Revisar y guardar</h3>
+                <p className="m-0 mt-1 text-sm text-muted-foreground">
+                  Nada se guarda en la plataforma hasta que pulse <span className="font-medium text-foreground">Importar prueba base</span>.
+                </p>
+                {compactImportSummary ? (
+                  <p className="m-0 mt-2 text-sm text-foreground/90">{compactImportSummary}</p>
+                ) : null}
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/20 px-3 py-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                  onClick={() => {
+                    const lines = validationRows
+                    const n = nextItemNumber(lines)
+                    const empty = createEmptyParsedLine(n)
+                    const draftRow = buildDraftFromParsedLines([empty])[0]
+                    setItemDrafts((prev) => [...(prev ?? []), draftRow])
+                    setEditorItems((prev) => [...prev, empty])
+                  }}
+                >
+                  <Plus className="mr-1 h-3.5 w-3.5" />
+                  Añadir fila
+                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Popover open={massScorePopoverOpen} onOpenChange={setMassScorePopoverOpen}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8"
+                        disabled={!itemDrafts?.length}
+                      >
+                        Asignar puntaje (sin puntaje)
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-80" align="end" sideOffset={6}>
+                      <p className="text-sm font-medium leading-snug m-0">Asignar puntaje a ítems sin puntaje</p>
+                      <div className="mt-3 flex flex-wrap items-center gap-2">
+                        <Input
+                          id="mass-score-points"
+                          type="number"
+                          min={0}
+                          step={1}
+                          className="h-9 w-[5.5rem]"
+                          inputMode="numeric"
+                          value={massScorePointsInput}
+                          onChange={(e) => setMassScorePointsInput(e.target.value)}
+                          aria-label="Puntos a asignar"
+                        />
+                        <span className="text-sm text-muted-foreground">puntos</span>
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="mt-3 w-full"
+                        onClick={() => {
+                          const raw = massScorePointsInput.trim()
+                          const n = raw === "" ? NaN : Number(raw.replace(",", "."))
+                          if (Number.isNaN(n) || n < 0 || !Number.isFinite(n)) {
+                            toast({
+                              title: "Valor inválido",
+                              description: "Indique un número entero mayor o igual a 0.",
+                              variant: "destructive",
+                            })
+                            return
+                          }
+                          const points = Math.max(0, Math.floor(n))
+                          setItemDrafts((prev) => (prev ? assignPointsToMissingMaxScores(prev, points) : null))
+                          toast({
+                            title: "Listo",
+                            description:
+                              points === 0
+                                ? "Puntaje 0 en cada ítem que no tenía puntaje."
+                                : `${points} punto${points === 1 ? "" : "s"} en cada ítem que no tenía puntaje.`,
+                          })
+                          setMassScorePopoverOpen(false)
+                        }}
+                      >
+                        Aplicar
+                      </Button>
+                    </PopoverContent>
+                  </Popover>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="h-8"
+                    onClick={confirmAllCompleteDraftRows}
+                    disabled={!itemDrafts?.length}
+                  >
+                    <ListChecks className="mr-1 h-3.5 w-3.5" />
+                    Confirmar todo
+                  </Button>
+                </div>
+              </div>
+              <div className="min-h-0 max-h-[min(68vh,620px)] flex-1 overflow-auto">
+                <Table>
+                  <TableHeader className="sticky top-0 z-20 bg-muted/95 shadow-sm backdrop-blur-sm">
+                    <TableRow className="hover:bg-transparent">
+                      <TableHead className="w-12 whitespace-nowrap">Nº</TableHead>
+                      <TableHead className="min-w-[220px]">Pregunta</TableHead>
+                      <TableHead className="min-w-[200px]">Alternativas / respuesta</TableHead>
+                      <TableHead className="w-16 whitespace-nowrap">Puntaje</TableHead>
+                      <TableHead className="min-w-[120px]">Eje</TableHead>
+                      <TableHead className="min-w-[120px]">Habilidad</TableHead>
+                      <TableHead className="w-[9rem] whitespace-nowrap">Estado</TableHead>
+                      <TableHead className="w-28 text-right whitespace-nowrap">Acciones</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {validationRows.length === 0 && (
+                      <TableRow>
+                        <TableCell colSpan={8} className="py-8 text-center text-sm text-muted-foreground">
+                          No hay ítems. Pulse Previsualizar (manual) o analice un documento (IA).
+                        </TableCell>
+                      </TableRow>
+                    )}
+                    {validationRows.map((p, i) => {
+                      const d = itemDrafts?.[i]
+                      const { stem, altBlock } = splitStemAndAlternatives(p.item_text)
+                      const statusLabel: TeacherFacingRowStatus = d ? teacherFacingRowStatus(d) : "Falta revisar"
+                      const openExtra = expandedReviewRow === i
+                      return (
+                        <React.Fragment key={`v-${i}-${p.item_number}`}>
+                          <TableRow
+                            ref={(el) => {
+                              reviewRowRefs.current[i] = el
+                            }}
+                            className={openExtra ? "bg-muted/40" : undefined}
+                          >
+                            <TableCell className="align-top py-3">
+                              <Input
+                                className="h-9 w-14"
+                                value={String(p.item_number)}
+                                onChange={(e) =>
+                                  updateRowAt(i, {
+                                    item_number: Math.max(1, parseInt(e.target.value || "1", 10) || 1),
+                                  })
+                                }
+                              />
+                            </TableCell>
+                            <TableCell className="align-top py-3 max-w-[min(32rem,44vw)]">
+                              <textarea
+                                className="min-h-[72px] w-full rounded-md border border-input bg-background px-2 py-2 text-sm leading-snug"
+                                value={p.item_text}
+                                onChange={(e) => updateRowAt(i, { item_text: e.target.value })}
+                                spellCheck={false}
+                              />
+                              {stem && altBlock ? (
+                                <p className="mt-1 text-[11px] text-muted-foreground m-0">
+                                  Enunciado y alternativas pueden ir en el mismo bloque; edítelo aquí si hace falta.
+                                </p>
+                              ) : null}
+                            </TableCell>
+                            <TableCell className="align-top py-3 text-sm">
+                              {altBlock ? (
+                                <pre className="mb-2 max-h-36 overflow-auto whitespace-pre-wrap rounded border border-border/60 bg-muted/30 p-2 font-sans text-xs leading-relaxed">
+                                  {altBlock}
+                                </pre>
+                              ) : (
+                                <p className="text-xs text-muted-foreground m-0 mb-2">
+                                  {p.question_type === "multiple_choice" || p.question_type === "true_false"
+                                    ? "Si no ves alternativas, compruebe el texto completo en «Pregunta»."
+                                    : "—"}
+                                </p>
+                              )}
+                              <div className="flex flex-col gap-1">
+                                <Label className="text-[11px] text-muted-foreground">Respuesta correcta</Label>
+                                <Input
+                                  className="h-9 w-20"
+                                  placeholder="A–E / V/F"
+                                  value={p.correct_answer ?? ""}
+                                  onChange={(e) =>
+                                    updateRowAt(i, { correct_answer: e.target.value.trim().toUpperCase() || null })
+                                  }
+                                />
+                              </div>
+                            </TableCell>
+                            <TableCell className="align-top py-3">
+                              <Input
+                                className="h-9 w-16"
+                                inputMode="numeric"
+                                value={p.max_score === 0 ? "0" : p.max_score ?? ""}
+                                onChange={(e) =>
+                                  updateRowAt(i, {
+                                    max_score:
+                                      e.target.value === "" ? null : Math.max(0, parseInt(e.target.value || "0", 10) || 0),
+                                  })
+                                }
+                              />
+                            </TableCell>
+                            <TableCell className="align-top py-3">
+                              <Input
+                                className="h-9 text-sm"
+                                placeholder="Eje"
+                                value={p.axis_label ?? ""}
+                                onChange={(e) => updateRowAt(i, { axis_label: e.target.value.trim() || null })}
+                              />
+                            </TableCell>
+                            <TableCell className="align-top py-3">
+                              <Input
+                                className="h-9 text-sm"
+                                placeholder="Habilidad"
+                                value={p.skill_label ?? ""}
+                                onChange={(e) => updateRowAt(i, { skill_label: e.target.value.trim() || null })}
+                              />
+                            </TableCell>
+                            <TableCell className="align-top py-3">
+                              <span className={`text-sm font-medium ${teacherStatusTextClass(statusLabel)}`}>{statusLabel}</span>
+                            </TableCell>
+                            <TableCell className="align-top py-3 text-right">
+                              <div className="flex flex-col items-end gap-1">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-8"
+                                  onClick={() => setExpandedReviewRow((x) => (x === i ? null : i))}
+                                >
+                                  <Pencil className="mr-1 h-3.5 w-3.5" />
+                                  Editar
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-8 text-muted-foreground hover:text-destructive"
+                                  onClick={() => {
+                                    setItemDrafts((prev) => (prev ? prev.filter((_, idx) => idx !== i) : null))
+                                    setEditorItems((prev) => prev.filter((_, idx) => idx !== i))
+                                    setExpandedReviewRow((x) => (x === i ? null : x))
+                                  }}
+                                >
+                                  <Trash2 className="mr-1 h-3.5 w-3.5" />
+                                  Quitar
+                                </Button>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                          {openExtra ? (
+                            <TableRow key={`extra-${i}`} className="bg-muted/25">
+                              <TableCell colSpan={8} className="py-3">
+                                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                                  <div>
+                                    <Label className="text-xs">Tipo de pregunta</Label>
+                                    <select
+                                      className="mt-1 h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                                      value={p.question_type ?? ""}
+                                      onChange={(e) => updateRowAt(i, { question_type: e.target.value || null })}
+                                    >
+                                      <option value="">—</option>
+                                      <option value="multiple_choice">Alternativas</option>
+                                      <option value="true_false">Verdadero / falso</option>
+                                      <option value="short_answer">Respuesta corta</option>
+                                      <option value="essay">Desarrollo</option>
+                                      <option value="completion">Completar</option>
+                                    </select>
+                                  </div>
+                                  <div>
+                                    <Label className="text-xs">Nivel cognitivo</Label>
+                                    <Input
+                                      className="mt-1 h-9 text-sm"
+                                      value={p.cognitive_level ?? ""}
+                                      onChange={(e) => updateRowAt(i, { cognitive_level: e.target.value.trim() || null })}
+                                    />
+                                  </div>
+                                  <div>
+                                    <Label className="text-xs">Dificultad</Label>
+                                    <Input
+                                      className="mt-1 h-9 text-sm"
+                                      value={p.difficulty ?? ""}
+                                      onChange={(e) => updateRowAt(i, { difficulty: e.target.value.trim() || null })}
+                                    />
+                                  </div>
+                                  <div className="sm:col-span-2 lg:col-span-4">
+                                    <Label className="text-xs">Rúbrica o criterios (si aplica)</Label>
+                                    <textarea
+                                      className="mt-1 min-h-[64px] w-full rounded-md border border-input bg-background px-2 py-2 text-sm"
+                                      value={p.rubric_text ?? ""}
+                                      onChange={(e) => updateRowAt(i, { rubric_text: e.target.value || null })}
+                                    />
+                                  </div>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          ) : null}
+                        </React.Fragment>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+                {validationRows.length > MAX_LINES && (
+                  <p className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
+                    Hay {validationRows.length} filas; el máximo por importación es {MAX_LINES}.
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="mt-3 space-y-2">
               <Collapsible open={sourcePanelOpen} onOpenChange={setSourcePanelOpen}>
                 <CollapsibleTrigger className="flex w-full items-center justify-between rounded-md border border-border bg-muted/40 px-3 py-2 text-left text-sm font-medium hover:bg-muted/60">
-                  <span>Texto fuente (apoyo para copiar/pegar)</span>
+                  <span>Opcional · texto fuente (manual)</span>
                   <ChevronDown
                     className={`h-4 w-4 shrink-0 transition-transform ${sourcePanelOpen ? "rotate-180" : ""}`}
                   />
                 </CollapsibleTrigger>
                 <CollapsibleContent className="space-y-2 pt-2">
                   <p className="text-xs text-muted-foreground m-0">
-                    Editar aquí no cambia la tabla hasta que pulse <strong>Previsualizar</strong>. La importación usa solo la
-                    tabla de arriba.
+                    Solo si importó desde listado manual: aquí no se actualiza la tabla hasta pulsar Previsualizar.
                   </p>
                   <textarea
-                    className="w-full min-h-[140px] rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                    className="w-full min-h-[120px] rounded-md border border-input bg-background px-3 py-2 text-sm"
                     placeholder={EXAMPLE}
                     value={text}
                     onChange={(e) => setText(e.target.value)}
@@ -1296,7 +1578,7 @@ export default function SourceExamItemsImportDialog({
               <Collapsible open={unrecognizedOpen} onOpenChange={setUnrecognizedOpen}>
                 <CollapsibleTrigger className="flex w-full items-center justify-between rounded-md border border-border bg-muted/40 px-3 py-2 text-left text-sm font-medium hover:bg-muted/60">
                   <span>
-                    Líneas no reconocidas como ítems
+                    Líneas no reconocidas (manual)
                     {preview.invalid.length > 0 ? ` (${preview.invalid.length})` : ""}
                   </span>
                   <ChevronDown
@@ -1305,7 +1587,7 @@ export default function SourceExamItemsImportDialog({
                 </CollapsibleTrigger>
                 <CollapsibleContent className="pt-2">
                   {preview.invalid.length === 0 ? (
-                    <p className="text-xs text-muted-foreground m-0">No hay líneas marcadas como inválidas en el último parse.</p>
+                    <p className="text-xs text-muted-foreground m-0">Ninguna.</p>
                   ) : (
                     <ul className="max-h-[200px] overflow-auto rounded-md border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive space-y-2 list-none m-0">
                       {preview.invalid.map((inv, i) => (
@@ -1318,121 +1600,8 @@ export default function SourceExamItemsImportDialog({
                 </CollapsibleContent>
               </Collapsible>
             </div>
-          )}
-            </div>
-          </TabsContent>
-          <TabsContent value="smart" className="mt-0 space-y-3 data-[state=inactive]:hidden overflow-auto max-h-[min(36vh,280px)] pr-1">
-            <p className="text-xs text-muted-foreground m-0 leading-relaxed">
-              Sube un PDF o DOCX: el servidor reutiliza el mismo extractor que en manual y envía el texto a{" "}
-              <strong>Claude</strong> (modelo según <code className="text-[10px]">ANTHROPIC_SMART_EXTRACT_MODEL</code> o
-              predeterminado). Los campos se filtran por confianza ≥ 75 % en el servidor; la tabla de previsualización muestra
-              Eje, Habilidad, Clave y el resto. Tras procesar, se abre la pestaña Manual para revisar y pulsar{" "}
-              <strong>Importar</strong>.
-            </p>
-            <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-muted-foreground/40 p-3 bg-muted/30">
-              <Label className="flex items-center gap-1.5 text-sm font-medium shrink-0">
-                <Sparkles className="h-4 w-4" /> Archivo
-              </Label>
-              <input
-                ref={smartFileInputRef}
-                type="file"
-                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                className="hidden"
-                onChange={handleSmartExtractUpload}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={smartExtracting || validatePracticeLoading || !hasActiveBase}
-                onClick={() => smartFileInputRef.current?.click()}
-              >
-                {smartExtracting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                {smartExtracting ? "Procesando…" : "Elegir PDF o DOCX"}
-              </Button>
-              <span className="text-xs text-muted-foreground">Máx. 10 MB · misma autenticación que la prueba base actual.</span>
-            </div>
-            {smartExtractMeta ? (
-              <div className="rounded-md border border-border bg-background text-xs p-3 space-y-1">
-                <p className="m-0 font-medium text-foreground">Métricas Smart IA (último intento)</p>
-                <p className="m-0 text-muted-foreground">
-                  ítems: {smartExtractMeta.items_detected ?? smartExtractMeta.items_returned ?? 0} · eje:{" "}
-                  {smartExtractMeta.items_with_axis_label ?? 0} · habilidad: {smartExtractMeta.items_with_skill_label ?? 0} ·
-                  nivel cognitivo: {smartExtractMeta.items_with_cognitive_level ?? 0} · puntaje:{" "}
-                  {smartExtractMeta.items_with_score_max ?? 0}
-                </p>
-                <p className="m-0 text-muted-foreground">
-                  pass1: {smartExtractMeta.smart_pass_1_ok ? "ok" : "no"} · pass2:{" "}
-                  {smartExtractMeta.smart_pass_2_ok ? "ok" : "no"} · enrich_parse:{" "}
-                  {smartExtractMeta.smart_extract_enrich_parse_ok ? "ok" : "no"} · hash:{" "}
-                  {smartExtractMeta.input_text_hash_short ?? "n/a"}
-                </p>
-              </div>
-            ) : null}
-            <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-primary/30 p-3 bg-muted/20">
-              <Label className="flex items-center gap-1.5 text-sm font-medium shrink-0">
-                <ShieldCheck className="h-4 w-4 text-primary" /> Validar prueba subida
-              </Label>
-              <input
-                ref={validatePracticeFileInputRef}
-                type="file"
-                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                className="hidden"
-                onChange={handleValidatePracticeUpload}
-              />
-              <Button
-                type="button"
-                variant="secondary"
-                size="sm"
-                disabled={smartExtracting || validatePracticeLoading || !hasActiveBase}
-                onClick={() => validatePracticeFileInputRef.current?.click()}
-              >
-                {validatePracticeLoading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                {validatePracticeLoading ? "Validando…" : "Comparar con la base (solo alternativas)"}
-              </Button>
-              <span className="text-xs text-muted-foreground">
-                No importa ni cambia ítems: solo compara tu archivo con los ítems de alternativa múltiple ya guardados.
-              </span>
-            </div>
-            {validatePracticeResult ? (
-              <div className="rounded-md border border-border bg-background text-xs space-y-2 p-3 max-h-[220px] overflow-auto">
-                <p className="font-medium text-foreground m-0">Resumen</p>
-                <ul className="list-disc pl-4 m-0 space-y-0.5 text-muted-foreground">
-                  <li>Base (alternativas): {validatePracticeResult.summary.base_alternative_count}</li>
-                  <li>Detectadas en archivo: {validatePracticeResult.summary.real_alternative_count}</li>
-                  <li>Faltantes en archivo: {validatePracticeResult.summary.missing_in_real_count}</li>
-                  <li>Sobrantes en archivo: {validatePracticeResult.summary.extra_in_real_count}</li>
-                  <li>Clave distinta: {validatePracticeResult.summary.key_mismatch_count}</li>
-                  <li>Clave en base sin detectar en archivo: {validatePracticeResult.summary.key_missing_in_real_count}</li>
-                  <li>Tipo distinto: {validatePracticeResult.summary.type_mismatch_count}</li>
-                  <li>Texto muy distinto: {validatePracticeResult.summary.text_very_different_count}</li>
-                  <li>Orden inusual en extracción: {validatePracticeResult.summary.order_unusual_in_real ? "sí" : "no"}</li>
-                </ul>
-                {validatePracticeResult.alerts.length > 0 ? (
-                  <>
-                    <p className="font-medium text-foreground m-0 pt-1">Alertas ({validatePracticeResult.alerts.length})</p>
-                    <ul className="list-none m-0 space-y-2">
-                      {validatePracticeResult.alerts.slice(0, 40).map((a, i) => (
-                        <li key={`val-${a.code}-${a.item_number ?? "x"}-${i}`} className="border-b border-border/60 pb-2 last:border-0">
-                          <span className="text-[10px] uppercase text-muted-foreground">{a.code}</span>
-                          {a.item_number != null ? (
-                            <span className="text-[10px] text-muted-foreground"> · ítem {a.item_number}</span>
-                          ) : null}
-                          <p className="m-0 mt-0.5 text-foreground/90">{a.detail}</p>
-                        </li>
-                      ))}
-                    </ul>
-                    {validatePracticeResult.alerts.length > 40 ? (
-                      <p className="text-muted-foreground m-0">… y {validatePracticeResult.alerts.length - 40} más (ver logs servidor).</p>
-                    ) : null}
-                  </>
-                ) : (
-                  <p className="text-muted-foreground m-0">Sin alertas en esta corrida.</p>
-                )}
-              </div>
-            ) : null}
-          </TabsContent>
-        </Tabs>
+          </>
+        )}
           <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 shrink-0">
             <Checkbox
               id="source-exam-replace-items"
@@ -1445,7 +1614,15 @@ export default function SourceExamItemsImportDialog({
               existentes y puede repetirse el mismo número de ítem.
             </Label>
           </div>
-          <div className="flex flex-wrap gap-2 shrink-0">
+          {showReadyToImportBanner ? (
+            <div
+              role="status"
+              className="rounded-md border border-emerald-500/45 bg-emerald-500/10 px-3 py-2.5 text-sm text-emerald-950 dark:text-emerald-100 shrink-0"
+            >
+              Todos los ítems están listos para importar.
+            </div>
+          ) : null}
+          <div className="flex flex-wrap gap-2 shrink-0 scroll-mt-24">
             <Button
               type="button"
               variant="outline"
@@ -1456,15 +1633,39 @@ export default function SourceExamItemsImportDialog({
               Previsualizar
             </Button>
             <Button
+              ref={importCtaRef}
               type="button"
               size="sm"
               onClick={handleImport}
               disabled={importing || (!text.trim() && !preview) || !hasActiveBase}
+              className={cn(
+                emphasizeImportCta && "ring-2 ring-primary ring-offset-2 ring-offset-background shadow-md",
+              )}
             >
               {importing ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-              Importar ítems válidos
+              Importar prueba base
             </Button>
           </div>
+        <AlertDialog open={postConfirmImportPromptOpen} onOpenChange={setPostConfirmImportPromptOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>¿Importar ahora?</AlertDialogTitle>
+              <AlertDialogDescription>¿Deseas importar la prueba base ahora?</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel type="button">Revisar</AlertDialogCancel>
+              <AlertDialogAction
+                type="button"
+                onClick={() => {
+                  void handleImport()
+                }}
+                disabled={importing || (!text.trim() && !preview) || !hasActiveBase}
+              >
+                Importar
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
         <DialogFooter>
           <Button variant="outline" onClick={() => onClose(false)} disabled={importing}>
             Cerrar
@@ -1474,3 +1675,5 @@ export default function SourceExamItemsImportDialog({
     </Dialog>
   )
 }
+
+/* Reversión UX (mismo comentario que arriba): git checkout -- app/components/SourceExamItemsImportDialog.tsx */

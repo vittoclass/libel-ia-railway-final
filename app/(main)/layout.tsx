@@ -1,6 +1,7 @@
 import type { ReactNode } from "react"
 import Link from "next/link"
 import AuthHeader from "@/app/components/AuthHeader"
+import { TeacherWizardShell } from "@/app/components/teacher-wizard/TeacherWizardShell"
 
 export default function MainShellLayout({ children }: { children: ReactNode }) {
   return (
@@ -16,7 +17,7 @@ export default function MainShellLayout({ children }: { children: ReactNode }) {
         </div>
         <AuthHeader />
       </header>
-      {children}
+      <TeacherWizardShell>{children}</TeacherWizardShell>
     </>
   )
 }

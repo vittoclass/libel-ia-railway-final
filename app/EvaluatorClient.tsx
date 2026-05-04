@@ -124,6 +124,17 @@ import { OMRSheetGeneratorModal } from "@/app/components/OMRSheetGeneratorModal"
 import { RobustLibeliaOMRModal } from "@/app/components/RobustLibeliaOMRModal"
 import ClosedAnswerOMRModal from "@/app/components/ClosedAnswerOMRModal"
 import DevAdminPanel from "@/app/components/DevAdminPanel"
+import {
+  applyGuidedWizardSessionToEvaluatorForm,
+  type GuidedEvaluatorFormField,
+} from "@/app/components/teacher-wizard/applyGuidedWizardSessionToEvaluatorForm"
+import { GuidedSessionEvaluatorContextBanner } from "@/app/components/teacher-wizard/GuidedSessionEvaluatorContextBanner"
+import { ENABLE_WIZARD } from "@/app/components/teacher-wizard/constants"
+import {
+  readWizardSession,
+  WIZARD_SESSION_CHANGED_EVENT,
+  WIZARD_SESSION_STORAGE_KEY,
+} from "@/app/components/teacher-wizard/sessionStorage"
 import { INTERNAL_SUPPORT_UI } from "@/app/lib/internal-support-ui"
 import { normalizeRutCanonical } from "@/app/lib/student-identity/rut"
 import { formatStudentDisplayName } from "@/app/lib/format-student-name"
@@ -1225,6 +1236,8 @@ export default function EvaluatorClient() {
   /** FASE 3 / FREEZE_EVALUATION_BASE_CERRADAS: prueba base opcional en el evaluador (no sustituye el formulario). */
   const [evaluatorSourceExamOptions, setEvaluatorSourceExamOptions] = useState<Array<{ id: string; title: string | null }>>([])
   const [evaluatorSourceExamListLoading, setEvaluatorSourceExamListLoading] = useState(false)
+  /** Primera carga de `/api/source-exams` en esta vista del evaluador (para avisos de prueba base guiada). */
+  const [evaluatorSourceExamListHydrated, setEvaluatorSourceExamListHydrated] = useState(false)
   const [selectedEvaluatorSourceExamId, setSelectedEvaluatorSourceExamId] = useState<string>("")
   const [evaluatorEvaluationBaseSnapshot, setEvaluatorEvaluationBaseSnapshot] = useState<EvaluationBase | null>(null)
   const [evaluatorLastSourceExamPayload, setEvaluatorLastSourceExamPayload] = useState<{
@@ -1661,6 +1674,10 @@ export default function EvaluatorClient() {
     }
   }, [deleteEvaluationDialog.id, evaluacionesDetailId, loadEvaluationsList, loadStudentsList, toast])
 
+  const guidedAutoAppliedSavedAtRef = useRef<string | null>(null)
+  const [wizardGuidedFilledFields, setWizardGuidedFilledFields] = useState<GuidedEvaluatorFormField[]>([])
+  const [wizardSessionRevision, setWizardSessionRevision] = useState(0)
+
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: {
@@ -1732,6 +1749,82 @@ export default function EvaluatorClient() {
     toast({ title: "Tipo de prueba actualizado (sugerencia desde prueba base)" })
   }, [evaluatorLastSourceExamPayload, form, toast])
 
+  const undoWizardGuidedApply = useCallback(() => {
+    wizardGuidedFilledFields.forEach((f) => form.setValue(f, "", { shouldDirty: true }))
+    setWizardGuidedFilledFields([])
+    const draft = readWizardSession()
+    if (draft?.savedAt) guidedAutoAppliedSavedAtRef.current = draft.savedAt
+  }, [form, wizardGuidedFilledFields])
+
+  const applyGuidedWizardConfiguration = useCallback(() => {
+    if (!ENABLE_WIZARD) return
+    const draft = readWizardSession()
+    if (!draft?.savedAt) {
+      toast({ title: "Configuración guiada", description: "No hay datos guardados en el asistente para aplicar." })
+      return
+    }
+    const hasWizardPayload =
+      Boolean(draft.course.trim()) || Boolean(draft.testName.trim()) || Boolean(draft.teacherName.trim())
+    if (!hasWizardPayload) {
+      toast({ title: "Configuración guiada", description: "No hay datos guardados en el asistente para aplicar." })
+      return
+    }
+    const r = applyGuidedWizardSessionToEvaluatorForm(
+      draft,
+      (f) => form.getValues(f),
+      (f, v) => form.setValue(f, v, { shouldDirty: true, shouldTouch: true }),
+    )
+    if (draft.savedAt) guidedAutoAppliedSavedAtRef.current = draft.savedAt
+    if (r.filled.length > 0) {
+      setWizardGuidedFilledFields((prev) => [...new Set([...prev, ...r.filled])])
+      toast({ title: "Configuración guiada aplicada.", description: "Puedes extraer nombres y evaluar." })
+    } else if (r.skippedHadValue.length > 0) {
+      toast({
+        title: "Sin reemplazar",
+        description: "Los campos que coinciden ya tenían información.",
+      })
+    } else {
+      toast({
+        title: "Configuración guiada",
+        description: "No quedaron campos vacíos que coincidan con los datos del asistente.",
+      })
+    }
+  }, [form, toast])
+
+  useEffect(() => {
+    if (!ENABLE_WIZARD) return
+    if (activeTab !== "evaluator") return
+    const draft = readWizardSession()
+    if (!draft?.savedAt) return
+    const hasWizardPayload =
+      Boolean(draft.course.trim()) || Boolean(draft.testName.trim()) || Boolean(draft.teacherName.trim())
+    if (!hasWizardPayload) return
+    if (guidedAutoAppliedSavedAtRef.current === draft.savedAt) return
+    const r = applyGuidedWizardSessionToEvaluatorForm(
+      draft,
+      (f) => form.getValues(f),
+      (f, v) => form.setValue(f, v, { shouldDirty: true, shouldTouch: true }),
+    )
+    guidedAutoAppliedSavedAtRef.current = draft.savedAt
+    if (r.filled.length > 0) {
+      setWizardGuidedFilledFields((prev) => [...new Set([...prev, ...r.filled])])
+      toast({ title: "Configuración guiada aplicada.", description: "Puedes extraer nombres y evaluar." })
+    }
+  }, [activeTab, form, toast, wizardSessionRevision])
+
+  useEffect(() => {
+    const bump = () => setWizardSessionRevision((n) => n + 1)
+    window.addEventListener(WIZARD_SESSION_CHANGED_EVENT, bump)
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === WIZARD_SESSION_STORAGE_KEY) bump()
+    }
+    window.addEventListener("storage", onStorage)
+    return () => {
+      window.removeEventListener(WIZARD_SESSION_CHANGED_EVENT, bump)
+      window.removeEventListener("storage", onStorage)
+    }
+  }, [])
+
   const handleEvaluatorSourceExamSelect = useCallback(
     async (value: string) => {
       const id = value === "__none__" ? "" : value
@@ -1766,6 +1859,18 @@ export default function EvaluatorClient() {
     [evaluatorSourceExamOptions, toast],
   )
 
+  const handleUseRememberedWizardSourceExam = useCallback(() => {
+    const id = readWizardSession()?.sessionSourceExamId?.trim()
+    if (id) void handleEvaluatorSourceExamSelect(id)
+  }, [handleEvaluatorSourceExamSelect])
+
+  const rememberedWizardSourceExamId = ENABLE_WIZARD ? (readWizardSession()?.sessionSourceExamId?.trim() ?? "") : ""
+  const rememberedWizardSourceExamMissingFromList =
+    Boolean(rememberedWizardSourceExamId) &&
+    evaluatorSourceExamListHydrated &&
+    !evaluatorSourceExamListLoading &&
+    !evaluatorSourceExamOptions.some((o) => o.id === rememberedWizardSourceExamId)
+
   /** Lista de pruebas base para el selector del Evaluador: debe refrescarse al volver desde el banco, no solo al cargar la página. */
   const loadEvaluatorSourceExamOptions = useCallback(() => {
     setEvaluatorSourceExamListLoading(true)
@@ -1779,7 +1884,10 @@ export default function EvaluatorClient() {
         }
       })
       .catch(() => {})
-      .finally(() => setEvaluatorSourceExamListLoading(false))
+      .finally(() => {
+        setEvaluatorSourceExamListLoading(false)
+        setEvaluatorSourceExamListHydrated(true)
+      })
   }, [])
 
   useEffect(() => {
@@ -4395,6 +4503,16 @@ w-8"
                         />
                       </div>
                     </div>
+
+                    <GuidedSessionEvaluatorContextBanner
+                      onApplyGuided={applyGuidedWizardConfiguration}
+                      wizardFilledFieldKeys={wizardGuidedFilledFields}
+                      onUndoWizardApply={undoWizardGuidedApply}
+                      evaluatorSourceExamListLoaded={evaluatorSourceExamListHydrated}
+                      evaluatorSourceExamListLoading={evaluatorSourceExamListLoading}
+                      rememberedSourceExamMissingFromList={rememberedWizardSourceExamMissingFromList}
+                      onUseRememberedSourceExam={handleUseRememberedWizardSourceExam}
+                    />
 
                     <FormField
                       control={form.control}
