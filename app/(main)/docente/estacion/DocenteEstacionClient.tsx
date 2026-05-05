@@ -4,13 +4,19 @@ import { createClientComponentClient } from "@supabase/auth-helpers-nextjs"
 import Link from "next/link"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { GuidedSessionStationSummary } from "@/app/components/teacher-wizard/GuidedSessionStationSummary"
+import { StationGuidedSessionPreScan } from "@/app/components/teacher-wizard/StationGuidedSessionPreScan"
 import { BatchMobileSyncPanel } from "@/app/components/docente/station/BatchMobileSyncPanel"
 import { BatchPhotoRealtimeGrid } from "@/app/components/docente/station/BatchPhotoRealtimeGrid"
-import { SourceExamQuickPicker, type SourceExamPick } from "@/app/components/docente/station/SourceExamQuickPicker"
+import { type SourceExamPick } from "@/app/components/docente/station/SourceExamQuickPicker"
 import {
   TeacherAssignmentSelector,
   type TeacherAssignmentOption,
 } from "@/app/components/docente/station/TeacherAssignmentSelector"
+import {
+  readWizardSession,
+  WIZARD_SESSION_CHANGED_EVENT,
+  WIZARD_SESSION_STORAGE_KEY,
+} from "@/app/components/teacher-wizard/sessionStorage"
 import { writeDocenteActiveBatchId } from "@/app/lib/docente/active-batch-id"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -128,6 +134,36 @@ export function DocenteEstacionClient() {
     }
   }, [batchId, pagesPerStudent, sourceExam?.id])
 
+  useEffect(() => {
+    const syncSourceExamFromGuidedSession = () => {
+      const guided = readWizardSession()
+      const id = guided?.sessionSourceExamId?.trim() ?? ""
+      if (!id) {
+        setSourceExam(null)
+        return
+      }
+      setSourceExam((prev) => {
+        if (prev?.id === id) return prev
+        return {
+          id,
+          title: (guided?.sessionSourceExamTitle ?? "").trim() || null,
+          subject: null,
+          course_label: null,
+        }
+      })
+    }
+    syncSourceExamFromGuidedSession()
+    window.addEventListener(WIZARD_SESSION_CHANGED_EVENT, syncSourceExamFromGuidedSession)
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === WIZARD_SESSION_STORAGE_KEY) syncSourceExamFromGuidedSession()
+    }
+    window.addEventListener("storage", onStorage)
+    return () => {
+      window.removeEventListener(WIZARD_SESSION_CHANGED_EVENT, syncSourceExamFromGuidedSession)
+      window.removeEventListener("storage", onStorage)
+    }
+  }, [])
+
   const onRegenerateBatch = useCallback(() => {
     setBatchId(crypto.randomUUID())
     setSourceExam(null)
@@ -193,7 +229,14 @@ export function DocenteEstacionClient() {
         )}
       </section>
 
-      <section className="space-y-4">
+      <StationGuidedSessionPreScan
+        onSyncPagesPerStudent={(n) => {
+          const v = Math.max(1, Math.min(50, Math.floor(Number(n)) || 1))
+          setPagesPerStudent(v)
+        }}
+      />
+
+      <section id="docente-estacion-sync-mobile" className="space-y-4 scroll-mt-24">
         <h2 className="text-lg font-semibold text-slate-900 px-1">2. Sincronización móvil</h2>
         <GuidedSessionStationSummary />
         {batchSessionError ? (
@@ -232,14 +275,25 @@ export function DocenteEstacionClient() {
       </section>
 
       <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-4">
-        <h2 className="text-lg font-semibold text-slate-900">3. Pauta para este lote</h2>
-        <SourceExamQuickPicker value={sourceExam} onChange={setSourceExam} />
-        {sourceExam && batchId ? (
-          <p className="text-xs text-slate-500">
-            Lote <span className="font-mono">{batchId.slice(0, 8)}…</span> ↔ pauta{" "}
-            <span className="font-mono">{sourceExam.id.slice(0, 8)}…</span> (solo UI; persistencia en paso siguiente).
+        <h2 className="text-lg font-semibold text-slate-900">3. Prueba base para este lote</h2>
+        {sourceExam ? (
+          <div className="space-y-2">
+            <p className="text-sm text-slate-700">
+              Seleccionada desde configuración previa:{" "}
+              <strong>{sourceExam.title?.trim() || sourceExam.id.slice(0, 8)}</strong>
+            </p>
+            {batchId ? (
+              <p className="text-xs text-slate-500">
+                Lote <span className="font-mono">{batchId.slice(0, 8)}…</span> ↔ pauta{" "}
+                <span className="font-mono">{sourceExam.id.slice(0, 8)}…</span> (solo UI; persistencia en paso siguiente).
+              </p>
+            ) : null}
+          </div>
+        ) : (
+          <p className="text-sm text-slate-500">
+            Sin prueba base seleccionada. Puedes definirla en el panel «Paso 1 · Configuración» antes de escanear.
           </p>
-        ) : null}
+        )}
       </section>
 
       <section className="space-y-4">
