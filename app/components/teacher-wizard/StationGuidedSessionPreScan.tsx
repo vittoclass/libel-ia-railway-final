@@ -27,7 +27,16 @@ type Props = {
   onSyncPagesPerStudent?: (n: number) => void
 }
 
-type FormState = Omit<TeacherWizardSessionDraft, "savedAt">
+type FormState = {
+  course: string
+  testName: string
+  teacherName: string
+  departmentName: string
+  studentCount: number
+  imagesPerStudent: number
+  sessionSourceExamId?: string
+  sessionSourceExamTitle?: string | null
+}
 
 function emptyForm(): FormState {
   return {
@@ -412,3 +421,5 @@ export function StationGuidedSessionPreScan({ onSyncPagesPerStudent }: Props) {
     </section>
   )
 }
+
+

@@ -10,6 +10,7 @@ export type TeacherWizardSessionDraft = {
   course: string
   testName: string
   teacherName: string
+  departmentName?: string
   studentCount: number
   imagesPerStudent: number
   savedAt: string
@@ -27,6 +28,7 @@ export function parseWizardSession(raw: string | null): TeacherWizardSessionDraf
     const course = typeof o.course === "string" ? o.course : ""
     const testName = typeof o.testName === "string" ? o.testName : ""
     const teacherName = typeof o.teacherName === "string" ? o.teacherName : ""
+    const departmentName = typeof o.departmentName === "string" ? o.departmentName : undefined
     const studentCount = typeof o.studentCount === "number" && Number.isFinite(o.studentCount) ? Math.max(0, Math.floor(o.studentCount)) : 0
     const imagesPerStudent =
       typeof o.imagesPerStudent === "number" && Number.isFinite(o.imagesPerStudent) ? Math.max(0, Math.floor(o.imagesPerStudent)) : 0
@@ -43,6 +45,7 @@ export function parseWizardSession(raw: string | null): TeacherWizardSessionDraf
       course,
       testName,
       teacherName,
+      ...(typeof departmentName === "string" ? { departmentName } : {}),
       studentCount,
       imagesPerStudent,
       savedAt,
