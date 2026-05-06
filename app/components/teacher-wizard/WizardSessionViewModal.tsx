@@ -1,6 +1,6 @@
 "use client"
 
-import { expectedImagesMeta, type TeacherWizardSessionDraft } from "./sessionStorage"
+import { buildWizardCourseFromParts, expectedImagesMeta, type TeacherWizardSessionDraft } from "./sessionStorage"
 
 type Props = {
   open: boolean
@@ -49,7 +49,10 @@ export function WizardSessionViewModal({ open, onClose, draft }: Props) {
         ) : (
           <ul className="mt-4 list-none space-y-2 text-sm text-[var(--text)]">
             <li>
-              <span className="text-[var(--text-muted)]">Curso:</span> {draft.course.trim() || "—"}
+              <span className="text-[var(--text-muted)]">Curso:</span>{" "}
+              {buildWizardCourseFromParts(draft.courseLevel ?? draft.course ?? "", draft.courseLetter).trim() ||
+                draft.course.trim() ||
+                "—"}
             </li>
             <li>
               <span className="text-[var(--text-muted)]">Prueba:</span> {draft.testName.trim() || "—"}
@@ -57,6 +60,26 @@ export function WizardSessionViewModal({ open, onClose, draft }: Props) {
             <li>
               <span className="text-[var(--text-muted)]">Profesor:</span> {draft.teacherName.trim() || "—"}
             </li>
+            {(draft.departmentName ?? "").trim() ? (
+              <li>
+                <span className="text-[var(--text-muted)]">Departamento:</span> {(draft.departmentName ?? "").trim()}
+              </li>
+            ) : null}
+            {(draft.subjectName ?? "").trim() ? (
+              <li>
+                <span className="text-[var(--text-muted)]">Asignatura:</span> {(draft.subjectName ?? "").trim()}
+              </li>
+            ) : null}
+            {draft.tipoPrueba ? (
+              <li>
+                <span className="text-[var(--text-muted)]">Tipo de prueba:</span>{" "}
+                {draft.tipoPrueba === "solo_alternativas"
+                  ? "Solo alternativas"
+                  : draft.tipoPrueba === "solo_desarrollo"
+                    ? "Solo desarrollo"
+                    : "Mixta"}
+              </li>
+            ) : null}
             <li className="border-t border-[var(--border-color)] pt-2 font-medium">
               Meta: {draft.studentCount} estudiantes × {draft.imagesPerStudent} imágenes = {meta} esperadas
             </li>

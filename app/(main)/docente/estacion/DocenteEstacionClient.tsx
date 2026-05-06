@@ -12,7 +12,9 @@ import {
   TeacherAssignmentSelector,
   type TeacherAssignmentOption,
 } from "@/app/components/docente/station/TeacherAssignmentSelector"
+import { ENABLE_WIZARD } from "@/app/components/teacher-wizard/constants"
 import {
+  isWizardSessionConfigValid,
   readWizardSession,
   WIZARD_SESSION_CHANGED_EVENT,
   WIZARD_SESSION_STORAGE_KEY,
@@ -37,6 +39,8 @@ export function DocenteEstacionClient() {
   const [debugError, setDebugError] = useState<unknown>(null)
   /** Debe coincidir con el móvil (QR /escaneo): ver MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT en mobile-scan-constants. */
   const [pagesPerStudent, setPagesPerStudent] = useState(2)
+  /** Con wizard activo, el QR y la grilla solo tras configuración válida guardada. */
+  const [scanSectionUnlocked, setScanSectionUnlocked] = useState(!ENABLE_WIZARD)
 
   const loadAssignments = useCallback(async () => {
     try {
@@ -135,6 +139,21 @@ export function DocenteEstacionClient() {
   }, [batchId, pagesPerStudent, sourceExam?.id])
 
   useEffect(() => {
+    if (!ENABLE_WIZARD) return
+    const syncUnlock = () => setScanSectionUnlocked(isWizardSessionConfigValid(readWizardSession()))
+    syncUnlock()
+    window.addEventListener(WIZARD_SESSION_CHANGED_EVENT, syncUnlock)
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === WIZARD_SESSION_STORAGE_KEY) syncUnlock()
+    }
+    window.addEventListener("storage", onStorage)
+    return () => {
+      window.removeEventListener(WIZARD_SESSION_CHANGED_EVENT, syncUnlock)
+      window.removeEventListener("storage", onStorage)
+    }
+  }, [])
+
+  useEffect(() => {
     const syncSourceExamFromGuidedSession = () => {
       const guided = readWizardSession()
       const id = guided?.sessionSourceExamId?.trim() ?? ""
@@ -191,12 +210,17 @@ export function DocenteEstacionClient() {
 
       <header className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-6">
         <div>
-          <p className="text-xs font-medium uppercase tracking-wide text-indigo-600">Paso B · Estación de control</p>
-          <h1 className="text-2xl font-bold text-slate-900 mt-1">Centro de mando docente (PC)</h1>
-          <p className="text-sm text-slate-600 mt-2 max-w-2xl">
-            Contexto desde carga horaria, recepción de fotos en vivo y elección de pauta para el lote actual. No modifica
-            el flujo OMR: use el evaluador clásico cuando corresponda.
-          </p>
+          <p className="text-xs font-medium uppercase tracking-wide text-indigo-600">Estación QR (PC)</p>
+          <h1 className="text-2xl font-bold text-slate-900 mt-1">Estación docente</h1>
+          {ENABLE_WIZARD ? (
+            <p className="text-sm text-slate-600 mt-2 max-w-xl">
+              Primero la configuración; después el QR y las fotos. Luego <strong>/evaluar</strong>.
+            </p>
+          ) : (
+            <p className="text-sm text-slate-600 mt-2 max-w-xl">
+              Configura el lote, escanea con el móvil y revisa fotos; en <strong>/evaluar</strong> extrae nombres y evalúa.
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" asChild>
@@ -209,8 +233,8 @@ export function DocenteEstacionClient() {
         <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">{assignmentsWarning}</p>
       ) : null}
 
-      <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-4">
-        <h2 className="text-lg font-semibold text-slate-900">1. Selector de carga horaria</h2>
+      <section className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 shadow-sm space-y-3">
+        <h2 className="text-sm font-semibold text-slate-800">Carga horaria (opcional)</h2>
         <TeacherAssignmentSelector
           assignments={assignments}
           value={assignmentId}
@@ -220,12 +244,12 @@ export function DocenteEstacionClient() {
           }}
         />
         {contextRow ? (
-          <p className="text-sm text-slate-700">
-            Contexto activo: <strong>{contextRow.subject}</strong> · <strong>{contextRow.course_label}</strong> (
-            {contextRow.semester} {contextRow.academic_year})
+          <p className="text-xs text-slate-600">
+            Activo: <strong>{contextRow.subject}</strong> · {contextRow.course_label} ({contextRow.semester}{" "}
+            {contextRow.academic_year})
           </p>
         ) : (
-          <p className="text-sm text-slate-500">Sin contexto seleccionado (opcional en este paso).</p>
+          <p className="text-xs text-slate-500">Opcional: etiqueta en la grilla de fotos.</p>
         )}
       </section>
 
@@ -236,83 +260,65 @@ export function DocenteEstacionClient() {
         }}
       />
 
-      <section id="docente-estacion-sync-mobile" className="space-y-4 scroll-mt-24">
-        <h2 className="text-lg font-semibold text-slate-900 px-1">2. Sincronización móvil</h2>
-        <GuidedSessionStationSummary />
-        {batchSessionError ? (
-          <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
-            <strong>QR no válido en el celular hasta corregir esto:</strong> {batchSessionError}
-          </p>
-        ) : null}
-        <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 max-w-md">
-          <Label htmlFor="pages-per-student" className="text-sm font-medium text-slate-800">
-            Fotos por alumno (páginas distintas)
-          </Label>
-          <Input
-            id="pages-per-student"
-            type="number"
-            min={1}
-            max={50}
-            value={pagesPerStudent}
-            onChange={(e) => {
-              const n = Math.max(1, Math.min(50, Math.floor(Number(e.target.value)) || 1))
-              setPagesPerStudent(n)
-            }}
-            className="w-24"
-          />
-          <p className="text-[11px] text-slate-500">
-            Debe coincidir con el número configurado en el celular al escanear. Al llegar todas las páginas de un alumno,
-            se crea la evaluación automáticamente.
-          </p>
-        </div>
-        <BatchMobileSyncPanel
-          batchId={batchId}
-          onRegenerateBatch={onRegenerateBatch}
-          onBatchSessionDebug={reportBatchSessionDebug}
-          expectedPagesPerStudent={pagesPerStudent}
-          sourceExamId={sourceExam?.id ?? null}
-        />
-      </section>
+      {scanSectionUnlocked ? (
+        <>
+          <section id="docente-estacion-sync-mobile" className="space-y-4 scroll-mt-24">
+            <h2 className="text-lg font-semibold text-slate-900 px-1">Paso 2: QR y escaneo</h2>
 
-      <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-4">
-        <h2 className="text-lg font-semibold text-slate-900">3. Prueba base para este lote</h2>
-        {sourceExam ? (
-          <div className="space-y-2">
-            <p className="text-sm text-slate-700">
-              Seleccionada desde configuración previa:{" "}
-              <strong>{sourceExam.title?.trim() || sourceExam.id.slice(0, 8)}</strong>
-            </p>
-            {batchId ? (
-              <p className="text-xs text-slate-500">
-                Lote <span className="font-mono">{batchId.slice(0, 8)}…</span> ↔ pauta{" "}
-                <span className="font-mono">{sourceExam.id.slice(0, 8)}…</span> (solo UI; persistencia en paso siguiente).
+            <GuidedSessionStationSummary />
+            {batchSessionError ? (
+              <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                <strong>QR no válido en el celular hasta corregir esto:</strong> {batchSessionError}
               </p>
             ) : null}
-          </div>
-        ) : (
-          <p className="text-sm text-slate-500">
-            Sin prueba base seleccionada. Puedes definirla en el panel «Paso 1 · Configuración» antes de escanear.
-          </p>
-        )}
-      </section>
+            {!ENABLE_WIZARD ? (
+              <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 max-w-md">
+                <Label htmlFor="pages-per-student" className="text-sm font-medium text-slate-800">
+                  Fotos por alumno (páginas distintas)
+                </Label>
+                <Input
+                  id="pages-per-student"
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={pagesPerStudent}
+                  onChange={(e) => {
+                    const n = Math.max(1, Math.min(50, Math.floor(Number(e.target.value)) || 1))
+                    setPagesPerStudent(n)
+                  }}
+                  className="w-24"
+                />
+                <p className="text-[11px] text-slate-500">Debe coincidir con el celular al escanear.</p>
+              </div>
+            ) : null}
+            <BatchMobileSyncPanel
+              batchId={batchId}
+              onRegenerateBatch={onRegenerateBatch}
+              onBatchSessionDebug={reportBatchSessionDebug}
+              expectedPagesPerStudent={pagesPerStudent}
+              sourceExamId={sourceExam?.id ?? null}
+            />
+          </section>
 
-      <section className="space-y-4">
-        <h2 className="text-lg font-semibold text-slate-900 px-1">4. Grilla de fotos</h2>
-        {batchId ? (
-          <BatchPhotoRealtimeGrid
-            key={batchId}
-            batchId={batchId}
-            supabase={supabase}
-            expectedPagesPerStudent={pagesPerStudent}
-            courseLabel={contextRow?.course_label ?? null}
-            subject={contextRow?.subject ?? sourceExam?.subject ?? null}
-          />
-        ) : (
-          <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50/80 px-4 py-10 text-center text-sm text-slate-500">
-            Preparando identificador de lote en el navegador…
-          </div>
-        )}
-      </section>
+          <section className="space-y-4">
+            <h2 className="text-lg font-semibold text-slate-900 px-1">Grilla de fotos</h2>
+            {batchId ? (
+              <BatchPhotoRealtimeGrid
+                key={batchId}
+                batchId={batchId}
+                supabase={supabase}
+                expectedPagesPerStudent={pagesPerStudent}
+                courseLabel={contextRow?.course_label ?? null}
+                subject={contextRow?.subject ?? sourceExam?.subject ?? null}
+              />
+            ) : (
+              <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50/80 px-4 py-10 text-center text-sm text-slate-500">
+                Preparando identificador de lote en el navegador…
+              </div>
+            )}
+          </section>
+        </>
+      ) : null}
     </div>
   )
 }

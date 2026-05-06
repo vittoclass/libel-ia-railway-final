@@ -13,6 +13,8 @@ export type GuidedSessionEvaluatorContextBannerProps = {
   evaluatorSourceExamListLoading: boolean
   rememberedSourceExamMissingFromList: boolean
   onUseRememberedSourceExam: () => void
+  /** Id de prueba base ya elegida en el evaluador (oculta el CTA si coincide con la del QR). */
+  evaluatorSelectedSourceExamId?: string
 }
 
 /** Solo lectura local + acciones de guiado; no OMR ni backend de evaluación. */
@@ -24,6 +26,7 @@ export function GuidedSessionEvaluatorContextBanner({
   evaluatorSourceExamListLoading,
   rememberedSourceExamMissingFromList,
   onUseRememberedSourceExam,
+  evaluatorSelectedSourceExamId = "",
 }: GuidedSessionEvaluatorContextBannerProps) {
   if (!ENABLE_WIZARD) return null
   const guided = readWizardSession()
@@ -31,8 +34,10 @@ export function GuidedSessionEvaluatorContextBanner({
 
   const metaTotal = expectedImagesMeta(guided.studentCount, guided.imagesPerStudent)
   const rememberedId = guided.sessionSourceExamId?.trim() ?? ""
+  const selectedTrim = (evaluatorSelectedSourceExamId ?? "").trim()
   const listReady = evaluatorSourceExamListLoaded && !evaluatorSourceExamListLoading
-  const showUseRememberedButton = Boolean(rememberedId) && listReady && !rememberedSourceExamMissingFromList
+  const showUseRememberedButton =
+    Boolean(rememberedId) && listReady && !rememberedSourceExamMissingFromList && selectedTrim !== rememberedId
   const showMissingRemembered = Boolean(rememberedId) && listReady && rememberedSourceExamMissingFromList
   const showGenericBaseReminder =
     listReady && !rememberedId && Boolean(guided.course.trim() || guided.testName.trim() || guided.teacherName.trim())
@@ -52,6 +57,26 @@ export function GuidedSessionEvaluatorContextBanner({
         <li>
           <span className="text-[var(--text-muted)]">Profesor:</span> {guided.teacherName.trim() || "—"}
         </li>
+        {(guided.departmentName ?? "").trim() ? (
+          <li>
+            <span className="text-[var(--text-muted)]">Departamento:</span> {(guided.departmentName ?? "").trim()}
+          </li>
+        ) : null}
+        {(guided.subjectName ?? "").trim() ? (
+          <li>
+            <span className="text-[var(--text-muted)]">Asignatura:</span> {(guided.subjectName ?? "").trim()}
+          </li>
+        ) : null}
+        {guided.tipoPrueba ? (
+          <li>
+            <span className="text-[var(--text-muted)]">Tipo de prueba:</span>{" "}
+            {guided.tipoPrueba === "solo_alternativas"
+              ? "Solo alternativas"
+              : guided.tipoPrueba === "solo_desarrollo"
+                ? "Solo desarrollo"
+                : "Mixta"}
+          </li>
+        ) : null}
         <li className="pt-1 font-medium text-[var(--text-primary)]">
           Meta: {guided.studentCount} estudiantes × {guided.imagesPerStudent} imágenes = {metaTotal} imágenes esperadas
         </li>
@@ -85,12 +110,22 @@ export function GuidedSessionEvaluatorContextBanner({
       ) : null}
 
       {showUseRememberedButton ? (
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          <Button type="button" variant="secondary" size="sm" onClick={onUseRememberedSourceExam}>
-            Usar prueba base seleccionada en esta sesión
+        <div className="rounded-lg border-2 border-amber-400/80 bg-amber-50 p-3 dark:border-amber-600 dark:bg-amber-950/50 space-y-2">
+          <p className="text-sm font-semibold text-amber-950 dark:text-amber-50">Prueba base desde QR</p>
+          <p className="text-sm text-amber-900 dark:text-amber-100">
+            <span className="text-[var(--text-muted)] dark:text-amber-200/90">Nombre:</span>{" "}
+            {(guided.sessionSourceExamTitle ?? "").trim() || rememberedId.slice(0, 8)}
+          </p>
+          <Button
+            type="button"
+            size="lg"
+            className="w-full sm:w-auto font-semibold bg-amber-600 text-white hover:bg-amber-700 dark:bg-amber-500 dark:hover:bg-amber-600"
+            onClick={onUseRememberedSourceExam}
+          >
+            Usar prueba base configurada en QR
           </Button>
-          <p className="text-[11px] text-[var(--text-muted)] leading-snug">
-            Confirma cargando la misma prueba que guardaste en la configuración (requiere un clic).
+          <p className="text-[11px] text-[var(--text-muted)] dark:text-amber-200/80 leading-snug">
+            Mismo handler que el selector de prueba base del evaluador. Un clic carga ítems y pauta.
           </p>
         </div>
       ) : null}

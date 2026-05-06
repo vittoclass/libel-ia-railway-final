@@ -11,9 +11,11 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import {
+  buildWizardCourseFromParts,
   expectedImagesMeta,
   readWizardSession,
   type TeacherWizardSessionDraft,
+  type WizardSessionTipoPrueba,
   writeWizardSession,
 } from "./sessionStorage"
 
@@ -23,15 +25,50 @@ type Props = {
   onSaved: () => void
 }
 
-type SessionFormState = Omit<TeacherWizardSessionDraft, "savedAt">
+type SessionFormState = {
+  courseLevel: string
+  courseLetter: string
+  testName: string
+  teacherName: string
+  departmentName: string
+  subjectName: string
+  tipoPrueba: WizardSessionTipoPrueba
+  studentCount: number
+  imagesPerStudent: number
+  sessionSourceExamId?: string
+  sessionSourceExamTitle?: string | null
+}
 
 function emptyForm(): SessionFormState {
   return {
-    course: "",
+    courseLevel: "",
+    courseLetter: "",
     testName: "",
     teacherName: "",
+    departmentName: "",
+    subjectName: "",
+    tipoPrueba: "mixta",
     studentCount: 0,
     imagesPerStudent: 0,
+  }
+}
+
+function draftToForm(d: TeacherWizardSessionDraft): SessionFormState {
+  const level = (d.courseLevel ?? d.course ?? "").trim()
+  const letter = (d.courseLetter ?? "").trim()
+  return {
+    courseLevel: level,
+    courseLetter: letter,
+    testName: d.testName,
+    teacherName: d.teacherName,
+    departmentName: d.departmentName ?? "",
+    subjectName: d.subjectName ?? "",
+    tipoPrueba: d.tipoPrueba ?? "mixta",
+    studentCount: d.studentCount,
+    imagesPerStudent: d.imagesPerStudent,
+    ...(d.sessionSourceExamId
+      ? { sessionSourceExamId: d.sessionSourceExamId, sessionSourceExamTitle: d.sessionSourceExamTitle ?? null }
+      : {}),
   }
 }
 
@@ -45,19 +82,7 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
     const existing = readWizardSession()
     if (existing?.savedAt) {
       setSaved(existing)
-      setForm({
-        course: existing.course,
-        testName: existing.testName,
-        teacherName: existing.teacherName,
-        studentCount: existing.studentCount,
-        imagesPerStudent: existing.imagesPerStudent,
-        ...(existing.sessionSourceExamId
-          ? {
-              sessionSourceExamId: existing.sessionSourceExamId,
-              sessionSourceExamTitle: existing.sessionSourceExamTitle ?? null,
-            }
-          : {}),
-      })
+      setForm(draftToForm(existing))
     } else {
       setSaved(null)
       setForm(emptyForm())
@@ -89,10 +114,17 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
 
   const handleSave = () => {
     const id = form.sessionSourceExamId?.trim()
-    const payload: SessionFormState = {
-      course: form.course,
+    const level = form.courseLevel.trim()
+    const letter = form.courseLetter.trim()
+    const draft = writeWizardSession({
+      course: buildWizardCourseFromParts(level, letter),
+      courseLevel: level,
+      ...(letter ? { courseLetter: letter } : {}),
       testName: form.testName,
       teacherName: form.teacherName,
+      departmentName: form.departmentName.trim() || undefined,
+      subjectName: form.subjectName.trim() || undefined,
+      tipoPrueba: form.tipoPrueba,
       studentCount: form.studentCount,
       imagesPerStudent: form.imagesPerStudent,
       ...(id
@@ -101,8 +133,7 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
             sessionSourceExamTitle: form.sessionSourceExamTitle ?? sourceExamOptions.find((o) => o.id === id)?.title ?? null,
           }
         : {}),
-    }
-    const draft = writeWizardSession(payload)
+    })
     setSaved(draft)
     onSaved()
   }
@@ -132,16 +163,34 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
           </button>
         </div>
         <p className="mt-1 text-xs text-[var(--text-muted)]">
-          Esto no envía datos al servidor ni modifica evaluaciones. Solo ayuda a orientarte durante el flujo.
+          Misma información que en la estación QR. Solo se guarda en este dispositivo.
         </p>
 
         <div className="mt-4 flex flex-col gap-3">
           <label className="flex flex-col gap-1 text-sm">
-            <span className="text-[var(--text-muted)]">Curso</span>
+            <span className="text-[var(--text-muted)]">Profesor</span>
             <input
               className="rounded-md border border-[var(--border-color)] bg-[var(--bg-page)] px-2 py-1.5 text-[var(--text)]"
-              value={form.course}
-              onChange={(e) => setForm((f) => ({ ...f, course: e.target.value }))}
+              value={form.teacherName}
+              onChange={(e) => setForm((f) => ({ ...f, teacherName: e.target.value }))}
+              autoComplete="name"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-[var(--text-muted)]">Departamento</span>
+            <input
+              className="rounded-md border border-[var(--border-color)] bg-[var(--bg-page)] px-2 py-1.5 text-[var(--text)]"
+              value={form.departmentName}
+              onChange={(e) => setForm((f) => ({ ...f, departmentName: e.target.value }))}
+              autoComplete="organization"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-[var(--text-muted)]">Asignatura</span>
+            <input
+              className="rounded-md border border-[var(--border-color)] bg-[var(--bg-page)] px-2 py-1.5 text-[var(--text)]"
+              value={form.subjectName}
+              onChange={(e) => setForm((f) => ({ ...f, subjectName: e.target.value }))}
               autoComplete="off"
             />
           </label>
@@ -154,14 +203,43 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
               autoComplete="off"
             />
           </label>
+          <div className="flex flex-col gap-1 text-sm">
+            <span className="text-[var(--text-muted)]">Tipo de prueba</span>
+            <Select
+              value={form.tipoPrueba}
+              onValueChange={(v) => setForm((f) => ({ ...f, tipoPrueba: v as WizardSessionTipoPrueba }))}
+            >
+              <SelectTrigger className="w-full border-[var(--border-color)] bg-[var(--bg-page)] text-[var(--text)]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="solo_alternativas">Solo alternativas</SelectItem>
+                <SelectItem value="solo_desarrollo">Solo desarrollo</SelectItem>
+                <SelectItem value="mixta">Mixta</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
           <label className="flex flex-col gap-1 text-sm">
-            <span className="text-[var(--text-muted)]">Profesor</span>
+            <span className="text-[var(--text-muted)]">Curso / nivel</span>
             <input
               className="rounded-md border border-[var(--border-color)] bg-[var(--bg-page)] px-2 py-1.5 text-[var(--text)]"
-              value={form.teacherName}
-              onChange={(e) => setForm((f) => ({ ...f, teacherName: e.target.value }))}
-              autoComplete="name"
+              value={form.courseLevel}
+              onChange={(e) => setForm((f) => ({ ...f, courseLevel: e.target.value }))}
+              autoComplete="off"
             />
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-[var(--text-muted)]">Letra del curso (opcional)</span>
+            <input
+              className="rounded-md border border-[var(--border-color)] bg-[var(--bg-page)] px-2 py-1.5 text-[var(--text)]"
+              value={form.courseLetter}
+              onChange={(e) => setForm((f) => ({ ...f, courseLetter: e.target.value }))}
+              autoComplete="off"
+              maxLength={8}
+            />
+            <span className="text-[11px] text-[var(--text-muted)]">
+              Curso final: {buildWizardCourseFromParts(form.courseLevel, form.courseLetter).trim() || "—"}
+            </span>
           </label>
           <label className="flex flex-col gap-1 text-sm">
             <span className="text-[var(--text-muted)]">Estudiantes a evaluar</span>
@@ -191,21 +269,16 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
           </label>
 
           <div className="flex flex-col gap-1 text-sm">
-            <span className="text-[var(--text-muted)]">Prueba base (opcional, referencia en este dispositivo)</span>
-            <p className="text-[11px] text-[var(--text-muted)] leading-snug">
-              Solo se guarda si eliges una opción; no sustituye seleccionar la prueba en el Evaluador hasta que confirmes allí.
-            </p>
+            <span className="text-[var(--text-muted)]">Prueba base (opcional)</span>
             <Select
               disabled={sourceExamLoading}
               value={form.sessionSourceExamId?.trim() ? form.sessionSourceExamId : "__none__"}
               onValueChange={(v) => {
                 if (v === "__none__") {
                   setForm((f) => ({
-                    course: f.course,
-                    testName: f.testName,
-                    teacherName: f.teacherName,
-                    studentCount: f.studentCount,
-                    imagesPerStudent: f.imagesPerStudent,
+                    ...f,
+                    sessionSourceExamId: undefined,
+                    sessionSourceExamTitle: undefined,
                   }))
                   return
                 }
@@ -251,10 +324,34 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
                 <span className="text-[var(--text-muted)]">Curso:</span> {saved.course || "—"}
               </li>
               <li>
+                <span className="text-[var(--text-muted)]">Asignatura:</span> {(saved.subjectName ?? "").trim() || "—"}
+              </li>
+              <li>
+                <span className="text-[var(--text-muted)]">Tipo de prueba:</span>{" "}
+                {saved.tipoPrueba === "solo_alternativas"
+                  ? "Solo alternativas"
+                  : saved.tipoPrueba === "solo_desarrollo"
+                    ? "Solo desarrollo"
+                    : "Mixta"}
+              </li>
+              <li>
                 <span className="text-[var(--text-muted)]">Prueba:</span> {saved.testName || "—"}
               </li>
               <li>
                 <span className="text-[var(--text-muted)]">Profesor:</span> {saved.teacherName || "—"}
+              </li>
+              {(saved.departmentName ?? "").trim() ? (
+                <li>
+                  <span className="text-[var(--text-muted)]">Departamento:</span> {(saved.departmentName ?? "").trim()}
+                </li>
+              ) : null}
+              <li>
+                <span className="text-[var(--text-muted)]">Prueba base:</span>{" "}
+                {(() => {
+                  const bid = (saved.sessionSourceExamId ?? "").trim()
+                  const bt = (saved.sessionSourceExamTitle ?? "").trim()
+                  return bid ? bt || bid.slice(0, 8) : "—"
+                })()}
               </li>
               <li className="pt-1 font-medium">
                 Meta: {saved.studentCount} estudiantes × {saved.imagesPerStudent} imágenes ={" "}

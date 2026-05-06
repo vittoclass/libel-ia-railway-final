@@ -1675,6 +1675,8 @@ export default function EvaluatorClient() {
   }, [deleteEvaluationDialog.id, evaluacionesDetailId, loadEvaluationsList, loadStudentsList, toast])
 
   const guidedAutoAppliedSavedAtRef = useRef<string | null>(null)
+  /** Evita repetir auto-selección de prueba base QR para el mismo `savedAt` de sesión. */
+  const wizardGuidedSourceExamAutoAppliedSavedAtRef = useRef<string | null>(null)
   const [wizardGuidedFilledFields, setWizardGuidedFilledFields] = useState<GuidedEvaluatorFormField[]>([])
   const [wizardSessionRevision, setWizardSessionRevision] = useState(0)
 
@@ -1750,7 +1752,17 @@ export default function EvaluatorClient() {
   }, [evaluatorLastSourceExamPayload, form, toast])
 
   const undoWizardGuidedApply = useCallback(() => {
-    wizardGuidedFilledFields.forEach((f) => form.setValue(f, "", { shouldDirty: true }))
+    wizardGuidedFilledFields.forEach((f) => {
+      if (f === "tipoPrueba") {
+        form.setValue("tipoPrueba", "mixta", { shouldDirty: true })
+      } else if (f === "puntajeTotal") {
+        form.setValue("puntajeTotal", "100", { shouldDirty: true })
+      } else if (f === "porcentajeExigencia") {
+        form.setValue("porcentajeExigencia", "55", { shouldDirty: true })
+      } else {
+        form.setValue(f, "", { shouldDirty: true })
+      }
+    })
     setWizardGuidedFilledFields([])
     const draft = readWizardSession()
     if (draft?.savedAt) guidedAutoAppliedSavedAtRef.current = draft.savedAt
@@ -1764,7 +1776,12 @@ export default function EvaluatorClient() {
       return
     }
     const hasWizardPayload =
-      Boolean(draft.course.trim()) || Boolean(draft.testName.trim()) || Boolean(draft.teacherName.trim())
+      Boolean(draft.course.trim()) ||
+      Boolean(draft.testName.trim()) ||
+      Boolean(draft.teacherName.trim()) ||
+      Boolean((draft.departmentName ?? "").trim()) ||
+      Boolean((draft.subjectName ?? "").trim()) ||
+      Boolean(draft.tipoPrueba)
     if (!hasWizardPayload) {
       toast({ title: "Configuración guiada", description: "No hay datos guardados en el asistente para aplicar." })
       return
@@ -1797,7 +1814,12 @@ export default function EvaluatorClient() {
     const draft = readWizardSession()
     if (!draft?.savedAt) return
     const hasWizardPayload =
-      Boolean(draft.course.trim()) || Boolean(draft.testName.trim()) || Boolean(draft.teacherName.trim())
+      Boolean(draft.course.trim()) ||
+      Boolean(draft.testName.trim()) ||
+      Boolean(draft.teacherName.trim()) ||
+      Boolean((draft.departmentName ?? "").trim()) ||
+      Boolean((draft.subjectName ?? "").trim()) ||
+      Boolean(draft.tipoPrueba)
     if (!hasWizardPayload) return
     if (guidedAutoAppliedSavedAtRef.current === draft.savedAt) return
     const r = applyGuidedWizardSessionToEvaluatorForm(
@@ -1826,7 +1848,7 @@ export default function EvaluatorClient() {
   }, [])
 
   const handleEvaluatorSourceExamSelect = useCallback(
-    async (value: string) => {
+    async (value: string): Promise<boolean> => {
       const id = value === "__none__" ? "" : value
       setSelectedEvaluatorSourceExamId(id)
       if (id) lastActiveEvaluatorSourceExamIdRef.current = id
@@ -1834,12 +1856,18 @@ export default function EvaluatorClient() {
         setEvaluatorEvaluationBaseSnapshot(null)
         setEvaluatorLastSourceExamPayload(null)
         setEvaluatorInstrumentSource("manual")
-        return
+        return true
       }
       setEvaluatorSourceExamItemsLoading(true)
       try {
         const r = await fetch(`/api/source-exams/${id}/items`, { credentials: "include" })
-        const j = await r.json()
+        const j = await r.json().catch(() => ({}))
+        if (!r.ok) {
+          setEvaluatorEvaluationBaseSnapshot(null)
+          setEvaluatorLastSourceExamPayload(null)
+          toast({ title: "No se pudieron cargar los ítems de la prueba base", variant: "destructive" })
+          return false
+        }
         const raw = Array.isArray(j.items) ? j.items : []
         const items = mapSourceExamApiRowsToInputs(raw)
         const title = evaluatorSourceExamOptions.find((o) => o.id === id)?.title ?? null
@@ -1848,10 +1876,12 @@ export default function EvaluatorClient() {
         const eb = buildEvaluationBase({ sourceExam: { title, items } })
         setEvaluatorEvaluationBaseSnapshot(eb)
         setEvaluatorInstrumentSource("source_exam")
+        return true
       } catch {
         setEvaluatorEvaluationBaseSnapshot(null)
         setEvaluatorLastSourceExamPayload(null)
         toast({ title: "No se pudieron cargar los ítems de la prueba base", variant: "destructive" })
+        return false
       } finally {
         setEvaluatorSourceExamItemsLoading(false)
       }
@@ -1894,6 +1924,38 @@ export default function EvaluatorClient() {
     if (activeTab !== "evaluator") return
     loadEvaluatorSourceExamOptions()
   }, [activeTab, loadEvaluatorSourceExamOptions])
+
+  /** Prueba base del QR: misma ruta que el selector (`handleEvaluatorSourceExamSelect`), solo si aún no hay una elegida. */
+  useEffect(() => {
+    if (!ENABLE_WIZARD) return
+    if (activeTab !== "evaluator") return
+    const draft = readWizardSession()
+    if (!draft?.savedAt) return
+    const wizId = draft.sessionSourceExamId?.trim()
+    if (!wizId) return
+    if (selectedEvaluatorSourceExamId.trim() !== "") return
+    if (!evaluatorSourceExamListHydrated || evaluatorSourceExamListLoading) return
+    if (!evaluatorSourceExamOptions.some((o) => o.id === wizId)) return
+    if (wizardGuidedSourceExamAutoAppliedSavedAtRef.current === draft.savedAt) return
+    let cancelled = false
+    void (async () => {
+      const ok = await handleEvaluatorSourceExamSelect(wizId)
+      if (!cancelled && ok) {
+        wizardGuidedSourceExamAutoAppliedSavedAtRef.current = draft.savedAt
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [
+    activeTab,
+    wizardSessionRevision,
+    evaluatorSourceExamListHydrated,
+    evaluatorSourceExamListLoading,
+    evaluatorSourceExamOptions,
+    selectedEvaluatorSourceExamId,
+    handleEvaluatorSourceExamSelect,
+  ])
 
   /** Nombre final visible del estudiante para sync-student. Fuente: group.studentName (single/batch) o payload.opts.student_name (retry). */
   function getFinalStudentNameForSync(
@@ -4512,6 +4574,7 @@ w-8"
                       evaluatorSourceExamListLoading={evaluatorSourceExamListLoading}
                       rememberedSourceExamMissingFromList={rememberedWizardSourceExamMissingFromList}
                       onUseRememberedSourceExam={handleUseRememberedWizardSourceExam}
+                      evaluatorSelectedSourceExamId={selectedEvaluatorSourceExamId}
                     />
 
                     <FormField
