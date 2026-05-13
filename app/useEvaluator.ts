@@ -323,13 +323,32 @@ export const useEvaluator = () => {
         return { success: false, error: msg, diagnostic };
       }
 
-      let response: Response;
+      const evaluateFetchInit: RequestInit = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: bodyStr,
+        cache: 'no-store',
+        credentials: 'same-origin',
+        keepalive: false,
+      };
+
+      let response: Response | undefined;
       try {
-        response = await fetch('/api/evaluate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: bodyStr,
-        });
+        let lastNetErr: unknown;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt > 0) {
+            await new Promise((r) => setTimeout(r, 450));
+          }
+          try {
+            response = await fetch('/api/evaluate', evaluateFetchInit);
+            break;
+          } catch (e) {
+            lastNetErr = e;
+          }
+        }
+        if (response === undefined) {
+          throw lastNetErr instanceof Error ? lastNetErr : new Error('fetch failed');
+        }
       } catch (netErr) {
         const diagnostic: EvaluateDiagnosticPayload = {
           phase: 'fetch_network_or_cors',

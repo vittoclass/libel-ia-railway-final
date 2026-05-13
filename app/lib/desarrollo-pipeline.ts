@@ -20,7 +20,7 @@ export function tryCanonicalDevelopmentItemKey(rawKey: string): string | null {
   if (!k) return null
   if (CERRADA_PREFIX.test(k)) return null
 
-  const u = k.toUpperCase().replace(/\s+/g, " ")
+  const u = k.toUpperCase().replace(/[_\-]+/g, " ").replace(/\s+/g, " ")
 
   let m = /^P(\d{1,3})$/i.exec(u.replace(/\s/g, ""))
   if (m) {

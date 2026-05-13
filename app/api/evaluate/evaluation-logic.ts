@@ -12,6 +12,8 @@ import { persistEvaluation } from "../../lib/persist-evaluation"
 import { getAuthUser } from "../../lib/supabase-route"
 import { getSupabaseServer } from "../../lib/supabase-server"
 import { runAzureLayoutOmrPipeline } from "../../lib/omr/experimental/azure-layout-omr-pipeline"
+import { extractStudentClosedAnswersInterleavedLayout } from "../../lib/omr-interleaved/extract-closed-answers"
+import type { OmrTemplateVariantInterleaved } from "../../lib/omr-interleaved/types"
 import {
   buildEvaluationBase,
   buildTeacherAnswerKeyFromFormPauta,
@@ -22,6 +24,11 @@ import {
   type EvaluationBaseSourceExamItemInput,
 } from "../../lib/evaluation-base"
 import {
+  cerradaMapKeyFromPregunta,
+  dedupePautaAlternativasToCanonicalMap,
+  normalizeToCanonicalId,
+} from "../../lib/canonical-closed-id"
+import {
   accumulateDesarrolloAcrossPages,
   collapseDevelopmentKeysToCanonical,
   filterDesarrolloExcludingClosedPautaSlots,
@@ -30,6 +37,12 @@ import {
   pruneCorreccionDetalladaForCanonicalDesarrollo,
   removeCorreccionEntriesForClosedPautaSlots,
 } from "../../lib/desarrollo-pipeline"
+import {
+  applyConsolidatedStudentClosedAnswers,
+  mergeConsolidatedDesarrolloFinales,
+  RESPUESTAS_FINALES_ESTUDIANTE,
+  type CerradaRowForFinalEvaluation,
+} from "../../lib/student-final-answers-for-evaluation"
 import {
   omrTemplateKeyForClosedQuestionCount,
   resolveSourceExamOmrMetadata,
@@ -161,6 +174,51 @@ function parsePautaEstructurada(pautaStr: string): ItemScore[] {
   return items
 }
 
+/**
+ * Inventario híbrido en orden de examen: solo ids tal como aparecen en `pautaEstructurada` (cerradas + desarrollo).
+ * Regla de oro: una sola pasada por `parsePautaEstructurada`; sin rellenos ni numeración inferida.
+ */
+function buildHybridStructuredQuestionOrder(pautaEstructurada: string): string[] {
+  return parsePautaEstructurada(pautaEstructurada)
+    .map((r) => String(r?.id ?? "").trim())
+    .filter((id) => id.length > 0)
+}
+
+/** Prueba mixta con bloques cerrado/desarrollo alternados en la pauta (≥2 transiciones). */
+function pautaHasInterleavedDevelopmentBlocks(rows: ItemScore[]): boolean {
+  if (rows.length < 3) return false
+  const hasDev = rows.some((r) => r.isDevelopment)
+  const hasClosed = rows.some((r) => !r.isDevelopment)
+  if (!hasDev || !hasClosed) return false
+  let transitions = 0
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i].isDevelopment !== rows[i - 1].isDevelopment) transitions++
+  }
+  return transitions >= 2
+}
+
+/**
+ * Activa el pipeline Azure interleaved si el body envía omrClosedLayoutMode === "interleaved_development",
+ * o heurísticamente cuando la pauta estructurada muestra cerradas y desarrollo intercalados (≥2 transiciones).
+ * EVALUATE_INTERLEAVED_OMR=false desactiva por completo. "standard" fuerza el layout Azure clásico (sin interleaved).
+ * Inventario de cerradas: siempre acotado por officialClosedCount (>0); solo_desarrollo no entra (0 cerradas).
+ */
+function resolveUseInterleavedAzureOmr(params: {
+  explicitLayoutMode: string
+  tipoPrueba: "mixta" | "solo_desarrollo" | "solo_alternativas"
+  pautaRows: ItemScore[]
+  officialClosedCount: number
+}): boolean {
+  if (params.officialClosedCount <= 0) return false
+  const explicit = params.explicitLayoutMode.trim().toLowerCase()
+  if (explicit === "standard") return false
+  const envOff = String(process.env.EVALUATE_INTERLEAVED_OMR ?? "true").trim().toLowerCase() === "false"
+  if (envOff) return false
+  if (explicit === "interleaved_development") return true
+  if (params.tipoPrueba === "solo_desarrollo") return false
+  return pautaHasInterleavedDevelopmentBlocks(params.pautaRows)
+}
+
 /** Extrae solo la opción marcada: A-E, V, F, o número. Evita frases completas. */
 function normalizeRespuestaCerrada(texto: string): string {
   if (!texto || typeof texto !== "string") return "BLANK"
@@ -179,45 +237,21 @@ function normalizeRespuestaCerrada(texto: string): string {
 
 type CerradaNormRow = { pregunta: string; respuesta_detectada: string; confianza: number }
 
-/** Índice de detecciones por clave en mayúsculas (sin inventar ítems). */
+/** Índice de detecciones por `C<n>` únicamente (sin alias duplicados en el mapa). */
 function buildCerradaDetectionLookup(rows: CerradaNormRow[]): Map<string, CerradaNormRow> {
   const m = new Map<string, CerradaNormRow>()
   for (const r of rows) {
-    const p = String(r.pregunta ?? "").trim()
-    if (!p) continue
-    const u = p.toUpperCase()
-    if (!m.has(u)) {
-      m.set(u, {
-        pregunta: p,
+    const canon = normalizeToCanonicalId(r.pregunta)
+    if (!canon) continue
+    if (!m.has(canon)) {
+      m.set(canon, {
+        pregunta: canon,
         respuesta_detectada: r.respuesta_detectada,
         confianza: Number(r.confianza) || 0.8,
       })
     }
-    if (/^\d+$/.test(u)) {
-      const sm = `SM${u}`
-      if (!m.has(sm)) m.set(sm, m.get(u)!)
-    }
   }
   return m
-}
-
-/**
- * Cruza una detección con un id oficial de evaluation base sin confundir prefijos (p. ej. VF12 vs SM12).
- */
-function lookupCerradaForOfficialId(lookup: Map<string, CerradaNormRow>, officialId: string): CerradaNormRow | undefined {
-  const o = officialId.trim()
-  if (!o) return undefined
-  const u = o.toUpperCase()
-  if (lookup.has(u)) return lookup.get(u)
-  const digits = u.replace(/\D/g, "")
-  if (!digits) return undefined
-  if (/^\d+$/.test(u)) {
-    return lookup.get(u) || lookup.get(`SM${u}`) || lookup.get(`VF${u}`) || lookup.get(`TP${u}`)
-  }
-  if (u.startsWith("SM")) return lookup.get(`SM${digits}`) || lookup.get(digits)
-  if (u.startsWith("VF")) return lookup.get(`VF${digits}`) || lookup.get(digits)
-  if (u.startsWith("TP")) return lookup.get(`TP${digits}`) || lookup.get(digits)
-  return lookup.get(digits) || lookup.get(`SM${digits}`)
 }
 
 function dedupeCerradasDetectedOnly(rows: CerradaNormRow[]): CerradaNormRow[] {
@@ -225,13 +259,13 @@ function dedupeCerradasDetectedOnly(rows: CerradaNormRow[]): CerradaNormRow[] {
   const out: CerradaNormRow[] = []
   let n = 0
   for (const r of rows) {
-    const p = String(r.pregunta ?? "").trim()
-    const id = p || `Q${++n}`
+    const canon = normalizeToCanonicalId(r.pregunta)
+    const id = (canon ?? String(r.pregunta ?? "").trim()) || `Q${++n}`
     const k = id.toUpperCase()
-    if (seen.has(k)) continue
+    if (!k || seen.has(k)) continue
     seen.add(k)
     out.push({
-      pregunta: id,
+      pregunta: canon ?? id,
       respuesta_detectada: normalizeRespuestaCerrada(String(r.respuesta_detectada ?? "")),
       confianza: Number(r.confianza) || 0.8,
     })
@@ -241,6 +275,7 @@ function dedupeCerradasDetectedOnly(rows: CerradaNormRow[]): CerradaNormRow[] {
 
 /**
  * Inventario oficial (evaluation base, ítems cerrados) + detecciones OMR/IA; sin inflar más allá del inventario.
+ * Alineación exclusiva por `canonicalId` (C{n}); nunca por posición en arreglo.
  */
 function alignCerradasToOfficialInventory(
   detected: CerradaNormRow[],
@@ -250,30 +285,124 @@ function alignCerradasToOfficialInventory(
   const lookup = buildCerradaDetectionLookup(detected)
   const sorted = [...officialClosed].sort((a, b) => a.order - b.order)
   const out: CerradaNormRow[] = []
-  const usedDetectedKeys = new Set<string>()
+  const usedCanonical = new Set<string>()
   for (const it of sorted) {
-    const hit = lookupCerradaForOfficialId(lookup, it.id)
-    if (hit) usedDetectedKeys.add(String(hit.pregunta ?? "").trim().toUpperCase())
+    const canon = normalizeToCanonicalId(it.id)
+    if (!canon) continue
+    const hit = lookup.get(canon)
+    if (hit) usedCanonical.add(canon)
     out.push({
-      pregunta: it.id,
+      pregunta: canon,
       respuesta_detectada: hit ? normalizeRespuestaCerrada(hit.respuesta_detectada) : "BLANK",
       confianza: hit ? hit.confianza : 0,
     })
   }
-  // Regla anti-truncamiento: nunca descartar detecciones extra si el inventario oficial viene corto.
   for (const row of dedupeCerradasDetectedOnly(detected)) {
-    const k = String(row.pregunta ?? "").trim().toUpperCase()
-    if (!k || usedDetectedKeys.has(k)) continue
+    const c = normalizeToCanonicalId(row.pregunta)
+    if (!c || usedCanonical.has(c)) continue
     out.push(row)
   }
   return out
 }
 
+/**
+ * Cuando `ingestExtradas` / el mapa por pregunta queda vacío pero el pipeline OMR sí materializó
+ * `officialOmrPerQuestionRaw`, reconstruye el mismo shape que el adaptador Azure/interleaved.
+ */
+function rebuildStudentClosedAnswersFromOfficialOmrPerQuestionRaw(
+  officialOmrPerQuestionRaw: any[],
+  closedQuestionIds: string[],
+  teacherAnswerKey: Array<{ pregunta: string; respuestaCorrecta: string }>,
+  opts?: { recovery?: boolean },
+): Array<{ pregunta: string; respuesta_detectada: string; confianza: number; source?: string; recovery?: boolean }> {
+  if (!Array.isArray(officialOmrPerQuestionRaw) || officialOmrPerQuestionRaw.length === 0) return []
+  const sorted = [...officialOmrPerQuestionRaw].sort(
+    (a, b) => Number(a?.questionNumber ?? 0) - Number(b?.questionNumber ?? 0),
+  )
+  const out: Array<{
+    pregunta: string
+    respuesta_detectada: string
+    confianza: number
+    source?: string
+    recovery?: boolean
+  }> = []
+  let rowOrdinal = 0
+  for (const row of sorted) {
+    const qn = Number(row?.questionNumber ?? 0)
+    if (qn < 1) continue
+    const canonRaw =
+      row && typeof row === "object" && typeof (row as any).canonicalId === "string"
+        ? String((row as any).canonicalId).trim()
+        : ""
+    const fromClosedAtPos = closedQuestionIds[rowOrdinal]
+    const fromTeacherAtPos = teacherAnswerKey[rowOrdinal]?.pregunta
+    rowOrdinal++
+    const keyId =
+      normalizeToCanonicalId(canonRaw) ||
+      normalizeToCanonicalId(fromClosedAtPos) ||
+      normalizeToCanonicalId(fromTeacherAtPos) ||
+      normalizeToCanonicalId(`C${qn}`) ||
+      `C${qn}`
+    const ansRaw = String(row?.selectedAnswer ?? "").trim().toUpperCase()
+    const confidenceMapRaw =
+      row && typeof row === "object" && (row as any).confidencesByColumn && typeof (row as any).confidencesByColumn === "object"
+        ? ((row as any).confidencesByColumn as Record<string, unknown>)
+        : {}
+    const confidenceEntries = Object.entries(confidenceMapRaw)
+      .map(([k, v]) => [String(k).toUpperCase(), Number(v)] as const)
+      .filter(([k, v]) => /^[A-Z]$/.test(k) && Number.isFinite(v))
+      .sort((a, b) => b[1] - a[1])
+    const bestByConfidence = confidenceEntries[0]?.[0] ?? ""
+    const ans =
+      ansRaw === "MULTIPLE"
+        ? bestByConfidence || "BLANK"
+        : ansRaw === "" || ansRaw === "SIN_RESPUESTA" || ansRaw === "BLANK"
+          ? "BLANK"
+          : ansRaw
+    const isBlankLike = ans === "BLANK" || ans === "SIN_RESPUESTA" || ans === ""
+    const confFromRow =
+      row && typeof row === "object" && typeof (row as any).confidence === "number" && Number.isFinite((row as any).confidence)
+        ? (row as any).confidence
+        : null
+    const confianza = confFromRow != null ? confFromRow : isBlankLike ? 0.4 : 0.92
+    const base = { pregunta: keyId, respuesta_detectada: ans, confianza }
+    out.push(
+      opts?.recovery ? { ...base, source: "officialOmrPerQuestionRaw", recovery: true } : base,
+    )
+  }
+  return out
+}
+
 function extractClosedOrdinalFromQuestionId(id: string): number | null {
+  const c = normalizeToCanonicalId(id)
+  if (c) {
+    const n = Number(c.slice(1))
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
   const m = String(id ?? "").toUpperCase().match(/(\d+)/)
   if (!m) return null
   const n = Number(m[1])
   return Number.isFinite(n) && n > 0 ? n : null
+}
+
+function sortDetectedCerradasByOfficialClosedOrder<
+  T extends { pregunta: string; respuesta_detectada: string; confianza: number },
+>(rows: T[], officialClosedOrderIds: string[]): T[] {
+  const rank = new Map<string, number>()
+  officialClosedOrderIds.forEach((id, i) => {
+    const c = normalizeToCanonicalId(id)
+    if (c && !rank.has(c)) rank.set(c, i)
+  })
+  return [...rows].sort((a, b) => {
+    const ca = normalizeToCanonicalId(a.pregunta)
+    const cb = normalizeToCanonicalId(b.pregunta)
+    const ra = ca != null ? rank.get(ca) ?? 999_999 : 999_999
+    const rb = cb != null ? rank.get(cb) ?? 999_999 : 999_999
+    if (ra !== rb) return ra - rb
+    const na = ca ? parseInt(ca.slice(1), 10) : Number.MAX_SAFE_INTEGER
+    const nb = cb ? parseInt(cb.slice(1), 10) : Number.MAX_SAFE_INTEGER
+    return na - nb
+  })
 }
 
 /** ¿La lectura OMR de cerrada es vacía / no detectada? (alineado a isBlankLikeDetectedAnswer en POST). */
@@ -758,6 +887,23 @@ Las claves de respuestas_desarrollo pueden ser P1, P2, P3, etc. según los ítem
   }
 }
 
+function normalizeOmrTemplateVariantFromBody(v: unknown): OmrTemplateVariantInterleaved {
+  if (v === "single_column") return "single_column"
+  if (v === "sequential_dual_column") return "sequential_dual_column"
+  return "odd_even_dual_column"
+}
+
+/** Ruta Mistral legacy: solo distingue impar/par vs secuencial en el prompt (sin modo una columna). */
+function legacyMistralDualVariant(
+  v: OmrTemplateVariantInterleaved,
+): "odd_even_dual_column" | "sequential_dual_column" {
+  return v === "sequential_dual_column" ? "sequential_dual_column" : "odd_even_dual_column"
+}
+
+function isOmrTemplateVariantInterleaved(v: string | undefined): v is OmrTemplateVariantInterleaved {
+  return v === "single_column" || v === "sequential_dual_column" || v === "odd_even_dual_column"
+}
+
 /** Extrae SOLO lo que el estudiante marcó. Si hay imagen de plantilla, se envían AMBAS imágenes:
  *  imagen 1 = plantilla del profesor (mismo layout), imagen 2 = hoja del estudiante.
  *  El modelo usa la plantilla solo como referencia de estructura; extrae únicamente de la imagen 2. */
@@ -886,7 +1032,7 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
   /** Orden pauta (isDevelopment) para orquestador Y; no altera visión de Azure. */
   pautaItemsForOmSegmentation?: Array<{ isDevelopment: boolean }>
   templateKey: string
-  templateVariant?: "odd_even_dual_column" | "sequential_dual_column"
+  templateVariant?: OmrTemplateVariantInterleaved
 }): Promise<{
   detectedAnswers: { pregunta: string; respuesta_detectada: string; confianza: number }[]
   officialOmrPerQuestionRaw: any[]
@@ -948,13 +1094,23 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
   )
 
   const out: { pregunta: string; respuesta_detectada: string; confianza: number }[] = []
+  let rowOrdinal = 0
   for (const row of sorted) {
     const qn = Number(row?.questionNumber ?? 0)
     if (qn < 1) continue
-    const keyIdRaw = String(
-      params.closedQuestionIds?.[qn - 1] ?? params.teacherAnswerKey[qn - 1]?.pregunta ?? `SM${qn}`
-    ).trim()
-    const keyId = keyIdRaw || `SM${qn}`
+    const canonRaw =
+      row && typeof row === "object" && typeof (row as any).canonicalId === "string"
+        ? String((row as any).canonicalId).trim()
+        : ""
+    const fromClosedAtPos = params.closedQuestionIds?.[rowOrdinal]
+    const fromTeacherAtPos = params.teacherAnswerKey[rowOrdinal]?.pregunta
+    rowOrdinal++
+    const keyId =
+      normalizeToCanonicalId(canonRaw) ||
+      normalizeToCanonicalId(fromClosedAtPos) ||
+      normalizeToCanonicalId(fromTeacherAtPos) ||
+      normalizeToCanonicalId(`C${qn}`) ||
+      `C${qn}`
     // Passthrough directo desde Azure; si reporta MULTIPLE elegimos la alternativa de mayor confianza.
     const ansRaw = String(row?.selectedAnswer ?? "").trim().toUpperCase()
     const confidenceMapRaw =
@@ -1211,46 +1367,26 @@ function calculateFinalScore(
   porcentajeExigencia: number
 ) {
   const itemScores = parsePautaEstructurada(pautaEstructurada)
-  
-  // Parsear pauta de alternativas correctas
-  // Soporta formatos: "SM1:A", "1:A", "pregunta1:A"
-  const pautaMap = new Map<string, string>()
-  if (pautaCorrectaAlternativas) {
-    const pairs = pautaCorrectaAlternativas.split(";").map(p => p.trim()).filter(p => p)
-    for (const pair of pairs) {
-      const [pregunta, respuesta] = pair.split(":").map(s => s.trim())
-      if (pregunta && respuesta) {
-        const key = pregunta.toUpperCase()
-        const val = respuesta.toUpperCase()
-        pautaMap.set(key, val)
-        // Tambien guardar variantes
-        const numMatch = key.match(/(\d+)/)
-        if (numMatch) {
-          const num = numMatch[1]
-          pautaMap.set(num, val)
-          pautaMap.set(`SM${num}`, val)
-          pautaMap.set(`PREGUNTA${num}`, val)
-        }
-      }
-    }
+
+  const { map: pautaMap, warnings: pautaCanonWarnings } = dedupePautaAlternativasToCanonicalMap(
+    String(pautaCorrectaAlternativas ?? ""),
+  )
+  for (const w of pautaCanonWarnings) {
+    console.warn(`[evaluate][calculateFinalScore] ${w}`)
   }
 
   let scoreAlternativas = 0
   let scoreDesarrollo = 0
   const alternativasCorregidas: AlternativeResult[] = []
 
-  // Corregir respuestas cerradas
+  // Corregir respuestas cerradas (solo claves C{n})
   for (const resp of respuestasCerradas || []) {
-    const preguntaId = String(resp.pregunta).toUpperCase()
+    const canon = normalizeToCanonicalId(resp.pregunta)
+    if (!canon) continue
+    const preguntaId = canon
     const respuestaDetectada = String(resp.respuesta_detectada || "").toUpperCase()
-    
-    // Buscar respuesta correcta con variantes
-    const numMatch = preguntaId.match(/(\d+)/)
-    const num = numMatch ? numMatch[1] : preguntaId
-    const respuestaCorrecta = pautaMap.get(preguntaId) 
-      || pautaMap.get(num) 
-      || pautaMap.get(`SM${num}`) 
-      || ""
+
+    const respuestaCorrecta = pautaMap.get(canon) || ""
 
     const legacyRead = (resp as { _omr_legacy_read?: boolean })._omr_legacy_read === true
     const confOmr = Number((resp as { confianza?: number }).confianza) || 0
@@ -1262,7 +1398,7 @@ function calculateFinalScore(
     })
 
     if (respuestaCorrecta && respuestaDetectada === respuestaCorrecta) {
-      const itemMatch = itemScores.find(i => i.id.toUpperCase() === preguntaId)
+      const itemMatch = itemScores.find((i) => normalizeToCanonicalId(i.id) === canon)
       scoreAlternativas += itemMatch?.maxScore || 1
     }
   }
@@ -1398,6 +1534,29 @@ function normalizeDetectedStudentName(raw: unknown): string {
 }
 
 /**
+ * Serialización HTTP final de éxito para POST /api/evaluate: un solo documento JSON UTF-8
+ * (equivalente a `res.status(200).json(...)` en Express). Sin parse del payload de negocio
+ * ni armado manual de JSON; solo `JSON.stringify` estándar + cabecera charset explícita.
+ */
+function finalizeEvaluateSuccessResponseHttp200(resultadoFinal: Record<string, unknown>): NextResponse {
+  const replacer = (_key: string, value: unknown) => (typeof value === "bigint" ? String(value) : value)
+  try {
+    const body = JSON.stringify(resultadoFinal, replacer)
+    return new NextResponse(body, {
+      status: 200,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+    })
+  } catch (err) {
+    console.error("[evaluate] finalizeEvaluateSuccessResponseHttp200: JSON.stringify falló", err)
+    const msg = err instanceof Error ? err.message : String(err)
+    return NextResponse.json(
+      { success: false, error: `No se pudo serializar la respuesta de evaluación: ${msg}` },
+      { status: 500 },
+    )
+  }
+}
+
+/**
  * Ejecuta la misma lógica que POST /api/evaluate sin HTTP interno (batch en servidor).
  * Usa cookies/Auth del request actual de Next (misma invocación que el POST del batch).
  */
@@ -1454,12 +1613,17 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       officialOmrAllowFallbackToLegacy: officialOmrAllowFallbackToLegacyIn,
       source_exam_id: sourceExamIdBody,
       source_exam_context_active: sourceExamContextActiveBody,
+      omrClosedLayoutMode: omrClosedLayoutModeBody,
+      /** Respuestas de desarrollo consolidadas (tabla editable / sync); opcional. */
+      detalle_desarrollo_finales: detalleDesarrolloFinalesBody,
     } = bodyObj as Record<string, any>
+    const isForcedInterleaved =
+      String(omrClosedLayoutModeBody ?? "").trim() === "interleaved_development"
     const officialOmrIntegrationEnabled = true
     const officialOmrEngineSelected: "legacy" | "azure_layout_family" = "azure_layout_family"
-    const omrTemplateVariant: "odd_even_dual_column" | "sequential_dual_column" =
-      omrTemplateVariantIn === "sequential_dual_column" ? "sequential_dual_column" : "odd_even_dual_column"
-    let officialOmrEngineUsed: "legacy" | "azure_layout_family" = "legacy"
+    const omrTemplateVariantRequested = normalizeOmrTemplateVariantFromBody(omrTemplateVariantIn)
+    const omrTemplateVariantLegacyDual = legacyMistralDualVariant(omrTemplateVariantRequested)
+    let officialOmrEngineUsed: "legacy" | "azure_layout_family" | "azure_layout_omr_interleaved" = "legacy"
     let officialOmrFallbackUsed = false
     let officialOmrFallbackReason: string | null = null
     const officialOmrAllowFallbackToLegacy = officialOmrAllowFallbackToLegacyIn !== false
@@ -1474,19 +1638,22 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
     let officialOmrTeacherAnswerKeyLength = 0
     let officialOmrTotalPregResolved = 0
     let officialOmrTemplateKeyUsed = "template_38_4"
-    let officialOmrTemplateVariantUsed: "odd_even_dual_column" | "sequential_dual_column" = "odd_even_dual_column"
+    /** Variante física efectiva del último pipeline OMR exitoso (intercalado: auto-resuelta; resto: solicitada). */
+    let officialOmrTemplateVariantUsed: OmrTemplateVariantInterleaved = omrTemplateVariantRequested
+    let officialOmrTemplateVariantAutoDiagnostics: unknown = null
     let officialOmrSourceExamIdUsed: string | null = null
     let officialOmrMetadataSource: string | null = null
     let officialOmrItemsClosedCountFromDb = 0
     /** Filas del mapa OMR (rejilla) antes de alinear al inventario de pauta. */
     let officialOmrGridQuestionCountAtEngine = 0
     const teacherAnswersSource = "teacher_key"
-    const studentAnswersSource = "student_omr_read"
+    let studentAnswersSource: "student_omr_read" | typeof RESPUESTAS_FINALES_ESTUDIANTE = "student_omr_read"
     console.info("[trace][omr_official][request_flags]", {
       officialOmrIntegrationEnabledIn,
       officialOmrEngineSelectedIn,
       officialOmrAllowFallbackToLegacyIn,
       omrTemplateVariantIn,
+      omrClosedLayoutModeBody: typeof omrClosedLayoutModeBody === "string" ? omrClosedLayoutModeBody : null,
     })
 
     // Regla de oro: teacher_id/school_id SOLO desde perfil en BD. Ignorar body.
@@ -1776,13 +1943,22 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         }
       }
 
-      const omrExpectedQuestionCount = Math.max(
+      /** Con pauta estructurada no se inventan huecos C1..Cn: el conteo OMR es solo ítems cerrados reales (Regla de Oro). */
+      const inventoryFromStructuredPauta =
+        pautaRowsNotDevelopment.length > 0 && officialClosedItems.length > 0
+
+      let omrExpectedQuestionCount = Math.max(
         1,
         sourceExamOmrAuthoritative > 0 ? sourceExamOmrAuthoritative : totalPreg,
       )
+      if (inventoryFromStructuredPauta) {
+        omrExpectedQuestionCount = Math.max(1, officialClosedItems.length)
+      }
       const templateKeyUsed = omrTemplateKeyForClosedQuestionCount(omrExpectedQuestionCount)
-      // Prioridad plantilla/base: el inventario oficial debe tener al menos el tamaño esperado del OMR.
-      officialClosedItems = ensureOfficialClosedInventorySize(officialClosedItems, omrExpectedQuestionCount)
+      // Sin pauta estructurada de cerradas: completar inventario hasta el tamaño esperado (comportamiento histórico).
+      if (!inventoryFromStructuredPauta) {
+        officialClosedItems = ensureOfficialClosedInventorySize(officialClosedItems, omrExpectedQuestionCount)
+      }
 
       officialOmrGridQuestionCountAtEngine = omrExpectedQuestionCount
       officialOmrTotalPregResolved = omrExpectedQuestionCount
@@ -1799,6 +1975,36 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       const officialClosedOrderIds = officialClosedSorted
         .map((it) => String(it.id ?? "").trim())
         .filter((id) => id.length > 0)
+      const pautaRowsForInterleavedOm = parsePautaEstructurada(pautaEstructurada)
+      const parsedStructuredRubricExists = pautaRowsForInterleavedOm.length > 0
+      let hybridStructuredQuestionOrder: string[] = []
+      if (parsedStructuredRubricExists) {
+        hybridStructuredQuestionOrder = buildHybridStructuredQuestionOrder(String(pautaEstructurada ?? ""))
+        if (!Array.isArray(hybridStructuredQuestionOrder) || hybridStructuredQuestionOrder.length === 0) {
+          throw new Error(
+            "[INTERLEAVED_INVALID_STRUCTURED_ORDER] " +
+              "No se pudo construir hybridStructuredQuestionOrder desde pautaEstructurada.",
+          )
+        }
+      }
+      const useInterleavedAzureOmr = resolveUseInterleavedAzureOmr({
+        explicitLayoutMode: typeof omrClosedLayoutModeBody === "string" ? omrClosedLayoutModeBody : "",
+        tipoPrueba: tipoPruebaReal,
+        pautaRows: pautaRowsForInterleavedOm,
+        officialClosedCount: officialClosedOrderIds.length,
+      })
+      // Diagnóstico de despliegue: mismas lecturas que runInterleavedAzureLayoutOmrPipeline (no toca lógica OMR).
+      console.log("[C30_AUDIT_FLAG]", process.env.INTERLEAVED_C30_C31_AUDIT ?? null)
+      console.log("[C30_RECOVERY_FLAG]", process.env.INTERLEAVED_FINAL_BLANK_RECOVERY_FROM_PHYSICAL_EVIDENCE ?? null)
+      console.log("[OMR_INTERLEAVED_ROUTING]", {
+        useInterleavedAzureOmr,
+        explicitLayoutMode: typeof omrClosedLayoutModeBody === "string" ? omrClosedLayoutModeBody : null,
+        evaluateInterleavedOmrEnv: process.env.EVALUATE_INTERLEAVED_OMR ?? null,
+        tipoPrueba: tipoPruebaReal,
+        pautaRowsForInterleavedCount: pautaRowsForInterleavedOm.length,
+        officialClosedCount: officialClosedOrderIds.length,
+        hasInterleavedHeuristicBlocks: pautaHasInterleavedDevelopmentBlocks(pautaRowsForInterleavedOm),
+      })
       const extractClosedOrdinal = (id: string): number | null => {
         const m = String(id).toUpperCase().match(/(\d+)/)
         if (!m) return null
@@ -1821,22 +2027,18 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         teacherQuestionNumbers.length > 0 &&
         officialClosedQuestionNumbers.length === teacherQuestionNumbers.length &&
         officialClosedQuestionNumbers.some((n, idx) => n !== teacherQuestionNumbers[idx])
+      /** OMR legacy devuelve la i-ésima burbuja cerrada en orden físico; se alinea por índice al i-ésimo ítem cerrado oficial, no por el dígito en `pregunta`. */
       const remapLegacyRawToOfficialOrder = (
         legacyRaw: { pregunta: string; respuesta_detectada: string; confianza: number }[]
       ): { pregunta: string; respuesta_detectada: string; confianza: number }[] =>
         officialClosedOrderIds.map((officialId, idx) => {
-          const expectedQn = officialClosedQuestionNumbers[idx] ?? idx + 1
-          const rawMatch = legacyRaw.find((item) => {
-            const m = String(item?.pregunta ?? "").toUpperCase().match(/(\d+)/)
-            if (!m) return false
-            const qn = Number(m[1])
-            return Number.isFinite(qn) && qn === expectedQn
-          })
-          const fallbackId = `C${expectedQn}`
+          const displayId = normalizeToCanonicalId(officialId) ?? String(officialId ?? "").trim()
+          const pregunta = displayId || `C${idx + 1}`
+          const rawRow = legacyRaw[idx]
           return {
-            pregunta: officialId || fallbackId,
-            respuesta_detectada: String(rawMatch?.respuesta_detectada ?? "BLANK"),
-            confianza: Number(rawMatch?.confianza) || 0.4,
+            pregunta,
+            respuesta_detectada: String(rawRow?.respuesta_detectada ?? "BLANK"),
+            confianza: Number(rawRow?.confianza) || 0.4,
           }
         })
       const isBlankLikeDetectedAnswer = (value: string): boolean => {
@@ -1862,15 +2064,17 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       >()
       let azureSuccessfulPages = 0
       let azureFailedPages = 0
+      let omrSuccessfulAzureWasInterleaved = false
 
       const ingestExtradas = (
         rows: { pregunta: string; respuesta_detectada: string; confianza: number }[],
         fromLegacyPipeline: boolean
       ) => {
         for (const item of rows) {
-          const pid = item.pregunta.toUpperCase()
+          const canon = normalizeToCanonicalId(item.pregunta)
+          const pid = canon ?? cerradaMapKeyFromPregunta(item.pregunta)
           const incoming = {
-            pregunta: item.pregunta,
+            pregunta: canon ?? item.pregunta,
             respuesta_detectada: String(item.respuesta_detectada ?? ""),
             confianza: Number(item.confianza) || 0.4,
           }
@@ -1916,6 +2120,9 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             totalPreg,
             omrExpectedQuestionCount,
             sourceExamOmrAuthoritative,
+            useInterleavedAzureOmr,
+            omrClosedLayoutModeBody: typeof omrClosedLayoutModeBody === "string" ? omrClosedLayoutModeBody : null,
+            hybridStructuredQuestionOrderLen: hybridStructuredQuestionOrder.length,
           })
           if (forceLegacyStableRouteForStructure) {
             officialOmrFallbackUsed = true
@@ -1927,7 +2134,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               alternativasArray,
               columnas,
               templateBase64,
-              omrTemplateVariant
+              omrTemplateVariantLegacyDual
             )
             extraidas = remapLegacyRawToOfficialOrder(legacyRaw)
             console.info("[trace][omr_official][extraidas_forced_legacy_structural_gaps]", {
@@ -1953,22 +2160,26 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             const expectedQuestionCountUsed = Math.max(1, omrExpectedQuestionCount)
             officialOmrExpectedQuestionCountUsed = expectedQuestionCountUsed
             officialOmrTemplateKeyUsed = templateKeyUsed
-            officialOmrTemplateVariantUsed = omrTemplateVariant
+            const authoritativeForAzure =
+              inventoryFromStructuredPauta || sourceExamOmrAuthoritative <= 0
+                ? undefined
+                : sourceExamOmrAuthoritative
             const azureParams = {
               teacherAnswerKey,
               closedQuestionIds: officialClosedOrderIds,
               expectedOptionCount,
               expectedQuestionCount: expectedQuestionCountUsed,
-              authoritativeOmrQuestionCount:
-                sourceExamOmrAuthoritative > 0 ? sourceExamOmrAuthoritative : undefined,
+              authoritativeOmrQuestionCount: authoritativeForAzure,
               pautaItemsForOmSegmentation: parsePautaEstructurada(pautaEstructurada).map((it) => ({
                 isDevelopment: it.isDevelopment,
               })),
               templateKey: templateKeyUsed,
-              templateVariant: omrTemplateVariant,
+              templateVariant: omrTemplateVariantRequested,
             }
-            let azureOfficial: Awaited<ReturnType<typeof extractStudentClosedAnswersAzureLayoutOfficial>> | null =
-              null
+            let azureOfficial:
+              | Awaited<ReturnType<typeof extractStudentClosedAnswersAzureLayoutOfficial>>
+              | Awaited<ReturnType<typeof extractStudentClosedAnswersInterleavedLayout>>
+              | null = null
             let lastAzureErr: unknown = null
             let azureRecoveredAfterImageEnhance = false
             for (let attempt = 0; attempt < 2 && !azureOfficial; attempt++) {
@@ -1984,10 +2195,34 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                     })
               if (attempt === 1 && !imgForAttempt) break
               try {
-                azureOfficial = await extractStudentClosedAnswersAzureLayoutOfficial({
-                  ...azureParams,
-                  studentImageBase64: imgForAttempt ?? studentBase64,
-                })
+                if (useInterleavedAzureOmr) {
+                  if (
+                    !Array.isArray(hybridStructuredQuestionOrder) ||
+                    hybridStructuredQuestionOrder.length === 0
+                  ) {
+                    throw new Error(
+                      "[INTERLEAVED_INVALID_STRUCTURED_ORDER] hybridStructuredQuestionOrder vacío.",
+                    )
+                  }
+                  console.info("[official_azure_layout_interleaved] invoking extractStudentClosedAnswersInterleavedLayout")
+                  azureOfficial = await extractStudentClosedAnswersInterleavedLayout({
+                    studentImageBase64: imgForAttempt ?? studentBase64,
+                    teacherAnswerKey,
+                    closedQuestionIds: officialClosedOrderIds,
+                    expectedOptionCount,
+                    expectedQuestionCount: Math.max(1, officialClosedOrderIds.length),
+                    authoritativeOmrQuestionCount: authoritativeForAzure,
+                    templateKey: templateKeyUsed,
+                    templateVariant: omrTemplateVariantRequested,
+                    suppressHybridSoftMismatchRecovery: isForcedInterleaved,
+                    hybridStructuredQuestionOrder,
+                  })
+                } else {
+                  azureOfficial = await extractStudentClosedAnswersAzureLayoutOfficial({
+                    ...azureParams,
+                    studentImageBase64: imgForAttempt ?? studentBase64,
+                  })
+                }
                 if (attempt === 1) azureRecoveredAfterImageEnhance = true
               } catch (e) {
                 lastAzureErr = e
@@ -2012,6 +2247,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                 officialOmrPerQuestionRawCount: Array.isArray(azureOfficial.officialOmrPerQuestionRaw)
                   ? azureOfficial.officialOmrPerQuestionRaw.length
                   : 0,
+                interleavedBranch: useInterleavedAzureOmr,
               })
               officialOmrPerQuestionRaw = azureOfficial.officialOmrPerQuestionRaw
               officialOmrDetectedAnswersPreview = azureOfficial.officialOmrDetectedAnswersPreview
@@ -2019,10 +2255,33 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               officialOmrDetectedAnswersCount = azureOfficial.officialOmrDetectedAnswersCount
               officialOmrDetectedVsPipelineMismatch = azureOfficial.officialOmrDetectedVsPipelineMismatch
               officialOmrAdapterMode = azureOfficial.officialOmrAdapterMode
-              officialOmrEngineUsed = "azure_layout_family"
+              if (useInterleavedAzureOmr) {
+                const resolvedEffective = (azureOfficial as { omrTemplateVariantEffective?: string })
+                  .omrTemplateVariantEffective
+                officialOmrTemplateVariantUsed = isOmrTemplateVariantInterleaved(resolvedEffective)
+                  ? resolvedEffective
+                  : omrTemplateVariantRequested
+                const variantAutoDiag = (azureOfficial as { omrTemplateVariantAutoDiagnostics?: unknown })
+                  .omrTemplateVariantAutoDiagnostics
+                if (variantAutoDiag != null) {
+                  officialOmrTemplateVariantAutoDiagnostics = variantAutoDiag
+                }
+                omrSuccessfulAzureWasInterleaved = true
+                officialOmrEngineUsed = "azure_layout_omr_interleaved"
+              } else {
+                officialOmrTemplateVariantUsed = omrTemplateVariantRequested
+                officialOmrEngineUsed = "azure_layout_family"
+              }
               azureSuccessfulPages++
               ingestExtradas(extraidas, false)
             } else {
+              if (isForcedInterleaved && useInterleavedAzureOmr) {
+                throw new Error(
+                  `[INTERLEAVED_FORCED_MODE_FAILED] ${
+                    lastAzureErr instanceof Error ? lastAzureErr.message : String(lastAzureErr ?? "unknown")
+                  }`,
+                )
+              }
               if (!officialOmrAllowFallbackToLegacy) {
                 throw lastAzureErr instanceof Error ? lastAzureErr : new Error(String(lastAzureErr))
               }
@@ -2037,7 +2296,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                 alternativasArray,
                 columnas,
                 templateBase64,
-                omrTemplateVariant
+                omrTemplateVariantLegacyDual
               )
               extraidas = remapLegacyRawToOfficialOrder(legacyRaw)
               console.info("[trace][omr_official][extraidas_after_fallback_legacy]", {
@@ -2057,7 +2316,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               alternativasArray,
               columnas,
               templateBase64,
-              omrTemplateVariant
+              omrTemplateVariantLegacyDual
             )
             extraidas = remapLegacyRawToOfficialOrder(legacyRaw)
             console.info("[trace][omr_official][extraidas_after_legacy_direct]", {
@@ -2068,6 +2327,63 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             ingestExtradas(extraidas, true)
           }
         } catch (e) {
+          if (isForcedInterleaved) {
+            const teacherKeyForOm = teacherAnswerKeyBase.map((r: any) => ({
+              pregunta: String(r?.pregunta ?? ""),
+              respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
+            }))
+            const recoveredFromRaw = rebuildStudentClosedAnswersFromOfficialOmrPerQuestionRaw(
+              officialOmrPerQuestionRaw,
+              officialClosedOrderIds,
+              teacherKeyForOm,
+              { recovery: true },
+            )
+            if (recoveredFromRaw.length > 0) {
+              console.warn(
+                "[EVALUATE_RECOVERY] OMR página con error; se aplican respuestas reconstruidas desde officialOmrPerQuestionRaw",
+                { page: i + 1, err: e instanceof Error ? e.message : String(e) },
+              )
+              ingestExtradas(
+                recoveredFromRaw.map(({ source: _s, recovery: _r, ...rest }) => rest),
+                false,
+              )
+              continue
+            }
+            return NextResponse.json(
+              {
+                success: false,
+                error: e instanceof Error ? e.message : String(e),
+                officialOmrIntegrationEnabled,
+                officialOmrEngineSelected,
+                officialOmrAllowFallbackToLegacy,
+                officialOmrEngineUsed,
+                officialOmrFallbackUsed,
+                officialOmrFallbackReason:
+                  (e instanceof Error ? e.message : String(e)) || officialOmrFallbackReason,
+                officialOmrPerQuestionRaw,
+                officialOmrDetectedAnswersPreview,
+                officialOmrQuestionCountFromPipeline,
+                officialOmrDetectedAnswersCount,
+                officialOmrDetectedVsPipelineMismatch,
+                officialOmrAdapterMode,
+                teacherAnswersSource,
+                studentAnswersSource,
+                teacherClosedAnswersCount:
+                  typeof answerKeyFromTemplate?.respuestas?.length === "number"
+                    ? answerKeyFromTemplate.respuestas.length
+                    : 0,
+                studentClosedAnswersCount: Math.max(
+                  respuestasCerradasDesdeOMR.length,
+                  detectedByPregunta.size,
+                ),
+                omrClosedLayoutMode: String(omrClosedLayoutModeBody ?? "").trim() || null,
+                omrTemplateVariantRequested,
+                omrTemplateVariantEffective: officialOmrTemplateVariantUsed,
+                omrTemplateVariantAutoDiagnostics: officialOmrTemplateVariantAutoDiagnostics,
+              },
+              { status: 500 },
+            )
+          }
           if (
             officialOmrIntegrationEnabled === true &&
             officialOmrEngineSelected === "azure_layout_family" &&
@@ -2096,7 +2412,13 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                   typeof answerKeyFromTemplate?.respuestas?.length === "number"
                     ? answerKeyFromTemplate.respuestas.length
                     : 0,
-                studentClosedAnswersCount: respuestasCerradasDesdeOMR.length,
+                studentClosedAnswersCount: Math.max(
+                  respuestasCerradasDesdeOMR.length,
+                  detectedByPregunta.size,
+                ),
+                omrTemplateVariantRequested,
+                omrTemplateVariantEffective: officialOmrTemplateVariantUsed,
+                omrTemplateVariantAutoDiagnostics: officialOmrTemplateVariantAutoDiagnostics,
               },
               { status: 500 }
             )
@@ -2104,16 +2426,45 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           console.warn("[Evaluate] OMR dedicado falló para imagen", i, e)
         }
       }
-      const officialClosedOrderUpper = officialClosedOrderIds.map((id) => id.toUpperCase())
-      respuestasCerradasDesdeOMR = Array.from(detectedByPregunta.values()).sort((a, b) => {
-        const ia = officialClosedOrderUpper.indexOf(String(a.pregunta ?? "").toUpperCase())
-        const ib = officialClosedOrderUpper.indexOf(String(b.pregunta ?? "").toUpperCase())
-        const ra = ia >= 0 ? ia : Number.MAX_SAFE_INTEGER
-        const rb = ib >= 0 ? ib : Number.MAX_SAFE_INTEGER
-        return ra - rb
-      })
+      respuestasCerradasDesdeOMR = sortDetectedCerradasByOfficialClosedOrder(
+        Array.from(detectedByPregunta.values()),
+        officialClosedOrderIds,
+      )
+      if (
+        (!respuestasCerradasDesdeOMR || respuestasCerradasDesdeOMR.length === 0) &&
+        Array.isArray(officialOmrPerQuestionRaw) &&
+        officialOmrPerQuestionRaw.length > 0
+      ) {
+        console.warn(
+          "[EVALUATE_RECOVERY] Rebuilding studentClosedAnswers from officialOmrPerQuestionRaw",
+        )
+        const teacherKeyForOm = teacherAnswerKeyBase.map((r: any) => ({
+          pregunta: String(r?.pregunta ?? ""),
+          respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
+        }))
+        respuestasCerradasDesdeOMR = sortDetectedCerradasByOfficialClosedOrder(
+          rebuildStudentClosedAnswersFromOfficialOmrPerQuestionRaw(
+            officialOmrPerQuestionRaw,
+            officialClosedOrderIds,
+            teacherKeyForOm,
+            { recovery: true },
+          ),
+          officialClosedOrderIds,
+        )
+      }
+      if (
+        Array.isArray(officialOmrPerQuestionRaw) &&
+        officialOmrPerQuestionRaw.length > 0 &&
+        (!respuestasCerradasDesdeOMR || respuestasCerradasDesdeOMR.length === 0)
+      ) {
+        throw new Error(
+          "No se pudieron reconstruir respuestas cerradas desde officialOmrPerQuestionRaw.",
+        )
+      }
       if (azureSuccessfulPages > 0) {
-        officialOmrEngineUsed = "azure_layout_family"
+        officialOmrEngineUsed = omrSuccessfulAzureWasInterleaved
+          ? "azure_layout_omr_interleaved"
+          : "azure_layout_family"
         officialOmrFallbackUsed = false
         officialOmrFallbackReason = null
         if (officialOmrAdapterMode !== "direct_passthrough_from_experimental") {
@@ -2146,6 +2497,9 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             ? answerKeyFromTemplate.respuestas.length
             : 0,
         studentClosedAnswersCount: respuestasCerradasDesdeOMR.length,
+        omrTemplateVariantRequested,
+        omrTemplateVariantEffective: officialOmrTemplateVariantUsed,
+        omrTemplateVariantAutoDiagnostics: officialOmrTemplateVariantAutoDiagnostics,
       }
       console.info("[evaluate] OMR phase completed", {
         pages: imageBase64List.length,
@@ -2216,9 +2570,9 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         if (analysis.respuestas_cerradas && respuestasCerradasDesdeOMR.length === 0) {
           // Evitar duplicados al combinar respuestas de multiples paginas
           for (const resp of analysis.respuestas_cerradas) {
-            const preguntaId = String(resp.pregunta).toUpperCase()
+            const key = cerradaMapKeyFromPregunta(resp.pregunta)
             const exists = combinedAnalysis.respuestas_cerradas.some(
-              (r: any) => String(r.pregunta).toUpperCase() === preguntaId
+              (r: any) => cerradaMapKeyFromPregunta(r.pregunta) === key,
             )
             if (!exists) {
               combinedAnalysis.respuestas_cerradas.push(resp)
@@ -2298,6 +2652,35 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
 
     }  // fin else (rama imágenes: Mistral Vision)
 
+    if (
+      (!respuestasCerradasDesdeOMR || respuestasCerradasDesdeOMR.length === 0) &&
+      Array.isArray(officialOmrPerQuestionRaw) &&
+      officialOmrPerQuestionRaw.length > 0
+    ) {
+      console.warn(
+        "[EVALUATE_RECOVERY] (post-vision) Rebuilding studentClosedAnswers from officialOmrPerQuestionRaw",
+      )
+      const closedIdsForRecovery = [...officialClosedItems]
+        .sort((a, b) => a.order - b.order)
+        .map((it) => String(it.id ?? "").trim())
+        .filter((id) => id.length > 0)
+      const teacherKeyForRecovery = Array.isArray(answerKeyFromTemplate?.respuestas)
+        ? answerKeyFromTemplate.respuestas.map((r: any) => ({
+            pregunta: String(r?.pregunta ?? ""),
+            respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
+          }))
+        : []
+      respuestasCerradasDesdeOMR = sortDetectedCerradasByOfficialClosedOrder(
+        rebuildStudentClosedAnswersFromOfficialOmrPerQuestionRaw(
+          officialOmrPerQuestionRaw,
+          closedIdsForRecovery,
+          teacherKeyForRecovery,
+          { recovery: true },
+        ),
+        closedIdsForRecovery,
+      )
+    }
+
     // Conservar siempre las respuestas cerradas detectadas por OMR del estudiante, aun sin pauta cargada.
     if (respuestasCerradasDesdeOMR.length > 0) {
       combinedAnalysis.respuestas_cerradas = respuestasCerradasDesdeOMR.map((r: any) => ({
@@ -2314,11 +2697,11 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           const r = respuestasAlternativas[idx]
           const preguntaSrc = String(r.pregunta ?? "").trim()
           const preguntaId = preguntaSrc || `Q${idx + 1}`
-          const mapKey = preguntaId.toUpperCase()
+          const mapKey = normalizeToCanonicalId(preguntaId) ?? preguntaId.toUpperCase()
           const respuestaEstudiante = (r.respuesta_estudiante ?? r.respuesta ?? "").toString().trim()
           if (!respMap.has(mapKey)) {
             respMap.set(mapKey, {
-              pregunta: preguntaId,
+              pregunta: normalizeToCanonicalId(preguntaId) ?? preguntaId,
               respuesta_detectada: respuestaEstudiante,
               confianza: r.confianza ?? 1.0,
             })
@@ -2332,10 +2715,10 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         const r = combinedAnalysis.respuestas_cerradas[idx]
         const preguntaSrc = String(r.pregunta ?? "").trim()
         const preguntaId = preguntaSrc || `Q${idx + 1}`
-        const mapKey = preguntaId.toUpperCase()
+        const mapKey = normalizeToCanonicalId(preguntaId) ?? preguntaId.toUpperCase()
         if (!respMap.has(mapKey)) {
           respMap.set(mapKey, {
-            pregunta: preguntaId,
+            pregunta: normalizeToCanonicalId(preguntaId) ?? preguntaId,
             respuesta_detectada: r.respuesta_detectada || "",
             confianza: r.confianza || 1.0,
           })
@@ -2350,28 +2733,54 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       confianza: Number(r.confianza) || 0.8,
     }))
     const cerradasAlineadas = alignCerradasToOfficialInventory(cerradasParaAlinear, officialClosedItems)
-    const expectedClosedCount = Math.max(
-      1,
-      cerradasParaAlinear.length,
-      officialClosedItems.length,
-      officialOmrTotalPregResolved || 0
-    )
     const byId = new Map<string, CerradaNormRow>()
     for (const r of cerradasAlineadas) {
-      const k = String(r.pregunta ?? "").trim().toUpperCase()
+      const canon = normalizeToCanonicalId(r.pregunta)
+      const k = canon ?? String(r.pregunta ?? "").trim().toUpperCase()
       if (!k || byId.has(k)) continue
-      byId.set(k, r)
+      byId.set(k, { ...r, pregunta: canon ?? k })
     }
-    for (let q = 1; q <= expectedClosedCount; q++) {
-      const cKey = `C${q}`
-      const smKey = `SM${q}`
-      if (!byId.has(cKey) && !byId.has(smKey)) {
-        byId.set(cKey, { pregunta: cKey, respuesta_detectada: "BLANK", confianza: 0 })
+    const officialClosedSortedForBlank = [...officialClosedItems].sort((a, b) => a.order - b.order)
+    const uniqueClosedInventory = new Set(
+      officialClosedSortedForBlank
+        .map((it) => normalizeToCanonicalId(it.id))
+        .filter((x): x is string => x != null),
+    )
+    for (const it of officialClosedSortedForBlank) {
+      const canon = normalizeToCanonicalId(it.id)
+      if (!canon) continue
+      if (!byId.has(canon)) {
+        byId.set(canon, { pregunta: canon, respuesta_detectada: "BLANK", confianza: 0 })
       }
     }
+    if (
+      uniqueClosedInventory.size > 0 &&
+      officialOmrQuestionCountFromPipeline > 0 &&
+      uniqueClosedInventory.size !== officialOmrQuestionCountFromPipeline
+    ) {
+      evaluationWarnings.push(
+        `[canonical_count_mismatch] closedItemsCount (${uniqueClosedInventory.size}) !== officialOmrQuestionCountFromPipeline (${officialOmrQuestionCountFromPipeline})`,
+      )
+    }
+    const teacherKeyUniqueCanonical = new Set(
+      (answerKeyFromTemplate?.respuestas ?? [])
+        .map((r: { pregunta?: unknown }) => normalizeToCanonicalId(String(r?.pregunta ?? "")))
+        .filter((x: string | null): x is string => x != null),
+    )
+    if (
+      uniqueClosedInventory.size > 0 &&
+      teacherKeyUniqueCanonical.size > 0 &&
+      teacherKeyUniqueCanonical.size !== uniqueClosedInventory.size
+    ) {
+      evaluationWarnings.push(
+        `[canonical_count_mismatch] teacherAnswerKey unique canonical (${teacherKeyUniqueCanonical.size}) !== closedItemsCount (${uniqueClosedInventory.size})`,
+      )
+    }
     combinedAnalysis.respuestas_cerradas = Array.from(byId.values()).sort((a, b) => {
-      const na = extractClosedOrdinalFromQuestionId(String(a.pregunta ?? "")) ?? Number.MAX_SAFE_INTEGER
-      const nb = extractClosedOrdinalFromQuestionId(String(b.pregunta ?? "")) ?? Number.MAX_SAFE_INTEGER
+      const ca = normalizeToCanonicalId(String(a.pregunta ?? ""))
+      const cb = normalizeToCanonicalId(String(b.pregunta ?? ""))
+      const na = ca ? parseInt(ca.slice(1), 10) : Number.MAX_SAFE_INTEGER
+      const nb = cb ? parseInt(cb.slice(1), 10) : Number.MAX_SAFE_INTEGER
       if (na !== nb) return na - nb
       return String(a.pregunta ?? "").localeCompare(String(b.pregunta ?? ""))
     })
@@ -2379,6 +2788,11 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       ...r,
       _omr_legacy_read: resolveOmrLegacyForRow(r, omrLegacyByPreguntaUpper),
     }))
+    const consolidatedClosed = applyConsolidatedStudentClosedAnswers(
+      combinedAnalysis.respuestas_cerradas as CerradaRowForFinalEvaluation[],
+      respuestasAlternativas,
+    )
+    combinedAnalysis.respuestas_cerradas = consolidatedClosed.cerradas as typeof combinedAnalysis.respuestas_cerradas
     officialOmrExpectedQuestionCountUsed = combinedAnalysis.respuestas_cerradas.length
     console.info("[trace][omr_official][combined_before_scoring]", {
       combinedRespuestasCerradasCount: Array.isArray(combinedAnalysis.respuestas_cerradas)
@@ -2396,6 +2810,23 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
     combinedAnalysis.respuestas_desarrollo = orderCanonicalDesarrolloRecord(
       collapseDevelopmentKeysToCanonical((combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>)
     ) as typeof combinedAnalysis.respuestas_desarrollo
+
+    let desarrolloFinalesApplied = false
+    if (
+      detalleDesarrolloFinalesBody &&
+      typeof detalleDesarrolloFinalesBody === "object" &&
+      !Array.isArray(detalleDesarrolloFinalesBody)
+    ) {
+      const devMerged = mergeConsolidatedDesarrolloFinales(
+        combinedAnalysis.respuestas_desarrollo as unknown as Record<string, unknown>,
+        detalleDesarrolloFinalesBody,
+      )
+      combinedAnalysis.respuestas_desarrollo = devMerged.merged as typeof combinedAnalysis.respuestas_desarrollo
+      desarrolloFinalesApplied = devMerged.applied
+    }
+    if (consolidatedClosed.applied || desarrolloFinalesApplied) {
+      studentAnswersSource = RESPUESTAS_FINALES_ESTUDIANTE
+    }
 
     // Normalizar respuestas_desarrollo para que puntaje sea siempre string "X/Y" (evita [object Object] y permite calcular nota)
     combinedAnalysis.respuestas_desarrollo = normalizeRespuestasDesarrollo(combinedAnalysis.respuestas_desarrollo)
@@ -2516,6 +2947,8 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       officialOmrAdapterMode,
       teacherAnswersSource,
       studentAnswersSource,
+      omrTemplateVariantRequested,
+      omrTemplateVariantEffective: officialOmrTemplateVariantUsed,
       teacherClosedAnswersCount:
         typeof answerKeyFromTemplate?.respuestas?.length === "number"
           ? answerKeyFromTemplate.respuestas.length
@@ -2652,51 +3085,59 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       has_source_exam_link: !!sourceExamIdTrimmed,
     })
 
-    return NextResponse.json(
-      {
-        ...result,
-        omrDebug: {
-          engineSelected: officialOmrEngineSelected,
-          engineUsed: officialOmrEngineUsed,
-          fallbackUsed: officialOmrFallbackUsed,
-          fallbackReason: officialOmrFallbackReason,
-          integrationEnabled: officialOmrIntegrationEnabled,
-          studentAnswersSource,
-          teacherAnswersSource,
-          expectedQuestionCountUsed: officialOmrExpectedQuestionCountUsed,
-          teacherAnswerKeyLength: officialOmrTeacherAnswerKeyLength,
-          totalPregResolved: officialOmrTotalPregResolved,
-          templateKeyUsed: officialOmrTemplateKeyUsed,
-          omrTemplateVariantUsed: officialOmrTemplateVariantUsed,
-          officialOmrQuestionCountFromPipeline,
-          officialOmrDetectedAnswersCount,
-          officialOmrDetectedVsPipelineMismatch,
-          officialOmrAdapterMode,
-          sourceExamOmrIdUsed: officialOmrSourceExamIdUsed,
-          sourceExamOmrMetadataSource: officialOmrMetadataSource,
-          sourceExamOmrItemsClosedCountFromDb: officialOmrItemsClosedCountFromDb,
-          gridQuestionCountAtEngine: officialOmrGridQuestionCountAtEngine,
-          officialOmrPerQuestionRawPreview: Array.isArray(officialOmrPerQuestionRaw)
-            ? officialOmrPerQuestionRaw.slice(0, 10)
-            : [],
-          detectedAnswersPreview:
-            Array.isArray(officialOmrDetectedAnswersPreview) && officialOmrDetectedAnswersPreview.length > 0
-              ? officialOmrDetectedAnswersPreview.slice(0, 10)
-              : Array.isArray(studentClosedAnswersDetected)
-                ? studentClosedAnswersDetected.slice(0, 10)
-                : [],
-          totalDetectedAnswers: Array.isArray(studentClosedAnswersDetected)
-            ? studentClosedAnswersDetected.length
-            : 0,
-        },
-        saved,
-        evaluation_id: evaluationId,
-        status,
-        save_error,
-        ...(save_reason && { reason: save_reason }),
+    // Cuerpo HTTP: no incluir `officialOmrPerQuestionRaw` completo (muy volumétrico; ya hay preview en omrDebug).
+    // Evita truncamiento intermedio que en el cliente produce "Unterminated string in JSON at position ...".
+    const resultForWire: Record<string, unknown> = { ...(result as unknown as Record<string, unknown>) }
+    delete resultForWire.officialOmrPerQuestionRaw
+
+    const resultadoFinal: Record<string, unknown> = {
+      ...resultForWire,
+      omrDebug: {
+        engineSelected: officialOmrEngineSelected,
+        engineUsed: officialOmrEngineUsed,
+        fallbackUsed: officialOmrFallbackUsed,
+        fallbackReason: officialOmrFallbackReason,
+        integrationEnabled: officialOmrIntegrationEnabled,
+        studentAnswersSource,
+        teacherAnswersSource,
+        expectedQuestionCountUsed: officialOmrExpectedQuestionCountUsed,
+        teacherAnswerKeyLength: officialOmrTeacherAnswerKeyLength,
+        totalPregResolved: officialOmrTotalPregResolved,
+        templateKeyUsed: officialOmrTemplateKeyUsed,
+        omrTemplateVariantRequested,
+        omrTemplateVariantEffective: officialOmrTemplateVariantUsed,
+        omrTemplateVariantUsed: officialOmrTemplateVariantUsed,
+        omrTemplateVariantAutoDiagnostics: officialOmrTemplateVariantAutoDiagnostics,
+        officialOmrQuestionCountFromPipeline,
+        officialOmrDetectedAnswersCount,
+        officialOmrDetectedVsPipelineMismatch,
+        officialOmrAdapterMode,
+        sourceExamOmrIdUsed: officialOmrSourceExamIdUsed,
+        sourceExamOmrMetadataSource: officialOmrMetadataSource,
+        sourceExamOmrItemsClosedCountFromDb: officialOmrItemsClosedCountFromDb,
+        gridQuestionCountAtEngine: officialOmrGridQuestionCountAtEngine,
+        officialOmrPerQuestionRawLength: Array.isArray(officialOmrPerQuestionRaw) ? officialOmrPerQuestionRaw.length : 0,
+        officialOmrPerQuestionRawPreview: Array.isArray(officialOmrPerQuestionRaw)
+          ? officialOmrPerQuestionRaw.slice(0, 10)
+          : [],
+        detectedAnswersPreview:
+          Array.isArray(officialOmrDetectedAnswersPreview) && officialOmrDetectedAnswersPreview.length > 0
+            ? officialOmrDetectedAnswersPreview.slice(0, 10)
+            : Array.isArray(studentClosedAnswersDetected)
+              ? studentClosedAnswersDetected.slice(0, 10)
+              : [],
+        totalDetectedAnswers: Array.isArray(studentClosedAnswersDetected)
+          ? studentClosedAnswersDetected.length
+          : 0,
       },
-      { status: 200 }
-    )
+      saved,
+      evaluation_id: evaluationId,
+      status,
+      save_error,
+      ...(save_reason && { reason: save_reason }),
+    }
+
+    return finalizeEvaluateSuccessResponseHttp200(resultadoFinal)
   } catch (error: any) {
     console.error("[Evaluate] Error:", error)
     let msg = error?.message || "Error procesando la evaluación"

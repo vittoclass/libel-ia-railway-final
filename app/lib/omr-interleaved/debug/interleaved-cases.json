@@ -1,0 +1,62 @@
+[
+  {
+    "label": "lab-reference-41q-odd-even",
+    "sourceExamId": "dc037cd6-7c4c-49ba-9719-c58cacd38ebc",
+    "photoPath": "dc64bd01-5b57-403f-b4b8-8aec3808b206/d3f52c65-4930-4afe-81d3-b0827f11ce12/s1_p1_ecb9a9f9-43ba-4e1f-81be-16d4b6f03c78.jpg",
+    "variant": "odd_even_dual_column"
+  },
+  {
+    "label": "exam-40q-batch-a-odd-even",
+    "sourceExamId": "b104f0ab-c277-4f01-bc1d-789df50d3213",
+    "photoPath": "dc64bd01-5b57-403f-b4b8-8aec3808b206/bfeb76ea-5766-4fbe-805c-5425a56daac7/s1_p1_608f37a1-a60f-43fe-b27a-b81c4beefdb1.jpg",
+    "variant": "odd_even_dual_column"
+  },
+  {
+    "label": "exam-40q-batch-b-odd-even-alt-storage",
+    "sourceExamId": "b104f0ab-c277-4f01-bc1d-789df50d3213",
+    "photoPath": "567cf743-276a-427a-b558-ad79931247d8/11fed492-1128-49b4-ab48-a647db8be9d4/s1_p1_59fa2b44-802e-43bf-9050-4f05dc1eaff0.jpg",
+    "variant": "odd_even_dual_column"
+  },
+  {
+    "label": "exam-40q-batch-a-sequential",
+    "sourceExamId": "b104f0ab-c277-4f01-bc1d-789df50d3213",
+    "photoPath": "dc64bd01-5b57-403f-b4b8-8aec3808b206/bfeb76ea-5766-4fbe-805c-5425a56daac7/s1_p1_608f37a1-a60f-43fe-b27a-b81c4beefdb1.jpg",
+    "variant": "sequential_dual_column"
+  },
+  {
+    "label": "exam-high-closed-count-page3-odd-even",
+    "sourceExamId": "81ee3351-6a4d-479f-9b1f-f7892c3c3ade",
+    "photoPath": "3356de01-f348-4653-959c-4a332fff4ee5/8a3d7d1e-980f-40b5-807a-c92f5bb5fb5d/s3_p1_d2bf3c68-61ed-428c-a8cc-855272d7705d.jpg",
+    "variant": "odd_even_dual_column"
+  },
+  {
+    "label": "exam-multi-student-s1-page1-odd-even",
+    "sourceExamId": "81ee3351-6a4d-479f-9b1f-f7892c3c3ade",
+    "photoPath": "3356de01-f348-4653-959c-4a332fff4ee5/8a3d7d1e-980f-40b5-807a-c92f5bb5fb5d/s1_p1_9d19a0c0-3d43-4f9e-9a89-b26f5550192d.jpg",
+    "variant": "odd_even_dual_column"
+  },
+  {
+    "label": "exam-multi-student-s2-page1-odd-even",
+    "sourceExamId": "81ee3351-6a4d-479f-9b1f-f7892c3c3ade",
+    "photoPath": "3356de01-f348-4653-959c-4a332fff4ee5/8a3d7d1e-980f-40b5-807a-c92f5bb5fb5d/s2_p1_67f144a7-7b56-410a-827b-f3c43bc23ce5.jpg",
+    "variant": "odd_even_dual_column"
+  },
+  {
+    "label": "exam-multi-student-s2-page1-b-odd-even",
+    "sourceExamId": "81ee3351-6a4d-479f-9b1f-f7892c3c3ade",
+    "photoPath": "3356de01-f348-4653-959c-4a332fff4ee5/8a3d7d1e-980f-40b5-807a-c92f5bb5fb5d/s2_p1_b159fb07-5673-41f0-8d90-2feca381c6ed.jpg",
+    "variant": "odd_even_dual_column"
+  },
+  {
+    "label": "exam-multi-student-s1-page1-c-odd-even",
+    "sourceExamId": "81ee3351-6a4d-479f-9b1f-f7892c3c3ade",
+    "photoPath": "3356de01-f348-4653-959c-4a332fff4ee5/8a3d7d1e-980f-40b5-807a-c92f5bb5fb5d/s1_p1_ab7a184b-b937-4862-9209-c51ea8cb3c65.jpg",
+    "variant": "odd_even_dual_column"
+  },
+  {
+    "label": "exam-high-closed-count-page3-sequential",
+    "sourceExamId": "81ee3351-6a4d-479f-9b1f-f7892c3c3ade",
+    "photoPath": "3356de01-f348-4653-959c-4a332fff4ee5/8a3d7d1e-980f-40b5-807a-c92f5bb5fb5d/s3_p1_d2bf3c68-61ed-428c-a8cc-855272d7705d.jpg",
+    "variant": "sequential_dual_column"
+  }
+]
