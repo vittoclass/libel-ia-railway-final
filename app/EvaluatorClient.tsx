@@ -353,6 +353,51 @@ function readFileAsDataUrl(file: File): Promise<string> {
   })
 }
 
+/**
+ * Data URLs muy grandes (~varios MB en base64) suelen provocar "Failed to fetch" en el navegador
+ * aunque el servidor acepte el cuerpo. Solo se reencodea por encima del umbral; si falla, se usa el original.
+ */
+function shrinkDataUrlIfHuge(dataUrl: string, mime: string): Promise<string> {
+  const thresholdChars = 2_000_000
+  if (typeof document === "undefined") return Promise.resolve(dataUrl)
+  if (dataUrl.length <= thresholdChars) return Promise.resolve(dataUrl)
+  const isImg =
+    dataUrl.startsWith("data:image/") || (typeof mime === "string" && mime.startsWith("image/"))
+  if (!isImg) return Promise.resolve(dataUrl)
+
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const maxSide = 2400
+        const w = img.naturalWidth || img.width
+        const h = img.naturalHeight || img.height
+        if (!w || !h) {
+          resolve(dataUrl)
+          return
+        }
+        const scale = Math.min(1, maxSide / Math.max(w, h))
+        const tw = Math.max(1, Math.round(w * scale))
+        const th = Math.max(1, Math.round(h * scale))
+        const canvas = document.createElement("canvas")
+        canvas.width = tw
+        canvas.height = th
+        const ctx = canvas.getContext("2d")
+        if (!ctx) {
+          resolve(dataUrl)
+          return
+        }
+        ctx.drawImage(img, 0, 0, tw, th)
+        resolve(canvas.toDataURL("image/jpeg", 0.92))
+      } catch {
+        resolve(dataUrl)
+      }
+    }
+    img.onerror = () => resolve(dataUrl)
+    img.src = dataUrl
+  })
+}
+
 interface FilePreview {
   id: string
   file: File
@@ -410,8 +455,9 @@ async function resolveFileUrlsForEvaluate(files: FilePreview[]): Promise<{ urls:
         })
       }
     }
-    urls.push(f.dataUrl)
-    mimes.push(f.file.type)
+    const slim = await shrinkDataUrlIfHuge(f.dataUrl, f.file.type || "")
+    urls.push(slim)
+    mimes.push(slim.startsWith("data:image/jpeg") ? "image/jpeg" : f.file.type)
   }
   return { urls, mimes }
 }
@@ -1058,6 +1104,9 @@ export default function EvaluatorClient() {
   const [selectedOmrTemplateVariant, setSelectedOmrTemplateVariant] = useState<
     "odd_even_dual_column" | "sequential_dual_column"
   >("odd_even_dual_column")
+  const [omrClosedLayoutMode, setOmrClosedLayoutMode] = useState<
+    "auto" | "standard" | "interleaved_development"
+  >("auto")
   // Progreso de evaluacion por lotes
 
   const batchInitial = { isActive: false, totalItems: 0, completedItems: 0, successCount: 0, errorCount: 0, currentBatch: 0, totalBatches: 0 }
@@ -2976,7 +3025,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       pautaEstructurada: pautaEstructuradaFinal,
       pautaCorrectaAlternativas: pautaCorrectaAlternativasFinal,
       tipoPrueba: tipoPrueba || "mixta",
-      respuestasAlternativas: answerKey ? undefined : group.alternativas_corregidas,
+      respuestasAlternativas: group.alternativas_corregidas,
       captureMode: captureMode,
       ...(teacherIdForPayload && { teacher_id: teacherIdForPayload }),
       ...(schoolIdForPayload && { school_id: schoolIdForPayload }),
@@ -2989,6 +3038,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
       ...(resolvedSourceExamId ? { source_exam_id: resolvedSourceExamId } : {}),
       source_exam_context_active: sourceExamContextActive,
+      ...(omrClosedLayoutMode === "auto" ? {} : { omrClosedLayoutMode }),
     }
 
     const result = await evaluate(payload)
@@ -3310,7 +3360,12 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             pautaEstructurada: pautaEstructuradaFinal,
             pautaCorrectaAlternativas: pautaCorrectaAlternativasFinal,
             tipoPrueba: tipoPrueba || "mixta",
-            respuestasAlternativas: answerKey ? undefined : group.alternativas_corregidas,
+            respuestasAlternativas:
+              Array.isArray(group.alternativas_corregidas) && group.alternativas_corregidas.length > 0
+                ? group.alternativas_corregidas
+                : answerKey
+                  ? undefined
+                  : group.alternativas_corregidas,
             captureMode: captureMode,
             ...(teacherIdForPayload && { teacher_id: teacherIdForPayload }),
             ...(schoolIdForPayload && { school_id: schoolIdForPayload }),
@@ -3328,6 +3383,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
             ...(resolvedSourceExamId ? { source_exam_id: resolvedSourceExamId } : {}),
             source_exam_context_active: sourceExamContextActive,
+            ...(omrClosedLayoutMode === "auto" ? {} : { omrClosedLayoutMode }),
           },
         }
       }),
@@ -3987,6 +4043,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   const isAdminRole =
     currentRole === "DIRECCION" || currentRole === "UTP" || currentRole === "ADMIN_INSTITUCION"
   const canSeePanelColegio = isIvan || isAdminRole
+  /** Panel técnico OMR en resultados: solo Ivan / admin institucional / rol ADMIN; oculto para docentes normales. */
+  const canSeeOmrOfficialDebugPanel = isIvan || isAdminRole || currentRole === "ADMIN"
 
   const evaluateDiagnosticText = evaluateDiagnostic
     ? (() => {
@@ -5750,29 +5808,62 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                     })}
                   </CardContent>
                   <CardFooter className="flex flex-col items-stretch gap-4">
-                    <div className="rounded-md border border-[var(--border-color)] bg-[var(--bg-muted-subtle)] p-3 space-y-2">
-                      <Label htmlFor="omr-template-variant" className="text-[var(--text-accent)]">
-                        Tipo de plantilla OMR
-                      </Label>
-                      <Select
-                        value={selectedOmrTemplateVariant}
-                        disabled={batchProgress.isActive || isLoading}
-                        onValueChange={(v) =>
-                          setSelectedOmrTemplateVariant(v as "odd_even_dual_column" | "sequential_dual_column")
-                        }
-                      >
-                        <SelectTrigger id="omr-template-variant" className="w-full max-w-md bg-[var(--bg-card)]">
-                          <SelectValue placeholder="Seleccionar" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="odd_even_dual_column">Pares e impares</SelectItem>
-                          <SelectItem value="sequential_dual_column">Continua / secuencial</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <p className="text-xs text-[var(--text-secondary)]">
-                        Se envía a la evaluación como <span className="font-mono">omrTemplateVariant</span>. Comprueba{" "}
-                        <span className="font-mono">omrTemplateVariantUsed</span> en OMR DEBUG (REAL).
-                      </p>
+                    <div className="rounded-md border border-[var(--border-color)] bg-[var(--bg-muted-subtle)] p-3 space-y-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="omr-template-variant" className="text-[var(--text-accent)]">
+                          Variante de plantilla OMR
+                        </Label>
+                        <Select
+                          value={selectedOmrTemplateVariant}
+                          disabled={batchProgress.isActive || isLoading}
+                          onValueChange={(v) =>
+                            setSelectedOmrTemplateVariant(v as "odd_even_dual_column" | "sequential_dual_column")
+                          }
+                        >
+                          <SelectTrigger id="omr-template-variant" className="w-full max-w-md bg-[var(--bg-card)]">
+                            <SelectValue placeholder="Seleccionar" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="odd_even_dual_column">Pares e impares</SelectItem>
+                            <SelectItem value="sequential_dual_column">Continua / secuencial</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p className="text-xs text-[var(--text-secondary)]">
+                          Se envía como <span className="font-mono">omrTemplateVariant</span>. En debug:{" "}
+                          <span className="font-mono">omrTemplateVariantUsed</span>.
+                        </p>
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="omr-closed-layout-mode">Motor OMR para preguntas cerradas</Label>
+                        <Select
+                          value={omrClosedLayoutMode}
+                          disabled={batchProgress.isActive || isLoading}
+                          onValueChange={(value) =>
+                            setOmrClosedLayoutMode(
+                              value as "auto" | "standard" | "interleaved_development",
+                            )
+                          }
+                        >
+                          <SelectTrigger id="omr-closed-layout-mode" className="w-full max-w-md bg-[var(--bg-card)]">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="auto">Automático</SelectItem>
+                            <SelectItem value="standard">OMR clásico</SelectItem>
+                            <SelectItem value="interleaved_development">
+                              OMR intercalado (cerradas + desarrollo)
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p className="text-xs text-[var(--text-secondary)]">
+                          <span className="font-mono">Automático</span> no envía{" "}
+                          <span className="font-mono">omrClosedLayoutMode</span>.{" "}
+                          <span className="font-mono">interleaved_development</span> fuerza el pipeline intercalado; si
+                          falla, no hay fallback silencioso a legacy (error visible y{" "}
+                          <span className="font-mono">/api/evaluate</span>). Desactivar todo el feature:{" "}
+                          <span className="font-mono">EVALUATE_INTERLEAVED_OMR=false</span>.
+                        </p>
+                      </div>
                     </div>
                     {/* Botón de Evaluación */}
                     <Button
@@ -6101,13 +6192,295 @@ La IA usará una escala 0-10 por criterio de desarrollo."
 
                         const typeInferenceSources = snapshotItems.map((it) => String((it.metadata as any)?.typeInferenceSource ?? "—"))
                         const inferTypeFromFormItemV2Used = typeInferenceSources.some((s) => s.includes("inferTypeFromFormItem:v2_altEvidence"))
-                        const inferTypeFromFormItemUsed = typeInferenceSources.some((s) => s.includes("inferTypeFromFormItem:"))
 
                         // 🔥 EXTRACCIÓN DE VALORES PARA EL VELOCÍMETRO
                         const puntajeObtenido = Number.parseInt(group.puntaje?.split("/")[0] || "0", 10)
                         const puntajeMaximo =
                           group.puntosMaximos || Number.parseInt(group.puntaje?.split("/")[1] || "0", 10)
                         const puntosAprobacion = group.puntosAprobacion || 0
+
+                        const omrIntegrationFieldsVisible =
+                          typeof group.shouldUseOfficialAzureOmr !== "undefined" ||
+                          typeof group.officialOmrEngineSelected !== "undefined"
+                        const hasAnyOmrOfficialDebugContent =
+                          omrIntegrationFieldsVisible ||
+                          (group.isEvaluated && Boolean(debug)) ||
+                          (SHOW_EVALUATION_TRACE_PANEL && Boolean(tracePayload))
+
+                        const omrOfficialDebugDetailsPanel =
+                          canSeeOmrOfficialDebugPanel && hasAnyOmrOfficialDebugContent ? (
+                            <details className="rounded-md border border-cyan-300 bg-cyan-50 dark:bg-cyan-950/30 p-3 text-xs">
+                              <summary className="cursor-pointer font-semibold text-cyan-900 dark:text-cyan-100">
+                                Ver debug técnico OMR
+                              </summary>
+                              <div className="mt-3 space-y-4">
+                                {omrIntegrationFieldsVisible && (
+                                  <>
+                                    <ul className="font-mono space-y-0.5 break-all">
+                                      <li>shouldUseOfficialAzureOmr: {String(group.shouldUseOfficialAzureOmr ?? "—")}</li>
+                                      <li>officialOmrActivationReason: {String(group.officialOmrActivationReason ?? "—")}</li>
+                                      <li>officialOmrIntegrationEnabled: {String(group.officialOmrIntegrationEnabled ?? "—")}</li>
+                                      <li>officialOmrEngineSelected: {String(group.officialOmrEngineSelected ?? "—")}</li>
+                                      <li>officialOmrEngineUsed: {String(group.officialOmrEngineUsed ?? "—")}</li>
+                                      <li>officialOmrFallbackUsed: {String(group.officialOmrFallbackUsed ?? "—")}</li>
+                                      <li>officialOmrFallbackReason: {String(group.officialOmrFallbackReason ?? "—")}</li>
+                                    </ul>
+                                    {group.officialOmrEngineSelected === "azure_layout_family" &&
+                                      group.officialOmrEngineUsed === "legacy" && (
+                                        <div className="mt-2 rounded border-2 border-rose-600 bg-rose-50 dark:bg-rose-950/50 p-2 text-rose-900 dark:text-rose-100 font-bold">
+                                          El motor Azure oficial NO se usó. Se hizo fallback a legacy.
+                                        </div>
+                                      )}
+                                  </>
+                                )}
+                                {group.isEvaluated && debug && (
+                                  <div
+                                    style={{
+                                      marginTop: "10px",
+                                      padding: "12px",
+                                      border: "3px solid red",
+                                      background: "#000",
+                                      color: "#00ff00",
+                                      fontSize: "12px",
+                                      zIndex: 9999,
+                                    }}
+                                  >
+                                    <div>
+                                      <b>OMR DEBUG (REAL)</b>
+                                    </div>
+
+                                    <div>engineSelected: {String(debug.engineSelected)}</div>
+                                    <div>engineUsed: {String(debug.engineUsed)}</div>
+                                    <div>fallbackUsed: {String(debug.fallbackUsed)}</div>
+                                    <div>fallbackReason: {String(debug.fallbackReason ?? "—")}</div>
+                                    <div>integrationEnabled: {String(debug.integrationEnabled)}</div>
+
+                                    <div>studentAnswersSource: {String(debug.studentAnswersSource)}</div>
+                                    <div>teacherAnswersSource: {String(debug.teacherAnswersSource)}</div>
+                                    <div>expectedQuestionCountUsed: {String(debug.expectedQuestionCountUsed)}</div>
+                                    <div>teacherAnswerKeyLength: {String(debug.teacherAnswerKeyLength)}</div>
+                                    <div>totalPregResolved: {String(debug.totalPregResolved)}</div>
+                                    <div>templateKeyUsed: {String(debug.templateKeyUsed)}</div>
+                                    <div>omrTemplateVariantUsed: {String(debug.omrTemplateVariantUsed)}</div>
+
+                                    <div>totalDetectedAnswers: {String(debug.totalDetectedAnswers)}</div>
+                                    <div>officialOmrQuestionCountFromPipeline: {String(debug.officialOmrQuestionCountFromPipeline)}</div>
+                                    <div>officialOmrDetectedAnswersCount: {String(debug.officialOmrDetectedAnswersCount)}</div>
+                                    <div>officialOmrDetectedVsPipelineMismatch: {String(debug.officialOmrDetectedVsPipelineMismatch)}</div>
+                                    <div>officialOmrAdapterMode: {String(debug.officialOmrAdapterMode)}</div>
+
+                                    <div style={{ marginTop: "10px" }}>detectedAnswersPreview:</div>
+                                    <pre style={{ maxHeight: "200px", overflow: "auto" }}>
+                                      {JSON.stringify(debug.detectedAnswersPreview, null, 2)}
+                                    </pre>
+                                    <div style={{ marginTop: "10px" }}>officialOmrPerQuestionRawPreview:</div>
+                                    <pre style={{ maxHeight: "200px", overflow: "auto" }}>
+                                      {JSON.stringify(debug.officialOmrPerQuestionRawPreview, null, 2)}
+                                    </pre>
+                                  </div>
+                                )}
+                                {SHOW_EVALUATION_TRACE_PANEL && tracePayload && (
+                                  <div className="rounded-lg border border-blue-300 bg-blue-50/30 p-3 space-y-4">
+                                    <div className="font-semibold text-blue-900 dark:text-blue-100">Diagnóstico técnico temporal</div>
+                                    <div className="space-y-4">
+                                      <div className="rounded-md border border-border bg-background/60 p-3">
+                                        <div className="font-semibold mb-2">PAYLOAD FINAL ENVIADO</div>
+                                        <div className="text-xs text-muted-foreground space-y-1">
+                                          <div>
+                                            tipoPrueba: <span className="font-mono">{tracePayload.tipoPrueba}</span>
+                                          </div>
+                                          <div>
+                                            evaluatorInstrumentSource:{" "}
+                                            <span className="font-mono">{tracePayload.evaluatorInstrumentSource}</span>
+                                          </div>
+                                          <div>
+                                            selectedEvaluatorSourceExamId:{" "}
+                                            <span className="font-mono">{tracePayload.selectedEvaluatorSourceExamId || "—"}</span>
+                                          </div>
+                                          <div className="pt-2">pautaEstructuradaFinal:</div>
+                                          <pre className="text-[11px] font-mono overflow-x-auto">{tracePayload.pautaEstructuradaFinal}</pre>
+                                          <div className="pt-2">pautaCorrectaAlternativasFinal:</div>
+                                          <pre className="text-[11px] font-mono overflow-x-auto">{tracePayload.pautaCorrectaAlternativasFinal}</pre>
+                                          <div className="pt-2">answerKeyFromTemplate (resumen):</div>
+                                          {tracePayload.answerKeyFromTemplateSummary ? (
+                                            <>
+                                              <div>
+                                                totalPreguntas:{" "}
+                                                <span className="font-mono">{tracePayload.answerKeyFromTemplateSummary.totalPreguntas}</span>
+                                              </div>
+                                              <div>
+                                                respuestas.length:{" "}
+                                                <span className="font-mono">{tracePayload.answerKeyFromTemplateSummary.respuestasLength}</span>
+                                              </div>
+                                              <pre className="text-[11px] font-mono overflow-x-auto">
+                                                {JSON.stringify(tracePayload.answerKeyFromTemplateSummary.primeras10, null, 2)}
+                                              </pre>
+                                            </>
+                                          ) : (
+                                            <div className="text-[11px] font-mono">null (no se pudo sintetizar clave desde la pauta)</div>
+                                          )}
+                                        </div>
+                                      </div>
+
+                                      <div className="rounded-md border border-border bg-background/60 p-3">
+                                        <div className="font-semibold mb-2">DEBUG OMR REAL</div>
+                                        <div className="text-xs text-muted-foreground space-y-1 font-mono">
+                                          <div>studentAnswersSource: {debug?.studentAnswersSource ?? "—"}</div>
+                                          <div>teacherAnswersSource: {debug?.teacherAnswersSource ?? "—"}</div>
+                                          <div>expectedQuestionCountUsed: {debug?.expectedQuestionCountUsed ?? "—"}</div>
+                                          <div>teacherAnswerKeyLength: {debug?.teacherAnswerKeyLength ?? "—"}</div>
+                                          <div>totalDetectedAnswers: {debug?.totalDetectedAnswers ?? "—"}</div>
+                                          <div>officialOmrQuestionCountFromPipeline: {debug?.officialOmrQuestionCountFromPipeline ?? "—"}</div>
+                                          <div>officialOmrDetectedAnswersCount: {debug?.officialOmrDetectedAnswersCount ?? "—"}</div>
+                                          <div>officialOmrDetectedVsPipelineMismatch: {debug?.officialOmrDetectedVsPipelineMismatch ?? "—"}</div>
+                                          <div>templateKeyUsed: {debug?.templateKeyUsed ?? "—"}</div>
+                                          <div>omrTemplateVariantUsed: {debug?.omrTemplateVariantUsed ?? "—"}</div>
+                                        </div>
+                                      </div>
+
+                                      <div className="rounded-md border border-border bg-background/60 p-3">
+                                        <div className="font-semibold mb-2">TRACE DE ORIGEN REAL DE TIPOS</div>
+                                        <div className="text-xs text-muted-foreground space-y-1">
+                                          <div>
+                                            evaluatorEvaluationBaseSnapshot.source:{" "}
+                                            <span className="font-mono">{String(snapshotSource)}</span>
+                                          </div>
+                                          <div>
+                                            Construido por: <span className="font-mono">{snapshotBuildFn}</span>
+                                          </div>
+                                          <div>
+                                            inferTypeFromFormItem (versión modificada) usada:{" "}
+                                            <span className="font-mono">{inferTypeFromFormItemV2Used ? "sí" : "no"}</span>
+                                          </div>
+                                        </div>
+                                        <div className="mt-3 max-h-64 overflow-auto">
+                                          <Table>
+                                            <TableHeader>
+                                              <TableRow>
+                                                <TableHead>item_number</TableHead>
+                                                <TableHead>type</TableHead>
+                                                <TableHead>correctAnswer</TableHead>
+                                                <TableHead>fuente</TableHead>
+                                                <TableHead>altEvidence</TableHead>
+                                                <TableHead>texto evaluado (alt)</TableHead>
+                                              </TableRow>
+                                            </TableHeader>
+                                            <TableBody>
+                                              {snapshotItems.map((it, idx) => {
+                                                const meta = it.metadata as any
+                                                const altText =
+                                                  typeof meta?.altEvidenceEvaluatedText === "string" ? meta.altEvidenceEvaluatedText : null
+                                                const altRes = typeof meta?.altEvidenceResult === "boolean" ? meta.altEvidenceResult : null
+                                                return (
+                                                  <TableRow key={it.id || idx}>
+                                                    <TableCell className="font-mono">{String(meta?.item_number ?? "—")}</TableCell>
+                                                    <TableCell className="font-mono">{it.type}</TableCell>
+                                                    <TableCell className="font-mono">{String(it.correctAnswer ?? "—")}</TableCell>
+                                                    <TableCell className="font-mono">{String(meta?.typeInferenceSource ?? "—")}</TableCell>
+                                                    <TableCell className="font-mono">{altRes == null ? "—" : altRes ? "true" : "false"}</TableCell>
+                                                    <TableCell>
+                                                      <div className="max-h-24 overflow-auto whitespace-pre-wrap font-mono text-[11px]">
+                                                        {altText ?? "—"}
+                                                      </div>
+                                                    </TableCell>
+                                                  </TableRow>
+                                                )
+                                              })}
+                                            </TableBody>
+                                          </Table>
+                                        </div>
+                                      </div>
+
+                                      <div className="rounded-md border border-border bg-background/60 p-3">
+                                        <div className="font-semibold mb-2">COMPARACIÓN CERRADAS REALES</div>
+                                        {Array.isArray(tableAlternativas) && tableAlternativas.length > 0 ? (
+                                          <div className="overflow-x-auto">
+                                            <Table>
+                                              <TableHeader>
+                                                <TableRow>
+                                                  <TableHead>Pregunta</TableHead>
+                                                  <TableHead>Respuesta detectada</TableHead>
+                                                  <TableHead>Respuesta correcta usada</TableHead>
+                                                  <TableHead>Estado real</TableHead>
+                                                  <TableHead>Fuente correct</TableHead>
+                                                  <TableHead>Fallback</TableHead>
+                                                  <TableHead>Slot/canonical</TableHead>
+                                                </TableRow>
+                                              </TableHeader>
+                                              <TableBody>
+                                                {tableAlternativas.slice(0, 30).map((item, idx) => {
+                                                  const est = (item.respuesta_estudiante ?? "").trim().toUpperCase()
+                                                  const corr = (item.respuesta_correcta ?? "").trim().toUpperCase()
+                                                  const ok = est && corr ? est === corr : false
+                                                  const preg = (item.pregunta ?? "").trim().toUpperCase()
+                                                  const slot = /^([CP])\d+$/.test(preg) ? preg : preg.match(/^\d+$/) ? `C${preg}` : "—"
+                                                  return (
+                                                    <TableRow key={idx}>
+                                                      <TableCell className="font-mono">{item.pregunta}</TableCell>
+                                                      <TableCell className="font-mono">{item.respuesta_estudiante}</TableCell>
+                                                      <TableCell className="font-mono text-green-700">{item.respuesta_correcta}</TableCell>
+                                                      <TableCell className="font-bold">{ok ? "OK" : "INCORRECTA"}</TableCell>
+                                                      <TableCell className="font-mono">{debug?.teacherAnswersSource ?? "—"}</TableCell>
+                                                      <TableCell className="font-mono">{debug?.fallbackUsed ? "sí" : "no"}</TableCell>
+                                                      <TableCell className="font-mono">{slot}</TableCell>
+                                                    </TableRow>
+                                                  )
+                                                })}
+                                              </TableBody>
+                                            </Table>
+                                          </div>
+                                        ) : (
+                                          <div className="text-xs text-muted-foreground">No hay alternativas corregidas para mostrar</div>
+                                        )}
+                                      </div>
+
+                                      <div className="rounded-md border border-border bg-background/60 p-3">
+                                        <div className="font-semibold mb-2">DESARROLLO REAL</div>
+                                        <div className="text-xs text-muted-foreground space-y-2">
+                                          <div>
+                                            total claves desarrollo detectadas: <span className="font-mono">{desarrolloKeys.length}</span>
+                                          </div>
+                                          <div>
+                                            colapso/evidencia de normalización (por claves canónicas):{" "}
+                                            <span className="font-mono">
+                                              {canonicalDevPairs.some((p) => p.canonical && p.canonical !== p.original) ? "sí" : "no"}
+                                            </span>
+                                          </div>
+                                          <div>
+                                            duplicación canónica detectada:{" "}
+                                            <span className="font-mono">{devCanonicalDuplicate ? "sí" : "no"}</span>
+                                          </div>
+                                          <pre className="text-[11px] font-mono overflow-x-auto">
+                                            {JSON.stringify(
+                                              canonicalDevPairs.slice(0, 60).map((p) => ({
+                                                original: p.original,
+                                                canonical: p.canonical ?? null,
+                                              })),
+                                              null,
+                                              2,
+                                            )}
+                                          </pre>
+                                        </div>
+                                      </div>
+
+                                      <div className="rounded-md border border-border bg-background/60 p-3">
+                                        <div className="font-semibold mb-2">CONTRADICCIONES DETECTADAS</div>
+                                        {traceAlerts.length > 0 ? (
+                                          <ul className="list-disc pl-5 text-xs text-destructive space-y-1">
+                                            {traceAlerts.map((a, i) => (
+                                              <li key={i}>{a}</li>
+                                            ))}
+                                          </ul>
+                                        ) : (
+                                          <div className="text-xs text-muted-foreground">Sin contradicciones detectadas para este caso.</div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </details>
+                          ) : null
 
                         return (
                           <div
@@ -6165,287 +6538,13 @@ h-4 w-4 animate-spin"
                             {group.error ? (
                               <div className="space-y-3">
                                 <p className="text-red-600">Error: {group.error}</p>
-                                {(typeof group.shouldUseOfficialAzureOmr !== "undefined" ||
-                                  typeof group.officialOmrEngineSelected !== "undefined") && (
-                                  <div className="rounded-md border border-cyan-300 bg-cyan-50 dark:bg-cyan-950/30 p-3 text-xs">
-                                    <p className="font-semibold text-cyan-900 dark:text-cyan-100 mb-1">
-                                      Debug OMR oficial (temporal)
-                                    </p>
-                                    <ul className="font-mono space-y-0.5 break-all">
-                                      <li>shouldUseOfficialAzureOmr: {String(group.shouldUseOfficialAzureOmr ?? "—")}</li>
-                                      <li>officialOmrActivationReason: {String(group.officialOmrActivationReason ?? "—")}</li>
-                                      <li>officialOmrIntegrationEnabled: {String(group.officialOmrIntegrationEnabled ?? "—")}</li>
-                                      <li>officialOmrEngineSelected: {String(group.officialOmrEngineSelected ?? "—")}</li>
-                                      <li>officialOmrEngineUsed: {String(group.officialOmrEngineUsed ?? "—")}</li>
-                                      <li>officialOmrFallbackUsed: {String(group.officialOmrFallbackUsed ?? "—")}</li>
-                                      <li>officialOmrFallbackReason: {String(group.officialOmrFallbackReason ?? "—")}</li>
-                                    </ul>
-                                    {group.officialOmrEngineSelected === "azure_layout_family" &&
-                                      group.officialOmrEngineUsed === "legacy" && (
-                                        <div className="mt-2 rounded border-2 border-rose-600 bg-rose-50 dark:bg-rose-950/50 p-2 text-rose-900 dark:text-rose-100 font-bold">
-                                          El motor Azure oficial NO se usó. Se hizo fallback a legacy.
-                                        </div>
-                                      )}
-                                  </div>
-                                )}
+                                {omrOfficialDebugDetailsPanel}
                               </div>
                             ) : (
                               <div className="mt-4 space-y-6">
-                                {(typeof group.shouldUseOfficialAzureOmr !== "undefined" ||
-                                  typeof group.officialOmrEngineSelected !== "undefined") && (
-                                  <div className="rounded-md border border-cyan-300 bg-cyan-50 dark:bg-cyan-950/30 p-3 text-xs">
-                                    <p className="font-semibold text-cyan-900 dark:text-cyan-100 mb-1">
-                                      Debug OMR oficial (temporal)
-                                    </p>
-                                    <ul className="font-mono space-y-0.5 break-all">
-                                      <li>shouldUseOfficialAzureOmr: {String(group.shouldUseOfficialAzureOmr ?? "—")}</li>
-                                      <li>officialOmrActivationReason: {String(group.officialOmrActivationReason ?? "—")}</li>
-                                      <li>officialOmrIntegrationEnabled: {String(group.officialOmrIntegrationEnabled ?? "—")}</li>
-                                      <li>officialOmrEngineSelected: {String(group.officialOmrEngineSelected ?? "—")}</li>
-                                      <li>officialOmrEngineUsed: {String(group.officialOmrEngineUsed ?? "—")}</li>
-                                      <li>officialOmrFallbackUsed: {String(group.officialOmrFallbackUsed ?? "—")}</li>
-                                      <li>officialOmrFallbackReason: {String(group.officialOmrFallbackReason ?? "—")}</li>
-                                    </ul>
-                                    {group.officialOmrEngineSelected === "azure_layout_family" &&
-                                      group.officialOmrEngineUsed === "legacy" && (
-                                        <div className="mt-2 rounded border-2 border-rose-600 bg-rose-50 dark:bg-rose-950/50 p-2 text-rose-900 dark:text-rose-100 font-bold">
-                                          El motor Azure oficial NO se usó. Se hizo fallback a legacy.
-                                        </div>
-                                      )}
-                                  </div>
-                                )}
+                                {omrOfficialDebugDetailsPanel}
                                 {group.isEvaluated && (
                                   <>
-                                    {debug && (
-                                      <div style={{
-                                        marginTop: "20px",
-                                        padding: "12px",
-                                        border: "3px solid red",
-                                        background: "#000",
-                                        color: "#00ff00",
-                                        fontSize: "12px",
-                                        zIndex: 9999
-                                      }}>
-                                        <div><b>OMR DEBUG (REAL)</b></div>
-
-                                        <div>engineSelected: {String(debug.engineSelected)}</div>
-                                        <div>engineUsed: {String(debug.engineUsed)}</div>
-                                        <div>fallbackUsed: {String(debug.fallbackUsed)}</div>
-                                        <div>fallbackReason: {String(debug.fallbackReason ?? "—")}</div>
-                                        <div>integrationEnabled: {String(debug.integrationEnabled)}</div>
-
-                                        <div>studentAnswersSource: {String(debug.studentAnswersSource)}</div>
-                                        <div>teacherAnswersSource: {String(debug.teacherAnswersSource)}</div>
-                                        <div>expectedQuestionCountUsed: {String(debug.expectedQuestionCountUsed)}</div>
-                                        <div>teacherAnswerKeyLength: {String(debug.teacherAnswerKeyLength)}</div>
-                                        <div>totalPregResolved: {String(debug.totalPregResolved)}</div>
-                                        <div>templateKeyUsed: {String(debug.templateKeyUsed)}</div>
-                                        <div>omrTemplateVariantUsed: {String(debug.omrTemplateVariantUsed)}</div>
-
-                                        <div>totalDetectedAnswers: {String(debug.totalDetectedAnswers)}</div>
-                                        <div>officialOmrQuestionCountFromPipeline: {String(debug.officialOmrQuestionCountFromPipeline)}</div>
-                                        <div>officialOmrDetectedAnswersCount: {String(debug.officialOmrDetectedAnswersCount)}</div>
-                                        <div>officialOmrDetectedVsPipelineMismatch: {String(debug.officialOmrDetectedVsPipelineMismatch)}</div>
-                                        <div>officialOmrAdapterMode: {String(debug.officialOmrAdapterMode)}</div>
-
-                                        <div style={{ marginTop: "10px" }}>detectedAnswersPreview:</div>
-                                        <pre style={{ maxHeight: "200px", overflow: "auto" }}>
-                                          {JSON.stringify(debug.detectedAnswersPreview, null, 2)}
-                                        </pre>
-                                        <div style={{ marginTop: "10px" }}>officialOmrPerQuestionRawPreview:</div>
-                                        <pre style={{ maxHeight: "200px", overflow: "auto" }}>
-                                          {JSON.stringify(debug.officialOmrPerQuestionRawPreview, null, 2)}
-                                        </pre>
-                                      </div>
-                                    )}
-                                    {SHOW_EVALUATION_TRACE_PANEL && tracePayload && (
-                                      <details
-                                        open
-                                        className="mt-4 rounded-lg border border-blue-300 bg-blue-50/30 p-3"
-                                      >
-                                        <summary className="cursor-pointer font-semibold text-blue-900 dark:text-blue-100">
-                                          Diagnóstico técnico temporal
-                                        </summary>
-                                        <div className="mt-3 space-y-4">
-                                          <div className="rounded-md border border-border bg-background/60 p-3">
-                                            <div className="font-semibold mb-2">PAYLOAD FINAL ENVIADO</div>
-                                            <div className="text-xs text-muted-foreground space-y-1">
-                                              <div>tipoPrueba: <span className="font-mono">{tracePayload.tipoPrueba}</span></div>
-                                              <div>evaluatorInstrumentSource: <span className="font-mono">{tracePayload.evaluatorInstrumentSource}</span></div>
-                                              <div>selectedEvaluatorSourceExamId: <span className="font-mono">{tracePayload.selectedEvaluatorSourceExamId || "—"}</span></div>
-                                              <div className="pt-2">pautaEstructuradaFinal:</div>
-                                              <pre className="text-[11px] font-mono overflow-x-auto">{tracePayload.pautaEstructuradaFinal}</pre>
-                                              <div className="pt-2">pautaCorrectaAlternativasFinal:</div>
-                                              <pre className="text-[11px] font-mono overflow-x-auto">{tracePayload.pautaCorrectaAlternativasFinal}</pre>
-                                              <div className="pt-2">answerKeyFromTemplate (resumen):</div>
-                                              {tracePayload.answerKeyFromTemplateSummary ? (
-                                                <>
-                                                  <div>
-                                                    totalPreguntas: <span className="font-mono">{tracePayload.answerKeyFromTemplateSummary.totalPreguntas}</span>
-                                                  </div>
-                                                  <div>
-                                                    respuestas.length: <span className="font-mono">{tracePayload.answerKeyFromTemplateSummary.respuestasLength}</span>
-                                                  </div>
-                                                  <pre className="text-[11px] font-mono overflow-x-auto">
-                                                    {JSON.stringify(tracePayload.answerKeyFromTemplateSummary.primeras10, null, 2)}
-                                                  </pre>
-                                                </>
-                                              ) : (
-                                                <div className="text-[11px] font-mono">null (no se pudo sintetizar clave desde la pauta)</div>
-                                              )}
-                                            </div>
-                                          </div>
-
-                                          <div className="rounded-md border border-border bg-background/60 p-3">
-                                            <div className="font-semibold mb-2">DEBUG OMR REAL</div>
-                                            <div className="text-xs text-muted-foreground space-y-1 font-mono">
-                                              <div>studentAnswersSource: {debug?.studentAnswersSource ?? "—"}</div>
-                                              <div>teacherAnswersSource: {debug?.teacherAnswersSource ?? "—"}</div>
-                                              <div>expectedQuestionCountUsed: {debug?.expectedQuestionCountUsed ?? "—"}</div>
-                                              <div>teacherAnswerKeyLength: {debug?.teacherAnswerKeyLength ?? "—"}</div>
-                                              <div>totalDetectedAnswers: {debug?.totalDetectedAnswers ?? "—"}</div>
-                                              <div>officialOmrQuestionCountFromPipeline: {debug?.officialOmrQuestionCountFromPipeline ?? "—"}</div>
-                                              <div>officialOmrDetectedAnswersCount: {debug?.officialOmrDetectedAnswersCount ?? "—"}</div>
-                                              <div>officialOmrDetectedVsPipelineMismatch: {debug?.officialOmrDetectedVsPipelineMismatch ?? "—"}</div>
-                                              <div>templateKeyUsed: {debug?.templateKeyUsed ?? "—"}</div>
-                                              <div>omrTemplateVariantUsed: {debug?.omrTemplateVariantUsed ?? "—"}</div>
-                                            </div>
-                                          </div>
-
-                                          <div className="rounded-md border border-border bg-background/60 p-3">
-                                            <div className="font-semibold mb-2">TRACE DE ORIGEN REAL DE TIPOS</div>
-                                            <div className="text-xs text-muted-foreground space-y-1">
-                                              <div>evaluatorEvaluationBaseSnapshot.source: <span className="font-mono">{String(snapshotSource)}</span></div>
-                                              <div>Construido por: <span className="font-mono">{snapshotBuildFn}</span></div>
-                                              <div>
-                                                inferTypeFromFormItem (versión modificada) usada:{" "}
-                                                <span className="font-mono">{inferTypeFromFormItemV2Used ? "sí" : "no"}</span>
-                                              </div>
-                                            </div>
-                                            <div className="mt-3 max-h-64 overflow-auto">
-                                              <Table>
-                                                <TableHeader>
-                                                  <TableRow>
-                                                    <TableHead>item_number</TableHead>
-                                                    <TableHead>type</TableHead>
-                                                    <TableHead>correctAnswer</TableHead>
-                                                    <TableHead>fuente</TableHead>
-                                                      <TableHead>altEvidence</TableHead>
-                                                      <TableHead>texto evaluado (alt)</TableHead>
-                                                  </TableRow>
-                                                </TableHeader>
-                                                <TableBody>
-                                                  {snapshotItems.map((it, idx) => {
-                                                    const meta = it.metadata as any
-                                                      const altText =
-                                                        typeof meta?.altEvidenceEvaluatedText === "string" ? meta.altEvidenceEvaluatedText : null
-                                                      const altRes = typeof meta?.altEvidenceResult === "boolean" ? meta.altEvidenceResult : null
-                                                    return (
-                                                      <TableRow key={it.id || idx}>
-                                                        <TableCell className="font-mono">{String(meta?.item_number ?? "—")}</TableCell>
-                                                        <TableCell className="font-mono">{it.type}</TableCell>
-                                                        <TableCell className="font-mono">{String(it.correctAnswer ?? "—")}</TableCell>
-                                                        <TableCell className="font-mono">{String(meta?.typeInferenceSource ?? "—")}</TableCell>
-                                                          <TableCell className="font-mono">{altRes == null ? "—" : altRes ? "true" : "false"}</TableCell>
-                                                          <TableCell>
-                                                            <div className="max-h-24 overflow-auto whitespace-pre-wrap font-mono text-[11px]">
-                                                              {altText ?? "—"}
-                                                            </div>
-                                                          </TableCell>
-                                                      </TableRow>
-                                                    )
-                                                  })}
-                                                </TableBody>
-                                              </Table>
-                                            </div>
-                                          </div>
-
-                                          <div className="rounded-md border border-border bg-background/60 p-3">
-                                            <div className="font-semibold mb-2">COMPARACIÓN CERRADAS REALES</div>
-                                            {Array.isArray(tableAlternativas) && tableAlternativas.length > 0 ? (
-                                              <div className="overflow-x-auto">
-                                                <Table>
-                                                  <TableHeader>
-                                                    <TableRow>
-                                                      <TableHead>Pregunta</TableHead>
-                                                      <TableHead>Respuesta detectada</TableHead>
-                                                      <TableHead>Respuesta correcta usada</TableHead>
-                                                      <TableHead>Estado real</TableHead>
-                                                      <TableHead>Fuente correct</TableHead>
-                                                      <TableHead>Fallback</TableHead>
-                                                      <TableHead>Slot/canonical</TableHead>
-                                                    </TableRow>
-                                                  </TableHeader>
-                                                  <TableBody>
-                                                    {tableAlternativas.slice(0, 30).map((item, idx) => {
-                                                      const est = (item.respuesta_estudiante ?? "").trim().toUpperCase()
-                                                      const corr = (item.respuesta_correcta ?? "").trim().toUpperCase()
-                                                      const ok = est && corr ? est === corr : false
-                                                      const preg = (item.pregunta ?? "").trim().toUpperCase()
-                                                      const slot = /^([CP])\d+$/.test(preg) ? preg : preg.match(/^\d+$/) ? `C${preg}` : "—"
-                                                      return (
-                                                        <TableRow key={idx}>
-                                                          <TableCell className="font-mono">{item.pregunta}</TableCell>
-                                                          <TableCell className="font-mono">{item.respuesta_estudiante}</TableCell>
-                                                          <TableCell className="font-mono text-green-700">{item.respuesta_correcta}</TableCell>
-                                                          <TableCell className="font-bold">{ok ? "OK" : "INCORRECTA"}</TableCell>
-                                                          <TableCell className="font-mono">{debug?.teacherAnswersSource ?? "—"}</TableCell>
-                                                          <TableCell className="font-mono">{debug?.fallbackUsed ? "sí" : "no"}</TableCell>
-                                                          <TableCell className="font-mono">{slot}</TableCell>
-                                                        </TableRow>
-                                                      )
-                                                    })}
-                                                  </TableBody>
-                                                </Table>
-                                              </div>
-                                            ) : (
-                                              <div className="text-xs text-muted-foreground">No hay alternativas corregidas para mostrar</div>
-                                            )}
-                                          </div>
-
-                                          <div className="rounded-md border border-border bg-background/60 p-3">
-                                            <div className="font-semibold mb-2">DESARROLLO REAL</div>
-                                            <div className="text-xs text-muted-foreground space-y-2">
-                                              <div>
-                                                total claves desarrollo detectadas: <span className="font-mono">{desarrolloKeys.length}</span>
-                                              </div>
-                                              <div>
-                                                colapso/evidencia de normalización (por claves canónicas):{" "}
-                                                <span className="font-mono">
-                                                  {canonicalDevPairs.some((p) => p.canonical && p.canonical !== p.original) ? "sí" : "no"}
-                                                </span>
-                                              </div>
-                                              <div>
-                                                duplicación canónica detectada: <span className="font-mono">{devCanonicalDuplicate ? "sí" : "no"}</span>
-                                              </div>
-                                              <pre className="text-[11px] font-mono overflow-x-auto">
-                                                {JSON.stringify(
-                                                  canonicalDevPairs.slice(0, 60).map((p) => ({
-                                                    original: p.original,
-                                                    canonical: p.canonical ?? null,
-                                                  })),
-                                                  null,
-                                                  2,
-                                                )}
-                                              </pre>
-                                            </div>
-                                          </div>
-
-                                          <div className="rounded-md border border-border bg-background/60 p-3">
-                                            <div className="font-semibold mb-2">CONTRADICCIONES DETECTADAS</div>
-                                            {traceAlerts.length > 0 ? (
-                                              <ul className="list-disc pl-5 text-xs text-destructive space-y-1">
-                                                {traceAlerts.map((a, i) => (
-                                                  <li key={i}>{a}</li>
-                                                ))}
-                                              </ul>
-                                            ) : (
-                                              <div className="text-xs text-muted-foreground">Sin contradicciones detectadas para este caso.</div>
-                                            )}
-                                          </div>
-                                        </div>
-                                      </details>
-                                    )}
                                     {/* REEMPLAZO DE PUNTAJE Y NOTA PARA INCLUIR VELOCÍMETRO */}
                                     <div className="flex justify-between items-start bg-[var(--bg-muted-subtle)] p-4 rounded-lg">
                                       <div>
