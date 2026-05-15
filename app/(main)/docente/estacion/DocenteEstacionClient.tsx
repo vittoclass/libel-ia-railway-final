@@ -5,7 +5,10 @@ import Link from "next/link"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { GuidedSessionStationSummary } from "@/app/components/teacher-wizard/GuidedSessionStationSummary"
 import { StationGuidedSessionPreScan } from "@/app/components/teacher-wizard/StationGuidedSessionPreScan"
-import { BatchMobileSyncPanel } from "@/app/components/docente/station/BatchMobileSyncPanel"
+import {
+  BatchMobileSyncPanel,
+  type BatchSessionStatusPayload,
+} from "@/app/components/docente/station/BatchMobileSyncPanel"
 import { BatchPhotoRealtimeGrid } from "@/app/components/docente/station/BatchPhotoRealtimeGrid"
 import { type SourceExamPick } from "@/app/components/docente/station/SourceExamQuickPicker"
 import {
@@ -23,6 +26,13 @@ import { writeDocenteActiveBatchId } from "@/app/lib/docente/active-batch-id"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+
+/** Solo UI estación: no mostrar el aviso de migración PASO A; el fetch y el estado siguen igual. */
+function isTeacherAssignmentsTableMigrationUiNoise(w: string | null): boolean {
+  if (!w) return false
+  const s = w.toLowerCase()
+  return s.includes("teacher_assignments") && (s.includes("no aplicada") || s.includes("paso a"))
+}
 
 export function DocenteEstacionClient() {
   const supabase = useMemo(() => createClientComponentClient(), [])
@@ -86,57 +96,30 @@ export function DocenteEstacionClient() {
     if (batchId) writeDocenteActiveBatchId(batchId)
   }, [batchId])
 
-  useEffect(() => {
-    if (!batchId) return
-    let cancelled = false
-    void (async () => {
-      try {
-        const res = await fetch("/api/docente/batch-session", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({
-            batch_id: batchId,
-            expected_pages_per_student: pagesPerStudent,
-            source_exam_id: sourceExam?.id ?? null,
-          }),
-        })
-        const j = await res.json().catch(() => ({}))
-        if (cancelled) return
-        if (res.ok && j?.ok) {
-          console.log("Lote registrado con éxito:", batchId)
-          setBatchSessionError(null)
-          setDebugError(null)
-        } else {
-          const msg = typeof (j as { error?: string })?.error === "string" ? (j as { error: string }).error : `Error HTTP ${res.status}`
-          console.warn("[DocenteEstacion] Registro de lote falló:", batchId, msg, j)
-          setBatchSessionError(msg)
-          setDebugError({
-            source: "DocenteEstacionClient",
-            endpoint: "POST /api/docente/batch-session",
-            httpStatus: res.status,
-            batchId,
-            body: j,
-          })
-        }
-      } catch (e) {
-        if (!cancelled) {
-          console.warn("[DocenteEstacion] batch-session (red):", batchId, e)
-          setBatchSessionError("No se pudo contactar al servidor para registrar el lote.")
-          setDebugError({
-            source: "DocenteEstacionClient",
-            endpoint: "POST /api/docente/batch-session",
-            networkOrParse: true,
-            exception: e instanceof Error ? { name: e.name, message: e.message, stack: e.stack } : String(e),
-            batchId,
-          })
-        }
-      }
-    })()
-    return () => {
-      cancelled = true
+  const batchSessionContext = useMemo(() => {
+    const bits: string[] = []
+    if (contextRow) bits.push(`${contextRow.subject} · ${contextRow.course_label}`)
+    if (sourceExam?.title) bits.push(sourceExam.title)
+    return bits.length ? bits.join(" | ") : null
+  }, [contextRow, sourceExam])
+
+  const handleBatchSessionStatus = useCallback((s: BatchSessionStatusPayload) => {
+    if (s.ok) {
+      setBatchSessionError(null)
+      setDebugError(null)
+    } else {
+      setBatchSessionError(s.message)
+      setDebugError({
+        source: "BatchMobileSyncPanel",
+        endpoint: "POST /api/docente/batch-session",
+        httpStatus: s.httpStatus,
+        message: s.message,
+        requestPayload: s.requestPayload,
+        responseJson: s.responseJson,
+        rawTextSnippet: s.rawTextSnippet,
+      })
     }
-  }, [batchId, pagesPerStudent, sourceExam?.id])
+  }, [])
 
   useEffect(() => {
     if (!ENABLE_WIZARD) return
@@ -190,10 +173,6 @@ export function DocenteEstacionClient() {
     setDebugError(null)
   }, [])
 
-  const reportBatchSessionDebug = useCallback((payload: unknown) => {
-    setDebugError(payload)
-  }, [])
-
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 space-y-8">
       {debugError != null ? (
@@ -229,29 +208,30 @@ export function DocenteEstacionClient() {
         </div>
       </header>
 
-      {assignmentsWarning ? (
+      {assignmentsWarning && !isTeacherAssignmentsTableMigrationUiNoise(assignmentsWarning) ? (
         <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">{assignmentsWarning}</p>
       ) : null}
 
-      <section className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 shadow-sm space-y-3">
-        <h2 className="text-sm font-semibold text-slate-800">Carga horaria (opcional)</h2>
-        <TeacherAssignmentSelector
-          assignments={assignments}
-          value={assignmentId}
-          onChange={(id, row) => {
-            setAssignmentId(id)
-            setContextRow(row)
-          }}
-        />
-        {contextRow ? (
-          <p className="text-xs text-slate-600">
-            Activo: <strong>{contextRow.subject}</strong> · {contextRow.course_label} ({contextRow.semester}{" "}
-            {contextRow.academic_year})
-          </p>
-        ) : (
-          <p className="text-xs text-slate-500">Opcional: etiqueta en la grilla de fotos.</p>
-        )}
-      </section>
+      {assignments.length > 0 ? (
+        <section className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 shadow-sm space-y-3">
+          <TeacherAssignmentSelector
+            assignments={assignments}
+            value={assignmentId}
+            onChange={(id, row) => {
+              setAssignmentId(id)
+              setContextRow(row)
+            }}
+          />
+          {contextRow ? (
+            <p className="text-xs text-slate-600">
+              Activo: <strong>{contextRow.subject}</strong> · {contextRow.course_label} ({contextRow.semester}{" "}
+              {contextRow.academic_year})
+            </p>
+          ) : (
+            <p className="text-xs text-slate-500">Opcional: etiqueta en la grilla de fotos.</p>
+          )}
+        </section>
+      ) : null}
 
       <StationGuidedSessionPreScan
         onSyncPagesPerStudent={(n) => {
@@ -294,9 +274,10 @@ export function DocenteEstacionClient() {
             <BatchMobileSyncPanel
               batchId={batchId}
               onRegenerateBatch={onRegenerateBatch}
-              onBatchSessionDebug={reportBatchSessionDebug}
+              onBatchSessionStatus={handleBatchSessionStatus}
               expectedPagesPerStudent={pagesPerStudent}
               sourceExamId={sourceExam?.id ?? null}
+              sessionContext={batchSessionContext}
             />
           </section>
 

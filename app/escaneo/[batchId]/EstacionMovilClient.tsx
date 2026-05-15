@@ -50,6 +50,7 @@ export function EstacionMovilClient({ batchId }: Props) {
   const [pcExpectedPages, setPcExpectedPages] = useState<number | null>(null)
   const [uploading, setUploading] = useState(false)
   const [lastOk, setLastOk] = useState<string | null>(null)
+  const [photosSentCount, setPhotosSentCount] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [cameraActivationError, setCameraActivationError] = useState<string | null>(null)
   /** Nombre DOM del error (NotAllowedError, OverconstrainedError, …) en rojo grande. */
@@ -242,31 +243,51 @@ export function EstacionMovilClient({ batchId }: Props) {
       setUploading(true)
       setError(null)
       setLastOk(null)
+      const maxAttempts = 3
+      const retryableStatus = (status: number) => status >= 500 || status === 408 || status === 429
+      const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms))
+
       try {
-        const fd = new FormData()
-        fd.set("batch_id", batchId)
-        fd.set("student_index", String(studentIndex))
-        fd.set("page_index", String(pageIndex))
-        fd.set("file", file)
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          if (attempt > 0) await sleep(800)
+          try {
+            const fd = new FormData()
+            fd.set("batch_id", batchId)
+            fd.set("student_index", String(studentIndex))
+            fd.set("page_index", String(pageIndex))
+            fd.set("file", file)
 
-        const res = await fetch("/api/docente/movil-upload", { method: "POST", body: fd })
-        const j = await res.json().catch(() => ({}))
-        if (!res.ok) {
-          setError(typeof j?.error === "string" ? j.error : "Error al subir")
-          return false
+            const res = await fetch("/api/docente/movil-upload", { method: "POST", body: fd })
+            const j = await res.json().catch(() => ({}))
+            if (!res.ok) {
+              const msg = typeof j?.error === "string" ? j.error : "Error al subir"
+              if (retryableStatus(res.status) && attempt < maxAttempts - 1) {
+                continue
+              }
+              setError(msg)
+              return false
+            }
+
+            setPhotosSentCount((c) => {
+              const next = c + 1
+              setLastOk(`Foto subida correctamente. Foto ${next} enviada.`)
+              return next
+            })
+
+            if (pageIndex < imagesPerStudent) {
+              setPageIndex((p) => p + 1)
+            } else {
+              setStudentIndex((s) => s + 1)
+              setPageIndex(1)
+            }
+            return true
+          } catch (err) {
+            if (attempt < maxAttempts - 1) continue
+            setError(err instanceof Error ? err.message : "Error al subir")
+            return false
+          }
         }
-
-        setLastOk("Foto capturada correctamente. Ahora puedes pasar a la siguiente imagen.")
-
-        if (pageIndex < imagesPerStudent) {
-          setPageIndex((p) => p + 1)
-        } else {
-          setStudentIndex((s) => s + 1)
-          setPageIndex(1)
-        }
-        return true
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Error al subir")
+        setError("No se pudo subir tras varios intentos.")
         return false
       } finally {
         setUploading(false)
@@ -344,8 +365,12 @@ export function EstacionMovilClient({ batchId }: Props) {
   }, [pendingPreview, uploadFile, revokePreview])
 
   useEffect(() => {
+    setPhotosSentCount(0)
+  }, [batchId])
+
+  useEffect(() => {
     if (!lastOk) return
-    const t = window.setTimeout(() => setLastOk(null), 2600)
+    const t = window.setTimeout(() => setLastOk(null), 4500)
     return () => window.clearTimeout(t)
   }, [lastOk])
 
@@ -537,9 +562,22 @@ export function EstacionMovilClient({ batchId }: Props) {
             ) : null}
 
             {error ? (
-              <div className="rounded-lg border border-rose-900 bg-rose-950/60 px-3 py-2 text-sm text-rose-100 flex gap-2">
-                <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" aria-hidden />
-                {error}
+              <div className="space-y-2">
+                <div className="rounded-lg border border-rose-900 bg-rose-950/60 px-3 py-2 text-sm text-rose-100 flex gap-2">
+                  <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" aria-hidden />
+                  {error}
+                </div>
+                {pendingPreview ? (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="w-full"
+                    disabled={uploading}
+                    onClick={() => void submitPendingPreview()}
+                  >
+                    Reintentar subida
+                  </Button>
+                ) : null}
               </div>
             ) : null}
           </div>

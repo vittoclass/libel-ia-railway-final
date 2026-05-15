@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
-import { getAuthUser, getSupabaseRouteClient } from "@/app/lib/supabase-route"
+import { getSupabaseRouteClientReadOnly } from "@/app/lib/supabase-route"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
@@ -24,6 +24,23 @@ function logSupabaseError(scope: string, batchId: string, err: { message?: strin
   console.error("[batch-session] Supabase:", JSON.stringify({ scope, batchId, ...supabasePayload(err) }))
 }
 
+/** Log estructurado temporal (sin secretos); incluye code/message/details/hint de PostgREST cuando existen. */
+function logBatchSessionError(payload: Record<string, unknown>) {
+  try {
+    console.error("[batch-session][error]", JSON.stringify({ ts: new Date().toISOString(), ...payload }))
+  } catch {
+    console.error("[batch-session][error]", payload.step, payload.batchId)
+  }
+}
+
+function httpStatusForPostgrest(err: { code?: string | null } | null): number {
+  const c = err?.code ?? ""
+  if (c === "42P01" || c === "42501") return 503
+  if (c === "23503" || c === "23514" || c === "PGRST116") return 400
+  if (c === "42703" || c === "PGRST204") return 503
+  return 422
+}
+
 function exceptionPayload(e: unknown) {
   if (e instanceof Error) {
     return { name: e.name, message: e.message, stack: e.stack ?? null }
@@ -36,21 +53,52 @@ function exceptionPayload(e: unknown) {
  * En errores, el JSON incluye siempre `supabase: { message, details, hint, code }` cuando aplica (o null).
  */
 export async function POST(req: NextRequest) {
+  let batchIdForLog = ""
   try {
-    const user = await getAuthUser()
-    if (!user) {
+    /** Solo lectura de cookies: evita intentos de refresh que llamen `cookies().set` en Route Handler (puede tumbar la ruta con 500 sin JSON). */
+    let routeClient
+    try {
+      routeClient = await getSupabaseRouteClientReadOnly()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      logBatchSessionError({
+        step: "getSupabaseRouteClientReadOnly",
+        message: msg,
+        exception: exceptionPayload(e),
+      })
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Error al inicializar cliente de sesión (solo lectura): ${msg}`,
+          supabase: null,
+          debug: { step: "getSupabaseRouteClientReadOnly", exception: exceptionPayload(e) },
+        },
+        { status: 503 },
+      )
+    }
+
+    const {
+      data: { user },
+      error: authErr,
+    } = await routeClient.auth.getUser()
+    if (authErr || !user) {
       return NextResponse.json(
         {
           ok: false,
           error: "No autorizado: sesión no válida o expirada en el PC.",
-          supabase: null,
-          debug: { step: "getAuthUser", userPresent: false },
+          supabase: supabasePayload(authErr),
+          debug: { step: "auth.getUser", userPresent: !!user, authMessage: authErr?.message ?? null },
         },
         { status: 401 },
       )
     }
 
-    let body: { batch_id?: string; expected_pages_per_student?: number; source_exam_id?: string | null }
+    let body: {
+      batch_id?: string
+      expected_pages_per_student?: number
+      source_exam_id?: string | null
+      session_context?: string | null
+    } = {}
     try {
       body = await req.json()
     } catch (parseErr) {
@@ -66,6 +114,7 @@ export async function POST(req: NextRequest) {
     }
 
     const batchId = String(body?.batch_id ?? "").trim()
+    batchIdForLog = batchId
     if (!UUID_REGEX.test(batchId)) {
       return NextResponse.json(
         {
@@ -124,57 +173,58 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    let routeClient
-    try {
-      routeClient = await getSupabaseRouteClient()
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      console.error("[batch-session] getSupabaseRouteClient falló:", msg)
-      return NextResponse.json(
-        {
-          ok: false,
-          error: `Error interno al crear cliente de sesión: ${msg}`,
-          supabase: null,
-          debug: { step: "getSupabaseRouteClient", exception: exceptionPayload(e) },
-        },
-        { status: 500 },
-      )
-    }
+    const sessionContextRaw = typeof body?.session_context === "string" ? body.session_context.trim() : ""
+    const sessionContextLogged = sessionContextRaw.length > 400 ? `${sessionContextRaw.slice(0, 400)}…` : sessionContextRaw
 
     const { data: profile, error: pErr } = await routeClient
       .from("profiles")
-      .select("teacher_id, school_id, department, role")
+      .select("teacher_id, school_id")
       .eq("user_id", user.id)
       .maybeSingle()
 
     if (pErr) {
       logSupabaseError("profiles.select", batchId, pErr)
+      logBatchSessionError({
+        step: "profiles.select",
+        batchId,
+        userId: user.id,
+        supabase: supabasePayload(pErr),
+      })
+      const st = httpStatusForPostgrest(pErr)
       return NextResponse.json(
         {
           ok: false,
-          error: pErr.message,
+          error: pErr.message || "No se pudo leer el perfil del usuario.",
+          error_code: "PROFILE_QUERY",
           supabase: supabasePayload(pErr),
           debug: { step: "profiles.select", batchId, userId: user.id },
         },
-        { status: 500 },
+        { status: st },
       )
     }
 
     const teacherId = String((profile as { teacher_id?: string | null } | null)?.teacher_id ?? "").trim()
     const schoolId = String((profile as { school_id?: string | null } | null)?.school_id ?? "").trim()
     if (!teacherId || !schoolId) {
+      logBatchSessionError({
+        step: "profile.teacher_school",
+        batchId,
+        teacherIdPresent: !!teacherId,
+        schoolIdPresent: !!schoolId,
+      })
       return NextResponse.json(
         {
           ok: false,
           error:
             "Perfil incompleto: asigne teacher_id y school_id al usuario en Supabase (tabla profiles) antes de usar el QR móvil.",
+          error_code: "PROFILE_INCOMPLETE",
           supabase: null,
           debug: {
             step: "profile.teacher_school",
             batchId,
             teacherIdPresent: !!teacherId,
             schoolIdPresent: !!schoolId,
-            profileRow: profile ?? null,
+            profileSnippet: profile ? { teacher_id: teacherId || null, school_id: schoolId || null } : null,
           },
         },
         { status: 400 },
@@ -212,41 +262,67 @@ export async function POST(req: NextRequest) {
       upErr = res.error
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
+      logBatchSessionError({
+        step: "batch_scan_sessions.upsert.throw",
+        batchId,
+        message: msg,
+        exception: exceptionPayload(e),
+      })
       console.error("[batch-session] Excepción en upsert (no PostgREST):", batchId, msg, e)
       return NextResponse.json(
         {
           ok: false,
           error: msg,
+          error_code: "BATCH_SCAN_SESSIONS_UPSERT_THROW",
           supabase: null,
           debug: { step: "batch_scan_sessions.upsert.throw", batchId, row, exception: exceptionPayload(e) },
         },
-        { status: 500 },
+        { status: 503 },
       )
     }
 
     if (upErr) {
       logSupabaseError("batch_scan_sessions.upsert", batchId, upErr)
+      logBatchSessionError({
+        step: "batch_scan_sessions.upsert",
+        batchId,
+        supabase: supabasePayload(upErr),
+        session_context: sessionContextLogged || undefined,
+      })
+      const st = httpStatusForPostgrest(upErr)
       return NextResponse.json(
         {
           ok: false,
           error: upErr.message,
+          error_code: "BATCH_SCAN_SESSIONS_UPSERT",
           supabase: supabasePayload(upErr),
           debug: { step: "batch_scan_sessions.upsert", batchId, row },
         },
-        { status: upErr.code === "42P01" ? 503 : upErr.code === "42501" ? 503 : 500 },
+        { status: st },
       )
     }
 
-    console.log("[batch-session] Lote registrado con éxito:", batchId)
+    if (sessionContextLogged) {
+      console.log("[batch-session] Lote registrado con éxito:", batchId, { session_context: sessionContextLogged })
+    } else {
+      console.log("[batch-session] Lote registrado con éxito:", batchId)
+    }
 
     return NextResponse.json({ ok: true, expires_at: expiresAt.toISOString() })
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
+    logBatchSessionError({
+      step: "POST.catch",
+      batchId: batchIdForLog || undefined,
+      message: msg,
+      exception: exceptionPayload(e),
+    })
     console.error("[batch-session] Error no manejado:", msg, e)
     return NextResponse.json(
       {
         ok: false,
         error: msg,
+        error_code: "UNHANDLED",
         supabase: null,
         debug: { step: "POST.catch", exception: exceptionPayload(e), raw: String(e) },
       },

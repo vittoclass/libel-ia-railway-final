@@ -3,7 +3,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { SupabaseClient } from "@supabase/supabase-js"
-import { ImageIcon, Loader2, Users } from "lucide-react"
+import { ImageIcon, Loader2, Users, RefreshCw, Wifi, WifiOff, CloudOff, Trash2 } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 import { MAX_BATCH_PHOTO_PAGE_SIZE } from "@/app/lib/docente/batch-photo-pagination"
 import { broadcastBatchPhotoActivity } from "@/app/lib/docente/active-batch-id"
@@ -32,6 +33,40 @@ type Props = {
   onPromoted?: (payload: { student_index: number; evaluation_id: string }) => void
 }
 
+const POLL_MS = 9000
+
+async function fetchAllBatchPhotos(batchId: string): Promise<{
+  photos: BatchPhotoRow[]
+  sessionEp: number | null
+  warning: string | null
+}> {
+  const aggregated: BatchPhotoRow[] = []
+  let offset = 0
+  let sessionEp: number | null = null
+  let warning: string | null = null
+  for (let i = 0; i < 80; i++) {
+    const res = await fetch(
+      `/api/docente/batch-photos?batch_id=${encodeURIComponent(batchId)}&offset=${offset}&limit=${MAX_BATCH_PHOTO_PAGE_SIZE}`,
+      { credentials: "include" },
+    )
+    const j = await res.json().catch(() => ({}))
+    if (j?.warning) warning = String(j.warning)
+    const chunk = Array.isArray(j?.photos) ? (j.photos as BatchPhotoRow[]) : []
+    aggregated.push(...chunk)
+    if (sessionEp == null) {
+      const ep = j?.session?.expected_pages_per_student
+      if (typeof ep === "number" && Number.isFinite(ep)) {
+        sessionEp = Math.max(1, Math.min(50, Math.floor(ep)))
+      }
+    }
+    const meta = j?.meta as { has_more?: boolean; next_offset?: number | null } | undefined
+    if (!meta?.has_more) break
+    offset = typeof meta.next_offset === "number" ? meta.next_offset : offset + chunk.length
+    await new Promise<void>((r) => window.setTimeout(r, 0))
+  }
+  return { photos: aggregated, sessionEp, warning }
+}
+
 export function BatchPhotoRealtimeGrid({
   batchId,
   supabase,
@@ -48,10 +83,24 @@ export function BatchPhotoRealtimeGrid({
   /** Coincide con batch_scan_sessions (misma fuente que el servidor al promover). */
   const [sessionExpectedPages, setSessionExpectedPages] = useState<number | null>(null)
 
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null)
+  const [syncing, setSyncing] = useState(false)
+  const [syncError, setSyncError] = useState<string | null>(null)
+  const [realtimeStatus, setRealtimeStatus] = useState<"idle" | "subscribed" | "error" | "closed">("idle")
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+
   const inFlight = useRef<Set<number>>(new Set())
   const promoteTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map())
   const propsRef = useRef({ batchId, courseLabel, subject, onPromoted })
   propsRef.current = { batchId, courseLabel, subject, onPromoted }
+  /** Primera carga del lote: no broadcast; después, fotos nuevas vía polling avisan al panel QR. */
+  const seenPhotoIdsRef = useRef<Set<string>>(new Set())
+  const syncPrimedRef = useRef(false)
+
+  useEffect(() => {
+    seenPhotoIdsRef.current = new Set()
+    syncPrimedRef.current = false
+  }, [batchId])
 
   const propExpected = Math.max(1, Math.min(50, Math.floor(Number(expectedPagesPerStudent)) || 2))
   const effectiveExpectedPages = sessionExpectedPages ?? propExpected
@@ -101,51 +150,61 @@ export function BatchPhotoRealtimeGrid({
 
   const rowPaths = useMemo(() => sortedRows.map((r) => r.storage_path).filter(Boolean) as string[], [sortedRows])
 
+  const syncFromServer = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      const silent = opts?.silent === true
+      if (!silent) setSyncing(true)
+      setSyncError(null)
+      try {
+        const { photos, sessionEp, warning } = await fetchAllBatchPhotos(batchId)
+        const nextIds = new Set(photos.map((p) => p.id))
+        let anyNew = false
+        for (const p of photos) {
+          if (!seenPhotoIdsRef.current.has(p.id)) {
+            if (syncPrimedRef.current) anyNew = true
+            seenPhotoIdsRef.current.add(p.id)
+          }
+        }
+        for (const id of [...seenPhotoIdsRef.current]) {
+          if (!nextIds.has(id)) seenPhotoIdsRef.current.delete(id)
+        }
+        syncPrimedRef.current = true
+        if (anyNew) broadcastBatchPhotoActivity(batchId)
+
+        setRows(photos)
+        if (sessionEp != null) setSessionExpectedPages(sessionEp)
+        else setSessionExpectedPages(null)
+        setHint(warning)
+        setLastSyncedAt(new Date())
+      } catch {
+        setSyncError("No se pudo sincronizar con el servidor.")
+        if (!silent) setRows([])
+      } finally {
+        if (!silent) setSyncing(false)
+        setLoading(false)
+      }
+    },
+    [batchId],
+  )
+
   useEffect(() => {
     let cancelled = false
     setLoading(true)
     void (async () => {
-      try {
-        const aggregated: BatchPhotoRow[] = []
-        let offset = 0
-        let sessionEp: number | null = null
-        for (let i = 0; i < 80; i++) {
-          const res = await fetch(
-            `/api/docente/batch-photos?batch_id=${encodeURIComponent(batchId)}&offset=${offset}&limit=${MAX_BATCH_PHOTO_PAGE_SIZE}`,
-          )
-          const j = await res.json().catch(() => ({}))
-          if (cancelled) return
-          if (j?.warning) setHint(String(j.warning))
-          const chunk = Array.isArray(j?.photos) ? (j.photos as BatchPhotoRow[]) : []
-          aggregated.push(...chunk)
-          if (sessionEp == null) {
-            const ep = j?.session?.expected_pages_per_student
-            if (typeof ep === "number" && Number.isFinite(ep)) {
-              sessionEp = Math.max(1, Math.min(50, Math.floor(ep)))
-            }
-          }
-          const meta = j?.meta as { has_more?: boolean; next_offset?: number | null } | undefined
-          if (!meta?.has_more) break
-          offset = typeof meta.next_offset === "number" ? meta.next_offset : offset + chunk.length
-          await new Promise<void>((r) => window.setTimeout(r, 0))
-        }
-        if (cancelled) return
-        setRows(aggregated)
-        if (sessionEp != null) setSessionExpectedPages(sessionEp)
-        else setSessionExpectedPages(null)
-      } catch {
-        if (!cancelled) {
-          setRows([])
-          setSessionExpectedPages(null)
-        }
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
+      await syncFromServer({ silent: false })
+      if (cancelled) return
     })()
     return () => {
       cancelled = true
     }
-  }, [batchId])
+  }, [batchId, syncFromServer])
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      void syncFromServer({ silent: true })
+    }, POLL_MS)
+    return () => window.clearInterval(id)
+  }, [batchId, syncFromServer])
 
   useEffect(() => {
     let cancelled = false
@@ -184,6 +243,10 @@ export function BatchPhotoRealtimeGrid({
     })
   }, [])
 
+  const removeRowById = useCallback((id: string) => {
+    setRows((prev) => prev.filter((p) => p.id !== id))
+  }, [])
+
   useEffect(() => {
     const channel = supabase
       .channel(`docente_batch_photos:${batchId}`)
@@ -213,12 +276,31 @@ export function BatchPhotoRealtimeGrid({
           broadcastBatchPhotoActivity(batchId)
         },
       )
-      .subscribe()
+      .on(
+        "postgres_changes",
+        {
+          event: "DELETE",
+          schema: "public",
+          table: "batch_photo_uploads",
+          filter: `batch_id=eq.${batchId}`,
+        },
+        (payload) => {
+          const oldRow = payload.old as { id?: string } | null
+          if (oldRow?.id) removeRowById(String(oldRow.id))
+          broadcastBatchPhotoActivity(batchId)
+        },
+      )
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") setRealtimeStatus("subscribed")
+        else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") setRealtimeStatus("error")
+        else if (status === "CLOSED") setRealtimeStatus("closed")
+      })
 
     return () => {
       void supabase.removeChannel(channel)
+      setRealtimeStatus("closed")
     }
-  }, [batchId, supabase, mergeRow])
+  }, [batchId, supabase, mergeRow, removeRowById])
 
   useEffect(() => {
     return () => {
@@ -299,13 +381,121 @@ export function BatchPhotoRealtimeGrid({
     }
   }, [studentStats])
 
+  const requestDeletePhoto = useCallback(
+    async (r: BatchPhotoRow) => {
+      const sent = Boolean(r.evaluation_id || r.status === "linked")
+      if (sent) {
+        window.alert(
+          "Esta imagen ya fue sincronizada al evaluador. No puede eliminarse desde la estación mientras esté vinculada a una evaluación.",
+        )
+        return
+      }
+      const ok = window.confirm("¿Eliminar esta foto? Se borrará del lote y del almacenamiento.")
+      if (!ok) return
+      setDeletingId(r.id)
+      setSyncError(null)
+      try {
+        const res = await fetch(
+          `/api/docente/batch-photo?photo_id=${encodeURIComponent(r.id)}&batch_id=${encodeURIComponent(batchId)}`,
+          { method: "DELETE", credentials: "include" },
+        )
+        const j = await res.json().catch(() => ({}))
+        if (res.status === 409 && j?.code === "ALREADY_LINKED") {
+          window.alert(
+            typeof j?.error === "string"
+              ? j.error
+              : "Esta imagen ya fue sincronizada al evaluador y no puede eliminarse desde la estación.",
+          )
+          return
+        }
+        if (!res.ok) {
+          setSyncError(typeof j?.error === "string" ? j.error : `Error ${res.status}`)
+          return
+        }
+        removeRowById(r.id)
+        if (r.storage_path) {
+          setUrls((prev) => {
+            const copy = { ...prev }
+            delete copy[r.storage_path!]
+            return copy
+          })
+        }
+        broadcastBatchPhotoActivity(batchId)
+        setLastSyncedAt(new Date())
+      } finally {
+        setDeletingId(null)
+      }
+    },
+    [batchId, removeRowById],
+  )
+
+  const lastSyncLabel = lastSyncedAt
+    ? lastSyncedAt.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "—"
+
+  const connectionBadge =
+    realtimeStatus === "subscribed" ? (
+      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-900">
+        <Wifi className="h-3 w-3" aria-hidden />
+        Realtime OK
+      </span>
+    ) : realtimeStatus === "error" ? (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-950">
+        <WifiOff className="h-3 w-3" aria-hidden />
+        Realtime con incidencias
+      </span>
+    ) : (
+      <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-700">
+        <CloudOff className="h-3 w-3" aria-hidden />
+        Realtime: {realtimeStatus === "closed" ? "cerrado" : "conectando…"}
+      </span>
+    )
+
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-3">
-      <div className="flex items-center gap-2">
-        <ImageIcon className="h-5 w-5 text-slate-600" aria-hidden />
-        <h3 className="font-semibold text-slate-900">Cola de fotos (Realtime)</h3>
-        {loading ? <Loader2 className="h-4 w-4 animate-spin text-slate-400" aria-hidden /> : null}
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-start sm:justify-between">
+        <div className="flex items-center gap-2 min-w-0">
+          <ImageIcon className="h-5 w-5 text-slate-600 shrink-0" aria-hidden />
+          <div className="min-w-0">
+            <h3 className="font-semibold text-slate-900 leading-tight">Cola de fotos</h3>
+            <p className="text-[11px] text-slate-500 mt-0.5">
+              Tiempo real + respaldo cada ~{Math.round(POLL_MS / 1000)} s. Las fotos se revalidan aunque falle Realtime.
+            </p>
+          </div>
+          {loading && !syncing ? <Loader2 className="h-4 w-4 animate-spin text-slate-400 shrink-0" aria-hidden /> : null}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {connectionBadge}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="gap-1 shrink-0"
+            disabled={syncing}
+            onClick={() => void syncFromServer({ silent: false })}
+          >
+            {syncing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />}
+            Sincronizar ahora
+          </Button>
+        </div>
       </div>
+
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600 border border-slate-100 rounded-lg bg-slate-50/80 px-3 py-2">
+        <span>
+          <strong className="text-slate-800">Última sincronización:</strong> {lastSyncLabel}
+        </span>
+        <span>
+          <strong className="text-slate-800">Fotos recibidas:</strong> {rows.length}
+        </span>
+        {syncError ? (
+          <span className="text-rose-700 font-medium w-full sm:w-auto">{syncError}</span>
+        ) : syncing ? (
+          <span className="text-indigo-700 font-medium">Sincronizando…</span>
+        ) : lastSyncedAt ? (
+          <span className="text-emerald-800 font-medium">Listo</span>
+        ) : null}
+      </div>
+
       {hint ? <p className="text-xs text-amber-800">{hint}</p> : null}
       {promoteHint ? <p className="text-xs text-emerald-800 bg-emerald-50 border border-emerald-100 rounded px-2 py-1">{promoteHint}</p> : null}
       <div className="flex flex-wrap items-start gap-3 text-xs text-slate-600">
@@ -339,7 +529,9 @@ export function BatchPhotoRealtimeGrid({
         ) : null}
       </div>
       <p className="text-xs text-slate-500">
-        INSERT + UPDATE en tiempo real. Tras promover, la celda pasa a <span className="text-emerald-700 font-medium">verde</span>.
+        INSERT + UPDATE + DELETE en tiempo real; el sondeo rescata cambios si el canal falla. Tras promover, la celda pasa a{" "}
+        <span className="text-emerald-700 font-medium">verde</span>. Puede eliminar fotos mal tomadas con la papelera (solo antes de
+        envío a evaluación).
       </p>
       {rows.length === 0 && !loading ? (
         <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50/80 py-12 text-center text-sm text-slate-500">
@@ -352,6 +544,7 @@ export function BatchPhotoRealtimeGrid({
             const si = r.student_index != null ? Number(r.student_index) : null
             const pi = r.page_index != null ? Number(r.page_index) : null
             const sent = Boolean(r.evaluation_id || r.status === "linked")
+            const canDelete = !sent
             return (
               <li
                 key={r.id}
@@ -371,6 +564,21 @@ export function BatchPhotoRealtimeGrid({
                   >
                     A{si} · P{pi}
                   </span>
+                ) : null}
+                {canDelete ? (
+                  <button
+                    type="button"
+                    className="absolute top-0 right-0 z-20 flex h-7 w-7 items-center justify-center rounded-bl bg-black/55 text-white hover:bg-rose-700/90 disabled:opacity-40"
+                    aria-label="Eliminar foto"
+                    disabled={deletingId === r.id}
+                    onClick={() => void requestDeletePhoto(r)}
+                  >
+                    {deletingId === r.id ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                    ) : (
+                      <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                    )}
+                  </button>
                 ) : null}
                 {src ? (
                   <img src={src} alt="" className="h-full w-full object-cover" />
