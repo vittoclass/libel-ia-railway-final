@@ -232,6 +232,16 @@ export function BatchMobileSyncPanel({
   const waitingFirstMobile = ready && batchSessionOk === true && lastPhotoActivityAt == null
   const staleMobile = ready && batchSessionOk === true && lastPhotoActivityAt != null && !mobileRecentlyActive
 
+  const confirmBeforeRegenerateBatch = useCallback(() => {
+    if (lastPhotoActivityAt != null || batchSessionOk === true) {
+      const go = window.confirm(
+        "Crear nuevo lote no borra las fotos del servidor, pero puede desconectar esta pantalla del lote actual (nuevo código QR). ¿Continuar?",
+      )
+      if (!go) return
+    }
+    onRegenerateBatch()
+  }, [batchSessionOk, lastPhotoActivityAt, onRegenerateBatch])
+
   return (
     <div className="rounded-xl border border-indigo-200 bg-indigo-50/50 p-4 space-y-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -245,7 +255,7 @@ export function BatchMobileSyncPanel({
             estación. Las fotos deben subirse al bucket <code>{BATCH_SCANS_BUCKET}</code> con la ruta indicada abajo.
           </p>
         </div>
-        <Button type="button" variant="outline" size="sm" onClick={onRegenerateBatch} className="shrink-0 gap-1">
+        <Button type="button" variant="outline" size="sm" onClick={confirmBeforeRegenerateBatch} className="shrink-0 gap-1">
           <RefreshCw className="h-3.5 w-3.5" aria-hidden />
           Nuevo lote / código
         </Button>

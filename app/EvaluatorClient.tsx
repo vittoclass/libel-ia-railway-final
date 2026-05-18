@@ -1120,7 +1120,16 @@ export default function EvaluatorClient() {
   const mobileBatchSyncPendingRef = useRef(false)
   /** En navegador `setTimeout` devuelve number; evita choque con tipo Node `Timeout`. */
   const mobileBatchRealtimeDebounceRef = useRef<number | null>(null)
-  const syncMobileBatchPhotosRef = useRef<() => Promise<void>>(async () => {})
+  type SyncMobileBatchPhotosResult =
+    | { ok: true; newlyRecovered: number }
+    | { ok: false; reason: "no_batch" }
+    | { ok: false; reason: "busy" }
+    | { ok: false; reason: "api_error"; message?: string }
+  const syncMobileBatchPhotosRef = useRef<() => Promise<SyncMobileBatchPhotosResult>>(async () => ({
+    ok: false,
+    reason: "no_batch",
+  }))
+  const [recoverMobileBatchPhotosLoading, setRecoverMobileBatchPhotosLoading] = useState(false)
   const {
     evaluate,
     isLoading,
@@ -2542,12 +2551,14 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   const isGenericGroupName = (name: string | undefined) => isGenericStudentSlotName(name)
 
-  const syncMobileBatchPhotos = useCallback(async () => {
+  const syncMobileBatchPhotos = useCallback(async (): Promise<SyncMobileBatchPhotosResult> => {
     const batchId = evaluationBatchIdRef.current
-    if (!batchId || !isDocenteBatchUuid(batchId)) return
+    if (!batchId || !isDocenteBatchUuid(batchId)) {
+      return { ok: false, reason: "no_batch" }
+    }
     if (mobileBatchSyncingRef.current) {
       mobileBatchSyncPendingRef.current = true
-      return
+      return { ok: false, reason: "busy" }
     }
     mobileBatchSyncingRef.current = true
     try {
@@ -2594,7 +2605,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           if (j?.error) {
             toast({ title: "Sincronización del lote", description: j.error, variant: "destructive" })
           }
-          return
+          return { ok: false, reason: "api_error", message: typeof j?.error === "string" ? j.error : undefined }
         }
         const chunk = j.photos ?? []
         if (offset === 0) slotsFromApi = j.slots ?? []
@@ -2654,6 +2665,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       )
       setStudentGroups(nextGroups)
       setUnassignedFiles(nextUnassigned)
+      return { ok: true, newlyRecovered: placement.length }
     } finally {
       mobileBatchSyncingRef.current = false
       if (mobileBatchSyncPendingRef.current) {
@@ -2711,6 +2723,40 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   }, [activeTab, evaluationBatchIdUi, supabaseBrowser, syncMobileBatchPhotos])
 
   syncMobileBatchPhotosRef.current = syncMobileBatchPhotos
+
+  const handleManualRecoverMobileBatchPhotos = useCallback(async () => {
+    setRecoverMobileBatchPhotosLoading(true)
+    try {
+      const res = await syncMobileBatchPhotos()
+      if (!res.ok && res.reason === "no_batch") {
+        toast({
+          title: "No hay lote activo para recuperar",
+          description: "Activa o fija un lote en esta pantalla antes de volver a traer fotos.",
+        })
+        return
+      }
+      if (!res.ok && res.reason === "busy") {
+        toast({
+          title: "Sincronización en curso",
+          description: "Ya había una pasada en ejecución; se completará y se reintentará al terminar.",
+        })
+        return
+      }
+      if (!res.ok && res.reason === "api_error") {
+        return
+      }
+      const n = res.newlyRecovered
+      toast({
+        title: "Sincronización ejecutada",
+        description:
+          n > 0
+            ? `Se recuperaron ${n} foto(s) en esta pasada.`
+            : "No había fotos nuevas para este lote (o ya estaban cargadas en el paso 2).",
+      })
+    } finally {
+      setRecoverMobileBatchPhotosLoading(false)
+    }
+  }, [syncMobileBatchPhotos, toast])
 
   /** Misma pestaña u otra: la grilla de estación emite al insertar/actualizar filas → Paso 2 sincroniza al instante. */
   useEffect(() => {
@@ -5425,10 +5471,36 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                       </Button>
                       <Button
                         type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="text-xs shrink-0 text-slate-600 hover:text-slate-900 h-8 px-2"
+                        disabled={recoverMobileBatchPhotosLoading}
+                        title="Vuelve a pedir al servidor las fotos del lote móvil (mismo batch_id), sin crear evaluaciones nuevas."
+                        onClick={() => void handleManualRecoverMobileBatchPhotos()}
+                      >
+                        {recoverMobileBatchPhotosLoading ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin mr-1 inline" aria-hidden />
+                        ) : (
+                          <RefreshCw className="h-3.5 w-3.5 mr-1 inline opacity-70" aria-hidden />
+                        )}
+                        Recuperar fotos del lote
+                      </Button>
+                      <Button
+                        type="button"
                         variant="outline"
                         size="sm"
                         className="text-xs shrink-0"
                         onClick={() => {
+                          const hasEvaluatorBatchWork =
+                            !!evaluationBatchIdUi ||
+                            unassignedFiles.length > 0 ||
+                            studentGroups.some((g) => g.files.length > 0)
+                          if (hasEvaluatorBatchWork) {
+                            const go = window.confirm(
+                              "Crear nuevo lote no borra las fotos del servidor, pero puede desconectar esta pantalla del lote actual. ¿Continuar?",
+                            )
+                            if (!go) return
+                          }
                           setStudentGroups((prev) =>
                             prev.map((g) => ({
                               ...g,

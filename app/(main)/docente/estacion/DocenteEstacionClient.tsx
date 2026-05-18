@@ -245,6 +245,12 @@ export function DocenteEstacionClient() {
           <section id="docente-estacion-sync-mobile" className="space-y-4 scroll-mt-24">
             <h2 className="text-lg font-semibold text-slate-900 px-1">Paso 2: QR y escaneo</h2>
 
+            <div className="rounded-lg border border-sky-200 bg-sky-50/90 px-3 py-2.5 text-sm text-slate-800 leading-snug">
+              Las fotos permanecen en el servidor hasta que se eliminen manualmente o se cree una evaluación vinculada. Si no
+              aparecen en Evaluador, en <strong className="font-semibold">/evaluar</strong> usa{" "}
+              <strong className="font-semibold">Recuperar fotos del lote</strong>.
+            </div>
+
             <GuidedSessionStationSummary />
             {batchSessionError ? (
               <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
