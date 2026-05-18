@@ -11,8 +11,18 @@ import {
   MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT,
   MOBILE_CAPTURE_PAGE_CHOICES,
 } from "@/app/lib/docente/mobile-scan-constants"
+import { OmrCaptureGuide } from "@/app/components/omr-capture/OmrCaptureGuide"
+import { useOmrCaptureQuality } from "@/app/hooks/useOmrCaptureQuality"
+import {
+  AUTO_CAPTURE_DELAY_MS,
+  SCORE_AUTO_CAPTURE,
+  SCORE_WARN_SEND,
+} from "@/app/lib/omr-capture/constants"
+import { dataUrlToJpegFile, validatePostCapture } from "@/app/lib/omr-capture/postCapture"
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+const OMR_CAPTURE_GUIDE_ENABLED = process.env.NEXT_PUBLIC_OMR_CAPTURE_GUIDE === "1"
 
 type Phase = "pages" | "scanner"
 
@@ -35,6 +45,7 @@ function formatCameraError(e: unknown): string {
 export function EstacionMovilClient({ batchId }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const autoCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const [phase, setPhase] = useState<Phase>("pages")
   const [scannerActive, setScannerActive] = useState(false)
@@ -44,26 +55,29 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   const [batchGateOk, setBatchGateOk] = useState<boolean | null>(null)
   const [batchGateError, setBatchGateError] = useState<string | null>(null)
-  /** Respuesta cruda de GET /public para depuración en pantalla. */
   const [publicApiDebug, setPublicApiDebug] = useState<unknown>(null)
-  /** Valor que envió la estación PC (batch_scan_sessions.expected_pages_per_student), si viene en GET /public. */
   const [pcExpectedPages, setPcExpectedPages] = useState<number | null>(null)
   const [uploading, setUploading] = useState(false)
   const [lastOk, setLastOk] = useState<string | null>(null)
   const [photosSentCount, setPhotosSentCount] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [cameraActivationError, setCameraActivationError] = useState<string | null>(null)
-  /** Nombre DOM del error (NotAllowedError, OverconstrainedError, …) en rojo grande. */
   const [cameraErrorName, setCameraErrorName] = useState<string | null>(null)
   const [activatingCamera, setActivatingCamera] = useState(false)
-  /** Stream activo: estado para enlazar <video> tras montar (el ref es null antes de scannerActive). */
   const [boundStream, setBoundStream] = useState<MediaStream | null>(null)
-  /** Foto tomada aún no enviada: solo estado local (misma `File` que recibirá `uploadFile`). */
   const [pendingPreview, setPendingPreview] = useState<{ url: string; file: File } | null>(null)
-  /** Evita doble disparo del obturador justo después de capturar (UI). */
   const [shutterCooldown, setShutterCooldown] = useState(false)
+  const [postCaptureScore, setPostCaptureScore] = useState<number | null>(null)
+  const [postCaptureMessage, setPostCaptureMessage] = useState<string | null>(null)
+  const [validatingCapture, setValidatingCapture] = useState(false)
 
   const batchOk = UUID_REGEX.test(batchId.trim())
+
+  const clearPostCapture = useCallback(() => {
+    setPostCaptureScore(null)
+    setPostCaptureMessage(null)
+    setValidatingCapture(false)
+  }, [])
 
   const stopStream = useCallback(() => {
     setBoundStream(null)
@@ -74,16 +88,20 @@ export function EstacionMovilClient({ batchId }: Props) {
       v.srcObject = null
     }
     setScannerActive(false)
+    if (autoCaptureTimerRef.current) {
+      clearTimeout(autoCaptureTimerRef.current)
+      autoCaptureTimerRef.current = null
+    }
   }, [])
 
   useEffect(() => {
     return () => {
       streamRef.current?.getTracks().forEach((t) => t.stop())
       streamRef.current = null
+      if (autoCaptureTimerRef.current) clearTimeout(autoCaptureTimerRef.current)
     }
   }, [])
 
-  /** El <video> solo existe con scannerActive=true; aquí enlazamos boundStream cuando ya está en el DOM. */
   useEffect(() => {
     if (!scannerActive || !boundStream) return
     const el = videoRef.current
@@ -184,6 +202,7 @@ export function EstacionMovilClient({ batchId }: Props) {
         if (prev?.url) URL.revokeObjectURL(prev.url)
         return null
       })
+      clearPostCapture()
       setImagesPerStudent(n)
       setPageIndex(1)
       setPhase("scanner")
@@ -192,7 +211,7 @@ export function EstacionMovilClient({ batchId }: Props) {
       setCameraActivationError(null)
       setCameraErrorName(null)
     },
-    [stopStream],
+    [stopStream, clearPostCapture],
   )
 
   const activateScanner = useCallback(async () => {
@@ -311,58 +330,156 @@ export function EstacionMovilClient({ batchId }: Props) {
       if (prev?.url) revokePreview(prev.url)
       return null
     })
-  }, [uploading, revokePreview])
+    clearPostCapture()
+  }, [uploading, revokePreview, clearPostCapture])
 
-  const captureToPreview = useCallback(async () => {
-    const video = videoRef.current
-    if (!video || !batchOk || batchGateOk !== true || shutterCooldown) return
-    const w = video.videoWidth
-    const h = video.videoHeight
-    if (w < 2 || h < 2) {
-      setError("La cámara aún no tiene imagen. Espere un segundo e intente de nuevo.")
-      return
-    }
+  const captureToPreviewRef = useRef<(mode?: "auto" | "manual") => Promise<void>>(async () => {})
 
-    setError(null)
+  const { snapshot, reset: resetQuality, markCapturing } = useOmrCaptureQuality({
+    enabled: OMR_CAPTURE_GUIDE_ENABLED,
+    active: scannerActive && !pendingPreview && phase === "scanner",
+    videoRef,
+    onAutoCapture: () => {
+      if (autoCaptureTimerRef.current) return
+      markCapturing()
+      autoCaptureTimerRef.current = setTimeout(() => {
+        autoCaptureTimerRef.current = null
+        void captureToPreviewRef.current("auto")
+      }, AUTO_CAPTURE_DELAY_MS)
+    },
+  })
 
-    const canvas = document.createElement("canvas")
-    canvas.width = w
-    canvas.height = h
-    const ctx = canvas.getContext("2d")
-    if (!ctx) {
-      setError("No se pudo preparar la captura.")
-      return
-    }
-    ctx.drawImage(video, 0, 0)
+  const captureToPreview = useCallback(
+    async (mode: "auto" | "manual" = "manual") => {
+      const video = videoRef.current
+      if (!video || !batchOk || batchGateOk !== true || shutterCooldown) return
+      const w = video.videoWidth
+      const h = video.videoHeight
+      if (w < 2 || h < 2) {
+        setError("La cámara aún no tiene imagen. Espere un segundo e intente de nuevo.")
+        return
+      }
 
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob((b) => resolve(b), "image/jpeg", 0.92)
-    })
-    if (!blob) {
-      setError("No se pudo generar la foto.")
-      return
-    }
+      if (OMR_CAPTURE_GUIDE_ENABLED && mode === "manual") {
+        const score = snapshot.score
+        if (score < SCORE_WARN_SEND) {
+          const ok = window.confirm(
+            "La calidad actual es baja y la foto puede fallar en OMR. ¿Tomar la foto de todas formas?",
+          )
+          if (!ok) return
+        } else if (score >= SCORE_WARN_SEND && score < SCORE_AUTO_CAPTURE) {
+          const ok = window.confirm(
+            "La calidad es aceptable pero no óptima. ¿Usar esta foto de todas formas?",
+          )
+          if (!ok) return
+        }
+      }
 
-    setShutterCooldown(true)
-    window.setTimeout(() => setShutterCooldown(false), 1000)
+      if (OMR_CAPTURE_GUIDE_ENABLED) {
+        markCapturing()
+      }
 
-    const file = new File([blob], `capture-${Date.now()}.jpg`, { type: "image/jpeg" })
-    const url = URL.createObjectURL(blob)
-    setPendingPreview((prev) => {
-      if (prev?.url) revokePreview(prev.url)
-      return { url, file }
-    })
-  }, [batchOk, batchGateOk, shutterCooldown, revokePreview])
+      setError(null)
+
+      const canvas = document.createElement("canvas")
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext("2d")
+      if (!ctx) {
+        setError("No se pudo preparar la captura.")
+        return
+      }
+      ctx.drawImage(video, 0, 0)
+
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.92)
+
+      setShutterCooldown(true)
+      window.setTimeout(() => setShutterCooldown(false), 1000)
+
+      let file: File
+      let url: string
+      let previewMessage: string | null = null
+      let previewScore: number | null = null
+
+      if (OMR_CAPTURE_GUIDE_ENABLED) {
+        setValidatingCapture(true)
+        try {
+          const validation = await validatePostCapture(dataUrl, w)
+          previewScore = validation.score
+          previewMessage = validation.message
+          const uploadDataUrl =
+            validation.warpedDataUrl && validation.score >= SCORE_WARN_SEND
+              ? validation.warpedDataUrl
+              : dataUrl
+          const warpedFile = await dataUrlToJpegFile(uploadDataUrl, `capture-${Date.now()}.jpg`)
+          if (warpedFile) {
+            file = warpedFile
+            url = URL.createObjectURL(warpedFile)
+          } else {
+            const blob = await (await fetch(dataUrl)).blob()
+            file = new File([blob], `capture-${Date.now()}.jpg`, { type: "image/jpeg" })
+            url = URL.createObjectURL(blob)
+          }
+        } finally {
+          setValidatingCapture(false)
+        }
+      } else {
+        const blob = await new Promise<Blob | null>((resolve) => {
+          canvas.toBlob((b) => resolve(b), "image/jpeg", 0.92)
+        })
+        if (!blob) {
+          setError("No se pudo generar la foto.")
+          return
+        }
+        file = new File([blob], `capture-${Date.now()}.jpg`, { type: "image/jpeg" })
+        url = URL.createObjectURL(blob)
+      }
+
+      setPostCaptureScore(previewScore)
+      setPostCaptureMessage(previewMessage)
+      resetQuality()
+
+      setPendingPreview((prev) => {
+        if (prev?.url) revokePreview(prev.url)
+        return { url, file }
+      })
+    },
+    [
+      batchOk,
+      batchGateOk,
+      shutterCooldown,
+      revokePreview,
+      markCapturing,
+      resetQuality,
+      snapshot.score,
+    ],
+  )
+
+  captureToPreviewRef.current = captureToPreview
 
   const submitPendingPreview = useCallback(async () => {
     if (!pendingPreview) return
+
+    if (OMR_CAPTURE_GUIDE_ENABLED && postCaptureScore != null) {
+      if (postCaptureScore < SCORE_WARN_SEND) {
+        const ok = window.confirm(
+          `${postCaptureMessage ?? "Foto de baja calidad."}\n\n¿Enviar de todas formas?`,
+        )
+        if (!ok) return
+      } else if (postCaptureScore >= SCORE_WARN_SEND && postCaptureScore < SCORE_AUTO_CAPTURE) {
+        const ok = window.confirm("¿Usar esta foto de todas formas?")
+        if (!ok) return
+      }
+    }
+
     const { file, url } = pendingPreview
     const ok = await uploadFile(file)
     if (ok) {
       revokePreview(url)
       setPendingPreview(null)
+      clearPostCapture()
     }
-  }, [pendingPreview, uploadFile, revokePreview])
+  }, [pendingPreview, uploadFile, revokePreview, postCaptureScore, postCaptureMessage, clearPostCapture])
 
   useEffect(() => {
     setPhotosSentCount(0)
@@ -384,7 +501,9 @@ export function EstacionMovilClient({ batchId }: Props) {
       if (prev?.url) URL.revokeObjectURL(prev.url)
       return null
     })
-  }, [stopStream])
+    clearPostCapture()
+    resetQuality()
+  }, [stopStream, clearPostCapture, resetQuality])
 
   if (!batchOk) {
     return (
@@ -427,6 +546,8 @@ export function EstacionMovilClient({ batchId }: Props) {
       </main>
     )
   }
+
+  const guideActive = OMR_CAPTURE_GUIDE_ENABLED && scannerActive && !pendingPreview
 
   return (
     <main className="min-h-screen flex flex-col bg-slate-950 text-slate-100 p-4 pb-12">
@@ -504,15 +625,19 @@ export function EstacionMovilClient({ batchId }: Props) {
             ) : (
               <>
                 <p className="text-center text-sm font-medium text-indigo-200">
-                  {pendingPreview
-                    ? "Revisa la foto. Enviála o descartala con la X."
-                    : "Paso 3: Dispara la foto."}
+                  {validatingCapture
+                    ? "Validando foto…"
+                    : pendingPreview
+                      ? "Revisa la foto. Enviála o descartala con la X."
+                      : OMR_CAPTURE_GUIDE_ENABLED
+                        ? "Encuadra la hoja. La guía te indicará cuándo capturar."
+                        : "Paso 3: Dispara la foto."}
                 </p>
                 <div className="relative w-full overflow-hidden rounded-lg border border-slate-700 bg-black aspect-[3/4] max-h-[55vh]">
                   {pendingPreview ? (
                     <div className="relative h-full w-full">
-                      {/* eslint-disable-next-line @next/next/no-img-element -- blob: URL local de previsualización */}
-                      <img src={pendingPreview.url} alt="" className="h-full w-full object-cover" />
+                      {/* eslint-disable-next-line @next/next/no-img-element -- blob: URL local */}
+                      <img src={pendingPreview.url} alt="" className="h-full w-full object-contain" />
                       <button
                         type="button"
                         className="absolute top-2 right-2 z-10 flex h-11 w-11 min-h-[44px] min-w-[44px] items-center justify-center rounded-full bg-black/75 text-white shadow-lg ring-1 ring-white/25 active:bg-black/90"
@@ -523,26 +648,70 @@ export function EstacionMovilClient({ batchId }: Props) {
                       </button>
                     </div>
                   ) : (
-                    /* playsInline + muted + autoPlay: iOS/Android suelen bloquear reproducción sin esto */
-                    <video
-                      ref={videoRef}
-                      className="h-full w-full object-cover"
-                      playsInline
-                      muted
-                      autoPlay
-                    />
+                    <>
+                      <video
+                        ref={videoRef}
+                        className={
+                          OMR_CAPTURE_GUIDE_ENABLED
+                            ? "h-full w-full object-contain"
+                            : "h-full w-full object-cover"
+                        }
+                        playsInline
+                        muted
+                        autoPlay
+                      />
+                      {guideActive ? (
+                        <OmrCaptureGuide
+                          videoRef={videoRef}
+                          snapshot={snapshot}
+                          captureDisabled={shutterCooldown || validatingCapture}
+                          onCaptureAnyway={() => void captureToPreview("manual")}
+                        />
+                      ) : null}
+                    </>
                   )}
                 </div>
-                <Button
-                  type="button"
-                  size="lg"
-                  className="w-full h-14 text-lg gap-2 bg-indigo-600 hover:bg-indigo-500"
-                  disabled={uploading || (!pendingPreview && shutterCooldown)}
-                  onClick={() => void (pendingPreview ? submitPendingPreview() : captureToPreview())}
-                >
-                  {uploading ? <Loader2 className="h-6 w-6 animate-spin" aria-hidden /> : <Camera className="h-6 w-6" aria-hidden />}
-                  {uploading ? "Subiendo…" : pendingPreview ? "Enviar foto" : "Disparar foto"}
-                </Button>
+
+                {pendingPreview && postCaptureMessage ? (
+                  <div
+                    className={`rounded-lg border px-3 py-2 text-sm ${
+                      postCaptureScore != null && postCaptureScore >= SCORE_AUTO_CAPTURE
+                        ? "border-emerald-600/50 bg-emerald-950/50 text-emerald-100"
+                        : postCaptureScore != null && postCaptureScore >= SCORE_WARN_SEND
+                          ? "border-amber-600/50 bg-amber-950/40 text-amber-100"
+                          : "border-rose-800/60 bg-rose-950/50 text-rose-100"
+                    }`}
+                    role="status"
+                  >
+                    {postCaptureMessage}
+                    {postCaptureScore != null ? (
+                      <span className="block text-xs opacity-80 mt-1">Calidad: {postCaptureScore}/100</span>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <div className="flex flex-col gap-2">
+                  <Button
+                    type="button"
+                    size="lg"
+                    className="w-full h-14 text-lg gap-2 bg-indigo-600 hover:bg-indigo-500"
+                    disabled={uploading || validatingCapture || (!pendingPreview && shutterCooldown)}
+                    onClick={() => void (pendingPreview ? submitPendingPreview() : captureToPreview("manual"))}
+                  >
+                    {uploading || validatingCapture ? (
+                      <Loader2 className="h-6 w-6 animate-spin" aria-hidden />
+                    ) : (
+                      <Camera className="h-6 w-6" aria-hidden />
+                    )}
+                    {uploading
+                      ? "Subiendo…"
+                      : validatingCapture
+                        ? "Validando…"
+                        : pendingPreview
+                          ? "Enviar foto"
+                          : "Disparar foto"}
+                  </Button>
+                </div>
               </>
             )}
 
