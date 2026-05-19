@@ -48,6 +48,7 @@ import {
   resolveSourceExamOmrMetadata,
 } from "../../lib/source-exam-omr-metadata"
 import { enhanceOmrStudentImageBase64 } from "../../lib/omr-image-preenhance"
+import { extractJsonObjectFromModelText } from "../../lib/smart-base-parser"
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY
 const DEFAULT_STUDENT_NAME = "Estudiante No Identificado"
@@ -81,6 +82,70 @@ const MISTRAL_FETCH_TIMEOUT_MS_VISION = 40_000
 
 function isMistralTimeoutError(e: unknown): boolean {
   return e instanceof Error && e.message === "ERROR_MISTRAL_TIMEOUT"
+}
+
+const ERROR_MISTRAL_JSON_DEGRADED = "ERROR_MISTRAL_JSON_DEGRADED"
+
+function isMistralJsonDegradedError(e: unknown): boolean {
+  return e instanceof Error && e.message === ERROR_MISTRAL_JSON_DEGRADED
+}
+
+/** Análisis vacío seguro cuando Mistral Vision no devuelve JSON parseable (conserva OMR ya leído). */
+function emptyMistralVisionAnalysis() {
+  return {
+    respuestas_cerradas: [] as { pregunta: string; respuesta_detectada: string; confianza: number }[],
+    respuestas_desarrollo: {} as Record<string, unknown>,
+    retroalimentacion: {
+      fortalezas:
+        "Lectura integrada de la hoja por visión no disponible (tiempo de espera del servicio o respuesta ilegible o truncada). Si hay OMR dedicado, las alternativas cerradas provienen de esa lectura.",
+      areas_mejora: "",
+      correccion_detallada: [] as { seccion: string; detalle: string }[],
+    },
+    nombreEstudiante: null as string | null,
+  }
+}
+
+/**
+ * JSON de Mistral: parse directo; si SyntaxError / cadena truncada, repara con extractJsonObjectFromModelText.
+ * Si no se puede reparar, lanza ERROR_MISTRAL_JSON_DEGRADED para degradar sin tumbar la evaluación.
+ */
+function parseMistralModelJsonContent(content: string): unknown {
+  const raw = String(content ?? "").trim()
+  if (!raw) throw new Error(ERROR_MISTRAL_JSON_DEGRADED)
+  try {
+    return JSON.parse(raw)
+  } catch (first) {
+    const tryLenient =
+      first instanceof SyntaxError ||
+      (first instanceof Error &&
+        /unterminated string|unexpected end of json|unexpected token/i.test(first.message))
+    if (!tryLenient) throw first
+    try {
+      return extractJsonObjectFromModelText(raw)
+    } catch {
+      throw new Error(ERROR_MISTRAL_JSON_DEGRADED)
+    }
+  }
+}
+
+const OMR_RAW_PREVIEW_SLICE = 10
+
+function officialOmrPerQuestionRawWireFields(raw: unknown): {
+  officialOmrPerQuestionRawLength: number
+  officialOmrPerQuestionRawPreview: unknown[]
+} {
+  const arr = Array.isArray(raw) ? raw : []
+  return {
+    officialOmrPerQuestionRawLength: arr.length,
+    officialOmrPerQuestionRawPreview: arr.slice(0, OMR_RAW_PREVIEW_SLICE),
+  }
+}
+
+/** Quita `officialOmrPerQuestionRaw` completo del cuerpo HTTP de error (evita truncamiento en cliente). */
+function omitHeavyOmrFieldsForErrorWire(payload: Record<string, unknown>): Record<string, unknown> {
+  if (!Object.prototype.hasOwnProperty.call(payload, "officialOmrPerQuestionRaw")) return payload
+  const { officialOmrPerQuestionRaw, ...rest } = payload
+  return { ...rest, ...officialOmrPerQuestionRawWireFields(officialOmrPerQuestionRaw) }
 }
 
 function mergeAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
@@ -1272,8 +1337,8 @@ INSTRUCCIONES PARA PREGUNTAS DE DESARROLLO (si la prueba tiene desarrollo):
   const data = await response.json()
   const content = data.choices?.[0]?.message?.content
   if (!content) throw new Error("Respuesta vacía de Mistral Vision")
-  
-  return JSON.parse(content)
+
+  return parseMistralModelJsonContent(content)
 }
 
 /** Llamada dedicada SOLO a preguntas de desarrollo: extracción con CITAS textuales obligatorias y retroalimentación profunda. */
@@ -1350,7 +1415,10 @@ Las claves de respuestas_desarrollo pueden ser P1, P2, P39, P40, etc. según los
   const data = await res.json()
   const content = data.choices?.[0]?.message?.content
   if (!content) return { respuestas_desarrollo: {}, retroalimentacion: {} }
-  const parsed = JSON.parse(content)
+  const parsed = parseMistralModelJsonContent(content) as {
+    respuestas_desarrollo?: Record<string, unknown>
+    retroalimentacion?: Record<string, unknown>
+  }
   return {
     respuestas_desarrollo: parsed.respuestas_desarrollo || {},
     retroalimentacion: parsed.retroalimentacion || {},
@@ -2360,7 +2428,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                 officialOmrFallbackUsed,
                 officialOmrFallbackReason:
                   (e instanceof Error ? e.message : String(e)) || officialOmrFallbackReason,
-                officialOmrPerQuestionRaw,
+                ...officialOmrPerQuestionRawWireFields(officialOmrPerQuestionRaw),
                 officialOmrDetectedAnswersPreview,
                 officialOmrQuestionCountFromPipeline,
                 officialOmrDetectedAnswersCount,
@@ -2400,7 +2468,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                 officialOmrFallbackUsed,
                 officialOmrFallbackReason:
                   (e instanceof Error ? e.message : String(e)) || officialOmrFallbackReason,
-                officialOmrPerQuestionRaw,
+                ...officialOmrPerQuestionRawWireFields(officialOmrPerQuestionRaw),
                 officialOmrDetectedAnswersPreview,
                 officialOmrQuestionCountFromPipeline,
                 officialOmrDetectedAnswersCount,
@@ -2484,7 +2552,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         officialOmrEngineUsed,
         officialOmrFallbackUsed,
         officialOmrFallbackReason,
-        officialOmrPerQuestionRaw,
+        ...officialOmrPerQuestionRawWireFields(officialOmrPerQuestionRaw),
         officialOmrDetectedAnswersPreview,
         officialOmrQuestionCountFromPipeline,
         officialOmrDetectedAnswersCount,
@@ -2545,21 +2613,18 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
           )
         } catch (e) {
-          if (!isMistralTimeoutError(e)) throw e
+          if (!isMistralTimeoutError(e) && !isMistralJsonDegradedError(e)) throw e
           evaluationDegraded = true
-          evaluationWarnings.push(`mistral_vision_timeout_page_${i + 1}`)
-          console.warn("[evaluate] Mistral Vision timeout (degraded), continuing", { page: i + 1 })
-          analysis = {
-            respuestas_cerradas: [],
-            respuestas_desarrollo: {},
-            retroalimentacion: {
-              fortalezas:
-                "Lectura integrada de la hoja por visión no disponible (tiempo de espera del servicio). Si hay OMR dedicado, las alternativas cerradas provienen de esa lectura.",
-              areas_mejora: "",
-              correccion_detallada: [],
-            },
-            nombreEstudiante: null,
-          }
+          evaluationWarnings.push(
+            isMistralTimeoutError(e)
+              ? `mistral_vision_timeout_page_${i + 1}`
+              : `mistral_vision_json_parse_page_${i + 1}`,
+          )
+          console.warn("[evaluate] Mistral Vision degraded, continuing", {
+            page: i + 1,
+            reason: isMistralTimeoutError(e) ? "timeout" : "json_parse",
+          })
+          analysis = emptyMistralVisionAnalysis()
         }
 
         // Combinar resultados
@@ -2626,10 +2691,17 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               }
             }
           } catch (e) {
-            if (isMistralTimeoutError(e)) {
+            if (isMistralTimeoutError(e) || isMistralJsonDegradedError(e)) {
               evaluationDegraded = true
-              evaluationWarnings.push(`mistral_development_timeout_page_${i + 1}`)
-              console.error("[evaluate] development analysis timeout", { page: i + 1 })
+              evaluationWarnings.push(
+                isMistralTimeoutError(e)
+                  ? `mistral_development_timeout_page_${i + 1}`
+                  : `mistral_development_json_parse_page_${i + 1}`,
+              )
+              console.warn("[evaluate] development analysis degraded", {
+                page: i + 1,
+                reason: isMistralTimeoutError(e) ? "timeout" : "json_parse",
+              })
             } else {
               console.warn("[Evaluate] Análisis desarrollo dedicado falló", e)
             }
@@ -3147,7 +3219,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
     const isPdfError = typeof msg === "string" && msg.includes("PDF") && msg.includes("solo acepta imágenes")
     const omrPayload =
       omrDebugSnapshotForCatch != null
-        ? omrDebugSnapshotForCatch
+        ? omitHeavyOmrFieldsForErrorWire(omrDebugSnapshotForCatch)
         : { omrStateUnknownDueToEarlyFailure: true as const }
     return NextResponse.json(
       {
