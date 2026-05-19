@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getOrCreateProfile } from "@/app/lib/profile"
+import { resolveStudentDisplayName } from "@/app/lib/student-display-name"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
@@ -132,13 +133,18 @@ export async function GET(req: NextRequest) {
   }
 
   const ids = list.map((e) => e.id)
-  let summaries: Array<{ evaluation_id: string; grade_chile: number | null }> = []
+  let summaries: Array<{
+    evaluation_id: string
+    grade_chile: number | null
+    student_name_raw?: string | null
+    raw?: unknown
+  }> = []
   let studentCounts: Map<string, number> = new Map()
   let firstStudentNames: Map<string, string> = new Map()
   if (ids.length > 0) {
     const sumRes = await supabase
       .from("evaluation_summaries")
-      .select("evaluation_id, grade_chile")
+      .select("evaluation_id, grade_chile, student_name_raw, raw")
       .in("evaluation_id", ids)
     if (sumRes.error) {
       return NextResponse.json(
@@ -169,6 +175,17 @@ export async function GET(req: NextRequest) {
       const first = [...names].sort((a, b) => a.localeCompare(b))[0]
       if (first) firstStudentNames.set(evalId, first)
     })
+    const summaryByEval = new Map(summaries.map((s) => [s.evaluation_id, s]))
+    for (const evalId of ids) {
+      if (firstStudentNames.has(evalId)) continue
+      const sum = summaryByEval.get(evalId)
+      const fromSummary = resolveStudentDisplayName({
+        student_name: null,
+        student_name_raw: sum?.student_name_raw ?? null,
+        raw: sum?.raw,
+      }).trim()
+      if (fromSummary) firstStudentNames.set(evalId, fromSummary)
+    }
   }
 
   const gradeByEval = new Map(summaries.map((s) => [s.evaluation_id, s.grade_chile]))
@@ -177,7 +194,7 @@ export async function GET(req: NextRequest) {
     status: e.status ?? "draft",
     grade_chile: gradeByEval.get(e.id) ?? null,
     student_count: studentCounts.get(e.id) ?? 0,
-    first_student_name: firstStudentNames.get(e.id) ?? null,
+    first_student_name: firstStudentNames.get(e.id) ?? "Sin nombre de estudiante",
     course_display: e.course_label != null && String(e.course_label).trim() !== "" ? e.course_label : (e.course_id ?? "Sin curso"),
   }))
 

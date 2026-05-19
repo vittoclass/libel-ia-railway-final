@@ -5,6 +5,8 @@
 
 export type PedagogicalAnalysisExportData = {
   evaluation_id: string
+  /** Nombre resuelto (evaluation_students → summary → raw); solo lectura. */
+  student_display_name?: string | null
   has_source_exam: boolean
   has_evaluation_items?: boolean
   has_source_exam_items?: boolean

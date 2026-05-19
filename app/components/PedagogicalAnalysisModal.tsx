@@ -95,6 +95,13 @@ export default function PedagogicalAnalysisModal({
     data?.analysis_available === true ||
     (data && data.has_source_exam && (data.by_question?.length ?? 0) > 0 && data.analysis_available !== false)
 
+  const resolvedStudentName =
+    studentName != null && String(studentName).trim() !== ""
+      ? String(studentName).trim()
+      : data?.student_display_name != null && String(data.student_display_name).trim() !== ""
+        ? String(data.student_display_name).trim()
+        : null
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
@@ -109,7 +116,7 @@ export default function PedagogicalAnalysisModal({
             loading={loading}
             error={error}
             data={data}
-            studentName={studentName}
+            studentName={resolvedStudentName}
             courseLabel={courseLabel}
             evaluationLabel={evaluationLabel}
           />

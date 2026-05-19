@@ -7,6 +7,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { canReadEvaluationInAppScope, normUuid, profileScopeFromRow } from "@/app/lib/evaluation-read-scope"
 import { getOrCreateProfile } from "@/app/lib/profile"
+import { resolveStudentDisplayName } from "@/app/lib/student-display-name"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { getSourceExamForEvaluation } from "@/app/lib/source-exam-db"
 import { enrichItemsWithPedagogy } from "@/app/lib/analyze-pedagogical-structure"
@@ -73,6 +74,42 @@ export async function GET(
   if (!canRead) {
     return NextResponse.json({ error: "No autorizado para esta evaluación" }, { status: 403 })
   }
+
+  const [studentsNameRes, summaryNameRes] = await Promise.all([
+    supabase.from("evaluation_students").select("student_name").eq("evaluation_id", evaluationId),
+    supabase
+      .from("evaluation_summaries")
+      .select("student_name_raw, raw, created_at")
+      .eq("evaluation_id", evaluationId)
+      .order("created_at", { ascending: true }),
+  ])
+  let student_display_name = ""
+  for (const row of studentsNameRes.data ?? []) {
+    const n = resolveStudentDisplayName({
+      student_name: (row as { student_name?: string | null }).student_name ?? null,
+      student_name_raw: null,
+      raw: null,
+    }).trim()
+    if (n) {
+      student_display_name = n
+      break
+    }
+  }
+  if (!student_display_name) {
+    const summaryRows = (summaryNameRes.data ?? []) as Array<{
+      student_name_raw?: string | null
+      raw?: unknown
+    }>
+    const summaryTyped = summaryRows.length > 0 ? summaryRows[summaryRows.length - 1]! : null
+    if (summaryTyped) {
+      student_display_name = resolveStudentDisplayName({
+        student_name: null,
+        student_name_raw: summaryTyped.student_name_raw ?? null,
+        raw: summaryTyped.raw,
+      }).trim()
+    }
+  }
+  if (!student_display_name) student_display_name = "Sin nombre de estudiante"
 
   /** Para agregados del curso (z-score): perfil o, en su defecto, profesor de la fila evaluada. */
   const teacherIdForCourseStats =
@@ -333,6 +370,7 @@ export async function GET(
   return NextResponse.json(
     {
       ...analysis,
+      student_display_name,
       has_source_exam,
       has_evaluation_items,
       has_source_exam_items,
