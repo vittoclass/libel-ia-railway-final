@@ -123,10 +123,21 @@ export function OmrCaptureGuide({
   }, [videoRef, snapshot])
 
   const barPct = Math.round(Math.min(100, Math.max(0, snapshot.smoothScore * 100)))
+  const debug = snapshot.debug
 
   return (
     <div className="pointer-events-none absolute inset-0 z-[5] flex flex-col">
       <canvas ref={overlayRef} className="absolute inset-0 h-full w-full" aria-hidden />
+
+      {debug ? (
+        <div
+          className="absolute top-2 left-2 z-10 max-w-[90%] rounded bg-black/75 px-2 py-1 text-[10px] font-mono text-emerald-200"
+          aria-hidden
+        >
+          {debug.strictMarkerCount}/{debug.markerCount} · score {debug.score} · {debug.uiState}
+          {debug.missingCorners.length > 0 ? ` · falta ${debug.missingCorners.join(",")}` : ""}
+        </div>
+      ) : null}
 
       <div className="mt-auto w-full space-y-2 px-3 pb-3 pt-8 bg-gradient-to-t from-black/80 to-transparent pointer-events-none">
         <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/15">

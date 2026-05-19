@@ -7,15 +7,12 @@ import {
   ANALYSIS_MAX_WIDTH_SLOW,
   MESSAGE_DEBOUNCE_MS,
 } from "@/app/lib/omr-capture/constants"
-import {
-  detectBlackSquareMarkers,
-  drawVideoFrameToWorkCanvas,
-  type SheetQuad,
-} from "@/app/lib/omr-capture/markerDetectV1"
+import { drawVideoFrameToWorkCanvas } from "@/app/lib/omr-capture/markerDetectV1"
+import { detectMarkersV2, type MarkerDetectV2Result } from "@/app/lib/omr-capture/markerDetectV2"
 import {
   analyzeFrame,
-  messageForKey,
   pickDominantMessageKey,
+  resolveTeacherMessage,
   type DominantMessageKey,
   type QualityBreakdown,
 } from "@/app/lib/omr-capture/omrCaptureQuality"
@@ -26,6 +23,19 @@ import {
   tickTemporalFilter,
   type CaptureUiState,
 } from "@/app/lib/omr-capture/temporalFilter"
+import type { SheetQuad } from "@/app/lib/omr-capture/markerDetectV1"
+
+export type OmrCaptureDebugInfo = {
+  markerCount: number
+  strictMarkerCount: number
+  relaxedMarkerCount: number
+  score: number
+  smoothScore: number
+  uiState: CaptureUiState
+  missingCorners: string[]
+  perspectiveError: number
+  areaRatio: number
+}
 
 export type OmrCaptureQualitySnapshot = {
   score: number
@@ -40,6 +50,7 @@ export type OmrCaptureQualitySnapshot = {
   workWidth: number
   workHeight: number
   shouldAutoCapture: boolean
+  debug?: OmrCaptureDebugInfo
 }
 
 const INITIAL_SNAPSHOT: OmrCaptureQualitySnapshot = {
@@ -48,8 +59,8 @@ const INITIAL_SNAPSHOT: OmrCaptureQualitySnapshot = {
   breakdown: null,
   uiState: "searching",
   greenLatched: false,
-  messageKey: "find_markers",
-  message: messageForKey("find_markers"),
+  messageKey: "find_sheet",
+  message: "Encuadra la hoja en la pantalla",
   quad: null,
   markers: [],
   workWidth: 0,
@@ -61,6 +72,7 @@ type Options = {
   enabled: boolean
   active: boolean
   videoRef: React.RefObject<HTMLVideoElement | null>
+  captureDebug?: boolean
   onAutoCapture?: () => void
 }
 
@@ -68,21 +80,24 @@ export function useOmrCaptureQuality({
   enabled,
   active,
   videoRef,
+  captureDebug = false,
   onAutoCapture,
 }: Options) {
   const [snapshot, setSnapshot] = useState<OmrCaptureQualitySnapshot>(INITIAL_SNAPSHOT)
   const temporalRef = useRef(createTemporalFilter())
   const workCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  const lastMessageKeyRef = useRef<DominantMessageKey>("find_markers")
+  const lastMessageRef = useRef("")
   const lastMessageChangeRef = useRef(0)
   const autoFiredRef = useRef(false)
   const slowModeRef = useRef(false)
   const frameTimesRef = useRef<number[]>([])
+  const lastDetectionRef = useRef<MarkerDetectV2Result | null>(null)
 
   const reset = useCallback(() => {
     resetTemporalFilter(temporalRef.current)
     autoFiredRef.current = false
-    lastMessageKeyRef.current = "find_markers"
+    lastMessageRef.current = ""
+    lastDetectionRef.current = null
     setSnapshot(INITIAL_SNAPSHOT)
   }, [])
 
@@ -93,7 +108,7 @@ export function useOmrCaptureQuality({
       ...s,
       uiState: "capturing",
       messageKey: "ready_capture",
-      message: messageForKey("ready_capture"),
+      message: "Perfecto, ya puedes sacar la foto",
       shouldAutoCapture: false,
     }))
   }, [])
@@ -121,7 +136,8 @@ export function useOmrCaptureQuality({
       const imageData = drawVideoFrameToWorkCanvas(video, work, maxW)
       if (!imageData) return
 
-      const detection = detectBlackSquareMarkers(imageData)
+      const detection = detectMarkersV2(imageData)
+      lastDetectionRef.current = detection
       const temporal = temporalRef.current
 
       const analyzed = analyzeFrame(
@@ -131,28 +147,48 @@ export function useOmrCaptureQuality({
         temporal.stabilityScore10
       )
 
+      const extremelyBlurry = analyzed.metrics.laplacianVariance < 30
+
       const fullTick = tickTemporalFilter(temporal, {
         rawScore: analyzed.breakdown.total,
         markerCount: detection.markerCount,
+        strictMarkerCount: detection.strictMarkerCount,
         now: performance.now(),
+        extremelyBlurry,
       })
 
       const uiState = fullTick.uiState
-      let messageKey = pickDominantMessageKey(analyzed.metrics, uiState)
+      let message = resolveTeacherMessage(analyzed.metrics, uiState, detection)
+
       const now = performance.now()
-      if (messageKey !== lastMessageKeyRef.current) {
+      if (message !== lastMessageRef.current) {
         if (now - lastMessageChangeRef.current >= MESSAGE_DEBOUNCE_MS) {
-          lastMessageKeyRef.current = messageKey
+          lastMessageRef.current = message
           lastMessageChangeRef.current = now
         } else {
-          messageKey = lastMessageKeyRef.current
+          message = lastMessageRef.current
         }
       } else {
         lastMessageChangeRef.current = now
       }
 
-      const shouldAutoCapture =
-        fullTick.shouldAutoCapture && !autoFiredRef.current
+      const messageKey = pickDominantMessageKey(analyzed.metrics, uiState, detection)
+
+      const shouldAutoCapture = fullTick.shouldAutoCapture && !autoFiredRef.current
+
+      const debug: OmrCaptureDebugInfo | undefined = captureDebug
+        ? {
+            markerCount: detection.markerCount,
+            strictMarkerCount: detection.strictMarkerCount,
+            relaxedMarkerCount: detection.relaxedMarkerCount,
+            score: analyzed.breakdown.total,
+            smoothScore: Math.round(fullTick.smoothScore * 100),
+            uiState,
+            missingCorners: detection.quadAudit.missingCorners,
+            perspectiveError: detection.perspectiveError,
+            areaRatio: detection.areaRatio,
+          }
+        : undefined
 
       setSnapshot({
         score: analyzed.breakdown.total,
@@ -161,12 +197,13 @@ export function useOmrCaptureQuality({
         uiState,
         greenLatched: fullTick.greenLatched,
         messageKey,
-        message: messageForKey(messageKey),
+        message,
         quad: detection.quad,
         markers: detection.markers,
         workWidth: detection.workWidth,
         workHeight: detection.workHeight,
         shouldAutoCapture,
+        debug,
       })
 
       const elapsed = performance.now() - t0
@@ -174,7 +211,7 @@ export function useOmrCaptureQuality({
       if (frameTimesRef.current.length > 8) frameTimesRef.current.shift()
       const avg =
         frameTimesRef.current.reduce((a, b) => a + b, 0) / frameTimesRef.current.length
-      slowModeRef.current = avg > 90
+      slowModeRef.current = avg > 95
 
       if (shouldAutoCapture && onAutoCapture) {
         autoFiredRef.current = true
@@ -186,7 +223,7 @@ export function useOmrCaptureQuality({
       cancelled = true
       clearInterval(timer)
     }
-  }, [enabled, active, videoRef, onAutoCapture, reset])
+  }, [enabled, active, videoRef, onAutoCapture, reset, captureDebug])
 
   useEffect(() => {
     if (!active) reset()

@@ -54,8 +54,10 @@ export function resetTemporalFilter(state: TemporalFilterState): void {
 export type TickInput = {
   rawScore: number
   markerCount: number
+  strictMarkerCount: number
   now: number
   frozen?: boolean
+  extremelyBlurry?: boolean
 }
 
 export type TickOutput = {
@@ -83,7 +85,7 @@ export function tickTemporalFilter(
   const rawNorm = input.rawScore / 100
   state.smoothScore = EMA_ALPHA * rawNorm + (1 - EMA_ALPHA) * state.smoothScore
 
-  if (rawNorm >= 0.8 && input.markerCount === 4) {
+  if (rawNorm >= 0.8 && input.strictMarkerCount === 4) {
     state.recentRawGood = Math.min(12, state.recentRawGood + 1)
   } else {
     state.recentRawGood = Math.max(0, state.recentRawGood - 1)
@@ -93,7 +95,7 @@ export function tickTemporalFilter(
   const { now } = input
 
   if (!state.greenLatched) {
-    if (state.smoothScore >= SMOOTH_ENTER_GREEN && input.markerCount === 4) {
+    if (state.smoothScore >= SMOOTH_ENTER_GREEN && input.strictMarkerCount === 4) {
       if (state.readySince == null) state.readySince = now
       if (now - (state.readySince ?? now) >= STABLE_ENTER_MS) {
         state.greenLatched = true
@@ -103,7 +105,7 @@ export function tickTemporalFilter(
       state.readySince = null
     }
   } else {
-    if (state.smoothScore < SMOOTH_EXIT_GREEN || input.markerCount < 4) {
+    if (state.smoothScore < SMOOTH_EXIT_GREEN || input.strictMarkerCount < 4) {
       if (state.belowSince == null) state.belowSince = now
       if (now - (state.belowSince ?? now) >= STABLE_EXIT_MS) {
         state.greenLatched = false
@@ -115,13 +117,16 @@ export function tickTemporalFilter(
   }
 
   let uiState: CaptureUiState = "searching"
-  if (input.markerCount < 2) {
+
+  if (input.extremelyBlurry && input.markerCount < 3) {
     uiState = "searching"
-  } else if (input.markerCount < 4) {
-    uiState = "adjusting"
-  } else if (state.greenLatched) {
+  } else if (input.markerCount < 2) {
+    uiState = "searching"
+  } else if (input.markerCount === 2) {
+    uiState = "searching"
+  } else if (state.greenLatched && input.strictMarkerCount === 4) {
     uiState = "ready"
-  } else if (state.smoothScore >= 0.55) {
+  } else if (input.markerCount >= 3) {
     uiState = "almost"
   } else {
     uiState = "adjusting"
@@ -130,7 +135,11 @@ export function tickTemporalFilter(
   state.uiState = uiState
 
   const shouldAutoCapture =
-    state.greenLatched && uiState === "ready" && input.markerCount === 4 && rawNorm >= 0.85
+    state.greenLatched &&
+    uiState === "ready" &&
+    input.strictMarkerCount === 4 &&
+    rawNorm >= 0.88 &&
+    state.stabilityScore10 >= 7
 
   return {
     smoothScore: state.smoothScore,

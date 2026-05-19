@@ -43,6 +43,7 @@ function formatCameraError(e: unknown): string {
 }
 
 export function EstacionMovilClient({ batchId }: Props) {
+  const [captureDebug, setCaptureDebug] = useState(false)
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const autoCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -100,6 +101,11 @@ export function EstacionMovilClient({ batchId }: Props) {
       streamRef.current = null
       if (autoCaptureTimerRef.current) clearTimeout(autoCaptureTimerRef.current)
     }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    setCaptureDebug(new URLSearchParams(window.location.search).get("captureDebug") === "1")
   }, [])
 
   useEffect(() => {
@@ -339,6 +345,7 @@ export function EstacionMovilClient({ batchId }: Props) {
     enabled: OMR_CAPTURE_GUIDE_ENABLED,
     active: scannerActive && !pendingPreview && phase === "scanner",
     videoRef,
+    captureDebug,
     onAutoCapture: () => {
       if (autoCaptureTimerRef.current) return
       markCapturing()
@@ -358,21 +365,6 @@ export function EstacionMovilClient({ batchId }: Props) {
       if (w < 2 || h < 2) {
         setError("La cámara aún no tiene imagen. Espere un segundo e intente de nuevo.")
         return
-      }
-
-      if (OMR_CAPTURE_GUIDE_ENABLED && mode === "manual") {
-        const score = snapshot.score
-        if (score < SCORE_WARN_SEND) {
-          const ok = window.confirm(
-            "La calidad actual es baja y la foto puede fallar en OMR. ¿Tomar la foto de todas formas?",
-          )
-          if (!ok) return
-        } else if (score >= SCORE_WARN_SEND && score < SCORE_AUTO_CAPTURE) {
-          const ok = window.confirm(
-            "La calidad es aceptable pero no óptima. ¿Usar esta foto de todas formas?",
-          )
-          if (!ok) return
-        }
       }
 
       if (OMR_CAPTURE_GUIDE_ENABLED) {
@@ -451,7 +443,6 @@ export function EstacionMovilClient({ batchId }: Props) {
       revokePreview,
       markCapturing,
       resetQuality,
-      snapshot.score,
     ],
   )
 
@@ -460,18 +451,6 @@ export function EstacionMovilClient({ batchId }: Props) {
   const submitPendingPreview = useCallback(async () => {
     if (!pendingPreview) return
 
-    if (OMR_CAPTURE_GUIDE_ENABLED && postCaptureScore != null) {
-      if (postCaptureScore < SCORE_WARN_SEND) {
-        const ok = window.confirm(
-          `${postCaptureMessage ?? "Foto de baja calidad."}\n\n¿Enviar de todas formas?`,
-        )
-        if (!ok) return
-      } else if (postCaptureScore >= SCORE_WARN_SEND && postCaptureScore < SCORE_AUTO_CAPTURE) {
-        const ok = window.confirm("¿Usar esta foto de todas formas?")
-        if (!ok) return
-      }
-    }
-
     const { file, url } = pendingPreview
     const ok = await uploadFile(file)
     if (ok) {
@@ -479,7 +458,7 @@ export function EstacionMovilClient({ batchId }: Props) {
       setPendingPreview(null)
       clearPostCapture()
     }
-  }, [pendingPreview, uploadFile, revokePreview, postCaptureScore, postCaptureMessage, clearPostCapture])
+  }, [pendingPreview, uploadFile, revokePreview, clearPostCapture])
 
   useEffect(() => {
     setPhotosSentCount(0)
@@ -684,8 +663,10 @@ export function EstacionMovilClient({ batchId }: Props) {
                     role="status"
                   >
                     {postCaptureMessage}
-                    {postCaptureScore != null ? (
-                      <span className="block text-xs opacity-80 mt-1">Calidad: {postCaptureScore}/100</span>
+                    {captureDebug && postCaptureScore != null ? (
+                      <span className="block text-xs opacity-80 mt-1 font-mono">
+                        score {postCaptureScore}/100
+                      </span>
                     ) : null}
                   </div>
                 ) : null}
@@ -709,7 +690,9 @@ export function EstacionMovilClient({ batchId }: Props) {
                         ? "Validando…"
                         : pendingPreview
                           ? "Enviar foto"
-                          : "Disparar foto"}
+                          : OMR_CAPTURE_GUIDE_ENABLED
+                            ? "Tomar foto"
+                            : "Disparar foto"}
                   </Button>
                 </div>
               </>

@@ -3,16 +3,17 @@
  */
 
 import { LIBELIA_SHEET_ASPECT_RATIO } from "./constants"
+import { postCaptureMessageForScore } from "./captureGuidance"
+import { detectMarkersV2 } from "./markerDetectV2"
 import {
-  detectBlackSquareMarkers,
   imageDataFromDataUrl,
   scalePointsToFull,
   type SheetQuad,
 } from "./markerDetectV1"
 import {
   analyzeFrame,
-  messageForKey,
   pickDominantMessageKey,
+  resolveTeacherMessage,
   type DominantMessageKey,
 } from "./omrCaptureQuality"
 import { warpPerspectiveToDataUrl } from "../sheet-perspective"
@@ -33,24 +34,22 @@ export async function validatePostCapture(
   dataUrl: string,
   captureWidth: number
 ): Promise<PostCaptureResult> {
-  const loaded = await imageDataFromDataUrl(dataUrl, 640)
+  const loaded = await imageDataFromDataUrl(dataUrl, 720)
   if (!loaded) {
     return {
       score: 0,
-      message: messageForKey("unsafe"),
-      messageKey: "unsafe",
+      message: postCaptureMessageForScore(0),
+      messageKey: "repeat_suggested",
       warpedDataUrl: null,
     }
   }
 
-  const detection = detectBlackSquareMarkers(loaded.imageData)
+  const detection = detectMarkersV2(loaded.imageData)
   const { breakdown, metrics } = analyzeFrame(loaded.imageData, detection, captureWidth, 10)
   const score = breakdown.total
 
-  const messageKey = pickDominantMessageKey(metrics, "review", score)
-  let message = messageForKey(messageKey)
-  if (score >= 85) message = messageForKey("adequate")
-  if (score < 70) message = messageForKey("unsafe")
+  const message = postCaptureMessageForScore(score)
+  const messageKey = pickDominantMessageKey(metrics, "review", detection, score)
 
   let warpedDataUrl: string | null = null
   if (detection.quad && detection.markerCount === 4 && score >= 70) {
@@ -67,6 +66,8 @@ export async function validatePostCapture(
 
   return { score, message, messageKey, warpedDataUrl }
 }
+
+export { resolveTeacherMessage, postCaptureMessageForScore }
 
 export async function dataUrlToJpegFile(
   dataUrl: string,
