@@ -1,193 +1,45 @@
-import { type NextRequest, NextResponse } from "next/server";
-import { ComputerVisionClient } from "@azure/cognitiveservices-computervision";
-import { ApiKeyCredentials } from "@azure/ms-rest-js";
-import OpenAI from "openai";
-import { findBestMatch } from "string-similarity"; // Asegúrate de tener 'string-similarity' instalado
-
-// --- Configuración de APIs ---
-const AZURE_VISION_ENDPOINT = process.env.AZURE_VISION_ENDPOINT!;
-const AZURE_VISION_KEY = process.env.AZURE_VISION_KEY!;
-const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY!;
-const openai = new OpenAI({ apiKey: MISTRAL_API_KEY, baseURL: "https://api.mistral.ai/v1" });
-
-// --- Funciones de Azure OCR (MANTENER SU IMPLEMENTACIÓN ORIGINAL) ---
-async function ocrAzure(imageBuffer: Buffer): Promise<string> {
-    if (!AZURE_VISION_ENDPOINT || !AZURE_VISION_KEY) {
-        throw new Error("Credenciales de Azure no configuradas en el servidor.");
-    }
-    const credentials = new ApiKeyCredentials({ inHeader: { "Ocp-Apim-Subscription-Key": AZURE_VISION_KEY } });
-    const client = new ComputerVisionClient(credentials, AZURE_VISION_ENDPOINT);
-    
-    const result = await client.readInStream(imageBuffer);
-    const operationId = result.operationLocation.split("/").pop()!;
-    let analysisResult;
-    do {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        analysisResult = await client.getReadResult(operationId);
-    } while (analysisResult.status === "running" || analysisResult.status === "notStarted");
-    
-    let fullText = "";
-    if (analysisResult.status === "succeeded" && analysisResult.analyzeResult?.readResults) {
-        analysisResult.analyzeResult.readResults.forEach(readResult => {
-            readResult.lines.forEach(line => {
-                fullText += line.text + " ";
-            });
-        });
-    }
-    return fullText.trim();
-}
-
-// --- FUNCIÓN ORIGINAL: FALLBACK DE IA (Modo 2) ---
-// 🚀 MEJORA: Prompt más estricto para excluir nombres de profesores y asegurar formato array de Nombres de ALUMNOS.
-// Reintentos ante 503/502 (Mistral overload) para mejorar extracción de nombres.
-async function extractNameWithAI(combinedText: string): Promise<string[]> {
-    const prompt = `Actúa como un extractor de datos de un examen o trabajo. Tu ÚNICO OBJETIVO es identificar y extraer los nombres completos de los estudiantes que realizaron el examen. 
-    
-    INSTRUCCIONES CLAVE:
-    1. EXCLUYE de la extracción cualquier nombre que esté asociado o etiquetado como "Profesor", "Docente", "Asignatura", "Curso", "Prueba", "Evaluación" o "Fecha". Concéntrate SÓLO en los nombres de los ALUMNOS.
-    2. Devuelve un array de strings llamado 'suggestions' con TODOS los nombres de ALUMNOS que encuentres (individuales o grupales), en el orden en que aparecen.
-    
-    Si solo encuentras un nombre de alumno, devuélvelo como el único elemento en el array. Si encuentras varios nombres, devuelve todos los nombres identificados (máximo 7).
-    
-    Tu única respuesta debe ser un objeto JSON.
-    
-    Texto OCR para análisis: ${combinedText}
-    
-    Ejemplo de respuesta (trabajo grupal): 
-    {"suggestions": ["Juan Pérez", "Ana Gómez", "Carlos Rojas"]}
-    `;
-
-    const maxRetries = 3
-    const retryStatuses = [502, 503, 429]
-    let lastError: unknown = null
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            const aiResponse = await openai.chat.completions.create({
-                model: "mistral-large-latest",
-                messages: [{ role: "user", content: prompt }],
-                response_format: { type: "json_object" },
-                temperature: 0.1,
-                max_tokens: 500
-            });
-
-            const content = aiResponse.choices[0].message.content;
-            if (!content) {
-                console.error("❌ La respuesta de la IA para extraer nombres vino vacía (null).");
-                return [];
-            }
-            const match = content.match(/({[\s\S]*})/);
-            const cleanedContent = match ? match[1] : "{\"suggestions\":[]}";
-            const result = JSON.parse(cleanedContent);
-            return Array.isArray(result.suggestions) ? result.suggestions : [];
-        } catch (error) {
-            lastError = error
-            const err = error as { status?: number; message?: string }
-            const status = err?.status
-            const msg = err?.message ?? ""
-            const isRetryable = (status != null && retryStatuses.includes(status)) || /503|502|429|overflow/.test(msg)
-            if (isRetryable && attempt < maxRetries) {
-                const delayMs = 2000 * Math.pow(2, attempt - 1)
-                console.warn(`[API /extract-name] Fallback IA error (intento ${attempt}/${maxRetries}), reintento en ${delayMs}ms`);
-                await new Promise(r => setTimeout(r, delayMs))
-            } else {
-                console.error("❌ Fallback de IA falló:", error);
-                return [];
-            }
-        }
-    }
-    console.error("❌ Fallback de IA falló tras reintentos:", lastError);
-    return [];
-}
-
-// --- FUNCIÓN PRINCIPAL: FUZZY MATCHING (Modo 1) ---
-function findTopNameSuggestions(ocrText: string, nameList: string[]): string[] {
-    const ratings: { target: string, rating: number }[] = [];
-    
-    nameList.forEach(name => {
-        const match = findBestMatch(name, [ocrText]);
-        const rating = match.ratings[0].rating;
-        ratings.push({ target: name, rating });
-    });
-
-    ratings.sort((a, b) => b.rating - a.rating);
-    
-    let topSuggestions: string[] = ratings.slice(0, 3).map(r => r.target);
-    topSuggestions = Array.from(new Set(topSuggestions));
-
-    return topSuggestions;
-}
-
+import { type NextRequest, NextResponse } from "next/server"
+import { parseNameListFromForm, runExtractNamePipeline } from "@/app/lib/extract-name-core"
 
 export async function POST(request: NextRequest) {
-    try {
-        const formData = await request.formData();
-        const files = formData.getAll("files") as File[];
-        
-        // --- INICIO DEL CÓDIGO CRÍTICO CON FIX DE ESTABILIDAD ---
-        const nameListJson = formData.get("nameList") as string | null;
-        let nameList: string[] = [];
-        
-        if (nameListJson) {
-            try {
-                // El FIX: Intentamos parsear el JSON dentro de un bloque try-catch.
-                const parsedList = JSON.parse(nameListJson);
-                
-                // Aseguramos que sea un array de strings.
-                if (Array.isArray(parsedList)) {
-                    nameList = parsedList;
-                } else {
-                    console.error("[API /extract-name] nameList JSON era válido, pero no era un array.");
-                }
-            } catch (e) {
-                // Si el JSON es inválido (la causa más común del 500), capturamos el error
-                // y nameList queda como [], forzando el MODO 2 (Fallback de IA).
-                console.error("[API /extract-name] ❌ ERROR CRÍTICO AL PARSEAR JSON. Fallando a MODO 2.", e);
-                // El error está contenido, el código sigue ejecutándose.
-            }
-        }
-        // --- FIN DEL CÓDIGO CRÍTICO CON FIX ---
+  try {
+    const formData = await request.formData()
+    const files = formData.getAll("files") as File[]
+    const nameListJson = formData.get("nameList") as string | null
+    const includeAudit = formData.get("includeAudit") === "1" || formData.get("includeAudit") === "true"
 
-        const isNameListAvailable = nameList.length > 0;
+    const { nameList, parseError: nameListParseError } = parseNameListFromForm(nameListJson)
 
-        console.log(`[API /extract-name] Nombres en lista de clase disponibles: ${isNameListAvailable}`);
-        
-        if (!files.length) {
-            return NextResponse.json({ success: false, error: "No se proporcionaron archivos" }, { status: 400 });
-        }
+    console.log(`[API /extract-name] Nombres en lista de clase disponibles: ${nameList.length > 0}`)
 
-        // 2. Extracción de texto con Azure
-        let combinedText = "";
-        for (const file of files) {
-            const buffer = Buffer.from(await file.arrayBuffer());
-            combinedText += await ocrAzure(buffer) + "\n\n---\n\n";
-        }
-        
-        if (combinedText.trim() === "") {
-             console.error("[API /extract-name] ERROR: Azure OCR no extrajo texto.");
-             return NextResponse.json({ success: true, suggestions: [] });
-        }
-
-        let suggestions: string[] = [];
-
-        if (isNameListAvailable) {
-            // --- MODO 1: FUZZY MATCHING (Rápido) ---
-            console.log("[API /extract-name] 🚀 USANDO MODO 1: Fuzzy Matching (Lista de Nombres).");
-            suggestions = findTopNameSuggestions(combinedText, nameList); 
-        } else {
-            // --- MODO 2: FALLBACK CON IA (Lento, pero seguro) ---
-            console.log("[API /extract-name] 🐌 USANDO MODO 2: Fallback con IA (Sin Lista de Nombres).");
-            suggestions = await extractNameWithAI(combinedText);
-        }
-        
-        console.log(`[API /extract-name] Sugerencias finales devueltas:`, suggestions);
-        
-        // 3. Retorno de Sugerencias
-        return NextResponse.json({ success: true, suggestions }); 
-
-    } catch (error) {
-        console.error("[API /extract-name] ❌ ERROR EN EL BLOQUE POST:", error);
-        // Siempre devolver 200 con suggestions vacías para no bloquear el flujo de evaluación.
-        return NextResponse.json({ success: true, suggestions: [] });
+    const fileBuffers: Array<{ name: string; buffer: Buffer }> = []
+    for (const file of files) {
+      fileBuffers.push({
+        name: file.name || "sin-nombre",
+        buffer: Buffer.from(await file.arrayBuffer()),
+      })
     }
+
+    const result = await runExtractNamePipeline({
+      files: fileBuffers,
+      nameList,
+      nameListParseError,
+      includeAudit,
+    })
+
+    if (!result.success) {
+      return NextResponse.json({ success: false, error: result.error }, { status: 400 })
+    }
+
+    console.log(`[API /extract-name] Sugerencias finales devueltas:`, result.suggestions)
+
+    return NextResponse.json({
+      success: true,
+      suggestions: result.suggestions,
+      ...(result.audit ? { audit: result.audit } : {}),
+    })
+  } catch (error) {
+    console.error("[API /extract-name] ❌ ERROR EN EL BLOQUE POST:", error)
+    return NextResponse.json({ success: true, suggestions: [] })
+  }
 }
