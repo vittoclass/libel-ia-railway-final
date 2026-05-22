@@ -15,6 +15,7 @@ import {
 } from "@/app/lib/pedagogical-graph/handwritingEvidence"
 import { appendHandwritingHistoricalMemory } from "@/app/lib/pedagogical-graph/handwritingHistoricalMemory"
 import { appendIntraEvaluationCoFailures } from "@/app/lib/pedagogical-graph/dynamicRelations"
+import { applyGraphLimits } from "@/app/lib/pedagogical-graph/graphLimits"
 import type {
   BuildGraphSnapshotResult,
   PedagogicalGraphConfidence,
@@ -129,6 +130,9 @@ export async function buildGraphSnapshot(
   supabase: SupabaseClient,
   evaluationId: string
 ): Promise<BuildGraphSnapshotResult> {
+  const buildStartedAt = Date.now()
+  const layersIncluded: string[] = ["core"]
+
   const { data: evaluation, error: evErr } = await supabase
     .from("evaluations")
     .select(
@@ -952,6 +956,9 @@ export async function buildGraphSnapshot(
     nodeMap,
     edgeMap,
   })
+  if (hwResult.evidenceCount > 0) {
+    layersIncluded.push("handwriting_evidence")
+  }
 
   const histMemoryResult = await appendHandwritingHistoricalMemory({
     supabase,
@@ -968,6 +975,9 @@ export async function buildGraphSnapshot(
     nodeMap,
     edgeMap,
   })
+  if (!histMemoryResult.skippedReason) {
+    layersIncluded.push("handwriting_historical")
+  }
 
   const coFailureResult = appendIntraEvaluationCoFailures({
     input: {
@@ -979,6 +989,11 @@ export async function buildGraphSnapshot(
     nodeMap,
     edgeMap,
   })
+  if (coFailureResult.coFailureClustersCount > 0 || coFailureResult.inferredIntraEvalEdgesCount > 0) {
+    layersIncluded.push("intra_eval_co_failure")
+  }
+
+  const buildDurationMs = Date.now() - buildStartedAt
 
   const snapshot: PedagogicalGraphSnapshot = {
     evaluation_id: evaluationId,
@@ -999,5 +1014,11 @@ export async function buildGraphSnapshot(
     },
   }
 
-  return { ok: true, snapshot }
+  const capped = applyGraphLimits({
+    snapshot,
+    buildDurationMs,
+    layersIncluded,
+  })
+
+  return { ok: true, snapshot: capped.snapshot }
 }

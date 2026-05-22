@@ -93,6 +93,20 @@ export interface PedagogicalGraphEdge {
   metadata?: Record<string, unknown>
 }
 
+/** FASE 2C — métricas y límites del snapshot (solo lectura). */
+export interface PedagogicalGraphObservability {
+  node_count: number
+  edge_count: number
+  build_duration_ms: number
+  layers_included: string[]
+  caps_applied: string[]
+  warnings: string[]
+  degraded: boolean
+  nodes_before_cap?: number
+  edges_before_cap?: number
+  response_bytes_estimate?: number
+}
+
 export interface PedagogicalGraphSummary {
   skills_count: number
   items_count: number
@@ -118,6 +132,8 @@ export interface PedagogicalGraphSnapshot {
   nodes: PedagogicalGraphNode[]
   edges: PedagogicalGraphEdge[]
   summary: PedagogicalGraphSummary
+  /** FASE 2C — observabilidad y estado de degradación (no altera nodos/aristas del núcleo). */
+  observability?: PedagogicalGraphObservability
 }
 
 export type BuildGraphSnapshotResult =
