@@ -123,6 +123,12 @@ import { TemplateOverlayOMRModal } from "@/app/components/TemplateOverlayOMRModa
 import { OMRSheetGeneratorModal } from "@/app/components/OMRSheetGeneratorModal"
 import { RobustLibeliaOMRModal } from "@/app/components/RobustLibeliaOMRModal"
 import ClosedAnswerOMRModal from "@/app/components/ClosedAnswerOMRModal"
+import {
+  NominalNameSuggestionBanner,
+  flushNominalMemoryForGroup,
+} from "@/app/components/evaluator/NominalNameSuggestionBanner"
+import { isGenericNominalName } from "@/app/lib/pedagogical-graph/nominalIdentity"
+import { extractStudentNameFromSummaryRaw } from "@/app/lib/student-display-name"
 import DevAdminPanel from "@/app/components/DevAdminPanel"
 import {
   applyGuidedWizardSessionToEvaluatorForm,
@@ -614,6 +620,8 @@ const calculateFinalScore = (
 interface StudentGroup {
   id: string
   studentName: string
+  /** Nombre leído por OCR/extract-name; no reemplaza la edición manual. */
+  observedOcrName?: string | null
   studentRut?: string
   files: FilePreview[]
   retroalimentacion?: RetroalimentacionEstructurada
@@ -696,6 +704,89 @@ function isGenericStudentSlotName(name: string | undefined): boolean {
   return false
 }
 
+const UUID_COURSE_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+/** Curso del formulario: etiqueta libre o UUID real (nunca enviar texto como course_id). */
+function resolveNominalCourseContext(curso: string | null | undefined): {
+  courseLabel: string | null
+  courseId: string | null
+} {
+  const t = (curso ?? "").trim()
+  if (!t) return { courseLabel: null, courseId: null }
+  if (UUID_COURSE_ID_RE.test(t)) return { courseLabel: null, courseId: t }
+  return { courseLabel: t, courseId: null }
+}
+
+/** Extrae nombre OCR observado desde payloads de evaluate, summary o raw (sin usar nombre confirmado). */
+function pickObservedNameFromUnknown(source: unknown): string | null {
+  if (source == null) return null
+  if (typeof source === "string") {
+    const t = source.trim()
+    return t && !isGenericNominalName(t) ? t : null
+  }
+  if (typeof source !== "object" || Array.isArray(source)) return null
+  const o = source as Record<string, unknown>
+  const fromRaw = extractStudentNameFromSummaryRaw(o.raw ?? o)
+  if (fromRaw && !isGenericNominalName(fromRaw)) return fromRaw
+  for (const key of [
+    "nombreEstudianteDetectado",
+    "student_name_raw",
+    "nombre_estudiante",
+    "nombreEstudiante",
+    "alumno",
+  ]) {
+    const v = o[key]
+    if (typeof v === "string") {
+      const t = v.trim()
+      if (t && !isGenericNominalName(t)) return t
+    }
+  }
+  return null
+}
+
+function pickObservedFromEvaluationDetailPayload(body: unknown): string | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null
+  const o = body as Record<string, unknown>
+  const summary = o.summary ?? o.evaluation_summaries
+  const fromSummary = pickObservedNameFromUnknown(summary)
+  if (fromSummary) return fromSummary
+  const summaries = o.summaries
+  if (Array.isArray(summaries)) {
+    for (const row of summaries) {
+      const n = pickObservedNameFromUnknown(row)
+      if (n) return n
+    }
+  }
+  return null
+}
+
+function mergeObservedOcrName(
+  current: string | null | undefined,
+  incoming: string | null | undefined,
+): string | null {
+  const inc = (incoming ?? "").trim()
+  if (!inc || isGenericNominalName(inc)) return current?.trim() ? current.trim() : null
+  return inc
+}
+
+/**
+ * Registra observación OCR sin auto-confirmar. `studentName` solo se rellena si el slot manual es genérico.
+ */
+function applyNominalObservationToGroup(
+  group: StudentGroup,
+  observedRaw: string | null | undefined,
+  opts?: { fillManualIfGeneric?: boolean },
+): StudentGroup {
+  const observed = (observedRaw ?? "").trim()
+  if (!observed || isGenericNominalName(observed)) return group
+  const nextObserved = mergeObservedOcrName(group.observedOcrName, observed) ?? observed
+  const fillManual = opts?.fillManualIfGeneric !== false
+  const studentName =
+    fillManual && isGenericStudentSlotName(group.studentName) ? observed : group.studentName
+  return { ...group, observedOcrName: nextObserved, studentName }
+}
+
 function mergeMobileBatchIntoEvaluatorState(
   prevGroups: StudentGroup[],
   prevUnassigned: FilePreview[],
@@ -733,12 +824,18 @@ function mergeMobileBatchIntoEvaluatorState(
     if (slotName.length > 0 && isGenericStudentSlotName(g.studentName)) newName = slotName
     let newRut = g.studentRut ?? ""
     if (rut && !String(g.studentRut ?? "").trim()) newRut = rut
-    next[i] = {
+    let merged: StudentGroup = {
       ...g,
       studentName: newName,
       studentRut: newRut,
       promotedEvaluationId: slot.evaluation_id || g.promotedEvaluationId || null,
     }
+    if (slotName.length > 0) {
+      merged = applyNominalObservationToGroup(merged, slotName, {
+        fillManualIfGeneric: isGenericStudentSlotName(g.studentName),
+      })
+    }
+    next[i] = merged
   }
 
   const orphans: FilePreview[] = []
@@ -930,6 +1027,13 @@ const MOBILE_BATCH_SYNC_TIMEOUT_MS = 15000
 const MOBILE_BATCH_POLL_INTERVAL_MS = 13000
 /** Coalescer ráfagas INSERT (Realtime + BroadcastChannel) para no spamear sync. */
 const MOBILE_BATCH_REALTIME_DEBOUNCE_MS = 550
+
+function isBrowserNetworkFetchError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  if (error.name === "TypeError") return true
+  const msg = error.message.toLowerCase()
+  return msg.includes("failed to fetch") || msg.includes("networkerror") || msg.includes("load failed")
+}
 
 /** Misma configuración de red para todo GET de detalle de evaluación (modal informe + historial). */
 const INFORME_DETAIL_FETCH_INIT: RequestInit = {
@@ -2386,11 +2490,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       setStudentGroups((prev) =>
         prev.map((g) => {
           if (g.id !== closedAnswerTargetGroupId) return g
-          return {
-            ...g,
-            alternativas_corregidas: alternativasCorregidas,
-            studentName: result.alumnoDetectado || g.studentName,
-          }
+          return applyNominalObservationToGroup(
+            { ...g, alternativas_corregidas: alternativasCorregidas },
+            result.alumnoDetectado ?? null,
+            { fillManualIfGeneric: isGenericStudentSlotName(g.studentName) },
+          )
         })
       )
     } else {
@@ -2400,20 +2504,20 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         if (targetIdx === -1 && prev.length > 0) {
           // Si todos tienen, asignar al primero
           const updated = [...prev]
-          updated[0] = {
-            ...updated[0],
-            alternativas_corregidas: alternativasCorregidas,
-            studentName: result.alumnoDetectado || updated[0].studentName,
-          }
+          updated[0] = applyNominalObservationToGroup(
+            { ...updated[0], alternativas_corregidas: alternativasCorregidas },
+            result.alumnoDetectado ?? null,
+            { fillManualIfGeneric: isGenericStudentSlotName(updated[0].studentName) },
+          )
           return updated
         }
         return prev.map((g, idx) => {
           if (idx !== targetIdx) return g
-          return {
-            ...g,
-            alternativas_corregidas: alternativasCorregidas,
-            studentName: result.alumnoDetectado || g.studentName,
-          }
+          return applyNominalObservationToGroup(
+            { ...g, alternativas_corregidas: alternativasCorregidas },
+            result.alumnoDetectado ?? null,
+            { fillManualIfGeneric: isGenericStudentSlotName(g.studentName) },
+          )
         })
       })
     }
@@ -2534,9 +2638,16 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         const allNamesList = detectedNames.map((n) => n.trim())
         const visibleGroupName = allNamesList.join(", ")
 
+        const primaryObserved = allNamesList[0] ?? visibleGroupName
         setStudentGroups((groups) => {
           if (groups.length === 0) return groups
-          return groups.map((g) => (g.id === groupId ? { ...g, studentName: visibleGroupName } : g))
+          return groups.map((g) =>
+            g.id !== groupId
+              ? g
+              : applyNominalObservationToGroup(g, primaryObserved, {
+                  fillManualIfGeneric: isGenericStudentSlotName(g.studentName),
+                }),
+          )
         })
       } else {
         alert("No se detectó ningún nombre.")
@@ -2587,19 +2698,76 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       let offset = 0
       const pageSize = MAX_BATCH_PHOTO_PAGE_SIZE
       let pages = 0
+      const isSyncAbortError = (error: unknown): boolean =>
+        (error instanceof DOMException && error.name === "AbortError") ||
+        (error instanceof Error && error.name === "AbortError")
+
       while (pages < 64) {
         pages++
-        const controller = new AbortController()
-        const timeoutId = window.setTimeout(() => controller.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
-        const r = await fetch(
-          `/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}&offset=${offset}&limit=${pageSize}`,
-          { signal: controller.signal },
-        ).finally(() => window.clearTimeout(timeoutId))
-        const j = (await r.json().catch(() => ({}))) as {
+        let r: Response | null = null
+        let j: {
           error?: string
           photos?: PhotoRow[]
           slots?: MobileBatchSlot[]
           meta?: { has_more?: boolean; next_offset?: number | null }
+        } = {}
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const controller = new AbortController()
+          let timeoutId: ReturnType<typeof window.setTimeout> | undefined
+          try {
+            timeoutId = window.setTimeout(() => controller.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
+            r = await fetch(
+              `/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}&offset=${offset}&limit=${pageSize}`,
+              { signal: controller.signal },
+            )
+            j = (await r.json().catch(() => ({}))) as typeof j
+            break
+          } catch (error: unknown) {
+            if (isSyncAbortError(error)) {
+              console.warn("[syncMobileBatchPhotos] batch-evaluar-sync timeout", {
+                batchId,
+                offset,
+                attempt,
+              })
+              if (attempt === 0) continue
+              toast({
+                title: "Sincronización del lote",
+                description: "La sincronización móvil tardó demasiado. Puedes reintentar.",
+              })
+              return {
+                ok: false,
+                reason: "api_error",
+                message: "La sincronización móvil tardó demasiado. Puedes reintentar.",
+              }
+            }
+            if (isBrowserNetworkFetchError(error)) {
+              console.warn("[syncMobileBatchPhotos] batch-evaluar-sync network error", {
+                batchId,
+                offset,
+                attempt,
+                error,
+              })
+              toast({
+                title: "Sincronización del lote",
+                description: "No se pudo conectar con el servidor. Revisa tu red e intenta de nuevo.",
+              })
+              return {
+                ok: false,
+                reason: "api_error",
+                message: "No se pudo conectar con el servidor.",
+              }
+            }
+            throw error
+          } finally {
+            if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+          }
+        }
+        if (!r) {
+          return {
+            ok: false,
+            reason: "api_error",
+            message: "La sincronización móvil tardó demasiado. Puedes reintentar.",
+          }
         }
         if (!r.ok) {
           if (j?.error) {
@@ -2724,6 +2892,45 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   syncMobileBatchPhotosRef.current = syncMobileBatchPhotos
 
+  /** Hidrata observedOcrName desde evaluación persistida (student_name_raw / raw) sin tocar evaluate. */
+  const nominalEvalHydratedRef = React.useRef(new Set<string>())
+  useEffect(() => {
+    if (activeTab !== "evaluator") return
+    const pending = studentGroups.filter((g) => {
+      const evalId = g.evaluation_id ?? g.promotedEvaluationId
+      if (!evalId || nominalEvalHydratedRef.current.has(evalId)) return false
+      return !(g.observedOcrName != null && String(g.observedOcrName).trim() !== "")
+    })
+    if (pending.length === 0) return
+    let cancelled = false
+    ;(async () => {
+      for (const g of pending.slice(0, 16)) {
+        if (cancelled) break
+        const evalId = (g.evaluation_id ?? g.promotedEvaluationId)!
+        nominalEvalHydratedRef.current.add(evalId)
+        try {
+          const r = await fetch(`/api/evaluations/${encodeURIComponent(evalId)}`, { cache: "no-store" })
+          if (!r.ok) continue
+          const j = await r.json()
+          const observed = pickObservedFromEvaluationDetailPayload(j)
+          if (!observed) continue
+          setStudentGroups((prev) =>
+            prev.map((x) =>
+              x.id === g.id
+                ? applyNominalObservationToGroup(x, observed, { fillManualIfGeneric: false })
+                : x,
+            ),
+          )
+        } catch {
+          /* hidratación nominal best-effort */
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [activeTab, studentGroups])
+
   const handleManualRecoverMobileBatchPhotos = useCallback(async () => {
     setRecoverMobileBatchPhotosLoading(true)
     try {
@@ -2847,9 +3054,15 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         const detectedNames = Array.isArray(data.suggestions) ? (data.suggestions as string[]) : []
         const numDetected = detectedNames.length
         if (numDetected > 0) {
-          const visibleGroupName = detectedNames.map((n) => n.trim()).join(", ")
+          const primaryObserved = detectedNames[0]?.trim() ?? detectedNames.map((n) => n.trim()).join(", ")
           setStudentGroups((groups) =>
-            groups.map((g) => (g.id === grp.id ? { ...g, studentName: visibleGroupName } : g)),
+            groups.map((g) =>
+              g.id !== grp.id
+                ? g
+                : applyNominalObservationToGroup(g, primaryObserved, {
+                    fillManualIfGeneric: isGenericStudentSlotName(g.studentName),
+                  }),
+            ),
           )
           found++
         } else {
@@ -3037,6 +3250,14 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     const group = studentGroups.find((g) => g.id === groupId)
     if (!group || group.files.length === 0) return false
 
+    const nominalCourse = resolveNominalCourseContext(form.getValues("curso"))
+    await flushNominalMemoryForGroup({
+      observedNameRaw: group.observedOcrName,
+      manualName: group.studentName,
+      evaluationId: group.evaluation_id ?? group.promotedEvaluationId ?? null,
+      courseLabel: nominalCourse.courseLabel,
+    })
+
     setStudentGroups((prev) =>
       prev.map((g) => (g.id === groupId ? { ...g, isEvaluating: true, isEvaluated: false, error: undefined } : g)),
     )
@@ -3204,31 +3425,35 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             }
             setShowRetrySaveButton(true)
           }
-          return {
-            ...g,
-            isEvaluating: false,
-            isEvaluated: true,
-            isValidationStep: false,
-            retroalimentacion: result.retroalimentacion,
-            puntaje: result.puntaje,
-            nota: result.nota,
-            detalle_desarrollo: result.detalle_desarrollo,
-            puntosAprobacion: result.puntosAprobacion,
-            puntosMaximos: result.puntosMaximos,
-            alternativas_corregidas:
-              result.alternativas_corregidas || result.retroalimentacion?.retroalimentacion_alternativas,
-            shouldUseOfficialAzureOmr: result.shouldUseOfficialAzureOmr,
-            officialOmrActivationReason: result.officialOmrActivationReason,
-            officialOmrIntegrationEnabled: result.officialOmrIntegrationEnabled,
-            officialOmrEngineSelected: result.officialOmrEngineSelected,
-            officialOmrEngineUsed: result.officialOmrEngineUsed,
-            officialOmrFallbackUsed: result.officialOmrFallbackUsed,
-            officialOmrFallbackReason: result.officialOmrFallbackReason ?? null,
-            omrDebug: result.omrDebug,
+          return applyNominalObservationToGroup(
+            {
+              ...g,
+              isEvaluating: false,
+              isEvaluated: true,
+              isValidationStep: false,
+              retroalimentacion: result.retroalimentacion,
+              puntaje: result.puntaje,
+              nota: result.nota,
+              detalle_desarrollo: result.detalle_desarrollo,
+              puntosAprobacion: result.puntosAprobacion,
+              puntosMaximos: result.puntosMaximos,
+              alternativas_corregidas:
+                result.alternativas_corregidas || result.retroalimentacion?.retroalimentacion_alternativas,
+              shouldUseOfficialAzureOmr: result.shouldUseOfficialAzureOmr,
+              officialOmrActivationReason: result.officialOmrActivationReason,
+              officialOmrIntegrationEnabled: result.officialOmrIntegrationEnabled,
+              officialOmrEngineSelected: result.officialOmrEngineSelected,
+              officialOmrEngineUsed: result.officialOmrEngineUsed,
+              officialOmrFallbackUsed: result.officialOmrFallbackUsed,
+              officialOmrFallbackReason: result.officialOmrFallbackReason ?? null,
+              omrDebug: result.omrDebug,
               evaluationTrace: { payload: evaluationTracePayload },
-            error: undefined,
-            evaluation_id: (result as { evaluation_id?: string }).evaluation_id ?? undefined,
-          }
+              error: undefined,
+              evaluation_id: (result as { evaluation_id?: string }).evaluation_id ?? undefined,
+            },
+            pickObservedNameFromUnknown(result),
+            { fillManualIfGeneric: false },
+          )
         } else {
           return {
             ...g,
@@ -3505,25 +3730,29 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               const msg = snapshot.get(g.id)
               if (!msg) return g
               if (msg.success && msg.data) {
-                return {
-                  ...g,
-                  isEvaluating: false,
-                  isEvaluated: true,
-                  isValidationStep: false,
-                  retroalimentacion: msg.data.retroalimentacion,
-                  puntaje: msg.data.puntaje,
-                  nota: msg.data.nota,
-                  detalle_desarrollo: msg.data.detalle_desarrollo,
-                  puntosAprobacion: msg.data.puntosAprobacion,
-                  puntosMaximos: msg.data.puntosMaximos,
-                  alternativas_corregidas:
-                    msg.data.alternativas_corregidas ||
-                    msg.data.retroalimentacion?.retroalimentacion_alternativas,
-                  omrDebug: msg.data.omrDebug,
-                  evaluationTrace: { payload: evaluationTracePayloadCommon },
-                  error: undefined,
-                  evaluation_id: (msg.data as { evaluation_id?: string }).evaluation_id ?? undefined,
-                }
+                return applyNominalObservationToGroup(
+                  {
+                    ...g,
+                    isEvaluating: false,
+                    isEvaluated: true,
+                    isValidationStep: false,
+                    retroalimentacion: msg.data.retroalimentacion,
+                    puntaje: msg.data.puntaje,
+                    nota: msg.data.nota,
+                    detalle_desarrollo: msg.data.detalle_desarrollo,
+                    puntosAprobacion: msg.data.puntosAprobacion,
+                    puntosMaximos: msg.data.puntosMaximos,
+                    alternativas_corregidas:
+                      msg.data.alternativas_corregidas ||
+                      msg.data.retroalimentacion?.retroalimentacion_alternativas,
+                    omrDebug: msg.data.omrDebug,
+                    evaluationTrace: { payload: evaluationTracePayloadCommon },
+                    error: undefined,
+                    evaluation_id: (msg.data as { evaluation_id?: string }).evaluation_id ?? undefined,
+                  },
+                  pickObservedNameFromUnknown(msg.data),
+                  { fillManualIfGeneric: false },
+                )
               }
               return { ...g, isEvaluating: false, error: msg.error || "Error en la evaluacion" }
             }),
@@ -5770,7 +5999,28 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                                 placeholder="Escribe nombre y apellido si no se detectó solo"
                                 value={group.studentName}
                                 onChange={(e) => updateStudentName(group.id, e.target.value)}
+                                onBlur={(e) => {
+                                  console.log("[nominal blur fired]")
+                                  const nominalCourse = resolveNominalCourseContext(form.watch("curso"))
+                                  void flushNominalMemoryForGroup({
+                                    observedNameRaw: group.observedOcrName,
+                                    manualName: e.currentTarget.value,
+                                    evaluationId: group.evaluation_id ?? group.promotedEvaluationId ?? null,
+                                    courseLabel: nominalCourse.courseLabel,
+                                  })
+                                }}
                                 aria-label="Nombre del estudiante"
+                              />
+                              <NominalNameSuggestionBanner
+                                observedNameRaw={group.observedOcrName}
+                                currentManualName={group.studentName}
+                                courseLabel={
+                                  resolveNominalCourseContext(form.watch("curso")).courseLabel
+                                }
+                                courseId={resolveNominalCourseContext(form.watch("curso")).courseId}
+                                evaluationId={group.evaluation_id ?? group.promotedEvaluationId ?? null}
+                                disabled={isLoading || batchProgress.isActive || isExtractingNames}
+                                onApplyConfirmedName={(name) => updateStudentName(group.id, name)}
                               />
                             </div>
                             <div className="flex flex-wrap items-center gap-2 shrink-0 pt-5">
