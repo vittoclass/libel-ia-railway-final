@@ -2713,7 +2713,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         } = {}
         for (let attempt = 0; attempt < 2; attempt++) {
           const controller = new AbortController()
-          let timeoutId: ReturnType<typeof window.setTimeout> | undefined
+          let timeoutId: number | undefined
           try {
             timeoutId = window.setTimeout(() => controller.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
             r = await fetch(

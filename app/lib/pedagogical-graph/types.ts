@@ -39,6 +39,11 @@ export type PedagogicalGraphNodeType =
   | "failure_pattern"
   | "co_occurrence_cluster"
   | "inferred_relation"
+  /** FASE 3B — identidad nominal en grafo (solo evidencia) */
+  | "name_observation"
+  | "name_candidate"
+  | "possible_student_match"
+  | "nominal_confirmation"
 
 export type PedagogicalGraphConfidence = "high" | "medium" | "low"
 
@@ -74,6 +79,11 @@ export type PedagogicalGraphEdgeType =
   | "co_fails_with"
   | "has_inferred_pattern"
   | "supported_by"
+  /** FASE 3B — identidad nominal en grafo */
+  | "has_name_observation"
+  | "has_possible_student_match"
+  | "suggests_name_candidate"
+  | "teacher_confirmed_match"
 
 export interface PedagogicalGraphNode {
   id: string

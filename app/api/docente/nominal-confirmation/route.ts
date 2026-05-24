@@ -37,7 +37,7 @@ const CONFIRMATION_TYPES = new Set<NominalConfirmationType>([
 ])
 
 /** Schema POST esperado (JSON). */
-export const NOMINAL_CONFIRMATION_BODY_SCHEMA = {
+const NOMINAL_CONFIRMATION_BODY_SCHEMA = {
   observed_name_raw: "string (requerido, no vacío)",
   confirmed_display_name: "string | null (requerido salvo ignored)",
   confirmation_type: "exact_match | manual_override | suggested_match | ignored",
