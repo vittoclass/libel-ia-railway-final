@@ -19,6 +19,8 @@ import {
 } from "recharts"
 import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
 import { formatStudentDisplayName } from "@/app/lib/format-student-name"
+import { paesMethodologyUiPhrase } from "@/app/lib/paesProjectionCanonical"
+import { SIMCE_PROJECTION_DISCLAIMER } from "@/app/lib/simceProjectionCanonical"
 import type { PedagogicalAnalysisExportData } from "@/app/lib/pedagogical-analysis-export-types"
 
 export type PedagogicalAnalysisReportBodyProps = {
@@ -189,12 +191,21 @@ function PedagogicalAnalysisInner({
               <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
                 <p className="text-xs font-medium text-[var(--text-muted)]">SIMCE (ESTIMADO)</p>
                 <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.simce_estimated)}</p>
+                <p className="text-xs text-[var(--text-muted)] mt-1">
+                  {data.projections.simce_projection_disclaimer ?? SIMCE_PROJECTION_DISCLAIMER}
+                </p>
               </div>
             )}
             {(mode === "PAES" || data.projections.paes_estimated != null) && (
               <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
                 <p className="text-xs font-medium text-[var(--text-muted)]">PAES (ESTIMADO)</p>
                 <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.paes_estimated)}</p>
+                {(() => {
+                  const phrase = paesMethodologyUiPhrase(data.projections.paes_projection_meta)
+                  return phrase ? (
+                    <p className="text-xs text-[var(--text-muted)] mt-1">{phrase}</p>
+                  ) : null
+                })()}
               </div>
             )}
           </div>

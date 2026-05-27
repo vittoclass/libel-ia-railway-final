@@ -3,6 +3,7 @@ import { institutionalTenantScopeFromProfile } from "@/app/lib/evaluation-read-s
 import { getAuthUser } from "@/app/lib/supabase-route"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
 import { isMasterEmail } from "@/app/lib/master-access"
+import type { PaesProjectionMeta } from "@/app/lib/paesProjectionCanonical"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 
 export const dynamic = "force-dynamic"
@@ -156,7 +157,7 @@ export async function GET(_req: NextRequest) {
     if (master) {
       const r = await supabase
         .from("student_projections")
-        .select("id, organization_id, student_id, evaluation_id, logro_pct, simce_level_label, paes_estimated, risk_level, calculated_at")
+        .select("id, organization_id, student_id, evaluation_id, logro_pct, simce_level_label, paes_estimated, risk_level, calculated_at, parameters_snapshot")
         .order("calculated_at", { ascending: false })
         .limit(150)
       projections = (r.data ?? []) as Array<Record<string, unknown>>
@@ -164,12 +165,19 @@ export async function GET(_req: NextRequest) {
     } else if (institutionalScopeId) {
       const r = await supabase
         .from("student_projections")
-        .select("id, organization_id, student_id, evaluation_id, logro_pct, simce_level_label, paes_estimated, risk_level, calculated_at")
+        .select("id, organization_id, student_id, evaluation_id, logro_pct, simce_level_label, paes_estimated, risk_level, calculated_at, parameters_snapshot")
         .eq("organization_id", institutionalScopeId)
         .order("calculated_at", { ascending: false })
         .limit(150)
       projections = (r.data ?? []) as Array<Record<string, unknown>>
       projectionsErr = r.error
+    }
+
+    function paesMetaFromSnapshot(snapshot: unknown): PaesProjectionMeta | null {
+      if (!snapshot || typeof snapshot !== "object") return null
+      const meta = (snapshot as { paes_projection_meta?: PaesProjectionMeta }).paes_projection_meta
+      if (!meta || meta.scoring_engine !== "paes_practice") return null
+      return meta
     }
 
     const riskRows = ((projections ?? []) as Array<{
@@ -181,6 +189,7 @@ export async function GET(_req: NextRequest) {
       paes_estimated: number | null
       risk_level: string | null
       calculated_at: string | null
+      parameters_snapshot?: unknown
     }>)
       .filter((r) => {
         const k = String(r.risk_level ?? "").toUpperCase()
@@ -194,6 +203,8 @@ export async function GET(_req: NextRequest) {
         logro_pct: Number(r.logro_pct) || 0,
         agency_level: r.simce_level_label ?? null,
         paes_estimated: r.paes_estimated ?? null,
+        paes_projection_meta:
+          r.paes_estimated != null ? paesMetaFromSnapshot(r.parameters_snapshot) : null,
         risk_level: r.risk_level ?? null,
         calculated_at: r.calculated_at ?? null,
       }))

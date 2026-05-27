@@ -55,8 +55,11 @@ export type PedagogicalAnalysisExportData = {
   projections?: {
     simce_estimated: number | null
     paes_estimated: number | null
+    paes_projection_meta?: import("@/app/lib/paesProjectionCanonical").PaesProjectionMeta | null
     level_label: "Insuficiente" | "Elemental" | "Adecuado" | null
     year?: number
+    simce_projection_type?: "referential"
+    simce_projection_disclaimer?: string
   }
   strategic_analysis?: {
     paragraph: string

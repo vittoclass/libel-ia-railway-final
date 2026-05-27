@@ -10,6 +10,8 @@ import {
   getDemreTable,
   paesFromCorrectas,
 } from "@/app/lib/services/pedagogical"
+import { paesProjectionMetaForMethodology } from "@/app/lib/paesProjectionCanonical"
+import { resolvePaesSubjectFromContext } from "@/app/lib/paesSubjectResolver"
 import { projectPaesFromLogroPct, projectSimceFromLogroPct } from "@/app/lib/standard-scale-converters"
 
 export type UpsertStudentProjectionResult =
@@ -135,7 +137,9 @@ export async function upsertStudentProjectionFromEvaluation(
 ): Promise<UpsertStudentProjectionResult> {
   const { data: evaluation, error: evalErr } = await supabase
     .from("evaluations")
-    .select("id, teacher_id, course_id")
+    .select(
+      "id, teacher_id, course_id, title, exam_type, assessment_category, subject, course_label, source_exam_id"
+    )
     .eq("id", evaluationId)
     .maybeSingle()
 
@@ -177,7 +181,58 @@ export async function upsertStudentProjectionFromEvaluation(
   const gradeLevel = (input?.gradeLevel ?? "2M").trim().toUpperCase()
   const subject = (input?.subject ?? "GENERAL").trim().toUpperCase()
   const paesApplication = input?.paesApplication ?? "REGULAR"
-  const paesSubject = (input?.paesSubject ?? "COMPETENCIA_LECTORA").trim().toUpperCase()
+
+  const evalRow = evaluation as {
+    title?: string | null
+    exam_type?: string | null
+    assessment_category?: string | null
+    subject?: string | null
+    course_label?: string | null
+    source_exam_id?: string | null
+  }
+
+  let sourceExamTitle: string | null = null
+  let sourceExamSubject: string | null = null
+  const sourceExamId = String(evalRow.source_exam_id ?? "").trim()
+  if (sourceExamId) {
+    const { data: sourceExam } = await supabase
+      .from("source_exams")
+      .select("title, subject")
+      .eq("id", sourceExamId)
+      .maybeSingle()
+    sourceExamTitle = String((sourceExam as { title?: string | null } | null)?.title ?? "").trim() || null
+    sourceExamSubject = String((sourceExam as { subject?: string | null } | null)?.subject ?? "").trim() || null
+  }
+
+  const fallbackPaesSubject = (input?.paesSubject ?? "COMPETENCIA_LECTORA").trim().toUpperCase()
+  const resolverEnabled = process.env.PAES_SUBJECT_RESOLVER_ENABLED === "true"
+  const explicitPaesSubject = input?.paesSubject != null && String(input.paesSubject).trim() !== ""
+
+  const resolvedPaes = resolvePaesSubjectFromContext({
+    exam_type: evalRow.exam_type,
+    assessment_category: evalRow.assessment_category,
+    subject: evalRow.subject ?? input?.subject,
+    source_exam_title: sourceExamTitle,
+    source_exam_subject: sourceExamSubject,
+    course_label: evalRow.course_label,
+    evaluation_title: evalRow.title,
+  })
+
+  const useResolvedPaesSubject =
+    resolverEnabled &&
+    !explicitPaesSubject &&
+    resolvedPaes.confidence === "high" &&
+    resolvedPaes.paesSubject != null
+
+  const paesSubject = useResolvedPaesSubject ? resolvedPaes.paesSubject! : fallbackPaesSubject
+
+  const paesSubjectResolution = {
+    enabled: resolverEnabled,
+    resolved_subject: resolvedPaes.paesSubject,
+    confidence: resolvedPaes.confidence,
+    reasons: resolvedPaes.reasons,
+    used: useResolvedPaesSubject,
+  }
 
   const [agency, demre] = await Promise.all([
     getAgencyCuts({
@@ -204,6 +259,9 @@ export async function upsertStudentProjectionFromEvaluation(
   const demreScore = paesFromCorrectas(correctAnswers, demre.rows)
   const paesFromLogro = projectPaesFromLogroPct(logroPct)
   const paesEstimated = Math.round(Math.max(100, demreScore ?? paesFromLogro))
+  const paes_projection_meta = paesProjectionMetaForMethodology(
+    demreScore != null ? "demre_table" : "linear_fallback",
+  )
 
   const agencyLevel = agencyLevelFromPct(logroPct, agency.cuts)
   const risk = riskLevelFromLogroPct(logroPct)
@@ -214,6 +272,8 @@ export async function upsertStudentProjectionFromEvaluation(
 
   const parametersSnapshot = {
     source_label: sourceLabel,
+    paes_projection_meta,
+    paes_subject_resolution: paesSubjectResolution,
     agency: {
       key: agency.parameterKey,
       year_used: agency.yearUsed,

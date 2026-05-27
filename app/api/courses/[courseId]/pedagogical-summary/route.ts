@@ -20,6 +20,8 @@ import {
   type LogroByQuestion,
 } from "@/app/lib/analyze-learning-results"
 import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
+import { paesProjectionMetaForMethodology, type PaesProjectionMeta } from "@/app/lib/paesProjectionCanonical"
+import { simceProjectionMetadata } from "@/app/lib/simceProjectionCanonical"
 import {
   clampLogroPctFromScores,
   projectPaesFromLogroPct,
@@ -73,6 +75,8 @@ type NationalAnalyticsRow = {
   logro_pct: number | null
   /** Solo modo PAES; null si instrumento es SIMCE u otro. */
   paes_score: number | null
+  /** Metadata metodología PAES; null si no aplica. */
+  paes_projection_meta: PaesProjectionMeta | null
   /** Solo modo SIMCE; null si instrumento es PAES u otro. */
   simce_score: number | null
   /** Nivel estilo Agencia/SIMCE; null si instrumento es PAES u otro. */
@@ -553,6 +557,7 @@ function toNationalAnalyticsRows(params: {
     const mode = params.instrumentModeByEvaluationId.get(evaluationId) ?? "INSTITUTIONAL_OTHER"
     const lp = Number(logro_pct ?? 0)
     let paes_score: number | null = null
+    let paes_projection_meta: PaesProjectionMeta | null = null
     let simce_score: number | null = null
     let simce_level: SimceLevel | null = null
     if (mode === "SIMCE") {
@@ -560,6 +565,7 @@ function toNationalAnalyticsRows(params: {
       simce_level = simceLevelFromLogroPct(lp)
     } else if (mode === "PAES") {
       paes_score = projectPaesFromLogroPct(lp)
+      paes_projection_meta = paesProjectionMetaForMethodology("linear_fallback")
     }
     rows.push({
       evaluation_id: evaluationId,
@@ -569,6 +575,7 @@ function toNationalAnalyticsRows(params: {
       score_max,
       logro_pct,
       paes_score,
+      paes_projection_meta,
       simce_score,
       simce_level,
       instrument_analytics_mode: mode,
@@ -676,6 +683,7 @@ export async function GET(
 
   const emptyNationalAnalytics = {
     enabled: ENABLE_NATIONAL_ANALYTICS,
+    paes_projection_meta: null as PaesProjectionMeta | null,
     by_evaluation: [] as NationalAnalyticsRow[],
     course_summary: {
       average_note_7: null as number | null,
@@ -1164,6 +1172,9 @@ export async function GET(
     }
     national_analytics = {
       enabled: true,
+      ...simceProjectionMetadata(),
+      paes_projection_meta:
+        paesRows.length > 0 ? paesProjectionMetaForMethodology("linear_fallback") : null,
       by_evaluation: byEvaluation,
       course_summary: {
         average_note_7,

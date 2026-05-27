@@ -1,3 +1,5 @@
+import { agencyAchievementLevelFromLogroPct } from "@/app/lib/chile-standards/agency-level-cuts"
+import { projectCanonicalSimce } from "@/app/lib/simceProjectionCanonical"
 import { NATIONAL_SCALE_TABLE_2026, type NationalScaleAnchor } from "@/app/lib/standard-scale/tables/2026"
 
 // PHASE_2_SCALES_V1
@@ -45,16 +47,15 @@ export function convertToNationalScore(
   year: number = 2026
 ): number | null {
   if (logroPct == null || !Number.isFinite(Number(logroPct))) return null
+  if (scaleType === "simce") {
+    return projectCanonicalSimce(Number(logroPct))
+  }
   const table = tableByYear(year)
-  const anchors = scaleType === "simce" ? table.simce : table.paes
-  return Math.round(interpolateLinear(Number(logroPct), anchors))
+  return Math.round(interpolateLinear(Number(logroPct), table.paes))
 }
 
-// PHASE_2_SCALES_V1
+// PHASE_2_SCALES_V1 — cortes Agencia: <50 · 50–69 · ≥70 (vía agency-level-cuts)
 export function nationalLevelLabel(logroPct: number | null | undefined): NationalLevelLabel | null {
   if (logroPct == null || !Number.isFinite(Number(logroPct))) return null
-  const pct = clampLogroPct(Number(logroPct))
-  if (pct >= 75) return "Adecuado"
-  if (pct >= 50) return "Elemental"
-  return "Insuficiente"
+  return agencyAchievementLevelFromLogroPct(Number(logroPct))
 }

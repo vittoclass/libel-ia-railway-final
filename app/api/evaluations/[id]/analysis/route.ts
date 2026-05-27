@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { getSourceExamForEvaluation } from "@/app/lib/source-exam-db"
+import { paesProjectionMetaForMethodology } from "@/app/lib/paesProjectionCanonical"
+import { simceProjectionMetadata } from "@/app/lib/simceProjectionCanonical"
 import { convertToNationalScore, nationalLevelLabel } from "@/app/lib/standard-scale/converters"
 
 export const dynamic = "force-dynamic"
@@ -127,6 +129,7 @@ export async function GET(
         paes_estimated: null,
         level_label: null,
         year: scaleYear,
+        ...simceProjectionMetadata(),
       },
       simceLevels: modeSimce ? { bySkill: [], byAxis: [] } : undefined,
       message: "Sin etiquetado pedagógico",
@@ -249,8 +252,11 @@ export async function GET(
     projections: {
       simce_estimated: simceEstimated,
       paes_estimated: paesEstimated,
+      paes_projection_meta:
+        paesEstimated != null ? paesProjectionMetaForMethodology("anchor_table") : null,
       level_label: levelLabel,
       year: scaleYear,
+      ...simceProjectionMetadata(),
     },
     ...(modeSimce && {
       simceLevels: {

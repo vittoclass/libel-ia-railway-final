@@ -11,6 +11,8 @@ import { resolveStudentDisplayName } from "@/app/lib/student-display-name"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { getSourceExamForEvaluation } from "@/app/lib/source-exam-db"
 import { enrichItemsWithPedagogy } from "@/app/lib/analyze-pedagogical-structure"
+import { paesProjectionMetaForMethodology } from "@/app/lib/paesProjectionCanonical"
+import { simceProjectionMetadata } from "@/app/lib/simceProjectionCanonical"
 import { convertToNationalScore, nationalLevelLabel } from "@/app/lib/standard-scale/converters"
 import { mean, sampleStdDev, zScore } from "@/app/lib/pedagogical-intelligence/metrics"
 import { generateStrategicAnalysis } from "@/app/lib/pedagogical-intelligence/inference-engine"
@@ -165,14 +167,18 @@ export async function GET(
   const totalObtained = analysis.by_question.reduce((sum, q) => sum + (Number(q.score_obtained) || 0), 0)
   const totalMax = analysis.by_question.reduce((sum, q) => sum + (Number(q.score_max) || 0), 0)
   const logroPct = totalMax > 0 ? Math.round((totalObtained / totalMax) * 100) : null
+  const paesEstimated =
+    instrument_analytics_mode === "PAES" ? convertToNationalScore(logroPct, "paes", scaleYear) : null
   const projections = {
     simce_estimated:
       instrument_analytics_mode === "SIMCE" ? convertToNationalScore(logroPct, "simce", scaleYear) : null,
-    paes_estimated:
-      instrument_analytics_mode === "PAES" ? convertToNationalScore(logroPct, "paes", scaleYear) : null,
+    paes_estimated: paesEstimated,
+    paes_projection_meta:
+      paesEstimated != null ? paesProjectionMetaForMethodology("anchor_table") : null,
     level_label:
       instrument_analytics_mode === "SIMCE" ? nationalLevelLabel(logroPct) : null,
     year: scaleYear,
+    ...simceProjectionMetadata(),
   }
   // PHASE_4_MEMORY_IDENTITY_V1
   let delta_analysis: {

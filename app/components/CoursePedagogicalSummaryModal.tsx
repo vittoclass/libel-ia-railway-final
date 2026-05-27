@@ -40,6 +40,7 @@ import { buildPedagogicalDiagnosis } from "@/app/lib/pedagogical-diagnosis-text"
 import { QuestionHeatMap } from "@/app/components/QuestionHeatMap"
 import { downloadCsvFile } from "@/app/lib/csv-export"
 import { EXAM_TYPE_FILTER_OPTIONS_WITH_NATIONAL } from "@/app/lib/exam-type-constants"
+import { SIMCE_PROJECTION_DISCLAIMER } from "@/app/lib/simceProjectionCanonical"
 import { projectPaesFromLogroPct, projectSimceFromLogroPct } from "@/app/lib/standard-scale-converters"
 import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
 
@@ -292,6 +293,9 @@ function SummaryBlock({ data }: { data: SummaryData }) {
             <span className="text-indigo-800 font-bold">{`${Math.round(estimatedNationalScore.value)} puntos`}</span>
             {avgLogro != null && Number.isFinite(avgLogro) ? (
               <span className="text-indigo-700"> · basado en logro promedio {Math.round(avgLogro)}%</span>
+            ) : null}
+            {estimatedNationalScore.kind === "SIMCE" ? (
+              <span className="block text-xs text-indigo-700 mt-1">{SIMCE_PROJECTION_DISCLAIMER}</span>
             ) : null}
           </>
         ) : (

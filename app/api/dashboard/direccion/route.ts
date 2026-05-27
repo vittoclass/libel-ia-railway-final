@@ -13,6 +13,7 @@ import { isMasterEmail } from "@/app/lib/master-access"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { approxGradeChileFromLogroPct, resolveStudentDisplayName } from "@/app/lib/student-display-name"
 import { normalizeSubjectKey } from "@/app/lib/pedagogy-segment-filters"
+import { paesProjectionMetaForMethodology, type PaesProjectionMeta } from "@/app/lib/paesProjectionCanonical"
 import { projectPaesFromLogroPct, projectSimceFromLogroPct } from "@/app/lib/standard-scale-converters"
 
 export const dynamic = "force-dynamic"
@@ -146,6 +147,7 @@ export async function GET(_req: NextRequest) {
       avg_logro_pct: number | null
       simce_projection: number | null
       paes_projection: number | null
+      paes_projection_meta: PaesProjectionMeta | null
       course_breakdown: Array<{
         course_key: string
         course_display: string
@@ -153,6 +155,7 @@ export async function GET(_req: NextRequest) {
         avg_logro_pct: number | null
         simce_projection: number | null
         paes_projection: number | null
+        paes_projection_meta: PaesProjectionMeta | null
       }>
     }>,
   }
@@ -622,6 +625,7 @@ export async function GET(_req: NextRequest) {
       avg_logro_pct: number | null
       simce_projection: number | null
       paes_projection: number | null
+      paes_projection_meta: PaesProjectionMeta | null
     }> {
       type CourseAcc = { ids: Set<string>; displayFreq: Map<string, number> }
       const courseMap = new Map<string, CourseAcc>()
@@ -644,6 +648,7 @@ export async function GET(_req: NextRequest) {
         avg_logro_pct: number | null
         simce_projection: number | null
         paes_projection: number | null
+        paes_projection_meta: PaesProjectionMeta | null
       }> = []
       for (const [course_key, cacc] of courseMap) {
         const idList = [...cacc.ids]
@@ -654,6 +659,7 @@ export async function GET(_req: NextRequest) {
           logros.length > 0 ? Math.round((logros.reduce((a, c) => a + c, 0) / logros.length) * 10) / 10 : null
         let simce_projection: number | null = null
         let paes_projection: number | null = null
+        let paes_projection_meta: PaesProjectionMeta | null = null
         if (instrument_family === "SIMCE") {
           const vals: number[] = []
           for (const eid of idList) {
@@ -670,6 +676,8 @@ export async function GET(_req: NextRequest) {
             vals.push(projectPaesFromLogroPct(pct))
           }
           paes_projection = vals.length ? Math.round(vals.reduce((a, c) => a + c, 0) / vals.length) : null
+          paes_projection_meta =
+            paes_projection != null ? paesProjectionMetaForMethodology("linear_fallback") : null
         }
         rows.push({
           course_key,
@@ -678,6 +686,7 @@ export async function GET(_req: NextRequest) {
           avg_logro_pct,
           simce_projection,
           paes_projection,
+          paes_projection_meta,
         })
       }
       rows.sort((a, b) => {
@@ -697,6 +706,7 @@ export async function GET(_req: NextRequest) {
           logros.length > 0 ? Math.round((logros.reduce((a, c) => a + c, 0) / logros.length) * 10) / 10 : null
         let simce_projection: number | null = null
         let paes_projection: number | null = null
+        let paes_projection_meta: PaesProjectionMeta | null = null
         if (b.instrument_family === "SIMCE") {
           const vals: number[] = []
           for (const eid of idList) {
@@ -713,6 +723,8 @@ export async function GET(_req: NextRequest) {
             vals.push(projectPaesFromLogroPct(pct))
           }
           paes_projection = vals.length ? Math.round(vals.reduce((a, c) => a + c, 0) / vals.length) : null
+          paes_projection_meta =
+            paes_projection != null ? paesProjectionMetaForMethodology("linear_fallback") : null
         }
         return {
           subject_key: b.subject_key,
@@ -722,6 +734,7 @@ export async function GET(_req: NextRequest) {
           avg_logro_pct,
           simce_projection,
           paes_projection,
+          paes_projection_meta,
           course_breakdown: buildCourseBreakdown(b.ids, b.instrument_family),
         }
       })
@@ -829,6 +842,8 @@ export async function GET(_req: NextRequest) {
         total_evaluaciones_mes: totalEvaluacionesMes,
         simce_proyectado_promedio: simcePromedio,
         paes_proyectado_promedio: paesPromedio,
+        paes_projection_meta:
+          paesValues.length > 0 ? paesProjectionMetaForMethodology("linear_fallback") : null,
       },
       semaforo: {
         insuficiente,

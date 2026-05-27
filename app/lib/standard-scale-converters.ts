@@ -5,6 +5,7 @@
  */
 
 import { agencyAchievementLevelFromLogroPct } from "@/app/lib/chile-standards/agency-level-cuts"
+import { projectCanonicalSimce } from "@/app/lib/simceProjectionCanonical"
 
 /** Nivel de desempeño por logro % (cortes Agencia: &lt;50 · 50–69 · ≥70). */
 export type SimceLevel = "Adecuado" | "Elemental" | "Insuficiente"
@@ -21,10 +22,9 @@ export function projectPaesFromLogroPct(logroPct: number): number {
   return Math.round(100 + (pct / 100) * 900)
 }
 
+/** Wrapper sobre proyección canónica referencial (200→400). */
 export function projectSimceFromLogroPct(logroPct: number): number {
-  const pct = Math.max(0, Math.min(100, logroPct))
-  /** Escala SIMCE solicitada para gestión: 200 (0% logro) → 400 (100% logro). */
-  return Math.round(200 + (pct / 100) * 200)
+  return projectCanonicalSimce(logroPct)
 }
 
 export function simceLevelFromLogroPct(logroPct: number): SimceLevel {

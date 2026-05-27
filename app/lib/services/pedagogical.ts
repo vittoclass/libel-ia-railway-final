@@ -84,14 +84,33 @@ async function findParameterWithFallback(input: FindParameterInput): Promise<{
 
     if (error || !data || data.length === 0) continue
 
+    const isDemrePaes = input.parameterType === "DEMRE_PAES_TABLE"
+
     const filtered = data.filter((row) => {
       const r = row as PedagogicalParameterRow
       if (input.gradeLevel && r.grade_level && r.grade_level !== input.gradeLevel) return false
+
+      if (isDemrePaes) {
+        if (input.subject != null && r.subject !== input.subject) return false
+        if (input.examName != null && r.exam_name !== input.examName) return false
+        if (input.application != null && r.application !== input.application) return false
+        return true
+      }
+
       if (input.subject && r.subject && r.subject !== input.subject) return false
       if (input.examName && r.exam_name && r.exam_name !== input.examName) return false
       if (input.application && r.application && r.application !== input.application) return false
       return true
     }) as PedagogicalParameterRow[]
+
+    if (isDemrePaes) {
+      if (filtered.length === 0) continue
+      return {
+        row: filtered[0],
+        source: y === input.year ? "OFICIAL" : "REFERENCIAL",
+        usedYear: y,
+      }
+    }
 
     const picked = filtered[0] ?? (data[0] as unknown as PedagogicalParameterRow)
     return {
