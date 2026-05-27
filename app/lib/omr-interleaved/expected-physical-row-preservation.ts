@@ -181,6 +181,9 @@ export function applyExpectedPhysicalRowPreservation(params: {
   }
 
   const existingCanonicalIds = new Set<string>()
+  const existingPhysicalIndices = new Set<number>()
+  const existingQuestionNumbers = new Set<number>()
+  const physicalSlotsWithSensorEvidence = new Set<number>()
   const existingDetectionIndices = new Set<number>()
   const detectedRowsForEstimation: Array<{ physicalIndex: number; centerY: number }> = []
 
@@ -196,6 +199,13 @@ export function applyExpectedPhysicalRowPreservation(params: {
     }
 
     const pIdx = typeof row.physicalIndex === "number" ? row.physicalIndex : null
+    const qn = Number(row.questionNumber ?? 0)
+    if (pIdx != null) {
+      existingPhysicalIndices.add(pIdx)
+      if (row.observedFromSensors === true) physicalSlotsWithSensorEvidence.add(pIdx)
+    }
+    if (Number.isFinite(qn) && qn >= 1) existingQuestionNumbers.add(qn)
+
     const centerY = typeof row.rowCenterY === "number" ? row.rowCenterY : null
     if (pIdx != null && centerY != null) {
       detectedRowsForEstimation.push({ physicalIndex: pIdx, centerY })
@@ -204,11 +214,12 @@ export function applyExpectedPhysicalRowPreservation(params: {
 
   const missingClosedIds: Array<{ canonicalId: string; physicalIndex: number }> = []
   for (const cid of closedQuestionIds) {
-    if (!existingCanonicalIds.has(cid)) {
-      const desc = closedSlotMap.get(cid)
-      const pIdx = desc?.physicalIndex ?? 0
-      missingClosedIds.push({ canonicalId: cid, physicalIndex: pIdx })
-    }
+    if (existingCanonicalIds.has(cid)) continue
+    const desc = closedSlotMap.get(cid)
+    const pIdx = desc?.physicalIndex ?? 0
+    if (existingPhysicalIndices.has(pIdx) || existingQuestionNumbers.has(pIdx)) continue
+    if (physicalSlotsWithSensorEvidence.has(pIdx)) continue
+    missingClosedIds.push({ canonicalId: cid, physicalIndex: pIdx })
   }
 
   if (missingClosedIds.length === 0) {
@@ -235,9 +246,10 @@ export function applyExpectedPhysicalRowPreservation(params: {
     const pIdx = typeof row.panelIndex === "number" ? row.panelIndex : -1
     if (pIdx < 0) continue
     const colDiag = row.interleavedColumnGeometryDiagnostic as Record<string, unknown> | undefined
-    if (colDiag && Array.isArray(colDiag.columnCenters)) {
-      const centers = (colDiag.columnCenters as unknown[]).filter(
-        (x): x is number => typeof x === "number",
+    const colRaw = colDiag?.expectedColumnCenters ?? colDiag?.columnCenters
+    if (colDiag && Array.isArray(colRaw)) {
+      const centers = (colRaw as unknown[]).filter(
+        (x): x is number => typeof x === "number" && Number.isFinite(x),
       )
       if (centers.length >= expectedOptionCount && !panelColumnCentersMap.has(pIdx)) {
         panelColumnCentersMap.set(pIdx, centers)
@@ -363,7 +375,7 @@ export function applyExpectedPhysicalRowPreservation(params: {
       assignedDetectionIndices.push(bestCandidate.markIdx)
       existingDetectionIndices.add(bestCandidate.markIdx)
     } else if (evidenceMarksConsidered > 0) {
-      physicalRowMissingReason = "marks_found_but_no_clear_column_assignment"
+      continue
     } else {
       physicalRowMissingReason = "no_marks_in_expected_zone"
     }
@@ -413,13 +425,15 @@ export function applyExpectedPhysicalRowPreservation(params: {
     })
   }
 
-  const augmented = [...original, ...preservedRows]
+  const maxPreserved = Math.max(0, closedQuestionIds.length - original.length)
+  const preservedLimited = preservedRows.slice(0, maxPreserved)
+  const augmented = [...original, ...preservedLimited]
 
   return {
     perQuestion: augmented,
     telemetry: {
       physicalRowPreservationEnabled: true,
-      physicalRowPreservationApplied: preservedRows.length > 0,
+      physicalRowPreservationApplied: preservedLimited.length > 0,
       expectedPhysicalRowsCount: closedQuestionIds.length,
       detectedPhysicalRowsCount: original.length,
       missingPhysicalRowsBeforePreservation: missingClosedIds.length,

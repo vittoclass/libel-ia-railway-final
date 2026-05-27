@@ -21,10 +21,33 @@ function median(values: number[]): number {
   return sorted[Math.floor(sorted.length / 2)]!
 }
 
-function kmeans1d(values: number[], k: number): number[] {
-  if (!values.length) return Array.from({ length: k }, (_, i) => (i + 0.5) / Math.max(1, k))
+export type GeometryRebuildSkippedReason =
+  | "empty_kmeans_cluster"
+  | "degenerate_column_centers"
+  | "insufficient_column_marks"
+
+const MIN_COLUMN_CENTER_GAP = 0.008
+
+export type Kmeans1dValidatedResult = {
+  centers: number[]
+  valid: boolean
+  skipReason?: GeometryRebuildSkippedReason
+}
+
+function kmeans1dValidated(values: number[], k: number): Kmeans1dValidatedResult {
+  if (k <= 0 || !values.length) {
+    return { centers: [], valid: false, skipReason: "insufficient_column_marks" }
+  }
+  if (values.length < k) {
+    return { centers: [], valid: false, skipReason: "insufficient_column_marks" }
+  }
+
   const sorted = [...values].sort((a, b) => a - b)
-  const centers = Array.from({ length: k }, (_, i) => sorted[Math.floor((i * (sorted.length - 1)) / Math.max(1, k - 1))]!)
+  const centers = Array.from({ length: k }, (_, i) => {
+    const idx = Math.min(sorted.length - 1, Math.floor(((i + 0.5) / k) * sorted.length))
+    return sorted[idx]!
+  })
+
   for (let iter = 0; iter < 10; iter++) {
     const buckets: number[][] = Array.from({ length: k }, () => [])
     for (const v of sorted) {
@@ -41,10 +64,78 @@ function kmeans1d(values: number[], k: number): number[] {
     }
     for (let i = 0; i < k; i++) {
       const b = buckets[i]!
-      if (b.length > 0) centers[i] = b.reduce((s, v) => s + v, 0) / b.length
+      if (b.length === 0) {
+        return { centers: [], valid: false, skipReason: "empty_kmeans_cluster" }
+      }
+      centers[i] = b.reduce((s, v) => s + v, 0) / b.length
     }
   }
-  return centers.sort((a, b) => a - b)
+
+  const ordered = [...centers].sort((a, b) => a - b)
+  for (let i = 1; i < ordered.length; i++) {
+    if (ordered[i]! - ordered[i - 1]! < MIN_COLUMN_CENTER_GAP) {
+      return { centers: [], valid: false, skipReason: "degenerate_column_centers" }
+    }
+  }
+  return { centers: ordered, valid: true }
+}
+
+/** Centros por cuantiles — fallback cuando k-means es inválido (sin [0,0,...]). */
+function quantileSpreadColumnCenters(values: number[], k: number): number[] {
+  if (!values.length || k <= 0) return []
+  const sorted = [...values].sort((a, b) => a - b)
+  const min = sorted[0]!
+  const max = sorted[sorted.length - 1]!
+  if (max - min < MIN_COLUMN_CENTER_GAP) return []
+  return Array.from({ length: k }, (_, i) => min + ((i + 0.5) / k) * (max - min))
+}
+
+function resolvePanelColumnCenters(params: {
+  panelMarks: IndexedMark[]
+  expectedOptionCount: number
+  priorCenters?: number[]
+}): {
+  centers: number[]
+  geometrySource: string
+  geometryRebuildSkippedReason?: GeometryRebuildSkippedReason
+} {
+  const { panelMarks, expectedOptionCount, priorCenters } = params
+  const xs = panelMarks.map((m) => m.mark.centerX).filter((x) => Number.isFinite(x))
+
+  if (priorCenters && priorCenters.length === expectedOptionCount) {
+    const orderedPrior = [...priorCenters].sort((a, b) => a - b)
+    let priorOk = true
+    for (let i = 1; i < orderedPrior.length; i++) {
+      if (orderedPrior[i]! - orderedPrior[i - 1]! < MIN_COLUMN_CENTER_GAP) {
+        priorOk = false
+        break
+      }
+    }
+    const nearZeroCount = orderedPrior.filter((c) => Math.abs(c) < 1e-5).length
+    if (priorOk && nearZeroCount < 2) {
+      return { centers: orderedPrior, geometrySource: "descriptor_prior_centers" }
+    }
+  }
+
+  const kmeans = kmeans1dValidated(xs, expectedOptionCount)
+  if (kmeans.valid && kmeans.centers.length === expectedOptionCount) {
+    return { centers: kmeans.centers, geometrySource: "kmeans_panel_rebuild" }
+  }
+
+  const quantile = quantileSpreadColumnCenters(xs, expectedOptionCount)
+  if (quantile.length === expectedOptionCount) {
+    return {
+      centers: quantile,
+      geometrySource: "quantile_panel_fallback",
+      geometryRebuildSkippedReason: kmeans.skipReason,
+    }
+  }
+
+  return {
+    centers: [],
+    geometrySource: "geometry_unavailable",
+    geometryRebuildSkippedReason: kmeans.skipReason ?? "insufficient_column_marks",
+  }
 }
 
 function nearestCenterIndex(x: number, centers: number[]): number {
@@ -158,17 +249,6 @@ function refineOnePanel(params: {
   }
   const yScale = Math.max(0.012, median(ySteps.length ? ySteps : [0.02]))
 
-  const colCenters = kmeans1d(
-    panelItems.map((it) => it.mark.centerX),
-    expectedOptionCount,
-  )
-  const colSteps: number[] = []
-  for (let i = 1; i < colCenters.length; i++) {
-    const d = Math.abs(colCenters[i]! - colCenters[i - 1]!)
-    if (d > 1e-6) colSteps.push(d)
-  }
-  const xScale = Math.max(0.012, median(colSteps.length ? colSteps : [0.03]))
-
   const modelRows = clusterRowsByYIndexed(panelItems)
   const model = buildPanelGeometryModel({
     panelIndex,
@@ -176,6 +256,27 @@ function refineOnePanel(params: {
     panelItems,
     expectedOptionCount,
   })
+
+  const colResolved = resolvePanelColumnCenters({
+    panelMarks: panelItems,
+    expectedOptionCount,
+    priorCenters:
+      model.expectedColumnCenters.length === expectedOptionCount
+        ? model.expectedColumnCenters
+        : undefined,
+  })
+  const colCenters =
+    colResolved.centers.length === expectedOptionCount
+      ? colResolved.centers
+      : model.expectedColumnCenters.length === expectedOptionCount
+        ? model.expectedColumnCenters
+        : colResolved.centers
+  const colSteps: number[] = []
+  for (let i = 1; i < colCenters.length; i++) {
+    const d = Math.abs(colCenters[i]! - colCenters[i - 1]!)
+    if (d > 1e-6) colSteps.push(d)
+  }
+  const xScale = Math.max(0.012, median(colSteps.length ? colSteps : [0.03]))
 
   let buckets: IndexedMark[][] = Array.from({ length: K }, () => [])
 
@@ -705,6 +806,7 @@ export type InterleavedColumnGeometryRowDiagnostic = {
   selectedAnswerMatchesNearestColumn: boolean | null
   assignedDetectionIndices: number[]
   geometrySource: string
+  geometryRebuildSkippedReason?: GeometryRebuildSkippedReason
   decisionSource: string
 }
 
@@ -715,6 +817,32 @@ export type InterleavedColumnGeometryValidationTelemetry = {
   interleavedColumnGeometryMismatchCount: number
   interleavedColumnGeometryCorrectedCount: number
   interleavedColumnGeometryTelemetryRows: InterleavedColumnGeometryRowDiagnostic[]
+}
+
+function extractPriorPanelCenters(
+  perQuestion: Array<Record<string, unknown>>,
+  panelIndex: number,
+  expectedOptionCount: number,
+): number[] | undefined {
+  for (const row of perQuestion) {
+    const p = Number(row.panelIndex ?? 0) === 1 ? 1 : 0
+    if (p !== panelIndex) continue
+    const diag = row.interleavedColumnGeometryDiagnostic as Record<string, unknown> | undefined
+    const raw = diag?.expectedColumnCenters ?? diag?.columnCenters
+    if (!Array.isArray(raw)) continue
+    const centers = (raw as unknown[]).filter((x): x is number => typeof x === "number" && Number.isFinite(x))
+    if (centers.length !== expectedOptionCount) continue
+    const ordered = [...centers].sort((a, b) => a - b)
+    let ok = true
+    for (let i = 1; i < ordered.length; i++) {
+      if (ordered[i]! - ordered[i - 1]! < MIN_COLUMN_CENTER_GAP) {
+        ok = false
+        break
+      }
+    }
+    if (ok) return ordered
+  }
+  return undefined
 }
 
 export function applyInterleavedColumnGeometryValidation(params: {
@@ -750,14 +878,31 @@ export function applyInterleavedColumnGeometryValidation(params: {
 
   const leftMarks = indexedMarks.filter((m) => m.mark.centerX <= SPLIT_X)
   const rightMarks = indexedMarks.filter((m) => m.mark.centerX > SPLIT_X)
-  const leftCenters =
-    leftMarks.length >= expectedOptionCount
-      ? kmeans1d(leftMarks.map((m) => m.mark.centerX), expectedOptionCount)
-      : []
-  const rightCenters =
-    rightMarks.length >= expectedOptionCount
-      ? kmeans1d(rightMarks.map((m) => m.mark.centerX), expectedOptionCount)
-      : []
+
+  const priorLeftCenters = extractPriorPanelCenters(perQuestion, 0, expectedOptionCount)
+  const priorRightCenters = extractPriorPanelCenters(perQuestion, 1, expectedOptionCount)
+
+  const leftResolved = resolvePanelColumnCenters({
+    panelMarks: leftMarks,
+    expectedOptionCount,
+    priorCenters: priorLeftCenters,
+  })
+  const rightResolved = resolvePanelColumnCenters({
+    panelMarks: rightMarks,
+    expectedOptionCount,
+    priorCenters: priorRightCenters,
+  })
+  const leftCenters = leftResolved.centers
+  const rightCenters = rightResolved.centers
+  const panelGeometryMeta = new Map<number, { geometrySource: string; geometryRebuildSkippedReason?: GeometryRebuildSkippedReason }>()
+  panelGeometryMeta.set(0, {
+    geometrySource: leftResolved.geometrySource,
+    geometryRebuildSkippedReason: leftResolved.geometryRebuildSkippedReason,
+  })
+  panelGeometryMeta.set(1, {
+    geometrySource: rightResolved.geometrySource,
+    geometryRebuildSkippedReason: rightResolved.geometryRebuildSkippedReason,
+  })
 
   const before = shallowCloneRows(perQuestion)
   const candidate = perQuestion.map((r) => ({ ...r }))
@@ -832,6 +977,10 @@ export function applyInterleavedColumnGeometryValidation(params: {
       }
     }
 
+    const panelMeta = panelGeometryMeta.get(panelIndex) ?? {
+      geometrySource: centers.length === expectedOptionCount ? "kmeans_panel_rebuild" : "geometry_unavailable",
+    }
+
     telemetryRows.push({
       panelIndex,
       rowIndexWithinPanel: Number(row.rowIndexWithinPanel ?? 0),
@@ -847,7 +996,8 @@ export function applyInterleavedColumnGeometryValidation(params: {
       nearestColumnLetterByX,
       selectedAnswerMatchesNearestColumn: matches,
       assignedDetectionIndices: assigned,
-      geometrySource: "kmeans_panel_rebuild",
+      geometrySource: panelMeta.geometrySource,
+      geometryRebuildSkippedReason: panelMeta.geometryRebuildSkippedReason,
       decisionSource,
     })
   }

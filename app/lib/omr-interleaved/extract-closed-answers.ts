@@ -11,6 +11,7 @@ import type { InterleavedPipelineForensicReport } from "./interleaved-pipeline-f
 import type { OmrTemplateVariantInterleaved } from "./types"
 
 import { normalizeToCanonicalId } from "../canonical-closed-id"
+import { dedupeInterleavedPerQuestionForOfficialOutput } from "./dedupe-interleaved-per-question-official"
 import { parseClosedIdNumericSlot } from "./optionalOcrQuestionAnchor"
 
 
@@ -66,6 +67,14 @@ export async function extractStudentClosedAnswersInterleavedLayout(params: {
   interleavedPartialStructuralSurvival?: boolean
 
   interleavedRecoveryPassthrough?: boolean
+
+  interleavedOfficialOutputSanitization?: {
+    droppedGhostRowsCount: number
+    sanitizedFromPipelineCount: number
+    sanitizedToExpectedCount: number
+    duplicateCanonicalIdsResolved: number
+    paddingRowsAdded: number
+  }
 
   omrTemplateVariantRequested?: string
 
@@ -279,11 +288,11 @@ export async function extractStudentClosedAnswersInterleavedLayout(params: {
 
 
 
-  const perQuestion = Array.isArray((effectiveInterleaved as any).perQuestion)
+  const pipelinePerQuestionRaw = Array.isArray((effectiveInterleaved as any).perQuestion)
     ? (effectiveInterleaved as any).perQuestion
     : []
 
-  if (perQuestion.length === 0) {
+  if (pipelinePerQuestionRaw.length === 0) {
 
     throw new Error("[interleaved_omr] pipeline devolvió 0 preguntas detectadas")
 
@@ -300,6 +309,19 @@ export async function extractStudentClosedAnswersInterleavedLayout(params: {
       ? (effectiveInterleaved as any).closedOmrQuestionCountUsed
 
       : closedIds.length
+
+  const officialOutputExpectation =
+    expectation ?? (expectedOmrClosedRows > 0 ? expectedOmrClosedRows : closedIds.length)
+  const expectedClosedCanonicalIds = closedIds
+    .map((id) => normalizeToCanonicalId(id))
+    .filter((id): id is string => Boolean(id))
+
+  const { perQuestion, sanitization: interleavedOfficialOutputSanitization } =
+    dedupeInterleavedPerQuestionForOfficialOutput(
+      pipelinePerQuestionRaw as Array<Record<string, unknown>>,
+      officialOutputExpectation > 0 ? officialOutputExpectation : pipelinePerQuestionRaw.length,
+      expectedClosedCanonicalIds.length > 0 ? expectedClosedCanonicalIds : undefined,
+    )
 
   const physicalHybrid =
 
@@ -501,6 +523,13 @@ export async function extractStudentClosedAnswersInterleavedLayout(params: {
 
     ...((effectiveInterleaved as any).interleavedRecoveryPassthrough === true
       ? { interleavedRecoveryPassthrough: true }
+      : {}),
+
+    ...(interleavedOfficialOutputSanitization.droppedGhostRowsCount > 0 ||
+    interleavedOfficialOutputSanitization.duplicateCanonicalIdsResolved > 0 ||
+    interleavedOfficialOutputSanitization.sanitizedFromPipelineCount !==
+      interleavedOfficialOutputSanitization.sanitizedToExpectedCount
+      ? { interleavedOfficialOutputSanitization }
       : {}),
 
     ...(typeof (effectiveInterleaved as any).interleavedStructuralShiftDetected === "boolean" ||
