@@ -49,8 +49,23 @@ import {
 } from "../../lib/source-exam-omr-metadata"
 import { enhanceOmrStudentImageBase64 } from "../../lib/omr-image-preenhance"
 import { extractJsonObjectFromModelText } from "../../lib/smart-base-parser"
+import {
+  DEFAULT_EVALUATION_PROVIDER_TRACE,
+  EvaluationIaUnavailableError,
+  evaluationAiKeysConfigured,
+  mergeEvaluationProviderTrace,
+  requestEvaluationTextCompletion,
+  requestEvaluationVisionCompletion,
+  type EvaluationProviderTrace,
+} from "../../lib/ai-evaluation-provider"
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY
+
+type ProviderTraceAcc = { current: EvaluationProviderTrace }
+
+function absorbProviderTrace(acc: ProviderTraceAcc | undefined, trace: EvaluationProviderTrace): void {
+  if (acc) acc.current = mergeEvaluationProviderTrace(acc.current, trace)
+}
 const DEFAULT_STUDENT_NAME = "Estudiante No Identificado"
 // SNAPSHOT_ESTABLE_OMR_MARCH_31
 // Ajuste reversible de rigor/fidelidad en desarrollo:
@@ -801,7 +816,8 @@ async function analyzeWithMistralText(
   porcentajeExigencia: number,
   tipoPrueba: "mixta" | "solo_desarrollo" | "solo_alternativas",
   flexibilidad: number = 3,
-  nombreEstudiante?: string
+  nombreEstudiante?: string,
+  providerTraceOut?: ProviderTraceAcc,
 ): Promise<{
   nombreEstudiante: string | null
   respuestas_cerradas: { pregunta: string; respuesta_detectada: string; confianza: number }[]
@@ -897,31 +913,13 @@ Responde ÚNICAMENTE con este JSON (sin markdown):
 
 Las claves de respuestas_desarrollo pueden ser P1, P2, P3, etc. según los ítems de desarrollo en la pauta. Asigna puntaje de 0 a máximo de cada ítem aplicando generosidad calibrada. Para respuestas_cerradas, usa exactamente los IDs: ${listaIdsAlternativas || "[]"}.`
 
-  const res = await fetchMistralWithRetry(
-    "https://api.mistral.ai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${MISTRAL_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "mistral-large-latest",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-        max_tokens: 8192,
-      }),
-    },
-    { timeoutMs: MISTRAL_FETCH_TIMEOUT_MS },
-  )
-  if (!res.ok) {
-    const err = await res.text()
-    throw new Error(`Mistral (texto) error: ${res.status} - ${err}`)
-  }
-  const data = await res.json()
-  const content = data.choices?.[0]?.message?.content
-  if (!content) throw new Error("Respuesta vacía de Mistral")
+  const { content, trace } = await requestEvaluationTextCompletion({
+    prompt,
+    maxTokens: 8192,
+    temperature: 0.1,
+    timeoutMs: MISTRAL_FETCH_TIMEOUT_MS,
+  })
+  absorbProviderTrace(providerTraceOut, trace)
   const parsed = JSON.parse(content)
   const rawCerradas = Array.isArray(parsed.respuestas_cerradas) ? parsed.respuestas_cerradas : []
   const byPregunta = new Map<string, { respuesta_detectada: string; confianza: number }>()
@@ -1233,7 +1231,8 @@ async function analyzeWithMistralVision(
   areaConocimiento: string,
   puntajeTotal: number,
   porcentajeExigencia: number,
-  tipoPrueba: "mixta" | "solo_desarrollo" | "solo_alternativas" = "mixta"
+  tipoPrueba: "mixta" | "solo_desarrollo" | "solo_alternativas" = "mixta",
+  providerTraceOut?: ProviderTraceAcc,
 ): Promise<any> {
   const itemScores = parsePautaEstructurada(pautaEstructurada)
   const soloDesarrollo = tipoPrueba === "solo_desarrollo"
@@ -1304,40 +1303,14 @@ INSTRUCCIONES PARA PREGUNTAS DE DESARROLLO (si la prueba tiene desarrollo):
 4. En "correccion_detallada" cada elemento en "detalle" DEBE contener al menos una cita entre comillas del texto del estudiante.
 5. PROHIBIDO: No escribas "Sin respuesta", "no contestó", "no respondió" ni "no hay texto escrito por el estudiante" en desarrollo si hay CUALQUIER texto manuscrito en la zona de esa pregunta. Solo usa "Sin respuesta" cuando la zona está realmente en blanco.`
 
-  const response = await fetchMistralWithRetry(
-    "https://api.mistral.ai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${MISTRAL_API_KEY}`,
-      },
-      body: JSON.stringify({
-        // IMPORTANTE: Usar pixtral-12b-2409 que SI tiene vision
-        model: "pixtral-12b-2409",
-        messages: [
-          {
-            role: "user",
-            content: [mistralVisionImagePart(imageBase64), { type: "text", text: prompt }],
-          },
-        ],
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-        max_tokens: 4096,
-      }),
-    },
-    { timeoutMs: MISTRAL_FETCH_TIMEOUT_MS_VISION },
-  )
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Mistral API error: ${response.status} - ${errorText}`)
-  }
-
-  const data = await response.json()
-  const content = data.choices?.[0]?.message?.content
-  if (!content) throw new Error("Respuesta vacía de Mistral Vision")
-
+  const { content, trace } = await requestEvaluationVisionCompletion({
+    imageBase64,
+    prompt,
+    maxTokens: 4096,
+    temperature: 0.1,
+    timeoutMs: MISTRAL_FETCH_TIMEOUT_MS_VISION,
+  })
+  absorbProviderTrace(providerTraceOut, trace)
   return parseMistralModelJsonContent(content)
 }
 
@@ -1348,7 +1321,8 @@ async function analyzeDevelopmentOnly(
   pauta: string,
   pautaEstructurada: string,
   nivelEducativo: string,
-  areaConocimiento: string
+  areaConocimiento: string,
+  providerTraceOut?: ProviderTraceAcc,
 ): Promise<{ respuestas_desarrollo: Record<string, any>; retroalimentacion: any }> {
   const prompt = `Eres un evaluador experto con mirada pedagógica. Esta imagen es de una prueba con PREGUNTAS DE DESARROLLO (respuestas abiertas, escritas a mano).
 
@@ -1389,31 +1363,14 @@ Responde ÚNICAMENTE con este JSON (cada texto_estudiante y cada detalle con cit
 }
 Las claves de respuestas_desarrollo pueden ser P1, P2, P39, P40, etc. según los números de pregunta que veas. texto_estudiante DEBE ser el texto real escrito por el estudiante, no un resumen.`
 
-  const res = await fetchMistralWithRetry(
-    "https://api.mistral.ai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${MISTRAL_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "pixtral-12b-2409",
-        messages: [{
-          role: "user",
-          content: [mistralVisionImagePart(imageBase64), { type: "text", text: prompt }],
-        }],
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-        max_tokens: 8192,
-      }),
-    },
-    { timeoutMs: MISTRAL_FETCH_TIMEOUT_MS_VISION },
-  )
-
-  if (!res.ok) throw new Error(`Mistral Development error: ${res.status}`)
-  const data = await res.json()
-  const content = data.choices?.[0]?.message?.content
+  const { content, trace } = await requestEvaluationVisionCompletion({
+    imageBase64,
+    prompt,
+    maxTokens: 8192,
+    temperature: 0.1,
+    timeoutMs: MISTRAL_FETCH_TIMEOUT_MS_VISION,
+  })
+  absorbProviderTrace(providerTraceOut, trace)
   if (!content) return { respuestas_desarrollo: {}, retroalimentacion: {} }
   const parsed = parseMistralModelJsonContent(content) as {
     respuestas_desarrollo?: Record<string, unknown>
@@ -1631,14 +1588,19 @@ function finalizeEvaluateSuccessResponseHttp200(resultadoFinal: Record<string, u
 export async function executeEvaluatePostBody(body: unknown): Promise<NextResponse> {
   /** Si el fallo ocurre antes de completar una fase con estado OMR real, el catch no debe inventar flags. */
   let omrDebugSnapshotForCatch: Record<string, unknown> | null = null
+  const providerTraceAcc: ProviderTraceAcc = { current: { ...DEFAULT_EVALUATION_PROVIDER_TRACE } }
   try {
     const evaluationWarnings: string[] = []
     let evaluationDegraded = false
 
-    if (!MISTRAL_API_KEY) {
+    if (!evaluationAiKeysConfigured()) {
       return NextResponse.json(
-        { success: false, error: "MISTRAL_API_KEY no configurada en el servidor" },
-        { status: 500 }
+        {
+          success: false,
+          error: "IA evaluadora temporalmente no disponible.",
+          provider_trace: providerTraceAcc.current,
+        },
+        { status: 503 },
       )
     }
 
@@ -1931,7 +1893,8 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           Number(porcentajeExigencia),
           tipoPruebaReal,
           Number(flexibilidad) || 3,
-          typeof nombreEstudianteBody === "string" ? nombreEstudianteBody.trim() || undefined : undefined
+          typeof nombreEstudianteBody === "string" ? nombreEstudianteBody.trim() || undefined : undefined,
+          providerTraceAcc,
         )
         omrDebugSnapshotForCatch = {
           evaluationInputKind: "azure_document_text",
@@ -1944,15 +1907,22 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               : 0,
           studentClosedAnswersCount: 0,
         }
-      } catch (e: any) {
+      } catch (e: unknown) {
         console.error("[evaluate] Rama Azure (PDF/Word):", e)
-        let errMsg = e?.message || "Error al evaluar el documento (Azure/Mistral)."
+        if (e instanceof EvaluationIaUnavailableError) {
+          providerTraceAcc.current = mergeEvaluationProviderTrace(providerTraceAcc.current, e.provider_trace)
+          return NextResponse.json(
+            { success: false, error: e.message, provider_trace: providerTraceAcc.current },
+            { status: 503 },
+          )
+        }
+        let errMsg = e instanceof Error ? e.message : "Error al evaluar el documento (Azure/Mistral)."
         if (/503|502|429|upstream connect error|overflow/.test(errMsg)) {
           errMsg = "El servicio de IA no está disponible en este momento. Espera unos minutos e intenta de nuevo."
         }
         return NextResponse.json(
-          { success: false, error: errMsg },
-          { status: 500 }
+          { success: false, error: errMsg, provider_trace: providerTraceAcc.current },
+          { status: 500 },
         )
       }
     } else {
@@ -2610,9 +2580,11 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             areaConocimiento,
             Number(puntajeTotal),
             Number(porcentajeExigencia),
-            tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
+            tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta",
+            providerTraceAcc,
           )
         } catch (e) {
+          if (e instanceof EvaluationIaUnavailableError) throw e
           if (!isMistralTimeoutError(e) && !isMistralJsonDegradedError(e)) throw e
           evaluationDegraded = true
           evaluationWarnings.push(
@@ -2670,7 +2642,8 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               pauta,
               pautaEstructurada,
               nivelEducativo,
-              areaConocimiento
+              areaConocimiento,
+              providerTraceAcc,
             )
             pageMergedDev = mergeVisionAndDedicatedDesarrollo(
               (analysis.respuestas_desarrollo || {}) as Record<string, unknown>,
@@ -2691,6 +2664,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               }
             }
           } catch (e) {
+            if (e instanceof EvaluationIaUnavailableError) throw e
             if (isMistralTimeoutError(e) || isMistralJsonDegradedError(e)) {
               evaluationDegraded = true
               evaluationWarnings.push(
@@ -3043,6 +3017,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       ...(evaluationDegraded
         ? { evaluation_degraded: true as const, evaluation_warnings: [...evaluationWarnings] }
         : {}),
+      provider_trace: providerTraceAcc.current,
     }
     console.info("[trace][omr_official][response_summary]", {
       success: true,
@@ -3201,7 +3176,9 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         totalDetectedAnswers: Array.isArray(studentClosedAnswersDetected)
           ? studentClosedAnswersDetected.length
           : 0,
+        provider_trace: providerTraceAcc.current,
       },
+      provider_trace: providerTraceAcc.current,
       saved,
       evaluation_id: evaluationId,
       status,
@@ -3210,9 +3187,12 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
     }
 
     return finalizeEvaluateSuccessResponseHttp200(resultadoFinal)
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("[Evaluate] Error:", error)
-    let msg = error?.message || "Error procesando la evaluación"
+    if (error instanceof EvaluationIaUnavailableError) {
+      providerTraceAcc.current = mergeEvaluationProviderTrace(providerTraceAcc.current, error.provider_trace)
+    }
+    let msg = error instanceof Error ? error.message : "Error procesando la evaluación"
     if (/503|502|429|upstream connect error|overflow/.test(msg)) {
       msg = "El servicio de IA no está disponible en este momento. Espera unos minutos e intenta de nuevo."
     }
@@ -3225,9 +3205,10 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       {
         success: false,
         error: msg,
+        provider_trace: providerTraceAcc.current,
         ...omrPayload,
       },
-      { status: isPdfError ? 400 : 500 }
+      { status: error instanceof EvaluationIaUnavailableError ? 503 : isPdfError ? 400 : 500 },
     )
   }
 }
