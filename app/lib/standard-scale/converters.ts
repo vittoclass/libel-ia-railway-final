@@ -51,7 +51,8 @@ export function convertToNationalScore(
     return projectCanonicalSimce(Number(logroPct))
   }
   const table = tableByYear(year)
-  return Math.round(interpolateLinear(Number(logroPct), table.paes))
+  const raw = Math.round(interpolateLinear(Number(logroPct), table.paes))
+  return Math.max(100, Math.min(1000, raw))
 }
 
 // PHASE_2_SCALES_V1 — cortes Agencia: <50 · 50–69 · ≥70 (vía agency-level-cuts)

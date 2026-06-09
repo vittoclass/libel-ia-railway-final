@@ -2,9 +2,13 @@ import { NextRequest, NextResponse } from "next/server"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { getSourceExamForEvaluation } from "@/app/lib/source-exam-db"
-import { paesProjectionMetaForMethodology } from "@/app/lib/paesProjectionCanonical"
+import { PAES_PROJECTION_DISCLAIMER, paesProjectionMetaForMethodology } from "@/app/lib/paesProjectionCanonical"
 import { simceProjectionMetadata } from "@/app/lib/simceProjectionCanonical"
-import { convertToNationalScore, nationalLevelLabel } from "@/app/lib/standard-scale/converters"
+import {
+  paesProjectionLevelFromLogroPct,
+  simceProjectionLevelFromLogroPct,
+} from "@/app/lib/standard-scale-converters"
+import { convertToNationalScore } from "@/app/lib/standard-scale/converters"
 
 export const dynamic = "force-dynamic"
 
@@ -234,7 +238,8 @@ export async function GET(
   // PHASE_2_SCALES_V1
   const simceEstimated = convertToNationalScore(logroPct, "simce", scaleYear)
   const paesEstimated = convertToNationalScore(logroPct, "paes", scaleYear)
-  const levelLabel = nationalLevelLabel(logroPct)
+  const levelLabel = simceProjectionLevelFromLogroPct(logroPct)
+  const paesLevelLabel = paesProjectionLevelFromLogroPct(logroPct)
 
   return NextResponse.json({
     bySkill,
@@ -250,11 +255,14 @@ export async function GET(
     pauta_total_max: pautaTotalMax,
     // PHASE_2_SCALES_V1
     projections: {
+      logro_pct: logroPct,
       simce_estimated: simceEstimated,
       paes_estimated: paesEstimated,
       paes_projection_meta:
         paesEstimated != null ? paesProjectionMetaForMethodology("anchor_table") : null,
+      paes_projection_disclaimer: paesEstimated != null ? PAES_PROJECTION_DISCLAIMER : null,
       level_label: levelLabel,
+      paes_level_label: paesEstimated != null ? paesLevelLabel : null,
       year: scaleYear,
       ...simceProjectionMetadata(),
     },

@@ -20,14 +20,18 @@ import {
   uiLegacyTooltipCoberturaCol,
   uiLegacyTooltipEstandarCol,
   uiPaesProyectadoBajada,
+  uiPaesProyectadoDisclaimer,
   uiPaesProyectadoTitulo,
+  uiProyeccionNacionalTitulo,
   uiSimceProyectadoBajada,
+  uiSimceProyectadoEscalaLabel,
   uiSimceProyectadoTitulo,
   uiSemaforoBajada,
   uiSemaforoTitulo,
   uiTablaCoberturaCol,
   uiTablaEstandarAgenciaCol,
 } from "@/app/lib/pedagogic-ui-copy"
+import { SIMCE_PROJECTION_DISCLAIMER, SIMCE_PROJECTION_SCALE_INLINE } from "@/app/lib/simceProjectionCanonical"
 import { formatDateTimeEsCl } from "@/app/lib/format-datetime-es-cl"
 import { formatStudentDisplayName } from "@/app/lib/format-student-name"
 
@@ -109,7 +113,7 @@ function formatDireccionSegmentProjection(
   paes_projection: number | null,
 ): string {
   if (instrument_family === "SIMCE" && simce_projection != null && Number.isFinite(Number(simce_projection))) {
-    return `SIMCE ${Math.round(Number(simce_projection))} (200–350)`
+    return `SIMCE ${Math.round(Number(simce_projection))} ${SIMCE_PROJECTION_SCALE_INLINE}`
   }
   if (instrument_family === "PAES" && paes_projection != null && Number.isFinite(Number(paes_projection))) {
     return `PAES ${Math.round(Number(paes_projection))} (100–1000)`
@@ -1105,10 +1109,10 @@ export default function DashboardUtpPage() {
       {!loading && (
         <div className="space-y-2">
           <div>
-            <h3 className="text-sm font-semibold text-slate-800">Proyección resultados nacionales</h3>
+            <h3 className="text-sm font-semibold text-slate-800">{uiProyeccionNacionalTitulo()}</h3>
             <p className="text-xs text-[var(--text-muted)] mt-0.5 max-w-3xl">
-              Misma agregación que Panel Dirección: proyección SIMCE y PAES desde evaluaciones reales en alcance (vínculo UTP
-              o universo institucional), usando la familia canónica por evaluación, sin mezclar internas en esas escalas.
+              Misma agregación que Panel Dirección: estimación pedagógica referencial SIMCE y PAES según desempeño observado en
+              evaluaciones en alcance (vínculo UTP o universo institucional), sin mezclar pruebas internas en esas escalas.
             </p>
           </div>
           <div className="grid gap-4 md:grid-cols-2">
@@ -1118,7 +1122,8 @@ export default function DashboardUtpPage() {
                 <p className="text-[11px] text-slate-500 mt-1 leading-snug">{uiSimceProyectadoBajada()}</p>
               ) : null}
               <p className="mt-2 text-3xl font-bold text-sky-700">{Math.round(simceProyectadoOmr)}</p>
-              <p className="text-xs text-[var(--text-muted)] mt-1">Escala SIMCE (200-350)</p>
+              <p className="text-xs text-[var(--text-muted)] mt-1">{uiSimceProyectadoEscalaLabel()}</p>
+              <p className="text-[11px] text-slate-500 mt-1 leading-snug">{SIMCE_PROJECTION_DISCLAIMER}</p>
             </article>
             <article className="rounded-xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-white p-4 shadow-sm">
               <p className="text-xs text-[var(--text-muted)] uppercase tracking-wide">{uiPaesProyectadoTitulo()}</p>
@@ -1126,7 +1131,8 @@ export default function DashboardUtpPage() {
                 <p className="text-[11px] text-slate-500 mt-1 leading-snug">{uiPaesProyectadoBajada()}</p>
               ) : null}
               <p className="mt-2 text-3xl font-bold text-indigo-700">{Math.round(paesProyectadoOmr)}</p>
-              <p className="text-xs text-[var(--text-muted)] mt-1">Escala DEMRE (100-1000)</p>
+              <p className="text-xs text-[var(--text-muted)] mt-1">Escala PAES referencial (100–1000)</p>
+              <p className="text-[11px] text-slate-500 mt-1 leading-snug">{uiPaesProyectadoDisclaimer()}</p>
             </article>
           </div>
         </div>

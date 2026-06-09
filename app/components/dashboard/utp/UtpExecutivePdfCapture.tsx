@@ -5,7 +5,8 @@
  * id: utp-dashboard-pdf-capture-root
  */
 import * as React from "react"
-import { uiCoberturaTitulo, uiSemaforoTitulo } from "@/app/lib/pedagogic-ui-copy"
+import { uiCoberturaTitulo, uiPaesProyectadoDisclaimer, uiProyeccionNacionalTitulo, uiSemaforoTitulo } from "@/app/lib/pedagogic-ui-copy"
+import { SIMCE_PROJECTION_DISCLAIMER, SIMCE_PROJECTION_SCALE_LABEL } from "@/app/lib/simceProjectionCanonical"
 
 const CARD: React.CSSProperties = {
   background: "#ffffff",
@@ -275,17 +276,19 @@ export const UtpExecutivePdfCapture = React.forwardRef<HTMLDivElement, UtpExecut
 
         {/* Tarjeta: Proyección */}
         <div style={{ ...CARD, marginBottom: 6 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#0f172a", marginBottom: 6 }}>Proyección resultados nacionales</div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#0f172a", marginBottom: 6 }}>{uiProyeccionNacionalTitulo()}</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
             <div style={{ ...INNER, background: "#ffffff", boxShadow: "inset 0 0 0 1px #e0f2fe" }}>
               <div style={{ fontSize: 9, fontWeight: 700, color: "#0c4a6e" }}>SIMCE proyectado</div>
               <div style={{ fontSize: 24, fontWeight: 800, color: "#0369a1", marginTop: 6, lineHeight: 1 }}>{Math.round(simceProyectadoOmr)}</div>
-              <div style={{ fontSize: 8, color: "#64748b", marginTop: 6 }}>Escala SIMCE (200-350)</div>
+              <div style={{ fontSize: 8, color: "#64748b", marginTop: 6 }}>{SIMCE_PROJECTION_SCALE_LABEL}</div>
+              <div style={{ fontSize: 7, color: "#64748b", marginTop: 4, lineHeight: 1.3 }}>{SIMCE_PROJECTION_DISCLAIMER}</div>
             </div>
             <div style={{ ...INNER, background: "#ffffff", boxShadow: "inset 0 0 0 1px #e0e7ff" }}>
               <div style={{ fontSize: 9, fontWeight: 700, color: "#312e81" }}>PAES proyectado</div>
               <div style={{ fontSize: 24, fontWeight: 800, color: "#4338ca", marginTop: 6, lineHeight: 1 }}>{Math.round(paesProyectadoOmr)}</div>
-              <div style={{ fontSize: 8, color: "#64748b", marginTop: 6 }}>Escala PAES (100-1000)</div>
+              <div style={{ fontSize: 8, color: "#64748b", marginTop: 6 }}>Escala PAES referencial (100–1000)</div>
+              <div style={{ fontSize: 7, color: "#64748b", marginTop: 4, lineHeight: 1.3 }}>{uiPaesProyectadoDisclaimer()}</div>
             </div>
           </div>
         </div>

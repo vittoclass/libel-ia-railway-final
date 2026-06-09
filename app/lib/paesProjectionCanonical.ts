@@ -5,6 +5,9 @@
 
 import type { ConfidenceLevel, ScoringMethodology, ScoringResultMetadata } from "@/app/lib/standardized/types"
 
+export const PAES_PROJECTION_DISCLAIMER =
+  "Proyección referencial basada en el logro de esta evaluación; no reemplaza el puntaje oficial DEMRE."
+
 export type PaesProjectionMethodology = "demre_table" | "linear_fallback" | "anchor_table"
 
 export type PaesProjectionMeta = {
@@ -15,9 +18,9 @@ export type PaesProjectionMeta = {
 }
 
 const METHODOLOGY_SOURCE_LABEL: Record<PaesProjectionMethodology, string> = {
-  demre_table: "Tabla DEMRE",
-  anchor_table: "Tabla de anclas nacional",
-  linear_fallback: "Proyección lineal desde % logro",
+  demre_table: "Tabla referencial por respuestas correctas",
+  anchor_table: "Tabla de anclas referencial (2026)",
+  linear_fallback: "Proyección lineal referencial desde % logro",
 }
 
 const METHODOLOGY_CONFIDENCE: Record<PaesProjectionMethodology, ConfidenceLevel> = {
@@ -53,9 +56,13 @@ export function paesProjectionMetaFromScoringMetadata(
 export function paesMethodologyUiPhrase(meta: PaesProjectionMeta | null | undefined): string | null {
   if (!meta) return null
   const label = meta.source_label.toLowerCase()
-  if (meta.methodology === "demre_table") return `PAES estimado según metodología: DEMRE (${label})`
-  if (meta.methodology === "anchor_table") return `PAES estimado según metodología: anclas (${label})`
-  return `PAES estimado según metodología: lineal (${label})`
+  if (meta.methodology === "demre_table") {
+    return `Proyección PAES referencial según ${label}`
+  }
+  if (meta.methodology === "anchor_table") {
+    return `Proyección PAES referencial según ${label}`
+  }
+  return `Proyección PAES referencial (${label})`
 }
 
 /** Solo metodologías PAES válidas en ScoringMethodology. */

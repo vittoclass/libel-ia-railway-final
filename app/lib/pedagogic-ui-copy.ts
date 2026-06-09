@@ -3,6 +3,9 @@
  * Reversión rápida: poner USE_NEW_PEDAGOGIC_LABELS = false.
  */
 
+import { PAES_PROJECTION_DISCLAIMER } from "@/app/lib/paesProjectionCanonical"
+import { SIMCE_PROJECTION_SCALE_LABEL, SIMCE_PROJECTION_SCALE_RANGE } from "@/app/lib/simceProjectionCanonical"
+
 export const USE_NEW_PEDAGOGIC_LABELS = true
 
 const LEGACY = {
@@ -36,10 +39,10 @@ const NUEVO = {
   coberturaCol: "Cobertura curricular (%)",
   simceProyectadoTitulo: "SIMCE Proyectado",
   simceProyectadoBajada:
-    "Estimación del puntaje nacional (escala 200-350) basado en el nivel de cobertura curricular actual.",
-  paesProyectadoTitulo: "PAES Proyectado",
+    `Estimación referencial (escala ${SIMCE_PROJECTION_SCALE_RANGE}) basada en el nivel de cobertura curricular actual.`,
+  paesProyectadoTitulo: "PAES Proyectado (referencial)",
   paesProyectadoBajada:
-    "Estimación del puntaje de acceso a la educación superior (escala 100-1000) según el desempeño en ítems de alta complejidad.",
+    "Estimación pedagógica en escala 100–1000 según el desempeño observado en esta evaluación; no reemplaza puntaje oficial DEMRE.",
 } as const
 
 const LEGACY_NACIONAL = {
@@ -124,7 +127,11 @@ export function uiSimceProyectadoTitulo() {
 }
 
 export function uiSimceProyectadoBajada() {
-  return USE_NEW_PEDAGOGIC_LABELS ? NUEVO.simceProyectadoBajada : "Escala SIMCE (200-350)"
+  return USE_NEW_PEDAGOGIC_LABELS ? NUEVO.simceProyectadoBajada : SIMCE_PROJECTION_SCALE_LABEL
+}
+
+export function uiSimceProyectadoEscalaLabel() {
+  return SIMCE_PROJECTION_SCALE_LABEL
 }
 
 export function uiPaesProyectadoTitulo() {
@@ -132,5 +139,13 @@ export function uiPaesProyectadoTitulo() {
 }
 
 export function uiPaesProyectadoBajada() {
-  return USE_NEW_PEDAGOGIC_LABELS ? NUEVO.paesProyectadoBajada : "Escala DEMRE (100-1000)"
+  return USE_NEW_PEDAGOGIC_LABELS ? NUEVO.paesProyectadoBajada : "Escala PAES referencial (100–1000)"
+}
+
+export function uiPaesProyectadoDisclaimer() {
+  return PAES_PROJECTION_DISCLAIMER
+}
+
+export function uiProyeccionNacionalTitulo() {
+  return "Proyección referencial (SIMCE / PAES)"
 }

@@ -8,10 +8,19 @@ import {
   uiCoberturaTitulo,
   uiEstandarAprendizajeBajada,
   uiEstandarAprendizajeTitulo,
+  uiPaesProyectadoBajada,
+  uiPaesProyectadoDisclaimer,
+  uiPaesProyectadoTitulo,
+  uiProyeccionNacionalTitulo,
   uiSemaforoBajada,
   uiSemaforoTitulo,
 } from "@/app/lib/pedagogic-ui-copy"
 import { formatStudentDisplayName } from "@/app/lib/format-student-name"
+import {
+  SIMCE_PROJECTION_DISCLAIMER,
+  SIMCE_PROJECTION_SCALE_INLINE,
+  SIMCE_PROJECTION_SCALE_LABEL,
+} from "@/app/lib/simceProjectionCanonical"
 
 type Kpis = {
   promedio_logro_institucional: number
@@ -72,7 +81,7 @@ function formatSegmentRowProjection(
   paes_projection: number | null,
 ): string {
   if (instrument_family === "SIMCE" && simce_projection != null && Number.isFinite(Number(simce_projection))) {
-    return `SIMCE ${Math.round(Number(simce_projection))} (200–350)`
+    return `SIMCE ${Math.round(Number(simce_projection))} ${SIMCE_PROJECTION_SCALE_INLINE}`
   }
   if (instrument_family === "PAES" && paes_projection != null && Number.isFinite(Number(paes_projection))) {
     return `PAES ${Math.round(Number(paes_projection))} (100–1000)`
@@ -299,12 +308,17 @@ export default function DashboardDireccionPage() {
         <article className="rounded-xl border border-sky-200 bg-gradient-to-br from-sky-50 to-white p-4 shadow-sm">
           <p className="text-xs text-[var(--text-muted)] uppercase tracking-wide">SIMCE Proyectado</p>
           <p className="mt-2 text-3xl font-bold text-sky-700">{Math.round(kpis.simce_proyectado_promedio)}</p>
-          <p className="text-xs text-[var(--text-muted)] mt-1">Escala SIMCE (200-350)</p>
+          <p className="text-xs text-[var(--text-muted)] mt-1">{SIMCE_PROJECTION_SCALE_LABEL}</p>
+          <p className="text-[11px] text-slate-500 mt-1 leading-snug">{SIMCE_PROJECTION_DISCLAIMER}</p>
         </article>
         <article className="rounded-xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-white p-4 shadow-sm">
-          <p className="text-xs text-[var(--text-muted)] uppercase tracking-wide">PAES Proyectado Promedio</p>
+          <p className="text-xs text-[var(--text-muted)] uppercase tracking-wide">{uiPaesProyectadoTitulo()}</p>
+          {uiPaesProyectadoBajada() ? (
+            <p className="text-[11px] text-slate-500 mt-1 leading-snug">{uiPaesProyectadoBajada()}</p>
+          ) : null}
           <p className="mt-2 text-3xl font-bold text-indigo-700">{Math.round(kpis.paes_proyectado_promedio)}</p>
-          <p className="text-xs text-[var(--text-muted)] mt-1">Escala DEMRE (100-1000)</p>
+          <p className="text-xs text-[var(--text-muted)] mt-1">Escala PAES referencial (100–1000)</p>
+          <p className="text-[11px] text-slate-500 mt-1 leading-snug">{uiPaesProyectadoDisclaimer()}</p>
         </article>
       </div>
       {!loading && segmentBreakdown.length > 0 && (

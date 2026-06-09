@@ -53,10 +53,13 @@ export type PedagogicalAnalysisExportData = {
   instrument_type?: string | null
   instrument_analytics_mode?: "SIMCE" | "PAES" | "INSTITUTIONAL_OTHER"
   projections?: {
+    logro_pct?: number | null
     simce_estimated: number | null
     paes_estimated: number | null
     paes_projection_meta?: import("@/app/lib/paesProjectionCanonical").PaesProjectionMeta | null
-    level_label: "Insuficiente" | "Elemental" | "Adecuado" | null
+    paes_projection_disclaimer?: string
+    level_label: "Insuficiente" | "Elemental" | "Adecuado" | "Alto" | null
+    paes_level_label?: "Bajo" | "Medio" | "Alto" | "Avanzado" | null
     year?: number
     simce_projection_type?: "referential"
     simce_projection_disclaimer?: string

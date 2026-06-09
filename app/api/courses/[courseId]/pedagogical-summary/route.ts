@@ -24,11 +24,11 @@ import { paesProjectionMetaForMethodology, type PaesProjectionMeta } from "@/app
 import { simceProjectionMetadata } from "@/app/lib/simceProjectionCanonical"
 import {
   clampLogroPctFromScores,
-  projectPaesFromLogroPct,
   projectSimceFromLogroPct,
   simceLevelFromLogroPct,
   type SimceLevel,
 } from "@/app/lib/standard-scale-converters"
+import { convertToNationalScore } from "@/app/lib/standard-scale/converters"
 import {
   evaluationMatchesExamTypeQueryParam,
   getInstrumentAnalyticsModeFromEvaluationTags,
@@ -564,8 +564,8 @@ function toNationalAnalyticsRows(params: {
       simce_score = projectSimceFromLogroPct(lp)
       simce_level = simceLevelFromLogroPct(lp)
     } else if (mode === "PAES") {
-      paes_score = projectPaesFromLogroPct(lp)
-      paes_projection_meta = paesProjectionMetaForMethodology("linear_fallback")
+      paes_score = convertToNationalScore(lp, "paes", 2026)
+      paes_projection_meta = paesProjectionMetaForMethodology("anchor_table")
     }
     rows.push({
       evaluation_id: evaluationId,

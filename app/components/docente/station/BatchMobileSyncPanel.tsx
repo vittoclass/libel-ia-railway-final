@@ -1,11 +1,13 @@
 "use client"
 /* eslint-disable @next/next/no-img-element -- QR PNG desde API con cookie de sesión. */
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback, useMemo } from "react"
 import { Button } from "@/components/ui/button"
 import { QrCode, RefreshCw, Copy, Check, Smartphone, Radio } from "lucide-react"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
 import { BATCH_PHOTO_ACTIVITY_CHANNEL } from "@/app/lib/docente/active-batch-id"
+import { readWizardSession } from "@/app/components/teacher-wizard/sessionStorage"
+import type { DevelopmentTipoPrueba } from "@/app/lib/development-crop/flags"
 
 const QR_SIZE_PX = 256
 const MOBILE_ACTIVE_MS = 90_000
@@ -80,7 +82,13 @@ export function BatchMobileSyncPanel({
   }, [])
 
   const ready = isMounted && !!batchId && !!origin
-  const mobileUrl = ready ? `${origin}/escaneo/${encodeURIComponent(batchId!)}` : ""
+  const mobileUrl = useMemo(() => {
+    if (!ready) return ""
+    const base = `${origin}/escaneo/${encodeURIComponent(batchId!)}`
+    const tipo = readWizardSession()?.tipoPrueba as DevelopmentTipoPrueba | undefined
+    if (!tipo) return base
+    return `${base}?tipo=${encodeURIComponent(tipo)}`
+  }, [ready, origin, batchId])
 
   const qrSrc = ready ? `/api/docente/station-qr?u=${encodeURIComponent(mobileUrl)}&v=${qrNonce}` : ""
 

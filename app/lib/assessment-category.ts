@@ -33,7 +33,7 @@ export function parseAssessmentTypeToFlat(raw: string | null | undefined): FlatA
   return null
 }
 
-/** Para KPI estilo SIMCE (escala 200–350). */
+/** Para KPI estilo SIMCE (escala referencial 200–400). */
 export function isSimceFamilyFlat(t: FlatAssessmentType): boolean {
   return t === "ENSAYO_SIMCE"
 }
