@@ -17,9 +17,14 @@ import {
   ResponsiveContainer,
   Cell,
 } from "recharts"
-import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
+import { formatPedagogicalReadableText, formatQuestionNumbersSpanish } from "@/app/lib/pedagogical-export-formatting"
 import { formatStudentDisplayName } from "@/app/lib/format-student-name"
-import { paesMethodologyUiPhrase } from "@/app/lib/paesProjectionCanonical"
+import {
+  buildStudentReportDiagnosis,
+  COGNITIVE_PERFORMANCE_LABELS,
+  type StudentReportDiagnosis,
+} from "@/app/lib/pedagogical-report-presentation"
+import { PAES_PROJECTION_DISCLAIMER, paesMethodologyUiPhrase } from "@/app/lib/paesProjectionCanonical"
 import { SIMCE_PROJECTION_DISCLAIMER } from "@/app/lib/simceProjectionCanonical"
 import type { PedagogicalAnalysisExportData } from "@/app/lib/pedagogical-analysis-export-types"
 
@@ -57,13 +62,17 @@ function StatusMessage({ data }: { data: PedagogicalAnalysisExportData }) {
   return wrap("No hay datos suficientes para generar el análisis pedagógico con la información actual.")
 }
 
+function clampDisplayPct(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)))
+}
+
 function formatPct(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return "—"
-  return `${Math.round(Number(value))}%`
+  return `${clampDisplayPct(Number(value))}%`
 }
 
 function chartPct(value: number | null | undefined): number {
-  return value == null || !Number.isFinite(Number(value)) ? 0 : Math.round(Number(value))
+  return value == null || !Number.isFinite(Number(value)) ? 0 : clampDisplayPct(Number(value))
 }
 
 function safeScore(value: number | null | undefined): string {
@@ -72,53 +81,20 @@ function safeScore(value: number | null | undefined): string {
 }
 
 function levelBadgeClass(level: string | null | undefined): string {
-  if (level === "Adecuado") return "border-emerald-700 bg-emerald-500 text-white"
-  if (level === "Elemental") return "border-amber-700 bg-amber-500 text-white"
+  if (level === "Adecuado" || level === "Alto" || level === "Avanzado") {
+    return "border-emerald-700 bg-emerald-500 text-white"
+  }
+  if (level === "Elemental" || level === "Medio") return "border-amber-700 bg-amber-500 text-white"
   return "border-rose-700 bg-rose-600 text-white"
 }
 
-function buildStudentDiagnosis(data: PedagogicalAnalysisExportData) {
-  const byAxis = data.by_axis ?? []
-  const bySkill = data.by_skill ?? []
-  const byCog = data.by_cognitive_level ?? []
-  const strengthsAxis = byAxis
-    .filter((r) => typeof r.logro_pct === "number" && r.logro_pct >= 70)
-    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
-  const strengthsSkill = bySkill
-    .filter((r) => typeof r.logro_pct === "number" && r.logro_pct >= 70)
-    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
-  const weakAxis = byAxis
-    .filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50)
-    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
-  const weakSkill = bySkill
-    .filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50)
-    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
-  const weakCog = byCog
-    .filter((r) => typeof r.logro_pct === "number" && r.logro_pct < 50)
-    .map((r) => ({ name: formatPedagogicalReadableText(r.dimension_value), pct: Number(r.logro_pct) }))
-  const recMap = new Map<string, { name: string; pct: number }>()
-  for (const row of [...weakSkill, ...weakAxis]) {
-    const k = row.name.trim().toLowerCase()
-    if (!k) continue
-    const cur = recMap.get(k)
-    if (!cur || row.pct < cur.pct) recMap.set(k, { name: row.name, pct: row.pct })
-  }
-  const recommendations = [...recMap.values()].sort((a, b) => a.pct - b.pct).slice(0, 6).map((x) => x.name)
-  return {
-    strengthsAxis,
-    strengthsSkill,
-    weakAxis,
-    weakSkill,
-    weakCog,
-    recommendations,
-    hasContent:
-      strengthsAxis.length > 0 ||
-      strengthsSkill.length > 0 ||
-      weakAxis.length > 0 ||
-      weakSkill.length > 0 ||
-      weakCog.length > 0 ||
-      recommendations.length > 0,
-  }
+function buildStudentDiagnosis(data: PedagogicalAnalysisExportData): StudentReportDiagnosis {
+  return buildStudentReportDiagnosis({
+    by_axis: data.by_axis ?? [],
+    by_skill: data.by_skill ?? [],
+    by_cognitive_level: data.by_cognitive_level ?? [],
+    by_question: data.by_question ?? [],
+  })
 }
 
 export function PedagogicalAnalysisReportBody({
@@ -177,19 +153,31 @@ function PedagogicalAnalysisInner({
   mode: PedagogicalAnalysisExportData["instrument_analytics_mode"] | undefined
   showNationalProjections: boolean
 }) {
+  const diagnosisSections =
+    data.by_axis.length > 0 || data.by_skill.length > 0 || data.by_cognitive_level.length > 0
+      ? buildStudentDiagnosis(data)
+      : null
+
   return (
     <>
       {showNationalProjections && data.projections && (
         <div className="space-y-3 rounded-md border border-[var(--border-color)] bg-[var(--bg-muted)] p-4">
-          <h4 className="font-semibold text-[var(--text-accent)]">Proyección según tipo de instrumento</h4>
+          <h4 className="font-semibold text-[var(--text-accent)]">Proyección referencial según tipo de instrumento</h4>
           <p className="text-xs text-[var(--text-muted)]">
-            {mode === "SIMCE" && "Ensayo SIMCE: proyección escala SIMCE y nivel de desempeño (no se muestra PAES)."}
-            {mode === "PAES" && "Ensayo PAES: proyección escala PAES (no se muestran puntaje SIMCE ni niveles tipo SIMCE/Agencia)."}
+            {mode === "SIMCE" &&
+              "Ensayo SIMCE: estimación pedagógica en escala referencial y nivel estimado según desempeño observado en esta evaluación."}
+            {mode === "PAES" &&
+              "Ensayo PAES: estimación pedagógica en escala referencial según desempeño observado en esta evaluación."}
           </p>
+          {data.projections.logro_pct != null && Number.isFinite(Number(data.projections.logro_pct)) && (
+            <p className="text-xs text-[var(--text-muted)]">
+              <span className="font-medium">Logro:</span> {formatPct(data.projections.logro_pct)}
+            </p>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {(mode === "SIMCE" || data.projections.simce_estimated != null) && (
               <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
-                <p className="text-xs font-medium text-[var(--text-muted)]">SIMCE (ESTIMADO)</p>
+                <p className="text-xs font-medium text-[var(--text-muted)]">Proyección SIMCE referencial</p>
                 <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.simce_estimated)}</p>
                 <p className="text-xs text-[var(--text-muted)] mt-1">
                   {data.projections.simce_projection_disclaimer ?? SIMCE_PROJECTION_DISCLAIMER}
@@ -198,7 +186,7 @@ function PedagogicalAnalysisInner({
             )}
             {(mode === "PAES" || data.projections.paes_estimated != null) && (
               <div className="rounded-md border border-slate-300 bg-white p-3 shadow-sm">
-                <p className="text-xs font-medium text-[var(--text-muted)]">PAES (ESTIMADO)</p>
+                <p className="text-xs font-medium text-[var(--text-muted)]">Proyección PAES referencial</p>
                 <p className="text-2xl font-bold text-slate-900">{safeScore(data.projections.paes_estimated)}</p>
                 {(() => {
                   const phrase = paesMethodologyUiPhrase(data.projections.paes_projection_meta)
@@ -206,12 +194,15 @@ function PedagogicalAnalysisInner({
                     <p className="text-xs text-[var(--text-muted)] mt-1">{phrase}</p>
                   ) : null
                 })()}
+                <p className="text-xs text-[var(--text-muted)] mt-1">
+                  {data.projections.paes_projection_disclaimer ?? PAES_PROJECTION_DISCLAIMER}
+                </p>
               </div>
             )}
           </div>
           {mode === "SIMCE" && data.projections.level_label != null && (
             <div className="flex items-center gap-2 text-xs">
-              <span className="font-medium text-[var(--text-muted)]">NIVEL DE DESEMPEÑO (referencia SIMCE/Agencia):</span>
+              <span className="font-medium text-[var(--text-muted)]">Nivel estimado (cortes internos referenciales):</span>
               <span
                 className={`inline-flex items-center rounded-full border px-3 py-1 font-semibold ${levelBadgeClass(data.projections.level_label)}`}
               >
@@ -219,33 +210,30 @@ function PedagogicalAnalysisInner({
               </span>
             </div>
           )}
+          {mode === "PAES" && data.projections.paes_level_label != null && (
+            <div className="flex items-center gap-2 text-xs">
+              <span className="font-medium text-[var(--text-muted)]">Nivel estimado (cortes internos referenciales):</span>
+              <span
+                className={`inline-flex items-center rounded-full border px-3 py-1 font-semibold ${levelBadgeClass(data.projections.paes_level_label)}`}
+              >
+                {data.projections.paes_level_label.toUpperCase()}
+              </span>
+            </div>
+          )}
         </div>
       )}
-      {summary && (
+      {summary && diagnosisSections && (
         <div className="rounded-md border bg-[var(--bg-muted)] p-3 space-y-2">
           <h4 className="font-semibold text-[var(--text-accent)]">Resumen del alumno</h4>
-          <div className="grid grid-cols-2 gap-2 text-xs">
+          <p className="text-xs text-[var(--text)]">{diagnosisSections.overview}</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
             <div>
-              <span className="text-muted-foreground">Ejes fuertes:</span>{" "}
-              {summary.strong_axes.length ? summary.strong_axes.join(", ") : "—"}
+              <span className="text-muted-foreground">{COGNITIVE_PERFORMANCE_LABELS.highest}:</span>{" "}
+              {summary.highest_cognitive_level ?? "—"}
             </div>
             <div>
-              <span className="text-muted-foreground">Ejes descendidos:</span>{" "}
-              {summary.weak_axes.length ? summary.weak_axes.join(", ") : "—"}
-            </div>
-            <div>
-              <span className="text-muted-foreground">Habilidades fuertes:</span>{" "}
-              {summary.strong_skills.length ? summary.strong_skills.join(", ") : "—"}
-            </div>
-            <div>
-              <span className="text-muted-foreground">Habilidades descendidas:</span>{" "}
-              {summary.weak_skills.length ? summary.weak_skills.join(", ") : "—"}
-            </div>
-            <div>
-              <span className="text-muted-foreground">Nivel cognitivo más alto:</span> {summary.highest_cognitive_level ?? "—"}
-            </div>
-            <div>
-              <span className="text-muted-foreground">Nivel cognitivo más bajo:</span> {summary.lowest_cognitive_level ?? "—"}
+              <span className="text-muted-foreground">{COGNITIVE_PERFORMANCE_LABELS.lowest}:</span>{" "}
+              {summary.lowest_cognitive_level ?? "—"}
             </div>
           </div>
         </div>
@@ -470,61 +458,94 @@ function PedagogicalAnalysisInner({
           </div>
         )}
       </div>
-      {(data.by_axis.length > 0 || data.by_skill.length > 0 || data.by_cognitive_level.length > 0) &&
+      {diagnosisSections?.hasContent &&
         (() => {
-          const d = buildStudentDiagnosis(data)
-          if (!d.hasContent) return null
+          const d = diagnosisSections
           return (
             <div className="space-y-4 pt-4 border-t border-[var(--border-color)]">
-              <h4 className="font-semibold text-[var(--text-accent)]">Diagnóstico pedagógico automático</h4>
               <div className="rounded-md border bg-[var(--bg-muted)] p-4 space-y-4 text-sm">
-                {(d.strengthsAxis.length > 0 || d.strengthsSkill.length > 0) && (
-                  <div>
-                    <p className="font-medium text-[var(--text-accent)] mb-1">El estudiante muestra fortalezas en:</p>
-                    <ul className="list-disc list-inside space-y-0.5 text-[var(--text)]">
-                      {d.strengthsAxis.map((x, i) => (
-                        <li key={`ax-${i}`}>
-                          {x.name} ({formatPct(x.pct)})
-                        </li>
+                <div>
+                  <h4 className="font-semibold text-[var(--text-accent)] mb-2">Diagnóstico pedagógico automático</h4>
+                  {d.strengths.length > 0 && (
+                    <div className="mb-3">
+                      <p className="font-medium text-[var(--text-accent)] mb-1">Desempeño destacado:</p>
+                      <ul className="list-disc list-inside space-y-1 text-[var(--text)]">
+                        {d.strengths.map((x, i) => (
+                          <li key={`st-${i}`}>
+                            <span className="font-medium">{x.displayName}</span> — {x.evidenceLabel}
+                            {x.evidenceSuffix ? (
+                              <span className="text-[var(--text-muted)]"> ({x.evidenceSuffix})</span>
+                            ) : null}
+                            {x.includesNote ? (
+                              <span className="block text-xs text-[var(--text-muted)] mt-0.5">{x.includesNote}</span>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {d.hierarchicalGaps.axes.length > 0 && (
+                    <div>
+                      <p className="font-medium text-[var(--text-accent)] mb-1">Brechas observadas:</p>
+                      <div className="space-y-3 text-[var(--text)]">
+                        {d.hierarchicalGaps.axes.map((axis, ai) => (
+                          <div key={`gap-axis-${ai}`}>
+                            <p className="font-medium">Eje: {axis.axisName}</p>
+                            <ul className="list-disc list-inside space-y-1 ml-2">
+                              {axis.skills.map((skill, si) => (
+                                <li key={`gap-skill-${ai}-${si}`}>
+                                  <span className="font-medium">Habilidad:</span> {skill.displayName} ({skill.pct}%
+                                  {skill.evidenceSuffix ? ` · ${skill.evidenceSuffix}` : ""})
+                                  {skill.cognitiveLevels.length > 0 ? (
+                                    <span className="block text-xs text-[var(--text-muted)] mt-0.5">
+                                      Nivel cognitivo asociado: {skill.cognitiveLevels.join(" / ")}
+                                    </span>
+                                  ) : null}
+                                  {skill.includesNote ? (
+                                    <span className="block text-xs text-[var(--text-muted)] mt-0.5">{skill.includesNote}</span>
+                                  ) : null}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {d.hierarchicalGaps.standaloneCognitiveGaps.length > 0 && (
+                    <div className="mt-3">
+                      <p className="font-medium text-[var(--text-accent)] mb-1">Dificultad cognitiva observada:</p>
+                      <ul className="list-disc list-inside space-y-1 text-[var(--text)]">
+                        {d.hierarchicalGaps.standaloneCognitiveGaps.map((cog, i) => (
+                          <li key={`cog-gap-${i}`}>
+                            {cog.name} ({cog.pct}%
+                            {cog.evidenceSuffix ? ` · ${cog.evidenceSuffix}` : ""})
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+                {d.groupedRecommendations.length > 0 && (
+                  <div className="pt-3 border-t border-[var(--border-color)]">
+                    <h4 className="font-semibold text-[var(--text-accent)] mb-2">Recomendaciones</h4>
+                    <div className="space-y-3 text-[var(--text)]">
+                      {d.groupedRecommendations.map((group, gi) => (
+                        <div key={`rec-group-${gi}`}>
+                          <p className="font-medium">{group.groupTitle}</p>
+                          <ul className="list-disc list-inside space-y-1 ml-2">
+                            {group.skills.map((skill, si) => (
+                              <li key={`rec-skill-${gi}-${si}`}>
+                                {skill.name}
+                                {skill.questionNumbers.length > 0
+                                  ? ` (ítems ${formatQuestionNumbersSpanish(skill.questionNumbers)})`
+                                  : ""}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
                       ))}
-                      {d.strengthsSkill.map((x, i) => (
-                        <li key={`sk-${i}`}>
-                          {x.name} ({formatPct(x.pct)})
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {(d.weakAxis.length > 0 || d.weakSkill.length > 0 || d.weakCog.length > 0) && (
-                  <div>
-                    <p className="font-medium text-[var(--text-accent)] mb-1">Presenta dificultades en:</p>
-                    <ul className="list-disc list-inside space-y-0.5 text-[var(--text)]">
-                      {d.weakAxis.map((x, i) => (
-                        <li key={`wax-${i}`}>
-                          {x.name} ({formatPct(x.pct)})
-                        </li>
-                      ))}
-                      {d.weakSkill.map((x, i) => (
-                        <li key={`wsk-${i}`}>
-                          {x.name} ({formatPct(x.pct)})
-                        </li>
-                      ))}
-                      {d.weakCog.map((x, i) => (
-                        <li key={`wcog-${i}`}>
-                          Nivel cognitivo: {x.name} ({formatPct(x.pct)})
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {d.recommendations.length > 0 && (
-                  <div>
-                    <p className="font-medium text-[var(--text-accent)] mb-1">Se recomienda reforzar:</p>
-                    <ul className="list-disc list-inside space-y-0.5 text-[var(--text)]">
-                      {d.recommendations.map((name, i) => (
-                        <li key={i}>{name}</li>
-                      ))}
-                    </ul>
+                    </div>
                   </div>
                 )}
               </div>

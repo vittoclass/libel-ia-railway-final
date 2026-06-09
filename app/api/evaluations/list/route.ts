@@ -53,6 +53,7 @@ export async function GET(req: NextRequest) {
   const courseId = searchParams.get("course_id")?.trim() || null
   const subject = searchParams.get("subject")?.trim() || null
   const statusFilter = searchParams.get("status")?.trim() || null
+  const includeArchived = searchParams.get("include_archived") === "true"
   const fromDate = searchParams.get("from_date")?.trim() || null
   const toDate = searchParams.get("to_date")?.trim() || null
   const search = searchParams.get("search")?.trim() || null
@@ -77,7 +78,7 @@ export async function GET(req: NextRequest) {
 
   let query = supabase
     .from("evaluations")
-    .select("id, title, course_id, course_label, subject, evaluated_at, status, batch_id")
+    .select("id, title, course_id, course_label, subject, evaluated_at, status, batch_id, is_archived")
     .order("evaluated_at", { ascending: false })
 
   if (school_id_used) query = query.eq("school_id", school_id_used)
@@ -86,6 +87,9 @@ export async function GET(req: NextRequest) {
   if (courseId) query = isUuid(courseId) ? query.eq("course_id", courseId) : query.eq("course_label", courseId)
   if (subject) query = query.eq("subject", subject)
   if (statusFilter) query = query.eq("status", statusFilter)
+  else if (!includeArchived) {
+    query = query.or("is_archived.is.null,is_archived.eq.false").neq("status", "archived")
+  }
   if (fromDate) query = query.gte("evaluated_at", fromDate)
   if (toDate) query = query.lte("evaluated_at", toDate)
   if (search) query = query.ilike("title", `%${search}%`)
@@ -124,10 +128,19 @@ export async function GET(req: NextRequest) {
     evaluated_at: string | null
     status?: string | null
     batch_id?: string | null
+    is_archived?: boolean | null
   }>
 
+  const activeOnly = !includeArchived && statusFilter !== "archived"
+  const listAfterArchiveFilter = activeOnly
+    ? listRaw.filter(
+        (e) =>
+          String(e.status ?? "").trim().toLowerCase() !== "archived" && e.is_archived !== true,
+      )
+    : listRaw
+
   /** Solo filas con id UUID válido (evita 404 por ids huérfanos/mal formados en UI). Reversible: quitar este filtro. */
-  const list = listRaw.filter((e) => e.id != null && String(e.id).trim() !== "" && isUuid(String(e.id).trim()))
+  const list = listAfterArchiveFilter.filter((e) => e.id != null && String(e.id).trim() !== "" && isUuid(String(e.id).trim()))
   if (isDev && list.length !== listRaw.length) {
     console.warn("[evaluations/list] omitidas filas sin id UUID válido", { total: listRaw.length, kept: list.length })
   }

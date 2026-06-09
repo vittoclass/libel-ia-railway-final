@@ -4,6 +4,11 @@
  * Consume: by_axis, by_skill, by_cognitive_level, most_failed_questions.
  */
 import { formatPedagogicalReadableText, formatQuestionNumbersSpanish } from "@/app/lib/pedagogical-export-formatting"
+import {
+  buildGroupedRecommendationsDisplay,
+  buildHierarchicalGapsDisplay,
+  groupEvidenceByCanonicalSkillForDisplay,
+} from "@/app/lib/pedagogical-report-presentation"
 
 export type HeatMapItem = {
   item_number: number
@@ -39,6 +44,10 @@ export type DiagnosisResult = {
   evidenceLines: string[]
   /** Mensaje de triangulación si varias preguntas fallidas comparten eje/habilidad */
   triangulationMessage: string | null
+  /** Brechas jerárquicas (solo presentación) */
+  hierarchicalGapLines?: string[]
+  /** Recomendaciones agrupadas (solo presentación) */
+  groupedRecommendationLines?: string[]
 }
 
 /**
@@ -69,9 +78,6 @@ export function buildPedagogicalDiagnosis(input: DiagnosisInput): DiagnosisResul
       skills.length > 0 ? skills.map((sk) => formatPedagogicalReadableText(String(sk))).join(", ") : "varias habilidades"
     diagnosisParagraphs.push(
       `Las preguntas con mayor porcentaje de error son: ${nums}, asociadas a la(s) habilidad(es) ${skillText}.`
-    )
-    diagnosisParagraphs.push(
-      "Esto sugiere dificultades en tareas de interpretación y resolución de problemas que requieren reforzar."
     )
   }
 
@@ -119,9 +125,69 @@ export function buildPedagogicalDiagnosis(input: DiagnosisInput): DiagnosisResul
     triangulationMessage = `Se observa un patrón consistente de error en la habilidad "${formatPedagogicalReadableText(skillWithPattern[0])}", evidenciado en múltiples preguntas del eje ${formatPedagogicalReadableText(axisWithPattern[0])}.`
   }
 
+  const byQuestionFromFailed = failedQ.map((q) => ({
+    item_number: q.item_number,
+    skill: q.skill,
+    axis: q.axis,
+  }))
+
+  const hierarchicalGaps = buildHierarchicalGapsDisplay({
+    by_axis,
+    by_skill,
+    by_cognitive_level,
+    by_question: byQuestionFromFailed,
+  })
+
+  const hierarchicalGapLines: string[] = []
+  for (const axis of hierarchicalGaps.axes) {
+    hierarchicalGapLines.push(`Eje: ${axis.axisName}`)
+    for (const skill of axis.skills) {
+      const suffix = skill.evidenceSuffix ? ` · ${skill.evidenceSuffix}` : ""
+      hierarchicalGapLines.push(`  Habilidad: ${skill.displayName} (${skill.pct}%${suffix})`)
+      if (skill.cognitiveLevels.length > 0) {
+        hierarchicalGapLines.push(`  Nivel cognitivo asociado: ${skill.cognitiveLevels.join(" / ")}`)
+      }
+    }
+  }
+  for (const cog of hierarchicalGaps.standaloneCognitiveGaps) {
+    hierarchicalGapLines.push(`Dificultad cognitiva observada: ${cog.name} (${cog.pct}%)`)
+  }
+
+  const groupedRecommendations = buildGroupedRecommendationsDisplay({
+    by_axis,
+    by_skill,
+    by_question: byQuestionFromFailed,
+  })
+  const groupedRecommendationLines: string[] = []
+  for (const group of groupedRecommendations) {
+    groupedRecommendationLines.push(group.groupTitle)
+    for (const skill of group.skills) {
+      const qPart =
+        skill.questionNumbers.length > 0
+          ? ` (ítems ${formatQuestionNumbersSpanish(skill.questionNumbers)})`
+          : ""
+      groupedRecommendationLines.push(`  ${skill.name}${qPart}`)
+    }
+  }
+
+  const weakSkillsGrouped = groupEvidenceByCanonicalSkillForDisplay(
+    by_skill.filter((s) => s.logro_pct < 70),
+    byQuestionFromFailed,
+    "weakness",
+  )
+  if (weakSkillsGrouped.length > 0 && diagnosisParagraphs.length > 0) {
+    const top = weakSkillsGrouped[0]
+    const evidenceNote = top.evidenceSuffix ? ` (${top.evidenceSuffix})` : ""
+    diagnosisParagraphs.push(
+      `La brecha prioritaria por habilidad se concentra en "${top.displayName}" (${top.pct}%${evidenceNote}).`,
+    )
+  }
+
   return {
     diagnosisParagraphs: diagnosisParagraphs.length > 0 ? diagnosisParagraphs : ["No hay suficientes datos para generar diagnóstico automático."],
     evidenceLines: evidenceLines.length > 0 ? evidenceLines : [],
     triangulationMessage,
+    hierarchicalGapLines: hierarchicalGapLines.length > 0 ? hierarchicalGapLines : undefined,
+    groupedRecommendationLines: groupedRecommendationLines.length > 0 ? groupedRecommendationLines : undefined,
   }
 }

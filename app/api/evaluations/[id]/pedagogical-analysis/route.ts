@@ -11,9 +11,13 @@ import { resolveStudentDisplayName } from "@/app/lib/student-display-name"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { getSourceExamForEvaluation } from "@/app/lib/source-exam-db"
 import { enrichItemsWithPedagogy } from "@/app/lib/analyze-pedagogical-structure"
-import { paesProjectionMetaForMethodology } from "@/app/lib/paesProjectionCanonical"
+import { PAES_PROJECTION_DISCLAIMER, paesProjectionMetaForMethodology } from "@/app/lib/paesProjectionCanonical"
 import { simceProjectionMetadata } from "@/app/lib/simceProjectionCanonical"
-import { convertToNationalScore, nationalLevelLabel } from "@/app/lib/standard-scale/converters"
+import {
+  paesProjectionLevelFromLogroPct,
+  simceProjectionLevelFromLogroPct,
+} from "@/app/lib/standard-scale-converters"
+import { convertToNationalScore } from "@/app/lib/standard-scale/converters"
 import { mean, sampleStdDev, zScore } from "@/app/lib/pedagogical-intelligence/metrics"
 import { generateStrategicAnalysis } from "@/app/lib/pedagogical-intelligence/inference-engine"
 import { getInstrumentAnalyticsModeFromEvaluationTags } from "@/app/lib/assessment-category"
@@ -170,13 +174,17 @@ export async function GET(
   const paesEstimated =
     instrument_analytics_mode === "PAES" ? convertToNationalScore(logroPct, "paes", scaleYear) : null
   const projections = {
+    logro_pct: logroPct,
     simce_estimated:
       instrument_analytics_mode === "SIMCE" ? convertToNationalScore(logroPct, "simce", scaleYear) : null,
     paes_estimated: paesEstimated,
     paes_projection_meta:
       paesEstimated != null ? paesProjectionMetaForMethodology("anchor_table") : null,
+    paes_projection_disclaimer: paesEstimated != null ? PAES_PROJECTION_DISCLAIMER : null,
     level_label:
-      instrument_analytics_mode === "SIMCE" ? nationalLevelLabel(logroPct) : null,
+      instrument_analytics_mode === "SIMCE" ? simceProjectionLevelFromLogroPct(Number(logroPct ?? 0)) : null,
+    paes_level_label:
+      instrument_analytics_mode === "PAES" ? paesProjectionLevelFromLogroPct(Number(logroPct ?? 0)) : null,
     year: scaleYear,
     ...simceProjectionMetadata(),
   }
@@ -289,7 +297,7 @@ export async function GET(
       modelacion_pct: number | null
       overall_pct: number | null
       z_score_course: number | null
-      simce_level: "Insuficiente" | "Elemental" | "Adecuado" | null
+      simce_level: "Insuficiente" | "Elemental" | "Adecuado" | "Alto" | null
     }
   } | null = null
   // PHASE_3_INFERENCE_SECURITY_V1

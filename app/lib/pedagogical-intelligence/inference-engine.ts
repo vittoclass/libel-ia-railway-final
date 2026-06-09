@@ -1,5 +1,6 @@
 import { normalizePedagogicalText } from "@/app/lib/analyze-learning-results"
 import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
+import { formatRelativeCoursePositionText } from "@/app/lib/pedagogical-report-presentation"
 
 function countDistinctZeroDimensions(
   by_axis: Array<{ dimension_value: string; logro_pct: number | null }>,
@@ -24,7 +25,7 @@ export type StrategicInferenceInput = {
   // PHASE_3_INFERENCE_SECURITY_V1
   z_score_course: number | null
   // PHASE_3_INFERENCE_SECURITY_V1
-  simce_level: "Insuficiente" | "Elemental" | "Adecuado" | null
+  simce_level: "Insuficiente" | "Elemental" | "Adecuado" | "Alto" | null
   // PHASE_4_MEMORY_IDENTITY_V1
   delta_overall_pct?: number | null
   // PHASE_4_MEMORY_IDENTITY_V1
@@ -42,7 +43,7 @@ export type StrategicInferenceOutput = {
     modelacion_pct: number | null
     overall_pct: number | null
     z_score_course: number | null
-    simce_level: "Insuficiente" | "Elemental" | "Adecuado" | null
+    simce_level: "Insuficiente" | "Elemental" | "Adecuado" | "Alto" | null
   }
   // PHASE_4_MEMORY_IDENTITY_V1
   delta?: {
@@ -88,13 +89,8 @@ export function generateStrategicAnalysis(input: StrategicInferenceInput): Strat
     (numbersPct != null && numbersPct >= 33 && modelacionPct != null && modelacionPct <= 0) ||
     (numbersPct != null && numbersPct >= 40 && modelacionPct != null && modelacionPct <= 10)
 
-  // PHASE_3_INFERENCE_SECURITY_V1
-  const zRiskText =
-    input.z_score_course != null && input.z_score_course <= -0.8
-      ? "La posición relativa del estudiante se ubica por debajo del promedio del curso."
-      : input.z_score_course != null && input.z_score_course >= 0.8
-        ? "La posición relativa del estudiante se ubica por encima del promedio del curso, aunque persiste una brecha específica."
-        : "La posición relativa del estudiante se mantiene en un rango cercano al promedio del curso."
+  // PHASE_3_INFERENCE_SECURITY_V1 — solo narrativa si hay z_score o percentil válido
+  const zRiskText = formatRelativeCoursePositionText(input.z_score_course) ?? ""
 
   // PHASE_4_MEMORY_IDENTITY_V1
   const topAxisProgress =
@@ -125,11 +121,12 @@ export function generateStrategicAnalysis(input: StrategicInferenceInput): Strat
         }`
 
   // PHASE_3_INFERENCE_SECURITY_V1
-  const paragraphHomogeneous = `Desde una perspectiva técnico-pedagógica, el perfil evidencia un desempeño más homogéneo entre ejes y habilidades, con logro global de ${formatPct(overallPct)} y nivel proyectado ${simceLevel.toUpperCase()}. ${zRiskText} La recomendación prioritaria es sostener la consolidación conceptual y aumentar la práctica de resolución contextualizada para proteger la estabilidad del desempeño en evaluaciones estandarizadas.${deltaSentence}`
-  const paragraphMultiZero = `Desde una perspectiva técnico-pedagógica, el perfil muestra logro nulo o crítico en varias dimensiones del instrumento, lo que indica que requiere intervención prioritaria en múltiples dimensiones. Con logro global de ${formatPct(overallPct)} y nivel proyectado ${simceLevel.toUpperCase()}, conviene ordenar un plan de refuerzo transversal y dar seguimiento en la evaluación siguiente. ${zRiskText} La recomendación prioritaria es priorizar las brechas más severas sin descuidar el resto de los ejes.${deltaSentence}`
+  const zRiskSentence = zRiskText ? ` ${zRiskText}` : ""
+  const paragraphHomogeneous = `Desde una perspectiva técnico-pedagógica, el perfil evidencia un desempeño más homogéneo entre ejes y habilidades, con logro global de ${formatPct(overallPct)} y nivel proyectado ${simceLevel.toUpperCase()}.${zRiskSentence} La recomendación prioritaria es sostener la consolidación conceptual y aumentar la práctica de resolución contextualizada para proteger la estabilidad del desempeño en evaluaciones estandarizadas.${deltaSentence}`
+  const paragraphMultiZero = `Desde una perspectiva técnico-pedagógica, el perfil muestra logro nulo o crítico en varias dimensiones del instrumento, lo que indica que requiere intervención prioritaria en múltiples dimensiones. Con logro global de ${formatPct(overallPct)} y nivel proyectado ${simceLevel.toUpperCase()}, conviene ordenar un plan de refuerzo transversal y dar seguimiento en la evaluación siguiente.${zRiskSentence} La recomendación prioritaria es priorizar las brechas más severas sin descuidar el resto de los ejes.${deltaSentence}`
 
   const paragraph = hasGap
-    ? `Desde una perspectiva técnico-pedagógica, se observa una brecha de transferencia: el desempeño en NÚMEROS alcanza ${formatPct(numbersPct)}, mientras que en MODELACIÓN registra ${formatPct(modelacionPct)}. Este patrón sugiere dominio de procedimientos y cálculo, pero dificultades para traducir situaciones contextualizadas a representaciones matemáticas y justificar decisiones de resolución. ${zRiskText} Con un logro global de ${formatPct(overallPct)} y nivel proyectado ${simceLevel.toUpperCase()}, el riesgo principal para SIMCE se concentra en tareas que exigen modelar, interpretar y validar resultados en contexto.${deltaSentence}`
+    ? `Desde una perspectiva técnico-pedagógica, se observa una brecha de transferencia: el desempeño en NÚMEROS alcanza ${formatPct(numbersPct)}, mientras que en MODELACIÓN registra ${formatPct(modelacionPct)}. Este patrón sugiere dominio de procedimientos y cálculo, pero dificultades para traducir situaciones contextualizadas a representaciones matemáticas y justificar decisiones de resolución.${zRiskSentence} Con un logro global de ${formatPct(overallPct)} y nivel proyectado ${simceLevel.toUpperCase()}, el riesgo principal para SIMCE se concentra en tareas que exigen modelar, interpretar y validar resultados en contexto.${deltaSentence}`
     : multiAreaZero
       ? paragraphMultiZero
       : paragraphHomogeneous

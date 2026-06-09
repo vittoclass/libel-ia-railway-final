@@ -2,7 +2,8 @@
 // GET: detalle de una evaluaci?n (metadata, items, summary, estudiantes). Solo del usuario autenticado.
 import { NextRequest, NextResponse } from "next/server"
 import { BATCH_SCANS_BUCKET } from "@/app/lib/docente/batch-scans-storage"
-import { canReadEvaluationInAppScope, profileScopeFromRow } from "@/app/lib/evaluation-read-scope"
+import { canReadEvaluationInAppScope, normUuid, profileScopeFromRow } from "@/app/lib/evaluation-read-scope"
+import { isMasterEmail } from "@/app/lib/master-access"
 import { getOrCreateProfile } from "@/app/lib/profile"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import { mergePedagogicalSummaryDisplayFields, resolveStudentDisplayName } from "@/app/lib/student-display-name"
@@ -303,6 +304,69 @@ export async function GET(
   )
 }
 
+const INSTITUTIONAL_ARCHIVE_ROLES = new Set(["UTP", "DIRECCION", "ADMIN_INSTITUCION", "ADMIN"])
+
+function normalizeArchiveRole(role: unknown): string {
+  return String(role ?? "").trim().toUpperCase()
+}
+
+/** school_id de la evaluación; si la fila no lo trae, infiere desde el teacher_id del docente creador. */
+async function resolveEvaluationSchoolId(
+  supabase: NonNullable<ReturnType<typeof getSupabaseServer>>,
+  evaluation: { teacher_id?: string | null; school_id?: string | null }
+): Promise<string | null> {
+  const direct = normUuid(evaluation.school_id ?? null)
+  if (direct) return direct
+
+  const evalTeacher = normUuid(evaluation.teacher_id ?? null)
+  if (!evalTeacher) return null
+
+  const { data: teacherProfile } = await supabase
+    .from("profiles")
+    .select("school_id")
+    .eq("teacher_id", evalTeacher)
+    .not("school_id", "is", null)
+    .limit(1)
+    .maybeSingle()
+
+  return normUuid((teacherProfile as { school_id?: string | null } | null)?.school_id ?? null)
+}
+
+async function canArchiveEvaluation(params: {
+  supabase: NonNullable<ReturnType<typeof getSupabaseServer>>
+  userEmail: string | undefined
+  userId: string
+  teacherId: string | null
+  profileRole: string | null | undefined
+  profileSchoolId: string | null
+  evaluation: { teacher_id?: string | null; user_id?: string | null; school_id?: string | null }
+}): Promise<boolean> {
+  if (isMasterEmail(params.userEmail)) return true
+
+  const evalTeacher = normUuid(params.evaluation.teacher_id ?? null)
+  const { teacher_id_used, school_id_used } = profileScopeFromRow({
+    teacher_id: params.teacherId,
+    school_id: params.profileSchoolId,
+  })
+
+  if (teacher_id_used && evalTeacher === teacher_id_used) return true
+
+  const evalUserId = params.evaluation.user_id != null ? String(params.evaluation.user_id).trim() : ""
+  if (evalUserId !== "" && (evalUserId === params.userId || (teacher_id_used && evalUserId === teacher_id_used))) {
+    return true
+  }
+
+  const role = normalizeArchiveRole(params.profileRole)
+  if (INSTITUTIONAL_ARCHIVE_ROLES.has(role) && school_id_used) {
+    const evalSchool =
+      normUuid(params.evaluation.school_id ?? null) ??
+      (await resolveEvaluationSchoolId(params.supabase, params.evaluation))
+    if (evalSchool && school_id_used === evalSchool) return true
+  }
+
+  return false
+}
+
 export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -315,8 +379,7 @@ export async function DELETE(
     )
   }
 
-  const { user, profile } = await getOrCreateProfile()
-  const teacherId = profile?.teacher_id ?? null
+  const { user } = await getOrCreateProfile()
   if (!user) {
     return NextResponse.json(
       isDev ? { step: "auth", message: "No autorizado", debug: { hasUser: false } } : { error: "No autorizado" },
@@ -332,9 +395,15 @@ export async function DELETE(
     )
   }
 
+  const { data: profileRow } = await supabase
+    .from("profiles")
+    .select("teacher_id, school_id, role")
+    .eq("user_id", user.id)
+    .maybeSingle()
+
   const { data: evaluation, error: evalErr } = await supabase
     .from("evaluations")
-    .select("id, teacher_id, user_id")
+    .select("id, teacher_id, user_id, school_id")
     .eq("id", id)
     .maybeSingle()
 
@@ -345,30 +414,85 @@ export async function DELETE(
     )
   }
 
-  const isOwnerByTeacher = teacherId && evaluation.teacher_id === teacherId
-  const isOwnerByUser = evaluation.user_id && evaluation.user_id === user.id
-  if (!isOwnerByTeacher && !isOwnerByUser) {
+  const profileScope = profileScopeFromRow(profileRow)
+  const resolvedEvalSchool =
+    normUuid(evaluation.school_id ?? null) ?? (await resolveEvaluationSchoolId(supabase, evaluation))
+  const canArchive = await canArchiveEvaluation({
+    supabase,
+    userEmail: user.email,
+    userId: user.id,
+    teacherId: profileRow?.teacher_id ?? null,
+    profileRole: profileRow?.role ?? null,
+    profileSchoolId: profileRow?.school_id ?? null,
+    evaluation,
+  })
+  if (!canArchive) {
     return NextResponse.json(
       isDev
         ? {
             step: "ownership",
             message: "No autorizado para esta evaluaci?n",
-            debug: { evaluationTeacherId: evaluation.teacher_id, evaluationUserId: evaluation.user_id, profileTeacherId: teacherId, userId: user.id },
+            debug: {
+              evaluationTeacherId: evaluation.teacher_id,
+              evaluationUserId: evaluation.user_id,
+              evaluationSchoolId: evaluation.school_id,
+              resolvedEvaluationSchoolId: resolvedEvalSchool,
+              profileTeacherId: profileRow?.teacher_id ?? null,
+              profileSchoolId: profileRow?.school_id ?? null,
+              profileRole: profileRow?.role ?? null,
+              normalizedProfileRole: normalizeArchiveRole(profileRow?.role),
+              userId: user.id,
+              isMaster: isMasterEmail(user.email),
+              institutionalRoleMatch: INSTITUTIONAL_ARCHIVE_ROLES.has(normalizeArchiveRole(profileRow?.role)),
+              sameSchoolAsProfile:
+                !!profileScope.school_id_used &&
+                !!resolvedEvalSchool &&
+                profileScope.school_id_used === resolvedEvalSchool,
+            },
           }
         : { error: "No autorizado para esta evaluaci?n" },
       { status: 403 }
     )
   }
 
-  // LOGICA_ANTERIOR_LOCAL: no existia borrado fisico en este endpoint.
-  // DATA_SCIENCE_FIX_V1: eliminacion por fila padre; dependencias se limpian por ON DELETE CASCADE en DB.
-  const { error: deleteErr } = await supabase.from("evaluations").delete().eq("id", id)
-  if (deleteErr) {
+  const { data: updated, error: archiveErr } = await supabase
+    .from("evaluations")
+    .update({ status: "archived", is_archived: true })
+    .eq("id", id)
+    .select("id, status, is_archived")
+    .maybeSingle()
+
+  if (archiveErr) {
     return NextResponse.json(
-      isDev ? { step: "delete_evaluation", message: deleteErr.message, debug: { id } } : { error: "No se pudo eliminar la evaluaci?n" },
+      isDev ? { step: "archive_evaluation", message: archiveErr.message, debug: { id } } : { error: "No se pudo archivar la evaluaci?n" },
       { status: 500 }
     )
   }
 
-  return NextResponse.json({ ok: true, deleted_evaluation_id: id }, { status: 200 })
+  if (!updated) {
+    return NextResponse.json(
+      isDev
+        ? { step: "archive_evaluation", message: "No se actualiz? ninguna fila (posible RLS o id inexistente)", debug: { id } }
+        : { error: "No se pudo archivar la evaluaci?n" },
+      { status: 409 }
+    )
+  }
+
+  if (updated.status !== "archived" || updated.is_archived !== true) {
+    return NextResponse.json(
+      isDev
+        ? {
+            step: "archive_evaluation",
+            message: "La evaluaci?n no qued? archivada en BD",
+            debug: { id, status: updated.status, is_archived: updated.is_archived },
+          }
+        : { error: "No se pudo archivar la evaluaci?n" },
+      { status: 500 }
+    )
+  }
+
+  return NextResponse.json(
+    { ok: true, archived_evaluation_id: id, status: "archived", is_archived: true },
+    { status: 200 }
+  )
 }

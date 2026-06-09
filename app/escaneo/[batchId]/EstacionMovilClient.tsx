@@ -19,6 +19,14 @@ import {
   SCORE_WARN_SEND,
 } from "@/app/lib/omr-capture/constants"
 import { dataUrlToJpegFile, validatePostCapture } from "@/app/lib/omr-capture/postCapture"
+import { DevelopmentCropOverlay } from "@/app/components/development-crop/DevelopmentCropOverlay"
+import {
+  emitDevelopmentCropDebug,
+  parseTipoPruebaFromQuery,
+  shouldOfferDevelopmentManualCrop,
+  type DevelopmentTipoPrueba,
+} from "@/app/lib/development-crop/flags"
+import { isCustomCropRect, type NormalizedCropRect } from "@/app/lib/development-crop/cropImageRegion"
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
@@ -71,8 +79,17 @@ export function EstacionMovilClient({ batchId }: Props) {
   const [postCaptureScore, setPostCaptureScore] = useState<number | null>(null)
   const [postCaptureMessage, setPostCaptureMessage] = useState<string | null>(null)
   const [validatingCapture, setValidatingCapture] = useState(false)
+  const [tipoPrueba, setTipoPrueba] = useState<DevelopmentTipoPrueba | null>(null)
+  const [developmentCropStepOpen, setDevelopmentCropStepOpen] = useState(false)
+  const [developmentCropStepDone, setDevelopmentCropStepDone] = useState(false)
+  const [developmentCropUsed, setDevelopmentCropUsed] = useState(false)
+  /** Imagen completa capturada; permite repetir recorte tras confirmar un subrecorte. */
+  const [developmentCropSourcePreview, setDevelopmentCropSourcePreview] = useState<{ url: string; file: File } | null>(
+    null,
+  )
 
   const batchOk = UUID_REGEX.test(batchId.trim())
+  const developmentManualCropActive = shouldOfferDevelopmentManualCrop(tipoPrueba)
 
   const clearPostCapture = useCallback(() => {
     setPostCaptureScore(null)
@@ -105,8 +122,16 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   useEffect(() => {
     if (typeof window === "undefined") return
-    setCaptureDebug(new URLSearchParams(window.location.search).get("captureDebug") === "1")
+    const params = new URLSearchParams(window.location.search)
+    setCaptureDebug(params.get("captureDebug") === "1")
+    setTipoPrueba(parseTipoPruebaFromQuery(params.get("tipo")))
   }, [])
+
+  useEffect(() => {
+    if (developmentManualCropActive) {
+      emitDevelopmentCropDebug("development_crop_enabled", { tipoPrueba })
+    }
+  }, [developmentManualCropActive, tipoPrueba])
 
   useEffect(() => {
     if (!scannerActive || !boundStream) return
@@ -336,6 +361,13 @@ export function EstacionMovilClient({ batchId }: Props) {
       if (prev?.url) revokePreview(prev.url)
       return null
     })
+    setDevelopmentCropStepOpen(false)
+    setDevelopmentCropStepDone(false)
+    setDevelopmentCropUsed(false)
+    setDevelopmentCropSourcePreview((prev) => {
+      if (prev?.url) revokePreview(prev.url)
+      return null
+    })
     clearPostCapture()
   }, [uploading, revokePreview, clearPostCapture])
 
@@ -431,6 +463,14 @@ export function EstacionMovilClient({ batchId }: Props) {
       setPostCaptureMessage(previewMessage)
       resetQuality()
 
+      setDevelopmentCropStepDone(false)
+      setDevelopmentCropUsed(false)
+      setDevelopmentCropStepOpen(developmentManualCropActive)
+      setDevelopmentCropSourcePreview((prev) => {
+        if (prev?.url) revokePreview(prev.url)
+        return developmentManualCropActive ? { url, file } : null
+      })
+
       setPendingPreview((prev) => {
         if (prev?.url) revokePreview(prev.url)
         return { url, file }
@@ -443,6 +483,7 @@ export function EstacionMovilClient({ batchId }: Props) {
       revokePreview,
       markCapturing,
       resetQuality,
+      developmentManualCropActive,
     ],
   )
 
@@ -450,15 +491,75 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   const submitPendingPreview = useCallback(async () => {
     if (!pendingPreview) return
+    if (developmentManualCropActive && developmentCropStepOpen && !developmentCropStepDone) return
 
     const { file, url } = pendingPreview
     const ok = await uploadFile(file)
     if (ok) {
+      if (developmentCropUsed) {
+        emitDevelopmentCropDebug("development_crop_sent_to_ocr", {
+          note: "subimagen subida vía movil-upload; OCR posterior en evaluate sin cambios de ruta",
+        })
+      }
       revokePreview(url)
       setPendingPreview(null)
+      setDevelopmentCropStepOpen(false)
+      setDevelopmentCropStepDone(false)
+      setDevelopmentCropUsed(false)
+      setDevelopmentCropSourcePreview((prev) => {
+        if (prev?.url) revokePreview(prev.url)
+        return null
+      })
       clearPostCapture()
     }
-  }, [pendingPreview, uploadFile, revokePreview, clearPostCapture])
+  }, [
+    pendingPreview,
+    uploadFile,
+    revokePreview,
+    clearPostCapture,
+    developmentManualCropActive,
+    developmentCropStepOpen,
+    developmentCropStepDone,
+    developmentCropUsed,
+  ])
+
+  const handleDevelopmentCropConfirm = useCallback(
+    (croppedFile: File, rect: NormalizedCropRect, pixelSize: { width: number; height: number }) => {
+      setPendingPreview((prev) => {
+        if (!prev) return prev
+        if (prev.url) revokePreview(prev.url)
+        const url = URL.createObjectURL(croppedFile)
+        return { url, file: croppedFile }
+      })
+      setDevelopmentCropStepOpen(false)
+      setDevelopmentCropStepDone(true)
+      setDevelopmentCropUsed(isCustomCropRect(rect))
+      emitDevelopmentCropDebug("development_crop_dimensions", {
+        normalized: rect,
+        pixels: pixelSize,
+        phase: "confirm_replace_preview",
+      })
+    },
+    [revokePreview],
+  )
+
+  const handleDevelopmentCropSkip = useCallback(() => {
+    setDevelopmentCropStepOpen(false)
+    setDevelopmentCropStepDone(true)
+    setDevelopmentCropUsed(false)
+  }, [])
+
+  const handleDevelopmentCropRedo = useCallback(() => {
+    const source = developmentCropSourcePreview
+    if (!source) return
+    setPendingPreview((prev) => {
+      if (prev?.url && prev.url !== source.url) revokePreview(prev.url)
+      return { url: source.url, file: source.file }
+    })
+    setDevelopmentCropStepOpen(true)
+    setDevelopmentCropStepDone(false)
+    setDevelopmentCropUsed(false)
+  }, [developmentCropSourcePreview, revokePreview])
 
   useEffect(() => {
     setPhotosSentCount(0)
@@ -477,6 +578,13 @@ export function EstacionMovilClient({ batchId }: Props) {
     setCameraErrorName(null)
     setError(null)
     setPendingPreview((prev) => {
+      if (prev?.url) URL.revokeObjectURL(prev.url)
+      return null
+    })
+    setDevelopmentCropStepOpen(false)
+    setDevelopmentCropStepDone(false)
+    setDevelopmentCropUsed(false)
+    setDevelopmentCropSourcePreview((prev) => {
       if (prev?.url) URL.revokeObjectURL(prev.url)
       return null
     })
@@ -651,6 +759,31 @@ export function EstacionMovilClient({ batchId }: Props) {
                   )}
                 </div>
 
+                {pendingPreview && developmentCropStepOpen ? (
+                  <DevelopmentCropOverlay
+                    imageUrl={pendingPreview.url}
+                    open={developmentCropStepOpen}
+                    onConfirm={handleDevelopmentCropConfirm}
+                    onSkip={handleDevelopmentCropSkip}
+                  />
+                ) : null}
+
+                {pendingPreview &&
+                developmentManualCropActive &&
+                developmentCropStepDone &&
+                !developmentCropStepOpen &&
+                developmentCropSourcePreview ? (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="w-full"
+                    disabled={uploading}
+                    onClick={handleDevelopmentCropRedo}
+                  >
+                    Repetir recorte
+                  </Button>
+                ) : null}
+
                 {pendingPreview && postCaptureMessage ? (
                   <div
                     className={`rounded-lg border px-3 py-2 text-sm ${
@@ -676,7 +809,12 @@ export function EstacionMovilClient({ batchId }: Props) {
                     type="button"
                     size="lg"
                     className="w-full h-14 text-lg gap-2 bg-indigo-600 hover:bg-indigo-500"
-                    disabled={uploading || validatingCapture || (!pendingPreview && shutterCooldown)}
+                    disabled={
+                      uploading ||
+                      validatingCapture ||
+                      (!pendingPreview && shutterCooldown) ||
+                      (pendingPreview != null && developmentCropStepOpen)
+                    }
                     onClick={() => void (pendingPreview ? submitPendingPreview() : captureToPreview("manual"))}
                   >
                     {uploading || validatingCapture ? (
@@ -688,11 +826,15 @@ export function EstacionMovilClient({ batchId }: Props) {
                       ? "Subiendo…"
                       : validatingCapture
                         ? "Validando…"
-                        : pendingPreview
-                          ? "Enviar foto"
-                          : OMR_CAPTURE_GUIDE_ENABLED
-                            ? "Tomar foto"
-                            : "Disparar foto"}
+                        : pendingPreview && developmentCropStepOpen
+                          ? "Confirma el recorte arriba"
+                          : pendingPreview
+                            ? developmentCropUsed
+                              ? "Enviar recorte"
+                              : "Enviar foto"
+                            : OMR_CAPTURE_GUIDE_ENABLED
+                              ? "Tomar foto"
+                              : "Disparar foto"}
                   </Button>
                 </div>
               </>

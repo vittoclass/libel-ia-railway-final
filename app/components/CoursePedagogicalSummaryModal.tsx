@@ -216,14 +216,18 @@ function normalizeSummaryData(raw: SummaryData): SummaryData {
   }
 }
 
+function clampDisplayPct(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)))
+}
+
 function formatPct(value: number | null | undefined): string {
   // DATA_NORMALIZATION_V2: no evaluado se representa con guion.
   if (value == null || !Number.isFinite(Number(value))) return "—"
-  return `${Math.round(Number(value))}%`
+  return `${clampDisplayPct(Number(value))}%`
 }
 
 function chartPct(value: number | null | undefined): number {
-  return value == null || !Number.isFinite(Number(value)) ? 0 : Math.round(Number(value))
+  return value == null || !Number.isFinite(Number(value)) ? 0 : clampDisplayPct(Number(value))
 }
 
 function computeGlobalLogroPct(data: SummaryData): number | null {
@@ -499,7 +503,7 @@ export default function CoursePedagogicalSummaryModal({
           row.simce_level === "Adecuado" || row.simce_level === "Elemental" || row.simce_level === "Insuficiente"
             ? row.simce_level
             : "N/A"
-        const safeLogro = row.logro_pct == null ? "N/A" : `${Math.round(Number(row.logro_pct))}%`
+        const safeLogro = row.logro_pct == null ? "N/A" : `${clampDisplayPct(Number(row.logro_pct))}%`
         return {
           id: String(row.evaluation_id ?? ""),
           student: safeText(row.student_name, "Estudiante"),

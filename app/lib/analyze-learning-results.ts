@@ -93,6 +93,12 @@ const LOGRO_WEAK_PCT = 50
 const MIN_QUESTIONS_FOR_STRENGTH = 1
 const EXIGENCIA_DEFAULT_DECIMAL = 0.6
 
+/** Clamp exclusivo para logro_pct mostrado (0–100). No altera obtained/max ni scoring. */
+function clampPedagogicalLogroPct(rawPct: number): number {
+  if (!Number.isFinite(rawPct)) return 0
+  return Math.max(0, Math.min(100, Math.round(rawPct)))
+}
+
 const SKILL_CANONICAL_ALIASES: Record<string, string> = {
   LECTOR: "LECTURA",
   LECTORA: "LECTURA",
@@ -244,7 +250,7 @@ export function analyzeLearningResults(
     const { obtained, max } = normalizeScoreObtained(ei, scoreMaxSource || 1)
     // LOGICA_ANTERIOR_LOCAL: const logroPct = max > 0 ? Math.round((obtained / max) * 100) : 0
     // DATA_NORMALIZATION_V2: no evaluado (max=0) retorna null.
-    const logroPct = max > 0 ? Math.round((obtained / max) * 100) : null
+    const logroPct = max > 0 ? clampPedagogicalLogroPct((obtained / max) * 100) : null
 
     byQuestion.push({
       item_number: qn,
@@ -283,7 +289,7 @@ export function analyzeLearningResults(
       score_obtained: v.obtained,
       score_max: v.max,
       // LOGICA_ANTERIOR_LOCAL: v.max > 0 ? Math.round((v.obtained / v.max) * 100) : 0
-      logro_pct: v.max > 0 ? Math.round((v.obtained / v.max) * 100) : null,
+      logro_pct: v.max > 0 ? clampPedagogicalLogroPct((v.obtained / v.max) * 100) : null,
       question_count: v.count,
     }))
 
@@ -425,7 +431,7 @@ export function aggregateCourseSummary(
       dimension_value: formatPedagogicalDisplayText(dimension_value),
       score_obtained: v.obtained,
       score_max: v.max,
-      logro_pct: v.max > 0 ? Math.round((v.obtained / v.max) * 100) : null,
+      logro_pct: v.max > 0 ? clampPedagogicalLogroPct((v.obtained / v.max) * 100) : null,
       question_count: v.count,
     }))
 

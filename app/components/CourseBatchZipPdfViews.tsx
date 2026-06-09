@@ -7,6 +7,7 @@
 import * as React from "react"
 import { formatPedagogicalReadableText } from "@/app/lib/pedagogical-export-formatting"
 import { formatStudentDisplayName } from "@/app/lib/format-student-name"
+import { SIMCE_PROJECTION_DISCLAIMER, SIMCE_PROJECTION_SCALE_LABEL } from "@/app/lib/simceProjectionCanonical"
 
 export type CourseZipNationalRow = {
   student_name?: string
@@ -49,9 +50,13 @@ const tableStyle: React.CSSProperties = {
 }
 const thtd: React.CSSProperties = { border: "1px solid #cbd5e1", padding: "4px 6px", textAlign: "left" as const }
 
+function clampDisplayPct(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)))
+}
+
 function pct(v: number | null | undefined): string {
   if (v == null || !Number.isFinite(Number(v))) return "—"
-  return `${Math.round(Number(v))}%`
+  return `${clampDisplayPct(Number(v))}%`
 }
 
 export function CourseResumenSimceZipBody({
@@ -89,6 +94,9 @@ export function CourseResumenSimceZipBody({
               {dist.Insuficiente ?? 0}
             </div>
           ) : null}
+          <div style={{ marginTop: 6, fontSize: 9, color: "#64748b", lineHeight: 1.35 }}>
+            {SIMCE_PROJECTION_SCALE_LABEL} · {SIMCE_PROJECTION_DISCLAIMER}
+          </div>
         </div>
       ) : null}
       <h2 style={{ fontSize: 12, fontWeight: 700, margin: "12px 0 0" }}>Resultados por estudiante</h2>

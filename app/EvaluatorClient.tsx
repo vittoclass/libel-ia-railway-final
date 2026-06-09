@@ -1268,7 +1268,7 @@ export default function EvaluatorClient() {
   const [historialFilters, setHistorialFilters] = useState({ courseId: "", from: "", to: "" })
   const [historialFetchKey, setHistorialFetchKey] = useState(0)
   // Evaluaciones guardadas: listado y detalle
-  const [evaluacionesList, setEvaluacionesList] = useState<Array<{ id: string; title: string | null; course_id: string | null; subject: string | null; evaluated_at: string | null; grade_chile: number | null; status?: string | null; student_count?: number; first_student_name?: string | null }>>([])
+  const [evaluacionesList, setEvaluacionesList] = useState<Array<{ id: string; title: string | null; course_id: string | null; subject: string | null; evaluated_at: string | null; grade_chile: number | null; status?: string | null; is_archived?: boolean | null; student_count?: number; first_student_name?: string | null }>>([])
   const [evaluacionesListLoading, setEvaluacionesListLoading] = useState(false)
   const [evaluacionesListUnauth, setEvaluacionesListUnauth] = useState(false)
   const [evaluacionesListMessage, setEvaluacionesListMessage] = useState<string | null>(null)
@@ -1420,6 +1420,9 @@ export default function EvaluatorClient() {
     title: null,
   })
   const [deleteEvaluationLoading, setDeleteEvaluationLoading] = useState(false)
+  /** IDs archivados recientemente: barrera final ante recargas con datos viejos. */
+  const recentlyArchivedEvaluationIdsRef = useRef<Set<string>>(new Set())
+  const isEvalArchiveDev = typeof process !== "undefined" && process.env.NODE_ENV === "development"
   /** Solo development: panel Debug UI colapsable */
   const [debugPanelOpen, setDebugPanelOpen] = useState(false)
   const [studentsModalEvalId, setStudentsModalEvalId] = useState<string | null>(null)
@@ -1478,11 +1481,35 @@ export default function EvaluatorClient() {
     evaluated_at: string | null
     grade_chile: number | null
     status: string
+    is_archived?: boolean | null
     student_count: number
     first_student_name: string | null
   }
 
-  function normalizeEvaluation(ev: { id: string; title?: string | null; course_id?: string | null; course_label?: string | null; course_display?: string | null; subject?: string | null; evaluated_at?: string | null; grade_chile?: number | null; status?: string | null; student_count?: number; first_student_name?: string | null }): EvaluationRowNormalized {
+  function logEvalArchiveDev(label: string, payload?: unknown) {
+    if (!isEvalArchiveDev) return
+    if (payload !== undefined) console.info(`[EVAL_ARCHIVE_DEV] ${label}`, payload)
+    else console.info(`[EVAL_ARCHIVE_DEV] ${label}`)
+  }
+
+  function isEvaluationArchived(ev: { status?: string | null; is_archived?: boolean | null }): boolean {
+    if (ev.is_archived === true) return true
+    return String(ev.status ?? "").trim().toLowerCase() === "archived"
+  }
+
+  function filterActiveEvaluations<T extends { status?: string | null; is_archived?: boolean | null }>(list: T[]): T[] {
+    return list.filter((e) => !isEvaluationArchived(e))
+  }
+
+  function applyRecentlyArchivedFilter<T extends { id: string }>(list: T[]): T[] {
+    return list.filter((e) => !recentlyArchivedEvaluationIdsRef.current.has(e.id))
+  }
+
+  function filterVisibleActiveEvaluations<T extends { id: string; status?: string | null; is_archived?: boolean | null }>(list: T[]): T[] {
+    return applyRecentlyArchivedFilter(filterActiveEvaluations(list))
+  }
+
+  function normalizeEvaluation(ev: { id: string; title?: string | null; course_id?: string | null; course_label?: string | null; course_display?: string | null; subject?: string | null; evaluated_at?: string | null; grade_chile?: number | null; status?: string | null; is_archived?: boolean | null; student_count?: number; first_student_name?: string | null }): EvaluationRowNormalized {
     const courseDisplay = ev.course_display ?? ev.course_label ?? ev.course_id
     return {
       id: ev.id,
@@ -1491,6 +1518,7 @@ export default function EvaluatorClient() {
       course_id: courseDisplay != null && String(courseDisplay).trim() !== "" ? courseDisplay : "Sin curso",
       evaluated_at: ev.evaluated_at ?? null,
       status: ev.status ?? "draft",
+      is_archived: ev.is_archived ?? null,
       grade_chile: ev.grade_chile ?? null,
       student_count: ev.student_count ?? 0,
       first_student_name: ev.first_student_name ?? null,
@@ -1503,7 +1531,7 @@ export default function EvaluatorClient() {
     normalized.forEach((ev) => {
       const course = ev.course_id ?? "Sin curso"
       if (!courses[course]) courses[course] = { active: [], archived: [] }
-      if (ev.status === "archived") courses[course].archived.push(ev)
+      if (isEvaluationArchived(ev)) courses[course].archived.push(ev)
       else courses[course].active.push(ev)
     })
     return courses
@@ -1521,7 +1549,7 @@ export default function EvaluatorClient() {
 
   const openCourseBatchZip = useCallback(
     (courseTabKey: string) => {
-      const matching = evaluacionesList.filter((ev) => (ev.status ?? "draft") !== "archived" && listEvalCourseTabKey(ev) === courseTabKey)
+      const matching = filterVisibleActiveEvaluations(evaluacionesList).filter((ev) => listEvalCourseTabKey(ev) === courseTabKey)
       const batches = matching
         .map((ev) => String((ev as { batch_id?: string | null }).batch_id ?? "").trim())
         .filter((b) => b.length > 0)
@@ -1554,14 +1582,20 @@ export default function EvaluatorClient() {
   const [evaluationStudents, setEvaluationStudents] = useState<Array<{ student_name: string; created_at: string | null }>>([])
 
   /** Una sola función de carga: lista de evaluaciones para Evaluaciones y Cursos. Se llama al entrar a la pestaña o al Recargar. */
-  const loadEvaluationsList = useCallback(async () => {
+  const loadEvaluationsList = useCallback(async (opts?: { includeArchived?: boolean }) => {
     setEvaluacionesListLoading(true)
     setEvaluacionesListError(null)
     try {
-      const r = await fetch("/api/evaluations/list", { cache: "no-store", credentials: "include" })
+      const qs = opts?.includeArchived ? "?include_archived=true" : ""
+      const r = await fetch(`/api/evaluations/list${qs}`, { cache: "no-store", credentials: "include" })
       const j = await r.json()
       if (r.ok) {
-        setEvaluacionesList(j.evaluations ?? [])
+        type EvalListRow = (typeof evaluacionesList)[number]
+        const rows = (j.evaluations ?? []) as EvalListRow[]
+        const baseRows = opts?.includeArchived ? rows : filterActiveEvaluations(rows)
+        const visibleRows = applyRecentlyArchivedFilter(baseRows)
+        logEvalArchiveDev("AFTER_RELOAD_IDS", visibleRows.map((e) => e.id))
+        setEvaluacionesList(visibleRows)
         setEvaluacionesIsAdmin(!!j.isAdmin)
         setEvaluacionesListUnauth(false)
         setEvaluacionesListMessage(typeof j.message === "string" ? j.message : null)
@@ -1802,39 +1836,91 @@ export default function EvaluatorClient() {
     setDeleteEvaluationDialog({ open: true, id: evaluationId, title: title ?? null })
   }, [])
 
-  const handleConfirmDeleteEvaluation = useCallback(async () => {
-    if (!deleteEvaluationDialog.id) return
-    setDeleteEvaluationLoading(true)
-    try {
-      // LOGICA_ANTERIOR_LOCAL: solo existia archivado, no borrado fisico.
-      // DATA_SCIENCE_FIX_V1: borrado fisico via endpoint DELETE.
-      const r = await fetch(`/api/evaluations/${deleteEvaluationDialog.id}`, {
+  const removeEvaluationFromAllClientState = useCallback((evaluationId: string) => {
+    const id = String(evaluationId ?? "").trim()
+    if (!id) return
+    recentlyArchivedEvaluationIdsRef.current.add(id)
+    setEvaluacionesList((prev) => {
+      logEvalArchiveDev("BEFORE_LIST_IDS", prev.map((item) => item.id))
+      const next = prev.filter((item) => item.id !== id)
+      logEvalArchiveDev("AFTER_OPTIMISTIC_REMOVE_IDS", next.map((item) => item.id))
+      return next
+    })
+    setHistorialEvaluations((prev) => prev.filter((item) => item.id !== id))
+    setDashboardList((prev) => prev.filter((item) => item.id !== id))
+    if (evaluacionesDetailId === id) {
+      setEvaluacionesDetailId(null)
+      setEvaluacionesDetail(null)
+      setEvaluacionesDetailError(null)
+      setEvaluacionesDetailItemsDraft(null)
+      setEvaluationStudents([])
+    }
+    if (pedagogicalAnalysisEvalId === id) setPedagogicalAnalysisEvalId(null)
+    if (studentsModalEvalId === id) {
+      setStudentsModalEvalId(null)
+      setStudentsModalList([])
+    }
+    if (evaluacionEditId === id) setEvaluacionEditId(null)
+    if (dashboardEvaluationId === id) {
+      setDashboardEvaluationId(null)
+      if (typeof window !== "undefined") localStorage.removeItem("dashboardEvaluationId")
+    }
+  }, [
+    dashboardEvaluationId,
+    evaluacionEditId,
+    evaluacionesDetailId,
+    pedagogicalAnalysisEvalId,
+    studentsModalEvalId,
+  ])
+
+  const archiveEvaluationById = useCallback(
+    async (evaluationId: string, opts?: { reloadIncludeArchived?: boolean }) => {
+      const id = String(evaluationId ?? "").trim()
+      if (!id) return false
+      logEvalArchiveDev("DELETE_CLICK", id)
+      const r = await fetch(`/api/evaluations/${id}`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
       })
       const j = await r.json().catch(() => ({}))
-      if (r.ok) {
-        setEvaluacionesList((prev) => prev.filter((item) => item.id !== deleteEvaluationDialog.id))
-        if (evaluacionesDetailId === deleteEvaluationDialog.id) {
-          setEvaluacionesDetailId(null)
-          setEvaluacionesDetail(null)
-          setEvaluacionesDetailError(null)
-          setEvaluacionesDetailItemsDraft(null)
-        }
-        toast({ title: "Evaluación eliminada definitivamente." })
-        setDeleteEvaluationDialog({ open: false, id: null, title: null })
-        loadEvaluationsList().catch(() => {})
+      logEvalArchiveDev("DELETE_RESPONSE", { status: r.status, body: j })
+      if (INTERNAL_SUPPORT_UI) {
+        setArchiveDebug((prev) => ({
+          ...(prev ?? { total: evaluacionesList.length, rows: [] }),
+          lastClick: id,
+          lastResponse: { status: r.status, json: j },
+        }))
+      }
+      if (r.ok && j?.ok) {
+        removeEvaluationFromAllClientState(id)
+        toast({ title: "Evaluación eliminada de tus listados." })
+        loadEvaluationsList({ includeArchived: opts?.reloadIncludeArchived ?? false }).catch(() => {})
         loadStudentsList().catch(() => {})
-      } else {
-        toast({ title: j?.message || j?.error || "Error al eliminar evaluación", variant: "destructive" })
+        return true
+      }
+      toast({ title: j?.message || j?.error || "Error al eliminar evaluación", variant: "destructive" })
+      return false
+    },
+    [evaluacionesList.length, loadEvaluationsList, loadStudentsList, removeEvaluationFromAllClientState, toast],
+  )
+
+  const handleConfirmDeleteEvaluation = useCallback(async () => {
+    if (!deleteEvaluationDialog.id) return
+    setDeleteEvaluationLoading(true)
+    try {
+      const ok = await archiveEvaluationById(deleteEvaluationDialog.id, {
+        reloadIncludeArchived: activeTab === "cursos",
+      })
+      if (ok) {
+        setDeleteEvaluationDialog({ open: false, id: null, title: null })
       }
     } catch {
       toast({ title: "Error al eliminar evaluación", variant: "destructive" })
     } finally {
       setDeleteEvaluationLoading(false)
     }
-  }, [deleteEvaluationDialog.id, evaluacionesDetailId, loadEvaluationsList, loadStudentsList, toast])
+  }, [activeTab, archiveEvaluationById, deleteEvaluationDialog.id, toast])
 
   const guidedAutoAppliedSavedAtRef = useRef<string | null>(null)
   /** Evita repetir auto-selección de prueba base QR para el mismo `savedAt` de sesión. */
@@ -2214,18 +2300,23 @@ export default function EvaluatorClient() {
   }, [activeTab, historialFetchKey])
   useEffect(() => {
     if (activeTab !== "evaluaciones" && activeTab !== "cursos") return
-    loadEvaluationsList()
+    loadEvaluationsList({ includeArchived: activeTab === "cursos" })
   }, [activeTab, loadEvaluationsList])
   useEffect(() => {
     if (INTERNAL_SUPPORT_UI && activeTab === "evaluaciones" && evaluacionesList.length >= 0) {
       const rows = evaluacionesList.map((e) => ({
         id: e.id,
         status: e.status ?? null,
-        canShowArchive: (e.status ?? "draft") !== "archived",
+        canShowArchive: !isEvaluationArchived(e),
       }))
       setArchiveDebug((prev) => ({ total: evaluacionesList.length, rows, lastClick: prev?.lastClick, lastResponse: prev?.lastResponse }))
     }
   }, [activeTab, evaluacionesList])
+  useEffect(() => {
+    if (!isEvalArchiveDev) return
+    if (activeTab !== "evaluaciones" && activeTab !== "cursos") return
+    logEvalArchiveDev("VISIBLE_RENDER_IDS", filterVisibleActiveEvaluations(evaluacionesList).map((e) => e.id))
+  }, [activeTab, evaluacionesList, isEvalArchiveDev])
   useEffect(() => {
     if (process.env.NODE_ENV !== "production" && studentHistoryData) {
       console.info("[UI][STUDENT_PROFILE] skills length", studentHistoryData?.skills?.length ?? 0)
@@ -7938,7 +8029,8 @@ h-4 w-4 animate-spin"
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {evaluacionesList.map((e) => {
+                        {filterVisibleActiveEvaluations(evaluacionesList)
+                          .map((e) => {
                           const ev = normalizeEvaluation(e)
                           return (
                             <TableRow key={ev.id}>
@@ -8028,9 +8120,9 @@ h-4 w-4 animate-spin"
                                       setArchiveDebug((prev) => ({ ...(prev ?? { total: evaluacionesList.length, rows: evaluacionesList.map((x) => ({ id: x.id, status: x.status ?? null, canShowArchive: (x.status ?? "draft") !== "archived" })) }), lastClick: ev.id, lastResponse: { status: r.status, json: j } }))
                                     }
                                     if (r.ok) {
-                                      setEvaluacionesList((prev) => prev.map((item) => (item.id === ev.id ? { ...item, status: "archived" } : item)))
+                                      removeEvaluationFromAllClientState(ev.id)
                                       toast({ title: "Evaluación archivada." })
-                                      loadEvaluationsList().catch(() => {})
+                                      loadEvaluationsList({ includeArchived: activeTab === "cursos" }).catch(() => {})
                                     } else {
                                       toast({ title: j?.message || j?.error || "Error al archivar", variant: "destructive" })
                                     }
@@ -8157,7 +8249,7 @@ h-4 w-4 animate-spin"
                         <Loader2 className="h-4 w-4 animate-spin" /> Cargando...
                       </p>
                     ) : (() => {
-                      const normalizedEvaluations = evaluacionesList.map(normalizeEvaluation)
+                      const normalizedEvaluations = applyRecentlyArchivedFilter(evaluacionesList).map(normalizeEvaluation)
                       const coursesGrouped = groupByCourse(normalizedEvaluations)
                       const courseEntries = Object.entries(coursesGrouped)
                       if (courseEntries.length === 0) {
@@ -8388,9 +8480,10 @@ h-4 w-4 animate-spin"
                       </div>
                     </div>
                     {(() => {
-                      const normalizedEvaluations = evaluacionesList.map(normalizeEvaluation)
+                      const normalizedEvaluations = applyRecentlyArchivedFilter(evaluacionesList).map(normalizeEvaluation)
                       const coursesGrouped = groupByCourse(normalizedEvaluations)
                       const data = coursesGrouped[selectedCourseId] ?? { active: [], archived: [] }
+                      const visibleActiveRows = filterVisibleActiveEvaluations(data.active)
                       return evaluacionesListLoading ? (
                         <p className="text-sm text-[var(--text-muted)] flex items-center gap-2">
                           <Loader2 className="h-4 w-4 animate-spin" /> Cargando...
@@ -8409,7 +8502,7 @@ h-4 w-4 animate-spin"
                               </TableRow>
                             </TableHeader>
                             <TableBody>
-                              {data.active.map((e) => (
+                              {visibleActiveRows.map((e) => (
                                 <TableRow key={e.id}>
                                   <TableCell>{e.evaluated_at ? format(new Date(e.evaluated_at), "dd/MM/yyyy HH:mm") : "—"}</TableCell>
                                   <TableCell>{e.title || "(Sin título)"}</TableCell>
@@ -8454,9 +8547,9 @@ h-4 w-4 animate-spin"
                                       onClick={async () => {
                                         const r = await fetch(`/api/evaluations/${e.id}/status`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "archived" }) })
                                         if (r.ok) {
-                                          setEvaluacionesList((prev) => prev.map((ev) => (ev.id === e.id ? { ...ev, status: "archived" } : ev)))
+                                          removeEvaluationFromAllClientState(e.id)
                                           toast({ title: "Evaluación archivada." })
-                                          loadEvaluationsList().catch(() => {})
+                                          loadEvaluationsList({ includeArchived: true }).catch(() => {})
                                         } else {
                                           const j = await r.json().catch(() => ({}))
                                           toast({ title: j?.message || j?.error || "Error al archivar", variant: "destructive" })
@@ -8570,7 +8663,7 @@ h-4 w-4 animate-spin"
                 </DialogHeader>
                 <div className="text-sm text-[var(--text-muted)] space-y-2">
                   <p>
-                    Esta acción eliminará definitivamente la evaluación y sus datos asociados.
+                    ¿Eliminar esta evaluación? Esta acción la quitará de tus listados.
                   </p>
                   <p>
                     <strong>Título:</strong> {deleteEvaluationDialog.title || "(Sin título)"}

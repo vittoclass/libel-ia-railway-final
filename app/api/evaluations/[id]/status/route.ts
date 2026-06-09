@@ -66,9 +66,13 @@ export async function PATCH(
     console.log("[ARCHIVE] updating evaluation", id, "to status", status)
   }
 
+  const updatePayload: { status: string; is_archived?: boolean } = { status }
+  if (status === "archived") updatePayload.is_archived = true
+  else updatePayload.is_archived = false
+
   const { data: updated, error: updateErr } = await supabase
     .from("evaluations")
-    .update({ status })
+    .update(updatePayload)
     .eq("id", id)
     .select()
     .single()
