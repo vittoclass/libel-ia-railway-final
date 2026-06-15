@@ -119,18 +119,20 @@ export function BatchPhotoRealtimeGrid({
     })
   }, [rows])
 
+  type StudentVisualStatus = "evaluado" | "listo" | "en_captura"
+
   const studentStats = useMemo(() => {
     const byStudent = new Map<number, { pages: Set<number>; pending: number; linked: boolean }>()
     for (const r of rows) {
       const si = r.student_index != null ? Math.floor(Number(r.student_index)) : null
       if (si == null || !Number.isFinite(si)) continue
       const cur = byStudent.get(si) ?? { pages: new Set<number>(), pending: 0, linked: false }
-      if (r.evaluation_id) {
+      if (r.evaluation_id || r.status === "linked") {
         cur.linked = true
-        byStudent.set(si, cur)
-        continue
       }
-      cur.pending += 1
+      if (!r.evaluation_id && r.status !== "linked") {
+        cur.pending += 1
+      }
       const pi = r.page_index != null ? Math.floor(Number(r.page_index)) : null
       if (pi != null && Number.isFinite(pi) && pi >= 1) cur.pages.add(pi)
       byStudent.set(si, cur)
@@ -138,15 +140,49 @@ export function BatchPhotoRealtimeGrid({
     const keys = [...byStudent.keys()].sort((a, b) => a - b)
     return keys.map((student_index) => {
       const s = byStudent.get(student_index)!
+      const ready = !s.linked && s.pages.size >= effectiveExpectedPages
+      const visualStatus: StudentVisualStatus = s.linked ? "evaluado" : ready ? "listo" : "en_captura"
       return {
         student_index,
         distinct_pages: s.pages.size,
         pending_rows: s.pending,
         linked: s.linked,
-        ready: !s.linked && s.pages.size >= effectiveExpectedPages,
+        ready,
+        visualStatus,
       }
     })
   }, [rows, effectiveExpectedPages])
+
+  const studentGroups = useMemo(() => {
+    const byStudent = new Map<number, BatchPhotoRow[]>()
+    const unassigned: BatchPhotoRow[] = []
+    for (const r of sortedRows) {
+      const si = r.student_index != null ? Math.floor(Number(r.student_index)) : null
+      if (si == null || !Number.isFinite(si)) {
+        unassigned.push(r)
+        continue
+      }
+      const list = byStudent.get(si) ?? []
+      list.push(r)
+      byStudent.set(si, list)
+    }
+    const groups = [...byStudent.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([student_index, photos]) => ({ student_index, photos }))
+    return { groups, unassigned }
+  }, [sortedRows])
+
+  const studentStatusLabel = (status: StudentVisualStatus): string => {
+    if (status === "evaluado") return "Evaluado"
+    if (status === "listo") return "Listo"
+    return "En captura"
+  }
+
+  const studentStatusClass = (status: StudentVisualStatus): string => {
+    if (status === "evaluado") return "bg-emerald-100 text-emerald-900 border-emerald-200"
+    if (status === "listo") return "bg-amber-100 text-amber-950 border-amber-200"
+    return "bg-slate-100 text-slate-700 border-slate-200"
+  }
 
   const rowPaths = useMemo(() => sortedRows.map((r) => r.storage_path).filter(Boolean) as string[], [sortedRows])
 
@@ -538,64 +574,153 @@ export function BatchPhotoRealtimeGrid({
           Aún no hay fotos en este lote. Saque fotos desde el móvil cuando el flujo de subida esté conectado.
         </div>
       ) : (
-        <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2">
-          {sortedRows.map((r) => {
-            const src = r.storage_path ? urls[r.storage_path] : undefined
-            const si = r.student_index != null ? Number(r.student_index) : null
-            const pi = r.page_index != null ? Number(r.page_index) : null
-            const sent = Boolean(r.evaluation_id || r.status === "linked")
-            const canDelete = !sent
+        <div className="space-y-4">
+          {studentGroups.groups.map(({ student_index, photos }) => {
+            const stat = studentStats.find((s) => s.student_index === student_index)
+            const visualStatus = stat?.visualStatus ?? "en_captura"
+            const pageNumbers = [
+              ...new Set(
+                photos
+                  .map((p) => (p.page_index != null ? Math.floor(Number(p.page_index)) : null))
+                  .filter((pi): pi is number => pi != null && Number.isFinite(pi) && pi >= 1),
+              ),
+            ].sort((a, b) => a - b)
+
             return (
-              <li
-                key={r.id}
+              <section
+                key={student_index}
                 className={cn(
-                  "aspect-square rounded-md border overflow-hidden relative transition-colors duration-300",
-                  sent
-                    ? "border-emerald-500 bg-emerald-50 shadow-[0_0_0_2px_rgba(16,185,129,0.35)]"
-                    : "border-slate-100 bg-slate-100",
+                  "rounded-lg border p-3 space-y-2",
+                  visualStatus === "evaluado"
+                    ? "border-emerald-200 bg-emerald-50/40"
+                    : visualStatus === "listo"
+                      ? "border-amber-200 bg-amber-50/30"
+                      : "border-slate-200 bg-slate-50/50",
                 )}
               >
-                {si != null && pi != null ? (
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <h4 className="text-sm font-semibold text-slate-900">Alumno {student_index}</h4>
                   <span
                     className={cn(
-                      "absolute top-0 left-0 z-10 text-[9px] text-white px-1.5 py-0.5 rounded-br font-medium",
-                      sent ? "bg-emerald-800" : "bg-slate-900/85",
+                      "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                      studentStatusClass(visualStatus),
                     )}
                   >
-                    A{si} · P{pi}
+                    Estado: {studentStatusLabel(visualStatus)}
                   </span>
-                ) : null}
-                {canDelete ? (
-                  <button
-                    type="button"
-                    className="absolute top-0 right-0 z-20 flex h-7 w-7 items-center justify-center rounded-bl bg-black/55 text-white hover:bg-rose-700/90 disabled:opacity-40"
-                    aria-label="Eliminar foto"
-                    disabled={deletingId === r.id}
-                    onClick={() => void requestDeletePhoto(r)}
-                  >
-                    {deletingId === r.id ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                    ) : (
-                      <Trash2 className="h-3.5 w-3.5" aria-hidden />
-                    )}
-                  </button>
-                ) : null}
-                {src ? (
-                  <img src={src} alt="" className="h-full w-full object-cover" />
-                ) : (
-                  <div className="flex h-full w-full items-center justify-center text-[10px] text-slate-400 p-1 text-center">
-                    {(r.storage_path ?? "").slice(-24)}
-                  </div>
-                )}
-                {sent ? (
-                  <span className="absolute bottom-0 left-0 right-0 bg-emerald-600 text-[8px] font-bold tracking-wide text-white text-center py-1 leading-tight px-0.5">
-                    ENVIADO A EVALUACIÓN
-                  </span>
-                ) : null}
-              </li>
+                  {pageNumbers.length > 0 ? (
+                    <span className="text-[11px] font-mono text-slate-600">
+                      {pageNumbers.map((pi) => `P${pi}`).join(" · ")}
+                    </span>
+                  ) : null}
+                </div>
+                <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2">
+                  {photos.map((r) => {
+                    const src = r.storage_path ? urls[r.storage_path] : undefined
+                    const pi = r.page_index != null ? Number(r.page_index) : null
+                    const sent = Boolean(r.evaluation_id || r.status === "linked")
+                    const canDelete = !sent
+                    return (
+                      <li
+                        key={r.id}
+                        className={cn(
+                          "aspect-square rounded-md border overflow-hidden relative transition-colors duration-300",
+                          sent
+                            ? "border-emerald-500 bg-emerald-50 shadow-[0_0_0_2px_rgba(16,185,129,0.35)]"
+                            : "border-slate-100 bg-slate-100",
+                        )}
+                      >
+                        {pi != null ? (
+                          <span
+                            className={cn(
+                              "absolute top-0 left-0 z-10 text-[9px] text-white px-1.5 py-0.5 rounded-br font-medium",
+                              sent ? "bg-emerald-800" : "bg-slate-900/85",
+                            )}
+                          >
+                            P{pi}
+                          </span>
+                        ) : null}
+                        {canDelete ? (
+                          <button
+                            type="button"
+                            className="absolute top-0 right-0 z-20 flex h-7 w-7 items-center justify-center rounded-bl bg-black/55 text-white hover:bg-rose-700/90 disabled:opacity-40"
+                            aria-label="Eliminar foto"
+                            disabled={deletingId === r.id}
+                            onClick={() => void requestDeletePhoto(r)}
+                          >
+                            {deletingId === r.id ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                            ) : (
+                              <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                            )}
+                          </button>
+                        ) : null}
+                        {src ? (
+                          <img src={src} alt="" className="h-full w-full object-cover" />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-[10px] text-slate-400 p-1 text-center">
+                            {(r.storage_path ?? "").slice(-24)}
+                          </div>
+                        )}
+                        {sent ? (
+                          <span className="absolute bottom-0 left-0 right-0 bg-emerald-600 text-[8px] font-bold tracking-wide text-white text-center py-1 leading-tight px-0.5">
+                            ENVIADO A EVALUACIÓN
+                          </span>
+                        ) : null}
+                      </li>
+                    )
+                  })}
+                </ul>
+              </section>
             )
           })}
-        </ul>
+          {studentGroups.unassigned.length > 0 ? (
+            <section className="rounded-lg border border-dashed border-slate-300 bg-slate-50/50 p-3 space-y-2">
+              <h4 className="text-sm font-semibold text-slate-700">Sin alumno asignado</h4>
+              <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2">
+                {studentGroups.unassigned.map((r) => {
+                  const src = r.storage_path ? urls[r.storage_path] : undefined
+                  const sent = Boolean(r.evaluation_id || r.status === "linked")
+                  const canDelete = !sent
+                  return (
+                    <li
+                      key={r.id}
+                      className={cn(
+                        "aspect-square rounded-md border overflow-hidden relative transition-colors duration-300",
+                        sent
+                          ? "border-emerald-500 bg-emerald-50 shadow-[0_0_0_2px_rgba(16,185,129,0.35)]"
+                          : "border-slate-100 bg-slate-100",
+                      )}
+                    >
+                      {canDelete ? (
+                        <button
+                          type="button"
+                          className="absolute top-0 right-0 z-20 flex h-7 w-7 items-center justify-center rounded-bl bg-black/55 text-white hover:bg-rose-700/90 disabled:opacity-40"
+                          aria-label="Eliminar foto"
+                          disabled={deletingId === r.id}
+                          onClick={() => void requestDeletePhoto(r)}
+                        >
+                          {deletingId === r.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                          ) : (
+                            <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                          )}
+                        </button>
+                      ) : null}
+                      {src ? (
+                        <img src={src} alt="" className="h-full w-full object-cover" />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center text-[10px] text-slate-400 p-1 text-center">
+                          {(r.storage_path ?? "").slice(-24)}
+                        </div>
+                      )}
+                    </li>
+                  )
+                })}
+              </ul>
+            </section>
+          ) : null}
+        </div>
       )}
     </div>
   )

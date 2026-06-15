@@ -32,6 +32,69 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 
 const OMR_CAPTURE_GUIDE_ENABLED = process.env.NEXT_PUBLIC_OMR_CAPTURE_GUIDE === "1"
 
+const MOBILE_CURSOR_KEY_PREFIX = "libelia_mobile_capture_cursor_v1:"
+const MOBILE_CAPTURE_DEV = process.env.NODE_ENV === "development"
+
+type MobileCaptureCursor = {
+  batchId: string
+  studentIndex: number
+  pageIndex: number
+  imagesPerStudent: number
+  updatedAt: string
+}
+
+function mobileCursorStorageKey(batchId: string): string {
+  return `${MOBILE_CURSOR_KEY_PREFIX}${batchId}`
+}
+
+function readMobileCaptureCursor(batchId: string): MobileCaptureCursor | null {
+  if (typeof window === "undefined") return null
+  try {
+    const raw = localStorage.getItem(mobileCursorStorageKey(batchId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<MobileCaptureCursor>
+    const studentIndex =
+      typeof parsed.studentIndex === "number" ? Math.floor(parsed.studentIndex) : Number.NaN
+    const pageIndex = typeof parsed.pageIndex === "number" ? Math.floor(parsed.pageIndex) : Number.NaN
+    const imagesPerStudent =
+      typeof parsed.imagesPerStudent === "number" ? Math.floor(parsed.imagesPerStudent) : Number.NaN
+    if (studentIndex < 1 || pageIndex < 1 || imagesPerStudent < 1) return null
+    return {
+      batchId,
+      studentIndex,
+      pageIndex,
+      imagesPerStudent,
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
+    }
+  } catch {
+    return null
+  }
+}
+
+function writeMobileCaptureCursor(cursor: MobileCaptureCursor): void {
+  if (typeof window === "undefined") return
+  try {
+    localStorage.setItem(mobileCursorStorageKey(cursor.batchId), JSON.stringify(cursor))
+    if (MOBILE_CAPTURE_DEV) {
+      console.log("[mobile-capture] saved cursor", cursor)
+    }
+  } catch {
+    // quota / private mode
+  }
+}
+
+function clearMobileCaptureCursor(batchId: string): void {
+  if (typeof window === "undefined") return
+  try {
+    localStorage.removeItem(mobileCursorStorageKey(batchId))
+    if (MOBILE_CAPTURE_DEV) {
+      console.log("[mobile-capture] reset local cursor", { batchId })
+    }
+  } catch {
+    // ignore
+  }
+}
+
 type Phase = "pages" | "scanner"
 
 type Props = {
@@ -57,10 +120,12 @@ export function EstacionMovilClient({ batchId }: Props) {
   const autoCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const [phase, setPhase] = useState<Phase>("pages")
+  const [captureSessionActive, setCaptureSessionActive] = useState(false)
   const [scannerActive, setScannerActive] = useState(false)
   const [imagesPerStudent, setImagesPerStudent] = useState(2)
   const [studentIndex, setStudentIndex] = useState(1)
   const [pageIndex, setPageIndex] = useState(1)
+  const persistedCursorRef = useRef(false)
 
   const [batchGateOk, setBatchGateOk] = useState<boolean | null>(null)
   const [batchGateError, setBatchGateError] = useState<string | null>(null)
@@ -126,6 +191,40 @@ export function EstacionMovilClient({ batchId }: Props) {
     setCaptureDebug(params.get("captureDebug") === "1")
     setTipoPrueba(parseTipoPruebaFromQuery(params.get("tipo")))
   }, [])
+
+  useEffect(() => {
+    persistedCursorRef.current = false
+    setCaptureSessionActive(false)
+
+    const cursor = readMobileCaptureCursor(batchId)
+    if (cursor) {
+      setStudentIndex(cursor.studentIndex)
+      setPageIndex(cursor.pageIndex)
+      setImagesPerStudent(cursor.imagesPerStudent)
+      setPhase("scanner")
+      setCaptureSessionActive(true)
+      persistedCursorRef.current = true
+      if (MOBILE_CAPTURE_DEV) {
+        console.log("[mobile-capture] restored cursor", cursor)
+      }
+    } else {
+      setStudentIndex(1)
+      setPageIndex(1)
+      setImagesPerStudent(2)
+      setPhase("pages")
+    }
+  }, [batchId])
+
+  useEffect(() => {
+    if (!batchOk || !captureSessionActive) return
+    writeMobileCaptureCursor({
+      batchId,
+      studentIndex,
+      pageIndex,
+      imagesPerStudent,
+      updatedAt: new Date().toISOString(),
+    })
+  }, [batchId, batchOk, captureSessionActive, studentIndex, pageIndex, imagesPerStudent])
 
   useEffect(() => {
     if (developmentManualCropActive) {
@@ -205,7 +304,9 @@ export function EstacionMovilClient({ batchId }: Props) {
           ? Math.max(1, Math.min(50, Math.floor(rawEp)))
           : 2
       setPcExpectedPages(ep)
-      setImagesPerStudent(Math.min(MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT, ep))
+      if (!persistedCursorRef.current) {
+        setImagesPerStudent(Math.min(MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT, ep))
+      }
     } catch (e) {
       setPcExpectedPages(null)
       setBatchGateOk(false)
@@ -234,6 +335,7 @@ export function EstacionMovilClient({ batchId }: Props) {
         return null
       })
       clearPostCapture()
+      setCaptureSessionActive(true)
       setImagesPerStudent(n)
       setPageIndex(1)
       setPhase("scanner")
@@ -571,6 +673,21 @@ export function EstacionMovilClient({ batchId }: Props) {
     return () => window.clearTimeout(t)
   }, [lastOk])
 
+  const resetLocalCaptureCursor = useCallback(() => {
+    const ok = window.confirm(
+      "¿Reiniciar captura de este lote?\n\nEsto solo reinicia el contador de este celular. No borra fotos ya subidas.",
+    )
+    if (!ok) return
+    clearMobileCaptureCursor(batchId)
+    persistedCursorRef.current = false
+    setStudentIndex(1)
+    setPageIndex(1)
+    setCaptureSessionActive(false)
+    setPhase("pages")
+    setLastOk(null)
+    setError(null)
+  }, [batchId])
+
   const backToPages = useCallback(() => {
     stopStream()
     setPhase("pages")
@@ -671,10 +788,17 @@ export function EstacionMovilClient({ batchId }: Props) {
           </div>
         ) : (
           <div className="space-y-5 flex-1 flex flex-col">
-            <p className="text-center text-xs text-slate-500">
-              {imagesPerStudent} foto{imagesPerStudent !== 1 ? "s" : ""} por estudiante · Alumno {studentIndex} · Captura{" "}
-              {pageIndex}/{imagesPerStudent}
-            </p>
+            <div className="rounded-lg border border-slate-700/80 bg-slate-900/60 px-3 py-2.5 text-center space-y-0.5">
+              <p className="text-sm font-semibold text-slate-100">
+                Alumno actual: <span className="text-indigo-300">{studentIndex}</span>
+              </p>
+              <p className="text-sm text-slate-300">
+                Página actual:{" "}
+                <span className="font-medium text-indigo-200">
+                  {pageIndex} de {imagesPerStudent}
+                </span>
+              </p>
+            </div>
 
             {!scannerActive ? (
               <>
@@ -840,9 +964,20 @@ export function EstacionMovilClient({ batchId }: Props) {
               </>
             )}
 
-            <Button type="button" variant="ghost" size="sm" className="text-slate-500" onClick={backToPages}>
-              Cambiar número de páginas
-            </Button>
+            <div className="flex flex-col gap-1">
+              <Button type="button" variant="ghost" size="sm" className="text-slate-500" onClick={backToPages}>
+                Cambiar número de páginas
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="text-slate-600 hover:text-amber-400/90 text-xs"
+                onClick={resetLocalCaptureCursor}
+              >
+                Reiniciar captura de este lote
+              </Button>
+            </div>
 
             {lastOk ? (
               <div
