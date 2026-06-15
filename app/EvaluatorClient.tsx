@@ -412,6 +412,10 @@ interface FilePreview {
   /** Id fila `batch_photo_uploads` cuando la imagen viene del escáner móvil. */
   mobileBatchPhotoId?: string
   fromMobileBatch?: boolean
+  /** Índice de página del escáner móvil (`batch_photo_uploads.page_index`). */
+  mobileBatchPageIndex?: number | null
+  /** Desempate estable: `processed_at` de la fila móvil (created_at no llega al cliente en sync). */
+  mobileBatchProcessedAt?: string | null
   /** Ruta en bucket batch-scans; permite POST liviano a /api/evaluate vía URL firmada. */
   batchScanStoragePath?: string | null
 }
@@ -687,11 +691,49 @@ type MobileBatchPlacement = {
   student_index: number | null
   evaluation_id: string | null
 }
+type MobileBatchPhotoMeta = {
+  page_index: number | null
+  processed_at: string | null
+}
 type MobileBatchSlot = {
   evaluation_id: string
   student_index: number | null
   student_name: string | null
   student_rut: string | null
+}
+
+function enrichFilePreviewMobileMeta(
+  f: FilePreview,
+  meta: MobileBatchPhotoMeta | undefined,
+): FilePreview {
+  if (!meta || !f.mobileBatchPhotoId) return f
+  return {
+    ...f,
+    mobileBatchPageIndex: f.mobileBatchPageIndex ?? meta.page_index ?? null,
+    mobileBatchProcessedAt: f.mobileBatchProcessedAt ?? meta.processed_at ?? null,
+  }
+}
+
+/** Orden estable por page_index ASC, processed_at ASC (proxy de created_at en sync). */
+function sortStudentGroupFilesStable(files: FilePreview[]): FilePreview[] {
+  if (files.length <= 1) return files
+  const tagged = files.map((f, originalIndex) => ({ f, originalIndex }))
+  tagged.sort((a, b) => {
+    const pa =
+      a.f.mobileBatchPageIndex != null && Number.isFinite(Number(a.f.mobileBatchPageIndex))
+        ? Math.floor(Number(a.f.mobileBatchPageIndex))
+        : 1e9
+    const pb =
+      b.f.mobileBatchPageIndex != null && Number.isFinite(Number(b.f.mobileBatchPageIndex))
+        ? Math.floor(Number(b.f.mobileBatchPageIndex))
+        : 1e9
+    if (pa !== pb) return pa - pb
+    const ta = a.f.mobileBatchProcessedAt ? new Date(a.f.mobileBatchProcessedAt).getTime() : 0
+    const tb = b.f.mobileBatchProcessedAt ? new Date(b.f.mobileBatchProcessedAt).getTime() : 0
+    if (ta !== tb) return ta - tb
+    return a.originalIndex - b.originalIndex
+  })
+  return tagged.map((t) => t.f)
 }
 
 /** Nombres de grupo que puede sobrescribir la sync del lote móvil (slots promovidos). */
@@ -793,6 +835,7 @@ function mergeMobileBatchIntoEvaluatorState(
   placement: MobileBatchPlacement[],
   slots: MobileBatchSlot[],
   apiIds: Set<string>,
+  photoMetaById?: Map<string, MobileBatchPhotoMeta>,
 ): { groups: StudentGroup[]; unassigned: FilePreview[] } {
   let next = prevGroups.map((g) => ({ ...g, files: [...g.files] }))
   for (let gi = 0; gi < next.length; gi++) {
@@ -870,6 +913,30 @@ function mergeMobileBatchIntoEvaluatorState(
   for (const p of orphans) {
     if (!unassigned.some((f) => f.id === p.id)) unassigned = [...unassigned, p]
   }
+
+  next = next.map((g, groupIndex) => {
+    const beforeIds = g.files.map((f) => f.id)
+    const enriched = g.files.map((f) =>
+      enrichFilePreviewMobileMeta(f, f.mobileBatchPhotoId ? photoMetaById?.get(f.mobileBatchPhotoId) : undefined),
+    )
+    const sorted = sortStudentGroupFilesStable(enriched)
+    const afterIds = sorted.map((f) => f.id)
+    if (
+      typeof process !== "undefined" &&
+      process.env.NODE_ENV === "development" &&
+      beforeIds.join("|") !== afterIds.join("|")
+    ) {
+      console.info("[evaluator] sorted student files by page_index", {
+        groupIndex,
+        studentName: g.studentName,
+        before: beforeIds,
+        after: afterIds,
+        pageIndexes: sorted.map((f) => f.mobileBatchPageIndex ?? null),
+      })
+    }
+    return { ...g, files: sorted }
+  })
+
   return { groups: next, unassigned }
 }
 
@@ -2779,6 +2846,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         id: string
         student_index: number | null
         page_index?: number | null
+        processed_at?: string | null
         storage_path: string | null
         evaluation_id: string | null
         signed_url: string | null
@@ -2876,6 +2944,14 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         await new Promise<void>((res) => window.setTimeout(res, 0))
       }
 
+      const photoMetaById = new Map<string, MobileBatchPhotoMeta>()
+      for (const p of allPhotos) {
+        photoMetaById.set(p.id, {
+          page_index: p.page_index ?? null,
+          processed_at: p.processed_at ?? null,
+        })
+      }
+
       const placement: MobileBatchPlacement[] = []
 
       for (const p of allPhotos) {
@@ -2901,6 +2977,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             dataUrl,
             mobileBatchPhotoId: p.id,
             fromMobileBatch: true,
+            mobileBatchPageIndex: p.page_index ?? null,
+            mobileBatchProcessedAt: p.processed_at ?? null,
             batchScanStoragePath: p.storage_path ?? null,
           }
           placement.push({
@@ -2921,6 +2999,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         placement,
         slotsFromApi,
         apiIds,
+        photoMetaById,
       )
       setStudentGroups(nextGroups)
       setUnassignedFiles(nextUnassigned)

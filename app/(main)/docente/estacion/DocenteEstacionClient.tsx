@@ -22,7 +22,10 @@ import {
   WIZARD_SESSION_CHANGED_EVENT,
   WIZARD_SESSION_STORAGE_KEY,
 } from "@/app/components/teacher-wizard/sessionStorage"
-import { writeDocenteActiveBatchId } from "@/app/lib/docente/active-batch-id"
+import {
+  readDocenteActiveBatchId,
+  writeDocenteActiveBatchId,
+} from "@/app/lib/docente/active-batch-id"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -89,7 +92,19 @@ export function DocenteEstacionClient() {
   }, [loadAssignments])
 
   useEffect(() => {
-    setBatchId((prev) => prev ?? crypto.randomUUID())
+    const activeBatchId = readDocenteActiveBatchId()
+    if (activeBatchId) {
+      if (process.env.NODE_ENV === "development") {
+        console.info("[station] restored active batch_id from localStorage", activeBatchId)
+      }
+      setBatchId(activeBatchId)
+      return
+    }
+    const newId = crypto.randomUUID()
+    if (process.env.NODE_ENV === "development") {
+      console.info("[station] created new batch_id", newId)
+    }
+    setBatchId(newId)
   }, [])
 
   useEffect(() => {
@@ -167,7 +182,11 @@ export function DocenteEstacionClient() {
   }, [])
 
   const onRegenerateBatch = useCallback(() => {
-    setBatchId(crypto.randomUUID())
+    const newId = crypto.randomUUID()
+    if (process.env.NODE_ENV === "development") {
+      console.info("[station] teacher requested new batch_id", newId)
+    }
+    setBatchId(newId)
     setSourceExam(null)
     setBatchSessionError(null)
     setDebugError(null)
