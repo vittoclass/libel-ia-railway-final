@@ -903,7 +903,12 @@ function mergeMobileBatchIntoEvaluatorState(
     const g = next[gi]
     const kept: FilePreview[] = []
     for (const f of g.files) {
-      if (f.fromMobileBatch && f.mobileBatchPhotoId && !apiIds.has(f.mobileBatchPhotoId)) {
+      if (
+        f.fromMobileBatch &&
+        f.mobileBatchPhotoId &&
+        !apiIds.has(f.mobileBatchPhotoId) &&
+        !g.isEvaluated
+      ) {
         try {
           URL.revokeObjectURL(f.previewUrl)
         } catch {
