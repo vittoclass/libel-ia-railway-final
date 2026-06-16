@@ -112,12 +112,17 @@ export async function GET(req: NextRequest) {
     })
   }
 
-  let slots: Array<{
-    evaluation_id: string
+  type BatchEvaluarSlot = {
+    evaluation_id: string | null
     student_index: number | null
     student_name: string | null
     student_rut: string | null
-  }> = []
+    grade_chile: number | null
+    is_evaluated: boolean
+    slot_phase: "corregido" | "vinculado" | "captura" | "pendiente"
+  }
+
+  let slots: BatchEvaluarSlot[] = []
 
   if (offset === 0) {
     const { data: evalRows } = await server
@@ -127,6 +132,14 @@ export async function GET(req: NextRequest) {
       .eq("teacher_id", teacherId)
       .not("batch_student_index", "is", null)
       .limit(220)
+
+    const { data: photoIndexRows } = await server
+      .from("batch_photo_uploads")
+      .select("student_index, evaluation_id")
+      .eq("batch_id", batchId)
+      .eq("teacher_id", teacherId)
+      .not("student_index", "is", null)
+      .limit(2000)
 
     const evalIds = (evalRows ?? []).map((e) => (e as { id: string }).id).filter(Boolean)
     /** Varias filas por evaluation_id (upserts distintos): fusionar nombre y RUT sin quedarnos solo con la primera. */
@@ -152,16 +165,87 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    slots = (evalRows ?? []).map((e) => {
+    const slotByIndex = new Map<
+      number,
+      { evaluation_id: string | null; student_name: string | null; student_rut: string | null }
+    >()
+
+    for (const e of evalRows ?? []) {
       const ev = e as { id: string; batch_student_index: number | null }
+      if (ev.batch_student_index == null || ev.batch_student_index < 1) continue
       const st = studentsByEval.get(ev.id)
-      return {
+      slotByIndex.set(ev.batch_student_index, {
         evaluation_id: ev.id,
-        student_index: ev.batch_student_index,
         student_name: st?.student_name ?? null,
         student_rut: st?.student_identifier ?? null,
+      })
+    }
+
+    const hasPhotosByIndex = new Map<number, boolean>()
+    for (const row of photoIndexRows ?? []) {
+      const pr = row as { student_index?: number | null; evaluation_id?: string | null }
+      const si = pr.student_index
+      if (si == null || si < 1) continue
+      hasPhotosByIndex.set(si, true)
+      const cur = slotByIndex.get(si) ?? { evaluation_id: null, student_name: null, student_rut: null }
+      const photoEvalId = pr.evaluation_id != null && String(pr.evaluation_id).trim() !== "" ? String(pr.evaluation_id).trim() : null
+      if (!cur.evaluation_id && photoEvalId) cur.evaluation_id = photoEvalId
+      slotByIndex.set(si, cur)
+    }
+
+    const allEvalIds = [
+      ...new Set(
+        [...slotByIndex.values()]
+          .map((s) => s.evaluation_id)
+          .filter((id): id is string => id != null && id.trim() !== ""),
+      ),
+    ]
+
+    const gradeChileByEval = new Map<string, number | null>()
+    const hasItemsByEval = new Set<string>()
+    if (allEvalIds.length > 0) {
+      const { data: summaryRows } = await server
+        .from("evaluation_summaries")
+        .select("evaluation_id, grade_chile")
+        .in("evaluation_id", allEvalIds)
+      for (const s of summaryRows ?? []) {
+        const row = s as { evaluation_id: string; grade_chile?: number | null }
+        if (row.evaluation_id) gradeChileByEval.set(row.evaluation_id, row.grade_chile ?? null)
       }
-    })
+
+      const { data: itemRows } = await server
+        .from("evaluation_items")
+        .select("evaluation_id")
+        .in("evaluation_id", allEvalIds)
+        .limit(5000)
+      for (const item of itemRows ?? []) {
+        const evId = (item as { evaluation_id?: string }).evaluation_id
+        if (evId) hasItemsByEval.add(evId)
+      }
+    }
+
+    slots = [...slotByIndex.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([student_index, base]) => {
+        const evaluation_id = base.evaluation_id
+        const grade_chile = evaluation_id ? (gradeChileByEval.get(evaluation_id) ?? null) : null
+        const hasGrade = grade_chile != null
+        const hasItems = evaluation_id ? hasItemsByEval.has(evaluation_id) : false
+        const is_evaluated = hasGrade || hasItems
+        let slot_phase: BatchEvaluarSlot["slot_phase"] = "pendiente"
+        if (is_evaluated) slot_phase = "corregido"
+        else if (evaluation_id) slot_phase = "vinculado"
+        else if (hasPhotosByIndex.get(student_index)) slot_phase = "captura"
+        return {
+          student_index,
+          evaluation_id,
+          student_name: base.student_name,
+          student_rut: base.student_rut,
+          grade_chile,
+          is_evaluated,
+          slot_phase,
+        }
+      })
 
     for (const slot of slots) {
       const hasName = slot.student_name != null && String(slot.student_name).trim() !== ""

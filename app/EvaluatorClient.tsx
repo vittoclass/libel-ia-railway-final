@@ -708,10 +708,13 @@ type MobileBatchPhotoMeta = {
   processed_at: string | null
 }
 type MobileBatchSlot = {
-  evaluation_id: string
+  evaluation_id: string | null
   student_index: number | null
   student_name: string | null
   student_rut: string | null
+  grade_chile?: number | null
+  is_evaluated?: boolean
+  slot_phase?: "corregido" | "vinculado" | "captura" | "pendiente"
 }
 
 function enrichFilePreviewMobileMeta(
@@ -876,7 +879,11 @@ function mergeMobileBatchIntoEvaluatorState(
     const rutRaw = slot.student_rut?.trim()
     const rut = rutRaw ? normalizeRutCanonical(rutRaw) ?? rutRaw : undefined
     let newName = g.studentName
-    if (slotName.length > 0 && isGenericStudentSlotName(g.studentName)) newName = slotName
+    if (slot.is_evaluated === true && slotName.length > 0) {
+      newName = slotName
+    } else if (slotName.length > 0 && isGenericStudentSlotName(g.studentName)) {
+      newName = slotName
+    }
     let newRut = g.studentRut ?? ""
     if (rut && !String(g.studentRut ?? "").trim()) newRut = rut
     let merged: StudentGroup = {
@@ -885,7 +892,27 @@ function mergeMobileBatchIntoEvaluatorState(
       studentRut: newRut,
       promotedEvaluationId: slot.evaluation_id || g.promotedEvaluationId || null,
     }
-    if (slotName.length > 0) {
+    if (slot.is_evaluated === true) {
+      merged = {
+        ...merged,
+        isEvaluated: true,
+        evaluation_id: slot.evaluation_id ?? merged.evaluation_id ?? null,
+        ...(slot.grade_chile != null ? { nota: slot.grade_chile } : {}),
+      }
+      if (
+        typeof process !== "undefined" &&
+        process.env.NODE_ENV === "development"
+      ) {
+        console.info("[evaluator][batch-sync] hydrated evaluated slot", {
+          student_index: si,
+          evaluation_id: slot.evaluation_id,
+          student_name: slot.student_name,
+          grade_chile: slot.grade_chile ?? null,
+          slot_phase: slot.slot_phase ?? null,
+        })
+      }
+    }
+    if (slotName.length > 0 && slot.is_evaluated !== true) {
       merged = applyNominalObservationToGroup(merged, slotName, {
         fillManualIfGeneric: isGenericStudentSlotName(g.studentName),
       })
@@ -901,6 +928,7 @@ function mergeMobileBatchIntoEvaluatorState(
       student_index != null && student_index >= 1 && student_index <= next.length ? student_index - 1 : -1
     if (gi >= 0) {
       const g = next[gi]
+      if (g.isEvaluated && g.files.length > 0) continue
       next[gi] = {
         ...g,
         files: [...g.files, preview],
@@ -2764,6 +2792,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     const toAssign: { fileId: string; groupId: string }[] = []
     let idx = 0
     for (const g of studentGroups) {
+      if (g.isEvaluated) continue
       const need = Math.max(0, per - g.files.length)
       for (let i = 0; i < need && idx < unassignedFiles.length; i++) {
         toAssign.push({ fileId: unassignedFiles[idx].id, groupId: g.id })
