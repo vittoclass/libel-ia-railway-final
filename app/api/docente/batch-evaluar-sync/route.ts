@@ -259,17 +259,91 @@ export async function GET(req: NextRequest) {
     }
   }
 
+  const evaluatedStudentIndexes = new Set<number>()
+  if (offset === 0) {
+    for (const slot of slots) {
+      if (slot.is_evaluated && slot.student_index != null && slot.student_index >= 1) {
+        evaluatedStudentIndexes.add(slot.student_index)
+      }
+    }
+  } else {
+    const { data: evalRowsForFilter } = await server
+      .from("evaluations")
+      .select("id, batch_student_index")
+      .eq("batch_id", batchId)
+      .eq("teacher_id", teacherId)
+      .not("batch_student_index", "is", null)
+      .limit(220)
+
+    const filterEvalIds = (evalRowsForFilter ?? [])
+      .map((e) => (e as { id: string }).id)
+      .filter(Boolean)
+    const gradeByEval = new Map<string, number | null>()
+    const hasItemsByEval = new Set<string>()
+    if (filterEvalIds.length > 0) {
+      const { data: summaryRows } = await server
+        .from("evaluation_summaries")
+        .select("evaluation_id, grade_chile")
+        .in("evaluation_id", filterEvalIds)
+      for (const s of summaryRows ?? []) {
+        const row = s as { evaluation_id: string; grade_chile?: number | null }
+        if (row.evaluation_id) gradeByEval.set(row.evaluation_id, row.grade_chile ?? null)
+      }
+      const { data: itemRows } = await server
+        .from("evaluation_items")
+        .select("evaluation_id")
+        .in("evaluation_id", filterEvalIds)
+        .limit(5000)
+      for (const item of itemRows ?? []) {
+        const evId = (item as { evaluation_id?: string }).evaluation_id
+        if (evId) hasItemsByEval.add(evId)
+      }
+    }
+    for (const e of evalRowsForFilter ?? []) {
+      const ev = e as { id: string; batch_student_index: number | null }
+      if (ev.batch_student_index == null || ev.batch_student_index < 1) continue
+      const hasGrade = gradeByEval.get(ev.id) != null
+      const hasItems = hasItemsByEval.has(ev.id)
+      if (hasGrade || hasItems) evaluatedStudentIndexes.add(ev.batch_student_index)
+    }
+  }
+
+  let filteredLinkedPhotosCount = 0
+  let filteredEvaluatedSlotPhotosCount = 0
+  const photosForEvaluar = withUrls.filter((photo) => {
+    const linkedEvalId =
+      photo.evaluation_id != null && String(photo.evaluation_id).trim() !== "" ? String(photo.evaluation_id).trim() : null
+    if (photo.status === "linked" && linkedEvalId) {
+      filteredLinkedPhotosCount++
+      return false
+    }
+    const si = photo.student_index
+    if (si != null && si >= 1 && evaluatedStudentIndexes.has(si)) {
+      filteredEvaluatedSlotPhotosCount++
+      return false
+    }
+    return true
+  })
+
   return NextResponse.json({
     batch_id: batchId,
-    photos: withUrls,
+    photos: photosForEvaluar,
     slots,
     meta: {
       teacher_id: teacherId,
       offset,
       limit,
-      count: withUrls.length,
+      count: photosForEvaluar.length,
       has_more: hasMore,
       next_offset: hasMore ? nextOffset : null,
     },
+    ...(process.env.NODE_ENV === "development"
+      ? {
+          debug: {
+            filteredLinkedPhotosCount,
+            filteredEvaluatedSlotPhotosCount,
+          },
+        }
+      : {}),
   })
 }

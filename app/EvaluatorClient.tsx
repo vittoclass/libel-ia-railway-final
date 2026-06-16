@@ -974,7 +974,7 @@ function mergeMobileBatchIntoEvaluatorState(
       student_index != null && student_index >= 1 && student_index <= next.length ? student_index - 1 : -1
     if (gi >= 0) {
       const g = next[gi]
-      if (g.isEvaluated && g.files.length > 0) continue
+      if (g.isEvaluated) continue
       next[gi] = {
         ...g,
         files: [...g.files, preview],
@@ -2945,6 +2945,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         processed_at?: string | null
         storage_path: string | null
         evaluation_id: string | null
+        status?: string | null
         signed_url: string | null
       }
       let slotsFromApi: MobileBatchSlot[] = []
@@ -3040,6 +3041,13 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         await new Promise<void>((res) => window.setTimeout(res, 0))
       }
 
+      const evaluatedStudentIndexes = new Set<number>()
+      for (const slot of slotsFromApi) {
+        if (slot.is_evaluated === true && slot.student_index != null && slot.student_index >= 1) {
+          evaluatedStudentIndexes.add(slot.student_index)
+        }
+      }
+
       const photoMetaById = new Map<string, MobileBatchPhotoMeta>()
       for (const p of allPhotos) {
         photoMetaById.set(p.id, {
@@ -3053,6 +3061,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       for (const p of allPhotos) {
         if (!p.signed_url) continue
         if (knownMobilePhotoIds.has(p.id)) continue
+        const linkedEvalId =
+          p.evaluation_id != null && String(p.evaluation_id).trim() !== "" ? String(p.evaluation_id).trim() : null
+        if (p.status === "linked" && linkedEvalId) continue
+        if (p.student_index != null && p.student_index >= 1 && evaluatedStudentIndexes.has(p.student_index)) continue
         try {
           const photoController = new AbortController()
           const photoTimeoutId = window.setTimeout(() => photoController.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
