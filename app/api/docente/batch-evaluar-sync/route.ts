@@ -308,15 +308,8 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  let filteredLinkedPhotosCount = 0
   let filteredEvaluatedSlotPhotosCount = 0
   const photosForEvaluar = withUrls.filter((photo) => {
-    const linkedEvalId =
-      photo.evaluation_id != null && String(photo.evaluation_id).trim() !== "" ? String(photo.evaluation_id).trim() : null
-    if (photo.status === "linked" && linkedEvalId) {
-      filteredLinkedPhotosCount++
-      return false
-    }
     const si = photo.student_index
     if (si != null && si >= 1 && evaluatedStudentIndexes.has(si)) {
       filteredEvaluatedSlotPhotosCount++
@@ -340,7 +333,6 @@ export async function GET(req: NextRequest) {
     ...(process.env.NODE_ENV === "development"
       ? {
           debug: {
-            filteredLinkedPhotosCount,
             filteredEvaluatedSlotPhotosCount,
           },
         }

@@ -3061,10 +3061,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       for (const p of allPhotos) {
         if (!p.signed_url) continue
         if (knownMobilePhotoIds.has(p.id)) continue
-        const linkedEvalId =
-          p.evaluation_id != null && String(p.evaluation_id).trim() !== "" ? String(p.evaluation_id).trim() : null
-        if (p.status === "linked" && linkedEvalId) continue
-        if (p.student_index != null && p.student_index >= 1 && evaluatedStudentIndexes.has(p.student_index)) continue
+        if (p.student_index != null && evaluatedStudentIndexes.has(p.student_index)) continue
         try {
           const photoController = new AbortController()
           const photoTimeoutId = window.setTimeout(() => photoController.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
