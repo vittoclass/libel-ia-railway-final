@@ -698,6 +698,52 @@ function studentGroupHasLocalPedagogicalReportPayload(g: StudentGroup): boolean 
   return hasPuntaje && (hasAlts || hasDev)
 }
 
+type ReportDocumentGroup = StudentGroup | CorrectionReportGroupForPdf
+
+/** Mismo criterio que ZIP masivo: payload local completo o GET por evaluation_id. */
+async function resolveGroupForReportDocument(
+  group: StudentGroup,
+  onWarning?: (message: string) => void,
+): Promise<ReportDocumentGroup> {
+  if (studentGroupHasLocalPedagogicalReportPayload(group)) {
+    return group
+  }
+  const evalId = typeof group.evaluation_id === "string" ? group.evaluation_id.trim() : ""
+  if (!evalId) {
+    return group
+  }
+  try {
+    const res = await fetch(`/api/evaluations/${encodeURIComponent(evalId)}`, {
+      credentials: "include",
+      cache: "no-store",
+    })
+    const j = (await res.json()) as Record<string, unknown>
+    if (!res.ok) {
+      const err =
+        typeof j.error === "string"
+          ? j.error
+          : typeof j.message === "string"
+            ? j.message
+            : `HTTP ${res.status}`
+      onWarning?.(`No se pudo cargar la evaluación persistida: ${err}`)
+      return group
+    }
+    const built = buildCorrectionReportGroupFromApiDetail(j as EvaluationDetailJsonForCorrectionZip)
+    if (!built.ok) {
+      onWarning?.(`No se pudo reconstruir el informe: ${built.error}`)
+      return group
+    }
+    for (const w of built.warnings) onWarning?.(w)
+    if (process.env.NODE_ENV === "development") {
+      console.info("[evaluator][report] loaded persisted evaluation for report", evalId)
+    }
+    return built.group
+  } catch (e) {
+    onWarning?.(e instanceof Error ? e.message : String(e))
+    return group
+  }
+}
+
 type MobileBatchPlacement = {
   preview: FilePreview
   student_index: number | null
@@ -1309,6 +1355,9 @@ export default function EvaluatorClient() {
   const [isExtractingNames, setIsExtractingNames] = useState(false)
   const [theme, setTheme] = useState("theme-ocaso")
   const [previewGroupId, setPreviewGroupId] = useState<string | null>(null)
+  const [previewGroupResolved, setPreviewGroupResolved] = useState<ReportDocumentGroup | null>(null)
+  const reportGroupCacheRef = useRef<Map<string, ReportDocumentGroup>>(new Map())
+  const [, setReportGroupCacheTick] = useState(0)
   /** Foco en un estudiante en Paso 3: al seleccionar una tarjeta del panorama, solo se muestra su detalle (reversible con "Ver todos"). */
   const [focusedGroupId, setFocusedGroupId] = useState<string | null>(null)
   /** Variante de plantilla OMR enviada a /api/evaluate (flujo oficial; no toca experimental). */
@@ -1353,6 +1402,12 @@ export default function EvaluatorClient() {
     reportEvaluateDiagnostic,
   } = useEvaluator()
   const { toast } = useToast()
+  const warnReportResolve = useCallback(
+    (message: string) => {
+      toast({ title: "Informe", description: message })
+    },
+    [toast],
+  )
 
   // Estado para el modal de plantilla de respuestas del profesor
   const [isAnswerKeyModalOpen, setIsAnswerKeyModalOpen] = useState(false)
@@ -4316,20 +4371,39 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   const isCurrentlyEvaluatingAny = studentGroups.some((g) => g.isEvaluating)
   const isCurrentlyValidatingAny = studentGroups.some((g) => g.isValidationStep) // 🚨 NUEVO: Comprobar si estamos en paso de validación
-  const previewGroup = previewGroupId ? studentGroups.find((g) => g.id === previewGroupId) : null
   const handlePreview = async (groupId: string) => {
     const group = studentGroups.find((g) => g.id === groupId)
-    if (!group || !group.retroalimentacion) return
+    if (!group) return
+    if (!group.retroalimentacion && !group.evaluation_id) return
+
+    const resolved = await resolveGroupForReportDocument(group, warnReportResolve)
+    reportGroupCacheRef.current.set(groupId, resolved)
+    setReportGroupCacheTick((t) => t + 1)
+
+    if (!studentGroupHasLocalPedagogicalReportPayload(resolved as StudentGroup)) return
+
     if (isMobile) {
       const docEl = (
-        <ReportDocument group={group} formData={form.getValues()} logoPreview={logoPreview} />
+        <ReportDocument group={resolved} formData={form.getValues()} logoPreview={logoPreview} />
       )
       const blob = await pdf(docEl).toBlob()
       const url = URL.createObjectURL(blob)
       window.open(url, "_blank")
     } else {
+      setPreviewGroupResolved(resolved)
       setPreviewGroupId(groupId)
     }
+  }
+
+  const handleDownloadIndividualPdf = async (group: StudentGroup) => {
+    const resolved = await resolveGroupForReportDocument(group, warnReportResolve)
+    reportGroupCacheRef.current.set(group.id, resolved)
+    setReportGroupCacheTick((t) => t + 1)
+    if (!studentGroupHasLocalPedagogicalReportPayload(resolved as StudentGroup)) return
+    const docEl = <ReportDocument group={resolved} formData={form.getValues()} logoPreview={logoPreview} />
+    const blob = await pdf(docEl).toBlob()
+    const fileName = `informe_${(formatStudentDisplayName(resolved.studentName) || resolved.studentName).replace(/[^a-zA-Z0-9]/g, "_")}.pdf`
+    saveAs(blob, fileName)
   }
 
   const handleDownloadCorrectionReportsZip = async () => {
@@ -4928,20 +5002,25 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         </div>
       )}
 
-      {!isMobile && previewGroup && previewGroup.retroalimentacion && (
+      {!isMobile && previewGroupResolved && previewGroupId && (
         <div className="pdf-modal-backdrop" role="dialog" aria-modal="true">
           <div className="pdf-modal">
             <div className="pdf-modal-header">
               <div className="font-semibold">
-                Vista previa del informe — {formatStudentDisplayName(previewGroup.studentName) || previewGroup.studentName}
+                Vista previa del informe —{" "}
+                {formatStudentDisplayName(previewGroupResolved.studentName) || previewGroupResolved.studentName}
               </div>
 
               <div className="pdf-modal-actions">
                 <PDFDownloadLink
                   document={
-                    <ReportDocument group={previewGroup} formData={form.getValues()} logoPreview={logoPreview} />
+                    <ReportDocument
+                      group={previewGroupResolved}
+                      formData={form.getValues()}
+                      logoPreview={logoPreview}
+                    />
                   }
-                  fileName={`informe_${(formatStudentDisplayName(previewGroup.studentName) || previewGroup.studentName).replace(/[^a-zA-Z0-9]/g, "_")}.pdf`}
+                  fileName={`informe_${(formatStudentDisplayName(previewGroupResolved.studentName) || previewGroupResolved.studentName).replace(/[^a-zA-Z0-9]/g, "_")}.pdf`}
                 >
                   {({ loading }) => (
                     <Button size="sm" disabled={loading}>
@@ -4955,14 +5034,21 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                     </Button>
                   )}
                 </PDFDownloadLink>
-                <Button variant="outline" size="sm" onClick={() => setPreviewGroupId(null)}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setPreviewGroupId(null)
+                    setPreviewGroupResolved(null)
+                  }}
+                >
                   Cerrar
                 </Button>
               </div>
             </div>
             <div className="pdf-modal-body">
               <PDFViewer style={{ width: "100%", height: "100%" }}>
-                <ReportDocument group={previewGroup} formData={form.getValues()} logoPreview={logoPreview} />
+                <ReportDocument group={previewGroupResolved} formData={form.getValues()} logoPreview={logoPreview} />
               </PDFViewer>
             </div>
           </div>
@@ -7054,28 +7140,49 @@ h-4 w-4 animate-spin"
                                     <Eye className="mr-2 h-4 w-4" /> Ver informe
                                   </Button>
 
-                                  <PDFDownloadLink
-                                    document={
-                                      <ReportDocument
-                                        group={group}
-                                        formData={form.getValues()}
-                                        logoPreview={logoPreview}
-                                      />
+                                  {(() => {
+                                    const pdfGroup =
+                                      reportGroupCacheRef.current.get(group.id) ??
+                                      (studentGroupHasLocalPedagogicalReportPayload(group) ? group : null)
+                                    if (pdfGroup) {
+                                      return (
+                                        <PDFDownloadLink
+                                          document={
+                                            <ReportDocument
+                                              group={pdfGroup}
+                                              formData={form.getValues()}
+                                              logoPreview={logoPreview}
+                                            />
+                                          }
+                                          fileName={`informe_${(formatStudentDisplayName(pdfGroup.studentName) || pdfGroup.studentName).replace(/[^a-zA-Z0-9]/g, "_")}.pdf`}
+                                        >
+                                          {({ loading }) => (
+                                            <Button variant="ghost" size="sm" disabled={loading}>
+                                              {loading ? (
+                                                "Preparando PDF..."
+                                              ) : (
+                                                <>
+                                                  <Printer className="mr-2 h-4 w-4" /> Descargar PDF
+                                                </>
+                                              )}
+                                            </Button>
+                                          )}
+                                        </PDFDownloadLink>
+                                      )
                                     }
-                                    fileName={`informe_${(formatStudentDisplayName(group.studentName) || group.studentName).replace(/[^a-zA-Z0-9]/g, "_")}.pdf`}
-                                  >
-                                    {({ loading }) => (
-                                      <Button variant="ghost" size="sm" disabled={loading}>
-                                        {loading ? (
-                                          "Preparando PDF..."
-                                        ) : (
-                                          <>
-                                            <Printer className="mr-2 h-4 w-4" /> Descargar PDF
-                                          </>
-                                        )}
-                                      </Button>
-                                    )}
-                                  </PDFDownloadLink>
+                                    if (group.evaluation_id) {
+                                      return (
+                                        <Button
+                                          variant="ghost"
+                                          size="sm"
+                                          onClick={() => void handleDownloadIndividualPdf(group)}
+                                        >
+                                          <Printer className="mr-2 h-4 w-4" /> Descargar PDF
+                                        </Button>
+                                      )
+                                    }
+                                    return null
+                                  })()}
                                 </div>
                               )}
                             </div>
