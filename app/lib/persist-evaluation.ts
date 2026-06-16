@@ -19,6 +19,7 @@ import {
 import type { SupabaseClient } from "@supabase/supabase-js"
 import { createClient } from "@supabase/supabase-js"
 import { upsertStudentProjectionFromEvaluation } from "@/app/lib/student-projection-upsert"
+import { linkFinalEvaluationToBatchSlot } from "@/app/lib/docente/batch-slot-link"
 
 export interface PersistEvaluationOpts {
   user_id?: string | null
@@ -37,6 +38,8 @@ export interface PersistEvaluationOpts {
   course?: string | null
   /** UUID de lote (EvaluatorClient); opcional, reversible si se ignora en BD. */
   batch_id?: string | null
+  /** Índice de alumno en el lote (1-based); solo para linker post-guardado. */
+  batch_student_index?: number | null
   /** Vínculo opcional a Prueba Base para trazabilidad pedagógica. */
   source_exam_id?: string | null
   /** Herencia opcional explícita del tipo de instrumento. */
@@ -73,6 +76,10 @@ export type PersistResult =
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 function isValidUUID(s: string | null | undefined): boolean {
   return typeof s === "string" && s.trim() !== "" && UUID_REGEX.test(s.trim())
+}
+
+function isValidBatchStudentIndex(n: unknown): n is number {
+  return typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= 500
 }
 
 /** Curso mayoritario entre evaluaciones del mismo lote (rezagados alineados al resto del curso). */
@@ -623,6 +630,47 @@ const isDev = process.env.NODE_ENV !== "production"
         step: pipelineError.step,
         message: `${pipelineError.message} (evaluation_id=${evaluationId})`,
       },
+    }
+  }
+
+  const batchIdForLink =
+    opts.batch_id != null && String(opts.batch_id).trim() !== "" ? String(opts.batch_id).trim() : null
+  const batchStudentIndexForLink = opts.batch_student_index ?? null
+  if (
+    isValidUUID(batchIdForLink) &&
+    isValidUUID(effective_teacher_id) &&
+    isValidUUID(evaluationId) &&
+    isValidBatchStudentIndex(batchStudentIndexForLink)
+  ) {
+    try {
+      const linkResult = await linkFinalEvaluationToBatchSlot({
+        supabase,
+        teacherId: effective_teacher_id!,
+        batchId: batchIdForLink!,
+        batchStudentIndex: batchStudentIndexForLink,
+        finalEvaluationId: evaluationId,
+      })
+      if (linkResult.ok && !linkResult.skipped) {
+        console.info("[persistEvaluation][batch-slot-link] ok", {
+          evaluation_id: evaluationId,
+          relinkedPhotoCount: linkResult.relinkedPhotoCount ?? 0,
+        })
+      } else if (linkResult.skipped) {
+        console.info("[persistEvaluation][batch-slot-link] skipped", {
+          evaluation_id: evaluationId,
+          reason: linkResult.reason ?? "unknown",
+        })
+      } else {
+        console.warn("[persistEvaluation][batch-slot-link] failed", {
+          evaluation_id: evaluationId,
+          reason: linkResult.reason ?? "unknown",
+        })
+      }
+    } catch (linkErr) {
+      console.warn("[persistEvaluation][batch-slot-link] failed", {
+        evaluation_id: evaluationId,
+        message: linkErr instanceof Error ? linkErr.message : String(linkErr),
+      })
     }
   }
 

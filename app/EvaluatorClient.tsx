@@ -482,6 +482,18 @@ function displayStudentNameForEvaluateGroup(
   const idx = studentGroups.findIndex((g) => g.id === groupId)
   return `Alumno ${idx >= 0 ? idx + 1 : 1}`
 }
+
+function resolveBatchStudentIndexForEvaluatePayload(
+  group: { id: string; files: FilePreview[] },
+  studentGroups: Array<{ id: string }>,
+  batchId: string | null | undefined,
+): number | undefined {
+  if (!batchId || !isDocenteBatchUuid(batchId)) return undefined
+  if (!group.files.some((f) => f.fromMobileBatch)) return undefined
+  const groupIndex = studentGroups.findIndex((g) => g.id === group.id)
+  if (groupIndex < 0) return undefined
+  return groupIndex + 1
+}
 interface AlternativeResult {
   pregunta: string
   respuesta_estudiante: string
@@ -3445,6 +3457,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
     const displayName = displayStudentNameForEvaluateGroup(group, studentGroups, groupId)
     const { urls: evaluateFileUrls, mimes: evaluateFileMimes } = await resolveFileUrlsForEvaluate(group.files)
+    const batchStudentIndex = resolveBatchStudentIndexForEvaluatePayload(
+      group,
+      studentGroups,
+      evaluationBatchIdRef.current,
+    )
 
     const payload = {
       fileUrls: evaluateFileUrls,
@@ -3473,6 +3490,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       student_rut: group.studentRut && String(group.studentRut).trim() !== "" ? String(group.studentRut).trim() : undefined,
       omrTemplateVariant: selectedOmrTemplateVariant,
       evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
+      ...(batchStudentIndex != null ? { batch_student_index: batchStudentIndex } : {}),
       ...(resolvedSourceExamId ? { source_exam_id: resolvedSourceExamId } : {}),
       source_exam_context_active: sourceExamContextActive,
       ...(omrClosedLayoutMode === "auto" ? {} : { omrClosedLayoutMode }),
@@ -3783,6 +3801,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       validGroups.map(async (group) => {
         const { urls: evaluateFileUrls, mimes: evaluateFileMimes } = await resolveFileUrlsForEvaluate(group.files)
         const displayName = displayStudentNameForEvaluateGroup(group, studentGroups, group.id)
+        const batchStudentIndex = resolveBatchStudentIndexForEvaluatePayload(
+          group,
+          studentGroups,
+          evaluationBatchIdRef.current,
+        )
         return {
           groupId: group.id,
           payload: {
@@ -3822,6 +3845,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               (tipoPrueba || "mixta") as any,
             ),
             evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
+            ...(batchStudentIndex != null ? { batch_student_index: batchStudentIndex } : {}),
             ...(resolvedSourceExamId ? { source_exam_id: resolvedSourceExamId } : {}),
             source_exam_context_active: sourceExamContextActive,
             ...(omrClosedLayoutMode === "auto" ? {} : { omrClosedLayoutMode }),

@@ -1637,6 +1637,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       evaluation_title: evaluationTitleBody,
       evaluation_subject: evaluationSubjectBody,
       evaluation_batch_id: evaluationBatchIdBody,
+      batch_student_index: batchStudentIndexBody,
       officialOmrIntegrationEnabled: officialOmrIntegrationEnabledIn,
       officialOmrEngineSelected: officialOmrEngineSelectedIn,
       omrTemplateVariant: omrTemplateVariantIn,
@@ -3063,6 +3064,19 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           console.info("[student] confirmed_students_before_save =", JSON.stringify(confirmedStudentName ? [confirmedStudentName] : []))
         }
         console.log("[evaluate] ANTES persistEvaluation (Supabase service role)")
+        const batchStudentIndexParsed =
+          typeof batchStudentIndexBody === "number" && Number.isInteger(batchStudentIndexBody)
+            ? batchStudentIndexBody
+            : typeof batchStudentIndexBody === "string" && batchStudentIndexBody.trim() !== ""
+              ? Number.parseInt(batchStudentIndexBody.trim(), 10)
+              : null
+        const batchStudentIndexForPersist =
+          batchStudentIndexParsed != null &&
+          Number.isInteger(batchStudentIndexParsed) &&
+          batchStudentIndexParsed >= 1 &&
+          batchStudentIndexParsed <= 500
+            ? batchStudentIndexParsed
+            : null
         saveResult = await persistEvaluation(result, {
           user_id: authUserId,
           teacher_id: effectiveTeacherId,
@@ -3075,6 +3089,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             typeof evaluationBatchIdBody === "string" && evaluationBatchIdBody.trim() !== ""
               ? evaluationBatchIdBody.trim()
               : null,
+          batch_student_index: batchStudentIndexForPersist,
           source_exam_id:
             typeof sourceExamIdBody === "string" && sourceExamIdBody.trim() !== ""
               ? sourceExamIdBody.trim()
