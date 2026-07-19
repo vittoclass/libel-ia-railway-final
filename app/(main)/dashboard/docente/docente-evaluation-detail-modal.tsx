@@ -19,6 +19,12 @@ import {
 } from "@/app/lib/correction-report-from-evaluation-detail"
 import { CorrectionReportPdfDocument } from "@/app/components/correction-report/CorrectionReportPdfDocument"
 import { buildPedagogicalResumenFromGroup } from "@/app/lib/pedagogical-feedback-from-group"
+import {
+  buildDevelopmentOrdinalMap,
+  formatDevelopmentItemDisplayLabel,
+  inferTipoPruebaRealForDisplay,
+  sortDevelopmentItemKeys,
+} from "@/app/lib/development-item-display-label"
 
 type ApiItem = {
   question_number?: number | string | null
@@ -97,6 +103,26 @@ export function DocenteEvaluationDetailModal({
     return buildCorrectionReportGroupFromApiDetail(payload as EvaluationDetailJsonForCorrectionZip)
   }, [payload])
 
+  const tipoPruebaRealForLabels = useMemo(() => {
+    if (!payload) return "mixta" as const
+    const summary = payload.summary as Record<string, unknown> | null | undefined
+    const summaryRaw =
+      summary && typeof summary.raw === "object" && summary.raw != null
+        ? (summary.raw as Record<string, unknown>)
+        : null
+    const group = correctionBuild?.ok === true ? correctionBuild.group : null
+    return inferTipoPruebaRealForDisplay({
+      tipoPrueba:
+        typeof summaryRaw?.tipoPrueba === "string"
+          ? summaryRaw.tipoPrueba
+          : typeof payload.tipoPrueba === "string"
+            ? String(payload.tipoPrueba)
+            : null,
+      detalle_desarrollo: group?.detalle_desarrollo,
+      alternativas_corregidas: group?.alternativas_corregidas,
+    })
+  }, [payload, correctionBuild])
+
   useEffect(() => {
     if (!open || !evaluationId) {
       setPayload(null)
@@ -166,6 +192,7 @@ export function DocenteEvaluationDetailModal({
           ),
           nivelEducativo: "Media",
           porcentajeExigencia: "60",
+          tipoPrueba: tipoPruebaRealForLabels,
         }
         const evaluatedAt = ev?.evaluated_at != null ? String(ev.evaluated_at) : null
         const doc = (
@@ -192,7 +219,7 @@ export function DocenteEvaluationDetailModal({
     const result = await exportElementToPdf(el, filename)
     setPdfBusy(false)
     if (!result.ok && result.error) toast({ title: result.error, variant: "destructive" })
-  }, [correctionBuild, payload, toast])
+  }, [correctionBuild, payload, toast, tipoPruebaRealForLabels])
 
   useEffect(() => {
     if (!autoDownloadPdf || !payload || loading || error || autoPdfDoneRef.current) return
@@ -265,6 +292,23 @@ export function DocenteEvaluationDetailModal({
   })()
 
   const richGroup = correctionBuild?.ok === true ? correctionBuild.group : null
+  const devKeysForModal = sortDevelopmentItemKeys(
+    Object.keys(richGroup?.detalle_desarrollo || {}),
+  )
+  const devOrdinalMapForModal = buildDevelopmentOrdinalMap(devKeysForModal, tipoPruebaRealForLabels)
+  const itemOrdinalByIndex = (() => {
+    const map = new Map<number, number>()
+    if (tipoPruebaRealForLabels !== "solo_desarrollo") return map
+    const sorted = [...items]
+      .map((it, idx) => ({ it, idx }))
+      .sort(
+        (a, b) =>
+          (Number(a.it.question_number) || 0) - (Number(b.it.question_number) || 0) ||
+          a.idx - b.idx,
+      )
+    sorted.forEach((entry, i) => map.set(entry.idx, i + 1))
+    return map
+  })()
   const resumenRich = richGroup
     ? buildPedagogicalResumenFromGroup({
         alternativas_corregidas: richGroup.alternativas_corregidas,
@@ -515,7 +559,13 @@ export function DocenteEvaluationDetailModal({
                     <ul className="space-y-2 text-xs">
                       {Object.entries(richGroup.detalle_desarrollo).map(([k, v]) => (
                         <li key={k} className="rounded border border-slate-100 bg-slate-50/80 p-2">
-                          <div className="font-semibold text-slate-800">{k.replace(/_/g, " ")}</div>
+                          <div className="font-semibold text-slate-800">
+                            {formatDevelopmentItemDisplayLabel(
+                              k,
+                              tipoPruebaRealForLabels,
+                              devOrdinalMapForModal.get(k),
+                            )}
+                          </div>
                           <div className="mt-1 text-slate-700 whitespace-pre-wrap">
                             {typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v)}
                           </div>
@@ -542,12 +592,15 @@ export function DocenteEvaluationDetailModal({
                         <tbody>
                           {items.map((it, idx) => {
                             const n = it.question_number
+                            const soloDevOrdinal = itemOrdinalByIndex.get(idx)
                             const numLabel =
-                              typeof n === "number" && Number.isFinite(n)
-                                ? String(n)
-                                : typeof n === "string" && n.trim()
-                                  ? n.trim()
-                                  : String(idx + 1)
+                              tipoPruebaRealForLabels === "solo_desarrollo" && soloDevOrdinal != null
+                                ? formatDevelopmentItemDisplayLabel("", tipoPruebaRealForLabels, soloDevOrdinal)
+                                : typeof n === "number" && Number.isFinite(n)
+                                  ? String(n)
+                                  : typeof n === "string" && n.trim()
+                                    ? n.trim()
+                                    : String(idx + 1)
                             const ok = it.is_correct === true
                             const wrong = it.is_correct === false
                             return (

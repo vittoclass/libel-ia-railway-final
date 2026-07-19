@@ -1,4 +1,5 @@
 import type { DocumentAnalysisClient } from "@azure/ai-form-recognizer"
+import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
 
 interface FileBuffer {
   buffer: Buffer
@@ -29,9 +30,19 @@ export async function extractTextFromFiles(fileBuffers: FileBuffer[], client: Do
 
       console.log(`[evaluate] OCR Azure (prebuilt-read) para: ${fileBuffer.mimeType}`)
 
+      const t0 = Date.now()
       // Usar Azure Document Intelligence para extraer texto
       const poller = await client.beginAnalyzeDocument("prebuilt-read", fileBuffer.buffer)
       const result = await poller.pollUntilDone()
+      const durationMs = Date.now() - t0
+
+      recordAzureDiCostAuditShadow({
+        operation: "evaluate_azure_read",
+        model: "prebuilt-read",
+        pagesProcessed: result.pages?.length ?? null,
+        filesProcessed: 1,
+        durationMs,
+      })
 
       if (!result.content || result.content.trim().length === 0) {
         console.warn("[evaluate] OCR no extrajo contenido de este archivo")

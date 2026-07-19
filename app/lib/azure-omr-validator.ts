@@ -5,6 +5,7 @@
  * Requiere: AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT, AZURE_DOCUMENT_INTELLIGENCE_KEY,
  *           AZURE_OMR_VALIDATION_ENABLED=true (opcional).
  */
+import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
 
 export type AzureOmrValidationResult = {
   hasSelectionMarks: boolean
@@ -79,6 +80,7 @@ export async function validateWithAzure(
   }
 
   try {
+    const t0 = Date.now()
     const initRes = await fetch(analyzeUrl, {
       method: "POST",
       headers,
@@ -159,6 +161,14 @@ export async function validateWithAzure(
       hasSelectionMarks,
       selectionMarkCount,
       qualityWarning: qualityWarning ?? undefined,
+    })
+
+    recordAzureDiCostAuditShadow({
+      operation: "omr_validation_azure_layout",
+      model: config.model === "prebuilt-read" ? "prebuilt-read" : "prebuilt-layout",
+      pagesProcessed: result.pages?.length ?? 1,
+      filesProcessed: 1,
+      durationMs: Date.now() - t0,
     })
 
     return {

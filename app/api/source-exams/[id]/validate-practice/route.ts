@@ -15,6 +15,7 @@ import {
   parseValidatePracticeMcExtract,
   type ValidatePracticeMcItem,
 } from "@/app/lib/validate-practice-vs-base"
+import { recordProviderCostAuditShadow } from "@/app/lib/cost-audit/recordProviderCostAuditShadow"
 
 export const dynamic = "force-dynamic"
 
@@ -151,6 +152,10 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     structured = await extractSourceDocumentStructured(buffer, {
       filename: name,
       mimeType: mime || (kind === "pdf" ? "application/pdf" : DOCX_MIME),
+      cost_audit: {
+        operation_prefix: "validate_practice_azure",
+        context: { source_exam_id: sourceExamId },
+      },
     })
   } catch (e) {
     return jsonNs(
@@ -187,12 +192,22 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   )
 
   try {
+    const anthropicStartedAt = Date.now()
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
     const msg = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_OUTPUT_TOKENS,
       system: VALIDATE_PRACTICE_MC_SYSTEM_PROMPT,
       messages: [{ role: "user", content: userContent }],
+    })
+
+    recordProviderCostAuditShadow({
+      provider: "anthropic",
+      model: MODEL,
+      operation: "validate_practice_anthropic",
+      usage: msg.usage,
+      durationMs: Date.now() - anthropicStartedAt,
+      costAuditContext: { source_exam_id: sourceExamId },
     })
 
     const textOut = messageTextContent(msg)

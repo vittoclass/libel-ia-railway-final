@@ -112,6 +112,12 @@ import {
   renderForWeb,
   splitCorreccionForTwoPages,
 } from "@/app/lib/correction-report-pdf-helpers"
+import {
+  buildDevelopmentOrdinalMap,
+  formatDevelopmentItemDisplayLabel,
+  normalizeTipoPruebaReal,
+  sortDevelopmentItemKeys,
+} from "@/app/lib/development-item-display-label"
 import { CorrectionReportPdfDocument as ReportDocument } from "@/app/components/correction-report/CorrectionReportPdfDocument"
 import JSZip from "jszip"
 import { saveAs } from "file-saver"
@@ -172,6 +178,89 @@ const PEDAGOGY_UI_ENABLED =
  * Ajusta a `false` cuando termines el diagnóstico del caso real.
  */
 const SHOW_EVALUATION_TRACE_PANEL = true
+
+type CriterioEvaluadoDesgloseUi = {
+  criterio_label?: unknown
+  nivel_logro?: unknown
+  evidencia?: unknown
+  justificacion?: unknown
+  max_points?: unknown
+  obtained_points?: unknown
+}
+
+/** Solo presentación web: badge de color por nivel_logro (sin tocar datos ni puntaje). */
+function nivelLogroBadgeClassName(nivel: string): string {
+  switch (nivel.trim().toUpperCase()) {
+    case "LOGRADO":
+      return "bg-green-100 text-green-800 border-green-300 dark:bg-green-950/40 dark:text-green-300 dark:border-green-700"
+    case "PARCIALMENTE_LOGRADO":
+      return "bg-amber-100 text-amber-800 border-amber-300 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-700"
+    case "INSUFICIENTE":
+      return "bg-orange-100 text-orange-800 border-orange-300 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-700"
+    case "NO_OBSERVABLE":
+      return "bg-gray-100 text-gray-700 border-gray-300 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600"
+    default:
+      return "bg-gray-100 text-gray-700 border-gray-300 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600"
+  }
+}
+
+/** Desglose cualitativo de criterios_evaluados — solo UI; no recalcula puntaje ni modifica el item. */
+function renderCriteriosEvaluadosDesgloseUi(item: Record<string, unknown>): React.ReactNode | null {
+  const raw = item.criterios_evaluados
+  if (!Array.isArray(raw) || raw.length === 0) return null
+
+  const lines: React.ReactNode[] = []
+  for (const entry of raw) {
+    if (entry == null || typeof entry !== "object") continue
+    const criterio = entry as CriterioEvaluadoDesgloseUi
+    const label = String(criterio.criterio_label ?? "Criterio").trim() || "Criterio"
+    const nivel = criterio.nivel_logro != null ? String(criterio.nivel_logro).trim() : ""
+    const evidencia = criterio.evidencia != null ? renderForWeb(criterio.evidencia).trim() : ""
+    const justificacion = criterio.justificacion != null ? renderForWeb(criterio.justificacion).trim() : ""
+    const detailParts = [evidencia, justificacion].filter((part, idx, arr) => part && arr.indexOf(part) === idx)
+    const detail = detailParts.join(" ")
+    const maxPoints = criterio.max_points
+    const obtainedPoints = criterio.obtained_points
+    const pointsSuffix =
+      maxPoints != null && obtainedPoints != null
+        ? ` (${renderForWeb(obtainedPoints)}/${renderForWeb(maxPoints)})`
+        : ""
+
+    lines.push(
+      <li key={`${label}-${nivel}-${lines.length}`} className="text-sm">
+        <span className="font-medium">{label}</span>
+        {nivel ? (
+          <>
+            {": "}
+            <span
+              className={cn(
+                "inline-flex items-center px-2 py-0.5 rounded border text-xs font-semibold",
+                nivelLogroBadgeClassName(nivel),
+              )}
+            >
+              {nivel}
+            </span>
+          </>
+        ) : null}
+        {detail ? <span>{`. ${detail}`}</span> : null}
+        {pointsSuffix ? <span>{pointsSuffix}</span> : null}
+      </li>,
+    )
+  }
+
+  if (lines.length === 0) return null
+
+  const puntaje = item.puntaje != null ? String(item.puntaje).trim() : ""
+
+  return (
+    <ul className="space-y-1 list-none pl-0">
+      {lines}
+      {puntaje ? (
+        <li className="text-sm text-[var(--text-secondary)] pt-1">Total asignado por LibelIA: {puntaje}.</li>
+      ) : null}
+    </ul>
+  )
+}
 
 function tryCanonicalDevelopmentKeyForTrace(rawKey: string): string | null {
   const k = String(rawKey ?? "").trim().toUpperCase()
@@ -349,6 +438,121 @@ const formSchema = z
       })
     }
   })
+
+type TipoPruebaEvaluatePayload = "mixta" | "solo_desarrollo" | "solo_alternativas"
+
+type CaptureMode = "sm_vf" | "terminos_pareados" | "desarrollo" | "closed_answer" | null
+
+type EvaluationCaptureIntent = CaptureMode | "obra_visual"
+
+function normalizeFormTipoPruebaForPayload(
+  raw: string | null | undefined,
+): TipoPruebaEvaluatePayload | null {
+  const t = String(raw ?? "").trim()
+  if (t === "solo_desarrollo" || t === "solo_alternativas" || t === "mixta") return t
+  return null
+}
+
+function isAlternativesCaptureIntent(intent: EvaluationCaptureIntent | null | undefined): boolean {
+  return intent === "sm_vf" || intent === "terminos_pareados" || intent === "closed_answer"
+}
+
+type FinalEvaluationModeInput = {
+  rawFormTipoPrueba: string | null | undefined
+  watchedTipoPrueba: string | null | undefined
+  captureMode: CaptureMode
+  selectedCaptureMode: EvaluationCaptureIntent | null
+  areaConocimiento: string | null | undefined
+}
+
+type FinalEvaluationModeResult = {
+  tipoPruebaFinal: TipoPruebaEvaluatePayload
+  areaConocimientoFinal: string
+  reason: string
+}
+
+/** Compuerta final de tipoPrueba/areaConocimiento justo antes del POST /api/evaluate. */
+function resolveFinalEvaluationModeForPayload(
+  input: FinalEvaluationModeInput,
+): FinalEvaluationModeResult {
+  const rawForm = normalizeFormTipoPruebaForPayload(input.rawFormTipoPrueba)
+  const watchedForm = normalizeFormTipoPruebaForPayload(input.watchedTipoPrueba)
+  const areaRaw = String(input.areaConocimiento ?? "").trim()
+  const areaFallback = areaRaw || "general"
+
+  const captureDesarrollo =
+    input.captureMode === "desarrollo" || input.selectedCaptureMode === "desarrollo"
+  const captureObraVisual = input.selectedCaptureMode === "obra_visual"
+  const captureAlternativas =
+    isAlternativesCaptureIntent(input.captureMode) ||
+    isAlternativesCaptureIntent(input.selectedCaptureMode)
+
+  const formDesarrollo = rawForm === "solo_desarrollo" || watchedForm === "solo_desarrollo"
+  const formAlternativas = rawForm === "solo_alternativas" || watchedForm === "solo_alternativas"
+  const formMixta = rawForm === "mixta" || watchedForm === "mixta"
+  const formObraVisual = formDesarrollo && areaRaw === "artes"
+
+  if (captureObraVisual || formObraVisual) {
+    return {
+      tipoPruebaFinal: "solo_desarrollo",
+      areaConocimientoFinal: "artes",
+      reason: captureObraVisual ? "selected_capture_obra_visual" : "form_obra_visual_preset",
+    }
+  }
+
+  if (captureDesarrollo) {
+    if (formMixta && !formDesarrollo) {
+      return {
+        tipoPruebaFinal: "solo_desarrollo",
+        areaConocimientoFinal: areaFallback,
+        reason: "capture_mode_development_overrides_stale_form_mixta",
+      }
+    }
+    return {
+      tipoPruebaFinal: "solo_desarrollo",
+      areaConocimientoFinal: areaFallback,
+      reason: "capture_mode_desarrollo",
+    }
+  }
+
+  if (formDesarrollo) {
+    return {
+      tipoPruebaFinal: "solo_desarrollo",
+      areaConocimientoFinal: areaFallback,
+      reason: "form_solo_desarrollo",
+    }
+  }
+
+  if (formAlternativas && !captureDesarrollo) {
+    return {
+      tipoPruebaFinal: "solo_alternativas",
+      areaConocimientoFinal: areaFallback,
+      reason: captureAlternativas ? "form_and_capture_solo_alternativas" : "form_solo_alternativas",
+    }
+  }
+
+  if (formMixta && !captureDesarrollo && !formDesarrollo) {
+    return {
+      tipoPruebaFinal: "mixta",
+      areaConocimientoFinal: areaFallback,
+      reason: "form_mixta_explicit",
+    }
+  }
+
+  if (captureAlternativas) {
+    return {
+      tipoPruebaFinal: "solo_alternativas",
+      areaConocimientoFinal: areaFallback,
+      reason: "capture_alternativas_intent",
+    }
+  }
+
+  return {
+    tipoPruebaFinal: "mixta",
+    areaConocimientoFinal: areaFallback,
+    reason: "default_mixta_no_development_signals",
+  }
+}
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -1032,7 +1236,6 @@ function mergeMobileBatchIntoEvaluatorState(
 }
 
 // *** TIPOS DECLARADOS PARA RESOLVER ERRORES LINT ***
-type CaptureMode = "sm_vf" | "terminos_pareados" | "desarrollo" | "closed_answer" | null
 interface CameraFeedback {
   confidence: number
   // Agrega aquí otras propiedades si son necesarias para el feedback
@@ -1341,6 +1544,17 @@ export default function EvaluatorClient() {
   // 🚨 NUEVOS ESTADOS PARA CAPTURA GUIADA
   const [isCaptureModeSelectionOpen, setIsCaptureModeSelectionOpen] = useState(false)
   const [captureMode, setCaptureMode] = useState<CaptureMode>(null)
+  /** Intención de captura que persiste tras cerrar la cámara (compuerta final de payload). */
+  const [selectedCaptureMode, setSelectedCaptureMode] = useState<EvaluationCaptureIntent | null>(null)
+  const [lastFinalPayloadModeGuard, setLastFinalPayloadModeGuard] = useState<{
+    rawFormTipoPrueba: unknown
+    watchedTipoPrueba: unknown
+    captureMode: CaptureMode
+    selectedCaptureMode: EvaluationCaptureIntent | null
+    tipoPruebaFinal: TipoPruebaEvaluatePayload
+    areaConocimientoFinal: string
+    reason: string
+  } | null>(null)
   // 🔥 AÑADIDO: Estado para el feedback de certeza en tiempo real
   const [cameraFeedback, setCameraFeedback] = useState<CameraFeedback | null>(null)
 
@@ -2097,6 +2311,7 @@ export default function EvaluatorClient() {
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
+    shouldUnregister: false,
     defaultValues: {
       tipoEvaluacion: "prueba",
       rubrica: "",
@@ -2122,6 +2337,35 @@ export default function EvaluatorClient() {
   })
 
   const watchedTipoPrueba = form.watch("tipoPrueba")
+  const watchedAreaConocimiento = form.watch("areaConocimiento")
+  const resolveFinalModeForEvaluatePayload = useCallback(() => {
+    const rawFormTipoPrueba = form.getValues("tipoPrueba")
+    const areaConocimientoRaw = form.getValues("areaConocimiento") ?? watchedAreaConocimiento
+    const finalMode = resolveFinalEvaluationModeForPayload({
+      rawFormTipoPrueba,
+      watchedTipoPrueba,
+      captureMode,
+      selectedCaptureMode,
+      areaConocimiento: areaConocimientoRaw,
+    })
+    const modeGuardDebug = {
+      rawFormTipoPrueba,
+      watchedTipoPrueba,
+      captureMode,
+      selectedCaptureMode,
+      tipoPruebaFinal: finalMode.tipoPruebaFinal,
+      areaConocimientoFinal: finalMode.areaConocimientoFinal,
+      reason: finalMode.reason,
+    }
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[FINAL-PAYLOAD-MODE-GUARD]", modeGuardDebug)
+    }
+    setLastFinalPayloadModeGuard(modeGuardDebug)
+    return finalMode
+  }, [form, watchedTipoPrueba, watchedAreaConocimiento, captureMode, selectedCaptureMode])
+  const tipoPruebaRealForLabels = normalizeTipoPruebaReal(watchedTipoPrueba)
+  const isObraVisualPreset =
+    watchedTipoPrueba === "solo_desarrollo" && watchedAreaConocimiento === "artes"
   const prevTipoPruebaRef = useRef<string | undefined>(undefined)
   useEffect(() => {
     const prev = prevTipoPruebaRef.current
@@ -3470,14 +3714,12 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       pauta,
       flexibilidad,
       tipoEvaluacion,
-      areaConocimiento,
       puntajeTotal,
       nivelEducativo,
       nombresGrupales,
       porcentajeExigencia,
       pautaEstructurada,
       pautaCorrectaAlternativas,
-      tipoPrueba,
     } = form.getValues()
     const puntajeTotalNum = Number(puntajeTotal)
     const porcentajeExigenciaNum = Number(porcentajeExigencia)
@@ -3502,29 +3744,6 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       })
       if (canonical.pautaEstructurada.trim()) pautaEstructuradaFinal = canonical.pautaEstructurada
       if (canonical.pautaCorrectaAlternativas.trim()) pautaCorrectaAlternativasFinal = canonical.pautaCorrectaAlternativas
-    }
-
-    const traceAnswerKey = buildTeacherAnswerKeyFromFormPauta(
-      String(pautaEstructuradaFinal),
-      String(pautaCorrectaAlternativasFinal),
-      (tipoPrueba || "mixta") as any,
-    )
-    const evaluationTracePayload = {
-      tipoPrueba: tipoPrueba || "mixta",
-      evaluatorInstrumentSource: evaluatorInstrumentSource,
-      selectedEvaluatorSourceExamId: selectedEvaluatorSourceExamId || "",
-      pautaEstructuradaFinal: String(pautaEstructuradaFinal),
-      pautaCorrectaAlternativasFinal: String(pautaCorrectaAlternativasFinal),
-      answerKeyFromTemplateSummary: traceAnswerKey
-        ? {
-            totalPreguntas: traceAnswerKey.totalPreguntas,
-            respuestasLength: traceAnswerKey.respuestas.length,
-            primeras10: traceAnswerKey.respuestas.slice(0, 10).map((r) => ({
-              pregunta: r.pregunta,
-              respuestaCorrecta: r.respuestaCorrecta,
-            })),
-          }
-        : null,
     }
 
     const group = studentGroups.find((g) => g.id === groupId)
@@ -3561,6 +3780,32 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       evaluationBatchIdRef.current,
     )
 
+    const { tipoPruebaFinal: tipoPruebaPayload, areaConocimientoFinal: areaConocimientoPayload } =
+      resolveFinalModeForEvaluatePayload()
+
+    const traceAnswerKey = buildTeacherAnswerKeyFromFormPauta(
+      String(pautaEstructuradaFinal),
+      String(pautaCorrectaAlternativasFinal),
+      tipoPruebaPayload,
+    )
+    const evaluationTracePayload = {
+      tipoPrueba: tipoPruebaPayload,
+      evaluatorInstrumentSource: evaluatorInstrumentSource,
+      selectedEvaluatorSourceExamId: selectedEvaluatorSourceExamId || "",
+      pautaEstructuradaFinal: String(pautaEstructuradaFinal),
+      pautaCorrectaAlternativasFinal: String(pautaCorrectaAlternativasFinal),
+      answerKeyFromTemplateSummary: traceAnswerKey
+        ? {
+            totalPreguntas: traceAnswerKey.totalPreguntas,
+            respuestasLength: traceAnswerKey.respuestas.length,
+            primeras10: traceAnswerKey.respuestas.slice(0, 10).map((r) => ({
+              pregunta: r.pregunta,
+              respuestaCorrecta: r.respuestaCorrecta,
+            })),
+          }
+        : null,
+    }
+
     const payload = {
       fileUrls: evaluateFileUrls,
       fileMimeTypes: evaluateFileMimes,
@@ -3568,7 +3813,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       pauta,
       flexibilidad: flexibilidad[0],
       tipoEvaluacion,
-      areaConocimiento,
+      areaConocimiento: areaConocimientoPayload,
       userEmail,
       puntajeTotal: puntajeTotalNum,
       nivelEducativo,
@@ -3576,7 +3821,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       porcentajeExigencia: porcentajeExigenciaNum,
       pautaEstructurada: pautaEstructuradaFinal,
       pautaCorrectaAlternativas: pautaCorrectaAlternativasFinal,
-      tipoPrueba: tipoPrueba || "mixta",
+      tipoPrueba: tipoPruebaPayload,
       respuestasAlternativas: group.alternativas_corregidas,
       captureMode: captureMode,
       ...(teacherIdForPayload && { teacher_id: teacherIdForPayload }),
@@ -3769,22 +4014,22 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       pauta,
       flexibilidad,
       tipoEvaluacion,
-      areaConocimiento,
       puntajeTotal,
       nivelEducativo,
       nombresGrupales,
       porcentajeExigencia,
       pautaEstructurada,
       pautaCorrectaAlternativas,
-      tipoPrueba,
       nombrePrueba,
       asignatura,
       curso,
     } = form.getValues()
     const puntajeTotalNum = Number(puntajeTotal)
     const porcentajeExigenciaNum = Number(porcentajeExigencia)
+    const { tipoPruebaFinal: tipoPruebaPayload, areaConocimientoFinal: areaConocimientoPayload } =
+      resolveFinalModeForEvaluatePayload()
 
-    if (tipoPrueba !== "solo_alternativas") {
+    if (tipoPruebaPayload !== "solo_alternativas") {
       if (!String(rubrica ?? "").trim()) {
         form.setError("rubrica", { type: "manual", message: "La rubrica es requerida." })
         return
@@ -3874,10 +4119,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     const traceAnswerKey = buildTeacherAnswerKeyFromFormPauta(
       String(pautaEstructuradaFinal),
       String(pautaCorrectaAlternativasFinal),
-      (tipoPrueba || "mixta") as any,
+      tipoPruebaPayload,
     )
     const evaluationTracePayloadCommon = {
-      tipoPrueba: tipoPrueba || "mixta",
+      tipoPrueba: tipoPruebaPayload,
       evaluatorInstrumentSource: evaluatorInstrumentSource,
       selectedEvaluatorSourceExamId: selectedEvaluatorSourceExamId || "",
       pautaEstructuradaFinal: String(pautaEstructuradaFinal),
@@ -3913,7 +4158,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             pauta,
             flexibilidad: flexibilidad[0],
             tipoEvaluacion,
-            areaConocimiento,
+            areaConocimiento: areaConocimientoPayload,
             userEmail,
             puntajeTotal: puntajeTotalNum,
             nivelEducativo,
@@ -3921,7 +4166,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             porcentajeExigencia: porcentajeExigenciaNum,
             pautaEstructurada: pautaEstructuradaFinal,
             pautaCorrectaAlternativas: pautaCorrectaAlternativasFinal,
-            tipoPrueba: tipoPrueba || "mixta",
+            tipoPrueba: tipoPruebaPayload,
             respuestasAlternativas:
               Array.isArray(group.alternativas_corregidas) && group.alternativas_corregidas.length > 0
                 ? group.alternativas_corregidas
@@ -3940,7 +4185,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             answerKeyFromTemplate: buildTeacherAnswerKeyFromFormPauta(
               String(pautaEstructuradaFinal),
               String(pautaCorrectaAlternativasFinal),
-              (tipoPrueba || "mixta") as any,
+              tipoPruebaPayload,
             ),
             evaluation_batch_id: evaluationBatchIdRef.current ?? undefined,
             ...(batchStudentIndex != null ? { batch_student_index: batchStudentIndex } : {}),
@@ -4929,6 +5174,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                 variant="outline"
                 onClick={() => {
                   setCaptureMode("sm_vf")
+                  setSelectedCaptureMode("sm_vf")
                   setIsCaptureModeSelectionOpen(false)
                   setIsCameraOpen(true)
                 }}
@@ -4940,6 +5186,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                 variant="outline"
                 onClick={() => {
                   setCaptureMode("terminos_pareados")
+                  setSelectedCaptureMode("terminos_pareados")
                   setIsCaptureModeSelectionOpen(false)
                   setIsCameraOpen(true)
                 }}
@@ -4950,7 +5197,12 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                 className="w-full justify-start bg-transparent"
                 variant="outline"
                 onClick={() => {
+                  form.setValue("tipoPrueba", "solo_desarrollo", {
+                    shouldDirty: true,
+                    shouldTouch: true,
+                  })
                   setCaptureMode("desarrollo")
+                  setSelectedCaptureMode("desarrollo")
                   setIsCaptureModeSelectionOpen(false)
                   setIsCameraOpen(true)
                 }}
@@ -4963,6 +5215,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
                 onClick={() => {
                   setIsCaptureModeSelectionOpen(false)
                   setCaptureMode("closed_answer")
+                  setSelectedCaptureMode("closed_answer")
                   setIsCameraOpen(true)
                 }}
               >
@@ -5518,7 +5771,20 @@ font-semibold"
                                 Tipo de prueba
                               </FormLabel>
                               <Select
-                                onValueChange={field.onChange}
+                                onValueChange={(value) => {
+                                  field.onChange(value)
+                                  form.setValue("tipoPrueba", value as TipoPruebaEvaluatePayload, {
+                                    shouldDirty: true,
+                                    shouldTouch: true,
+                                  })
+                                  if (value === "solo_desarrollo") {
+                                    setSelectedCaptureMode("desarrollo")
+                                  } else if (value === "solo_alternativas") {
+                                    setSelectedCaptureMode("sm_vf")
+                                  } else {
+                                    setSelectedCaptureMode(null)
+                                  }
+                                }}
                                 value={field.value}
                               >
                                 <FormControl>
@@ -5535,6 +5801,33 @@ font-semibold"
                               <FormDescription>
                                 Elige según lo que quieras que la IA revise. No rompe evaluaciones existentes.
                               </FormDescription>
+                              <div className="mt-3 rounded-lg border border-violet-200 bg-violet-50/60 p-3 space-y-2">
+                                <button
+                                  type="button"
+                                  className={`w-full text-left rounded-md border px-3 py-2 text-sm font-semibold transition-colors ${
+                                    isObraVisualPreset
+                                      ? "border-violet-500 bg-violet-100 text-violet-900"
+                                      : "border-violet-200 bg-white text-violet-900 hover:bg-violet-50"
+                                  }`}
+                                  onClick={() => {
+                                    form.setValue("tipoPrueba", "solo_desarrollo", {
+                                      shouldDirty: true,
+                                      shouldTouch: true,
+                                    })
+                                    form.setValue("areaConocimiento", "artes", {
+                                      shouldDirty: true,
+                                      shouldTouch: true,
+                                    })
+                                    setSelectedCaptureMode("obra_visual")
+                                  }}
+                                >
+                                  Obra visual / Imagen
+                                </button>
+                                <p className="text-xs text-violet-800/90 leading-relaxed">
+                                  Utilice esta opción para evaluar dibujos, pinturas, fotografías, collages, maquetas y
+                                  otras evidencias visuales.
+                                </p>
+                              </div>
                               <FormMessage />
                             </FormItem>
                           )}
@@ -6773,6 +7066,13 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           ? group.alternativas_corregidas
                           : []
                         const tableAlternativas = currentAlternativas
+                        const devKeysSortedForGroup = sortDevelopmentItemKeys(
+                          Object.keys(group.detalle_desarrollo || {}),
+                        )
+                        const devOrdinalMapForGroup = buildDevelopmentOrdinalMap(
+                          devKeysSortedForGroup,
+                          tipoPruebaRealForLabels,
+                        )
 
                         const tracePayload = group.evaluationTrace?.payload ?? null
                         const teacherAnswerKeyLength =
@@ -6893,35 +7193,14 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                                     <div>
                                       <b>OMR DEBUG (REAL)</b>
                                     </div>
-
-                                    <div>engineSelected: {String(debug.engineSelected)}</div>
-                                    <div>engineUsed: {String(debug.engineUsed)}</div>
-                                    <div>fallbackUsed: {String(debug.fallbackUsed)}</div>
-                                    <div>fallbackReason: {String(debug.fallbackReason ?? "—")}</div>
-                                    <div>integrationEnabled: {String(debug.integrationEnabled)}</div>
-
-                                    <div>studentAnswersSource: {String(debug.studentAnswersSource)}</div>
-                                    <div>teacherAnswersSource: {String(debug.teacherAnswersSource)}</div>
-                                    <div>expectedQuestionCountUsed: {String(debug.expectedQuestionCountUsed)}</div>
-                                    <div>teacherAnswerKeyLength: {String(debug.teacherAnswerKeyLength)}</div>
-                                    <div>totalPregResolved: {String(debug.totalPregResolved)}</div>
-                                    <div>templateKeyUsed: {String(debug.templateKeyUsed)}</div>
-                                    <div>omrTemplateVariantUsed: {String(debug.omrTemplateVariantUsed)}</div>
-
-                                    <div>totalDetectedAnswers: {String(debug.totalDetectedAnswers)}</div>
-                                    <div>officialOmrQuestionCountFromPipeline: {String(debug.officialOmrQuestionCountFromPipeline)}</div>
-                                    <div>officialOmrDetectedAnswersCount: {String(debug.officialOmrDetectedAnswersCount)}</div>
-                                    <div>officialOmrDetectedVsPipelineMismatch: {String(debug.officialOmrDetectedVsPipelineMismatch)}</div>
-                                    <div>officialOmrAdapterMode: {String(debug.officialOmrAdapterMode)}</div>
-
-                                    <div style={{ marginTop: "10px" }}>detectedAnswersPreview:</div>
-                                    <pre style={{ maxHeight: "200px", overflow: "auto" }}>
-                                      {JSON.stringify(debug.detectedAnswersPreview, null, 2)}
-                                    </pre>
-                                    <div style={{ marginTop: "10px" }}>officialOmrPerQuestionRawPreview:</div>
-                                    <pre style={{ maxHeight: "200px", overflow: "auto" }}>
-                                      {JSON.stringify(debug.officialOmrPerQuestionRawPreview, null, 2)}
-                                    </pre>
+                                    <div style={{ marginTop: "10px" }}>
+                                    </div>
+                                    <div style={{ marginTop: "10px" }}>
+                                    </div>
+                                    <div style={{ marginTop: "10px" }}>
+                                    </div>
+                                    <div style={{ marginTop: "10px" }}>
+                                    </div>
                                   </div>
                                 )}
                                 {SHOW_EVALUATION_TRACE_PANEL && tracePayload && (
@@ -7291,6 +7570,11 @@ h-4 w-4 animate-spin"
                                               </TableRow>
                                             ))}
                                             {Object.keys(group.detalle_desarrollo || {}).map((key) => {
+                                              const displayLabel = formatDevelopmentItemDisplayLabel(
+                                                key,
+                                                tipoPruebaRealForLabels,
+                                                devOrdinalMapForGroup.get(key),
+                                              )
                                               const item = group.detalle_desarrollo?.[key]
                                               if (item == null) return null
                                               // Si item no tiene la forma esperada (puntaje/texto/justificacion), puede ser un objeto de rúbrica; mostrarlo como texto seguro
@@ -7312,11 +7596,19 @@ h-4 w-4 animate-spin"
                                                 isDevelopmentItem && item.justificacion != null
                                                   ? renderForWeb(item.justificacion)
                                                   : ""
+                                              const criteriosBreakdownUi =
+                                                isDevelopmentItem &&
+                                                Array.isArray(item.criterios_evaluados) &&
+                                                item.criterios_evaluados.length > 0
+                                                  ? renderCriteriosEvaluadosDesgloseUi(
+                                                      item as Record<string, unknown>,
+                                                    )
+                                                  : null
                                               if (!isDevelopmentItem) {
                                                 return (
                                                   <TableRow key={key}>
                                                     <TableCell className="font-medium text-purple-600">
-                                                      {key.replace(/_/g, " ")}
+                                                      {displayLabel}
                                                     </TableCell>
                                                     <TableCell>{renderForWeb(item)}</TableCell>
                                                   </TableRow>
@@ -7325,7 +7617,7 @@ h-4 w-4 animate-spin"
                                               return (
                                                 <TableRow key={key}>
                                                   <TableCell className="font-medium text-purple-600">
-                                                    {key.replace(/_/g, " ")}
+                                                    {displayLabel}
                                                   </TableCell>
                                                   <TableCell>
                                                     <p className="font-semibold text-sm mb-1">
@@ -7335,6 +7627,14 @@ h-4 w-4 animate-spin"
                                                       Cita Estudiante: &quot;{citaStr}&quot;
                                                     </p>
                                                     <p className="text-sm">{justifStr}</p>
+                                                    {criteriosBreakdownUi ? (
+                                                      <div className="mt-2 pt-2 border-t border-gray-200">
+                                                        <p className="text-xs font-semibold text-[var(--text-secondary)] mb-1">
+                                                          Desglose del puntaje
+                                                        </p>
+                                                        {criteriosBreakdownUi}
+                                                      </div>
+                                                    ) : null}
                                                   </TableCell>
                                                 </TableRow>
                                               )

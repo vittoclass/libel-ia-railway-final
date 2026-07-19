@@ -29,6 +29,7 @@ import {
   supplementRowsToMaps,
   type SupplementRow,
 } from "@/app/lib/source-exam-draft-merge"
+import { recordProviderCostAuditShadow } from "@/app/lib/cost-audit/recordProviderCostAuditShadow"
 
 export const dynamic = "force-dynamic"
 
@@ -314,6 +315,7 @@ export async function POST(req: NextRequest) {
     structured = await extractSourceDocumentStructured(buffer, {
       filename: name,
       mimeType: mime || (kind === "pdf" ? "application/pdf" : DOCX_MIME),
+      cost_audit: { operation_prefix: "smart_extract_azure" },
     })
     extractionFinishedAt = Date.now()
   } catch (e) {
@@ -375,6 +377,14 @@ export async function POST(req: NextRequest) {
       messages: [{ role: "user", content: userContent }],
     })
     pass1FinishedAt = Date.now()
+
+    recordProviderCostAuditShadow({
+      provider: "anthropic",
+      model: MODEL,
+      operation: "smart_extract_stage_1",
+      usage: msg1.usage,
+      durationMs: pass1FinishedAt - pass1StartedAt,
+    })
 
     const textOut1 = messageTextContent(msg1)
 
@@ -509,6 +519,15 @@ export async function POST(req: NextRequest) {
         })
         pass2FinishedAt = Date.now()
         textOut2 = messageTextContent(msg2)
+
+        recordProviderCostAuditShadow({
+          provider: "anthropic",
+          model: MODEL,
+          operation: "smart_extract_stage_2",
+          usage: msg2.usage,
+          durationMs: pass2FinishedAt - pass2StartedAt,
+        })
+
         console.log(
           "[smart-extract] pasada 2 Anthropic:",
           JSON.stringify(
@@ -606,6 +625,7 @@ export async function POST(req: NextRequest) {
             mimeType:
               supplementAk.mime ||
               (supplementAk.name.toLowerCase().endsWith(".pdf") ? "application/pdf" : DOCX_MIME),
+            cost_audit: { operation_prefix: "smart_extract_azure" },
           })
           pautaDoc = truncateDocumentForLlm(exAk.raw_text ?? "", MAX_SUPPLEMENT_CHARS).text.trim()
         }
@@ -615,6 +635,7 @@ export async function POST(req: NextRequest) {
             mimeType:
               supplementRf.mime ||
               (supplementRf.name.toLowerCase().endsWith(".pdf") ? "application/pdf" : DOCX_MIME),
+            cost_audit: { operation_prefix: "smart_extract_azure" },
           })
           rubricDoc = truncateDocumentForLlm(exRf.raw_text ?? "", MAX_SUPPLEMENT_CHARS).text.trim()
         }
@@ -634,6 +655,14 @@ export async function POST(req: NextRequest) {
             ],
           })
           const textSup = messageTextContent(msgSup)
+
+          recordProviderCostAuditShadow({
+            provider: "anthropic",
+            model: MODEL,
+            operation: "smart_extract_supplement",
+            usage: msgSup.usage,
+          })
+
           const parsedSup = extractJsonObjectFromModelText(textSup)
           const obj =
             parsedSup && typeof parsedSup === "object"

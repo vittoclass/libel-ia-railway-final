@@ -131,6 +131,63 @@ Justificación: ${pdfSafe(v.justificacion)}`
   }
 }
 
+type CriterioEvaluadoDisplay = {
+  criterio_label?: unknown
+  nivel_logro?: unknown
+  evidencia?: unknown
+  justificacion?: unknown
+  max_points?: unknown
+  obtained_points?: unknown
+}
+
+function formatCriterioEvaluadoLine(criterio: CriterioEvaluadoDisplay): string {
+  const label = String(criterio.criterio_label ?? "Criterio").trim() || "Criterio"
+  const nivel = criterio.nivel_logro != null ? String(criterio.nivel_logro).trim() : ""
+  const evidencia = criterio.evidencia != null ? renderForWeb(criterio.evidencia).trim() : ""
+  const justificacion = criterio.justificacion != null ? renderForWeb(criterio.justificacion).trim() : ""
+  const detailParts = [evidencia, justificacion].filter((part, idx, arr) => part && arr.indexOf(part) === idx)
+  const detail = detailParts.join(" ")
+  let line = `- ${label}`
+  if (nivel) line += `: ${nivel}`
+  if (detail) line += `. ${detail}`
+  const maxPoints = criterio.max_points
+  const obtainedPoints = criterio.obtained_points
+  if (maxPoints != null && obtainedPoints != null) {
+    line += ` (${renderForWeb(obtainedPoints)}/${renderForWeb(maxPoints)})`
+  }
+  return line
+}
+
+/**
+ * Desglose cualitativo de criterios_evaluados — solo presentación.
+ * No recalcula puntaje ni modifica el item.
+ */
+export function formatCriteriosEvaluadosBreakdown(
+  item: Record<string, unknown>,
+  puntajeTotal?: string,
+): string {
+  const raw = item.criterios_evaluados
+  if (!Array.isArray(raw) || raw.length === 0) return ""
+  const lines: string[] = []
+  for (const entry of raw) {
+    if (entry == null || typeof entry !== "object") continue
+    const line = formatCriterioEvaluadoLine(entry as CriterioEvaluadoDisplay)
+    if (line.trim()) lines.push(line)
+  }
+  if (lines.length === 0) return ""
+  const puntaje =
+    puntajeTotal != null && String(puntajeTotal).trim() !== ""
+      ? String(puntajeTotal).trim()
+      : item.puntaje != null
+        ? String(item.puntaje).trim()
+        : ""
+  if (puntaje) {
+    lines.push("")
+    lines.push(`Total asignado por LibelIA: ${puntaje}.`)
+  }
+  return lines.join("\n")
+}
+
 export function formatDetalleDesarrolloPdf(raw: unknown): string {
   if (raw == null) return ""
   if (typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean") return String(raw)
@@ -147,7 +204,9 @@ export function formatDetalleDesarrolloPdf(raw: unknown): string {
   const jVal = o.justificacion
   const j = jVal != null ? renderForWeb(jVal).trim() : ""
   const jPart = j ? `Justificación: ${j}` : ""
-  const main = [p, txtPart, jPart].filter(Boolean).join("\n")
+  const breakdown = formatCriteriosEvaluadosBreakdown(o)
+  const breakdownPart = breakdown ? `Desglose del puntaje:\n${breakdown}` : ""
+  const main = [p, txtPart, jPart, breakdownPart].filter(Boolean).join("\n")
   if (main) return main
   const fallback = Object.entries(o)
     .filter(([, v]) => v != null && typeof v !== "object" && typeof v !== "function")

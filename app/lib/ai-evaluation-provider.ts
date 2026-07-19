@@ -3,6 +3,10 @@
  * No usar para OMR ni lectura de alternativas por visión dedicada.
  */
 import Anthropic from "@anthropic-ai/sdk"
+import { recordProviderCostAuditShadow } from "./cost-audit/recordProviderCostAuditShadow"
+import type { CostAuditContext } from "./cost-audit/types"
+
+export type { CostAuditContext } from "./cost-audit/types"
 
 export const EVALUATION_IA_UNAVAILABLE_MESSAGE = "IA evaluadora temporalmente no disponible."
 
@@ -214,14 +218,34 @@ function normalizeVisionBase64(imageRef: string): { mediaType: "image/jpeg" | "i
   return { mediaType: "image/jpeg", data: s.replace(/^data:.*?;base64,/, "") }
 }
 
-async function callAnthropicText(prompt: string, maxTokens: number): Promise<string> {
+type AnthropicCostAuditMeta = {
+  operation: "anthropic_text_fallback" | "anthropic_vision_fallback"
+  costAuditContext?: CostAuditContext
+}
+
+async function callAnthropicText(
+  prompt: string,
+  maxTokens: number,
+  auditMeta?: Pick<AnthropicCostAuditMeta, "costAuditContext">,
+): Promise<string> {
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim()
   if (!apiKey) throw new EvaluationIaUnavailableError()
   const anthropic = new Anthropic({ apiKey })
+  const model = anthropicEvaluationModel()
+  const startedAt = Date.now()
   const msg = await anthropic.messages.create({
-    model: anthropicEvaluationModel(),
+    model,
     max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
+  })
+  recordProviderCostAuditShadow({
+    provider: "anthropic",
+    model,
+    operation: "anthropic_text_fallback",
+    usage: msg.usage,
+    providerRequestId: typeof msg.id === "string" ? msg.id : null,
+    durationMs: Date.now() - startedAt,
+    costAuditContext: auditMeta?.costAuditContext,
   })
   const text = messageTextContent(msg)
   if (!text) throw new EvaluationIaUnavailableError()
@@ -232,14 +256,17 @@ async function callAnthropicVision(
   imageBase64: string,
   prompt: string,
   maxTokens: number,
+  auditMeta?: Pick<AnthropicCostAuditMeta, "costAuditContext">,
 ): Promise<string> {
   const apiKey = process.env.ANTHROPIC_API_KEY?.trim()
   if (!apiKey) throw new EvaluationIaUnavailableError()
   const { mediaType, data } = normalizeVisionBase64(imageBase64)
   if (!data) throw new EvaluationIaUnavailableError()
   const anthropic = new Anthropic({ apiKey })
+  const model = anthropicEvaluationModel()
+  const startedAt = Date.now()
   const msg = await anthropic.messages.create({
-    model: anthropicEvaluationModel(),
+    model,
     max_tokens: maxTokens,
     messages: [
       {
@@ -250,6 +277,15 @@ async function callAnthropicVision(
         ],
       },
     ],
+  })
+  recordProviderCostAuditShadow({
+    provider: "anthropic",
+    model,
+    operation: "anthropic_vision_fallback",
+    usage: msg.usage,
+    providerRequestId: typeof msg.id === "string" ? msg.id : null,
+    durationMs: Date.now() - startedAt,
+    costAuditContext: auditMeta?.costAuditContext,
   })
   const text = messageTextContent(msg)
   if (!text) throw new EvaluationIaUnavailableError()
@@ -302,6 +338,7 @@ export type EvaluationTextCompletionParams = {
   maxTokens: number
   temperature?: number
   timeoutMs?: number
+  costAuditContext?: CostAuditContext
 }
 
 export async function requestEvaluationTextCompletion(
@@ -310,12 +347,16 @@ export async function requestEvaluationTextCompletion(
   const mistralKey = process.env.MISTRAL_API_KEY?.trim()
   if (!mistralKey) {
     if (!isAnthropicFallbackEnabled()) throw new EvaluationIaUnavailableError()
-    const content = await callAnthropicText(params.prompt, params.maxTokens)
+    const content = await callAnthropicText(params.prompt, params.maxTokens, {
+      costAuditContext: params.costAuditContext,
+    })
     return { content, trace: anthropicFallbackTrace() }
   }
 
   return withAnthropicFallbackOnMistralAuth(
     async () => {
+      const mistralModel = "mistral-large-latest"
+      const startedAt = Date.now()
       const res = await fetchMistralWithRetry(
         MISTRAL_CHAT_URL,
         {
@@ -325,7 +366,7 @@ export async function requestEvaluationTextCompletion(
             Authorization: `Bearer ${mistralKey}`,
           },
           body: JSON.stringify({
-            model: "mistral-large-latest",
+            model: mistralModel,
             messages: [{ role: "user", content: params.prompt }],
             temperature: params.temperature ?? 0.1,
             response_format: { type: "json_object" },
@@ -335,11 +376,23 @@ export async function requestEvaluationTextCompletion(
         { timeoutMs: params.timeoutMs ?? MISTRAL_FETCH_TIMEOUT_MS },
       )
       const data = await res.json()
+      recordProviderCostAuditShadow({
+        provider: "mistral",
+        model: mistralModel,
+        operation: "evaluate_text",
+        usage: data?.usage,
+        providerRequestId: typeof data?.id === "string" ? data.id : null,
+        durationMs: Date.now() - startedAt,
+        costAuditContext: params.costAuditContext,
+      })
       const content = data.choices?.[0]?.message?.content
       if (!content) throw new Error("Respuesta vacía de Mistral")
       return { content: String(content), trace: DEFAULT_EVALUATION_PROVIDER_TRACE }
     },
-    () => callAnthropicText(params.prompt, params.maxTokens),
+    () =>
+      callAnthropicText(params.prompt, params.maxTokens, {
+        costAuditContext: params.costAuditContext,
+      }),
   )
 }
 
@@ -349,6 +402,7 @@ export type EvaluationVisionCompletionParams = {
   maxTokens: number
   temperature?: number
   timeoutMs?: number
+  costAuditContext?: CostAuditContext
 }
 
 export async function requestEvaluationVisionCompletion(
@@ -365,12 +419,16 @@ export async function requestEvaluationVisionCompletion(
 
   if (!mistralKey) {
     if (!isAnthropicFallbackEnabled()) throw new EvaluationIaUnavailableError()
-    const content = await callAnthropicVision(params.imageBase64, params.prompt, params.maxTokens)
+    const content = await callAnthropicVision(params.imageBase64, params.prompt, params.maxTokens, {
+      costAuditContext: params.costAuditContext,
+    })
     return { content, trace: anthropicFallbackTrace() }
   }
 
   return withAnthropicFallbackOnMistralAuth(
     async () => {
+      const mistralModel = "pixtral-12b-2409"
+      const startedAt = Date.now()
       const res = await fetchMistralWithRetry(
         MISTRAL_CHAT_URL,
         {
@@ -380,7 +438,7 @@ export async function requestEvaluationVisionCompletion(
             Authorization: `Bearer ${mistralKey}`,
           },
           body: JSON.stringify({
-            model: "pixtral-12b-2409",
+            model: mistralModel,
             messages: [
               {
                 role: "user",
@@ -395,10 +453,22 @@ export async function requestEvaluationVisionCompletion(
         { timeoutMs: params.timeoutMs ?? MISTRAL_FETCH_TIMEOUT_MS_VISION },
       )
       const data = await res.json()
+      recordProviderCostAuditShadow({
+        provider: "mistral",
+        model: mistralModel,
+        operation: "evaluate_vision",
+        usage: data?.usage,
+        providerRequestId: typeof data?.id === "string" ? data.id : null,
+        durationMs: Date.now() - startedAt,
+        costAuditContext: params.costAuditContext,
+      })
       const content = data.choices?.[0]?.message?.content
       if (!content) throw new Error("Respuesta vacía de Mistral Vision")
       return { content: String(content), trace: DEFAULT_EVALUATION_PROVIDER_TRACE }
     },
-    () => callAnthropicVision(params.imageBase64, params.prompt, params.maxTokens),
+    () =>
+      callAnthropicVision(params.imageBase64, params.prompt, params.maxTokens, {
+        costAuditContext: params.costAuditContext,
+      }),
   )
 }

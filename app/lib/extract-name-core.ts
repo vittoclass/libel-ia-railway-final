@@ -3,6 +3,8 @@ import { ApiKeyCredentials } from "@azure/ms-rest-js"
 import { AzureKeyCredential, DocumentAnalysisClient } from "@azure/ai-form-recognizer"
 import OpenAI from "openai"
 import { findBestMatch } from "string-similarity"
+import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
+import { recordProviderCostAuditShadow } from "@/app/lib/cost-audit/recordProviderCostAuditShadow"
 
 const AZURE_VISION_ENDPOINT = process.env.AZURE_VISION_ENDPOINT!
 const AZURE_VISION_KEY = process.env.AZURE_VISION_KEY!
@@ -118,6 +120,7 @@ export async function ocrAzure(imageBuffer: Buffer): Promise<string> {
   const credentials = new ApiKeyCredentials({ inHeader: { "Ocp-Apim-Subscription-Key": AZURE_VISION_KEY } })
   const client = new ComputerVisionClient(credentials, AZURE_VISION_ENDPOINT)
 
+  const t0 = Date.now()
   const result = await client.readInStream(imageBuffer)
   const operationId = result.operationLocation.split("/").pop()!
   let analysisResult
@@ -125,6 +128,17 @@ export async function ocrAzure(imageBuffer: Buffer): Promise<string> {
     await new Promise((resolve) => setTimeout(resolve, 1000))
     analysisResult = await client.getReadResult(operationId)
   } while (analysisResult.status === "running" || analysisResult.status === "notStarted")
+
+  const pageCount = analysisResult.analyzeResult?.readResults?.length ?? null
+  recordProviderCostAuditShadow({
+    provider: "azure_vision",
+    model: "read_api",
+    operation: "extract_name_azure_vision_read",
+    pagesProcessed: pageCount ?? 1,
+    filesProcessed: 1,
+    durationMs: Date.now() - t0,
+    costSource: "REAL_PROVIDER_USAGE",
+  })
 
   let fullText = ""
   if (analysisResult.status === "succeeded" && analysisResult.analyzeResult?.readResults) {
@@ -146,8 +160,16 @@ export async function ocrDocumentIntelligence(
   if (!isMimeSupportedByDocumentIntelligence(mimeType)) {
     return ""
   }
+  const t0 = Date.now()
   const poller = await client.beginAnalyzeDocument("prebuilt-read", buffer)
   const result = await poller.pollUntilDone()
+  recordAzureDiCostAuditShadow({
+    operation: "extract_name_azure_di_read",
+    model: "prebuilt-read",
+    pagesProcessed: result.pages?.length ?? null,
+    filesProcessed: 1,
+    durationMs: Date.now() - t0,
+  })
   return result.content?.trim() ?? ""
 }
 
@@ -176,12 +198,21 @@ export async function extractNameWithAI(
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
+      const aiStartedAt = Date.now()
       const aiResponse = await openai.chat.completions.create({
         model: "mistral-large-latest",
         messages: [{ role: "user", content: prompt }],
         response_format: { type: "json_object" },
         temperature: 0.1,
         max_tokens: 500,
+      })
+
+      recordProviderCostAuditShadow({
+        provider: "mistral",
+        model: "mistral-large-latest",
+        operation: "extract_name_mistral",
+        usage: aiResponse.usage,
+        durationMs: Date.now() - aiStartedAt,
       })
 
       const content = aiResponse.choices[0].message.content
