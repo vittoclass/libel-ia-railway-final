@@ -1619,6 +1619,8 @@ export default function EvaluatorClient() {
     evaluateDiagnostic,
     clearEvaluateDiagnostic,
     reportEvaluateDiagnostic,
+    asyncEvaluationStatus,
+    asyncEvaluationWrapperEnabled,
   } = useEvaluator()
   const { toast } = useToast()
   const warnReportResolve = useCallback(
@@ -6831,6 +6833,26 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         </>
                       )}
                     </Button>
+
+                    {asyncEvaluationWrapperEnabled &&
+                      asyncEvaluationStatus.phase !== "idle" &&
+                      asyncEvaluationStatus.phase !== "completed" && (
+                        <p className="text-sm text-[var(--text-secondary)]" role="status">
+                          {asyncEvaluationStatus.message ||
+                            (asyncEvaluationStatus.phase === "pending"
+                              ? "Evaluación en cola…"
+                              : asyncEvaluationStatus.phase === "processing"
+                                ? "Procesando evaluación en segundo plano…"
+                                : asyncEvaluationStatus.phase === "waiting_timeout"
+                                  ? "Sigue en el servidor; puedes esperar o revisar el historial."
+                                  : asyncEvaluationStatus.phase === "failed"
+                                    ? "La evaluación asíncrona falló."
+                                    : "Evaluación asíncrona…")}
+                          {asyncEvaluationStatus.job_id
+                            ? ` (job ${asyncEvaluationStatus.job_id.slice(0, 8)}…)`
+                            : ""}
+                        </p>
+                      )}
 
                     {/* Panel de progreso del batch */}
                     {batchProgress.isActive && (
