@@ -16,6 +16,12 @@ import {
   renderForWeb,
   splitCorreccionForTwoPages,
 } from "@/app/lib/correction-report-pdf-helpers"
+import {
+  buildDevelopmentOrdinalMap,
+  formatDevelopmentItemSectionLabel,
+  normalizeTipoPruebaReal,
+  sortDevelopmentItemKeys,
+} from "@/app/lib/development-item-display-label"
 
 const LIBELIA_LOGO_PNG_BASE64 = "/LOGO-LIBEL.png"
 
@@ -93,6 +99,8 @@ export type CorrectionReportPdfFormData = {
   curso?: string | null
   nivelEducativo?: string | null
   porcentajeExigencia?: string | number | null
+  /** Solo presentación; no altera datos internos del informe. */
+  tipoPrueba?: string | null
 }
 
 function formatReportDate(evaluatedAtIso: string | null | undefined): string {
@@ -126,7 +134,9 @@ export function CorrectionReportPdfDocument({
   const notaNum = Number(group.nota) || 0
   const decimas = typeof group.decimasAdicionales === "number" ? group.decimasAdicionales : 0
   const notaFinal = (notaNum + decimas).toFixed(1)
-  const devKeys = Object.keys(group.detalle_desarrollo || {})
+  const devKeys = sortDevelopmentItemKeys(Object.keys(group.detalle_desarrollo || {}))
+  const tipoPruebaReal = normalizeTipoPruebaReal(formData.tipoPrueba)
+  const devOrdinalMap = buildDevelopmentOrdinalMap(devKeys, tipoPruebaReal)
   const correccionSinDuplicarDesarrollo = filterCorreccionDetalladaParaDesarrolloUnico(group)
   const correccionDesarrolloArray = devKeys.map((key) => {
     const raw = group.detalle_desarrollo![key]
@@ -135,7 +145,7 @@ export function CorrectionReportPdfDocument({
         ? String(raw)
         : formatDetalleDesarrolloPdf(raw)
     return {
-      seccion: `Pregunta Desarrollo: ${key.replace(/_/g, " ")}`,
+      seccion: formatDevelopmentItemSectionLabel(key, tipoPruebaReal, devOrdinalMap.get(key)),
       detalle,
     }
   })

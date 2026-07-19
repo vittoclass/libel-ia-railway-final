@@ -3,6 +3,7 @@
  * Consumido solo desde app/api/evaluate/route.ts (OMR oficial).
  */
 import sharp from "sharp"
+import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
 import { mapDualPanelsWithPautaOrchestrator } from "./azure-layout-omr-pauta-orchestrator"
 
 export type OmrTemplateVariant = "odd_even_dual_column" | "sequential_dual_column" | "single_column"
@@ -404,6 +405,13 @@ export async function runAzureLayoutOmrPipeline(params: {
       azureAnalyzeUsedNormalizedBuffer: orientation.azureAnalyzeUsedNormalizedBuffer,
     }
   }
+
+  recordAzureDiCostAuditShadow({
+    operation: "omr_official_azure_layout",
+    model: "prebuilt-layout",
+    pagesProcessed: analyze.analyzeResult.pages?.length ?? 1,
+    filesProcessed: 1,
+  })
 
   const parsed = parseMarks(analyze.analyzeResult)
   const normalizeMarksAffine = (marks: Mark[]): Mark[] => {

@@ -12,6 +12,20 @@ import { persistEvaluation } from "../../lib/persist-evaluation"
 import { getAuthUser } from "../../lib/supabase-route"
 import { getSupabaseServer } from "../../lib/supabase-server"
 import { runAzureLayoutOmrPipeline } from "../../lib/omr/experimental/azure-layout-omr-pipeline"
+import {
+  assertOmrRawMatchesDetected,
+  buildDetectedAnswersFromMerged,
+  buildOfficialOmrPerQuestionRawFromMerged,
+  buildOmrPageContributionFromAzureRaw,
+  buildOmrPageContributionFromDetectedAnswers,
+  isOmrMultipageSafeMergeEnabled,
+  mergeMultipageOmrContributions,
+  type OmrPageContribution,
+} from "../../lib/omr/integration/merge-multipage-omr"
+import {
+  omrExpectedOptionCountFromTeacherKeyUniqueLetters,
+  omrExpectedOptionCountFromTemplateKey,
+} from "../../lib/omr/integration/omr-expected-option-count"
 import { extractStudentClosedAnswersInterleavedLayout } from "../../lib/omr-interleaved/extract-closed-answers"
 import type { OmrTemplateVariantInterleaved } from "../../lib/omr-interleaved/types"
 import {
@@ -30,12 +44,22 @@ import {
 } from "../../lib/canonical-closed-id"
 import {
   accumulateDesarrolloAcrossPages,
+  applyMechanicalDevelopmentScoreToAnalysis,
+  applyPedagogicalEvidencePlanToDevelopmentAnswers,
+  buildPedagogicalEvidencePromptInstruction,
   collapseDevelopmentKeysToCanonical,
+  deduplicateDevelopmentAnswersForSoloDesarrollo,
+  enforceSoloDesarrolloFinalInvariants,
+  repairSoloDesarrolloMechanicalScoreIfNeeded,
   filterDesarrolloExcludingClosedPautaSlots,
   mergeVisionAndDedicatedDesarrollo,
   orderCanonicalDesarrolloRecord,
   pruneCorreccionDetalladaForCanonicalDesarrollo,
+  reconcileSoloDesarrolloScoringGranularity,
   removeCorreccionEntriesForClosedPautaSlots,
+  buildSoloDesarrolloRespuestasDesarrolloJsonExample,
+  resolvePedagogicalEvidenceUnitPlan,
+  type PedagogicalEvidenceUnitPlan,
 } from "../../lib/desarrollo-pipeline"
 import {
   applyConsolidatedStudentClosedAnswers,
@@ -818,6 +842,7 @@ async function analyzeWithMistralText(
   flexibilidad: number = 3,
   nombreEstudiante?: string,
   providerTraceOut?: ProviderTraceAcc,
+  pedagogicalEvidencePlan?: PedagogicalEvidenceUnitPlan,
 ): Promise<{
   nombreEstudiante: string | null
   respuestas_cerradas: { pregunta: string; respuesta_detectada: string; confianza: number }[]
@@ -848,7 +873,59 @@ async function analyzeWithMistralText(
       ? `**IMPORTANTE:** El nombre del estudiante es "${nombreEstudiante}". USA este nombre en fortalezas y áreas de mejora (ej: "${nombreEstudiante} demuestra...", "${nombreEstudiante} debe mejorar...").`
       : `**IMPORTANTE:** Si no hay nombre, usa "El estudiante" o "La estudiante" en fortalezas y áreas de mejora. NUNCA dejes frases sin sujeto.`
 
-  const prompt = `Actúa como un profesor universitario riguroso pero justo. El objetivo es la EVALUACIÓN CUALITATIVA y la PUNTUACIÓN DIRECTA.
+  const prompt = soloDesarrollo
+    ? `Actúa como un evaluador pedagógico experto. Tu rol es OBSERVAR evidencia y JUZGAR criterios según la rúbrica. NO calcules puntaje numérico.
+
+Puntaje máximo de la evaluación (referencia del sistema): ${puntajeTotal} puntos. Exigencia para aprobar: ${porcentajeExigencia}%.
+
+${nombreInstruccion}
+
+RÚBRICA DE EVALUACIÓN (criterios para juzgar la evidencia):
+${rubrica}
+
+${pauta ? `PAUTA DE RESPUESTAS (Desarrollo/Abiertas):\n${pauta}\n\n` : ""}
+
+REGLAS DE ORO:
+
+1) EVIDENCIA Y CRITERIOS (OBLIGATORIO):
+   - Observa la evidencia real del estudiante (texto, obra visual u otra según la prueba).
+   - Evalúa cada criterio de la rúbrica y asigna nivel_logro: LOGRADO, PARCIALMENTE_LOGRADO, INSUFICIENTE o NO_OBSERVABLE.
+   - Devuelve criterios_evaluados con evidencia observada y justificación pedagógica.
+   - NO calcules puntaje final ni puntos por criterio; el sistema lo hará mecánicamente.
+
+2) FORTALEZAS: Reconoce aspectos POSITIVOS concretos. Cita entre comillas lo que escribió o lo observable en la evidencia.
+
+3) ÁREAS DE MEJORA: Orienta el crecimiento citando la evidencia e indicando qué puede mejorar.
+
+4) En respuestas_desarrollo: "texto_estudiante" = CITA LITERAL o descripción observable de la evidencia.
+   - Si una palabra es ilegible, usa [ilegible]. NO inventes ni completes por contexto.
+   - Usa contexto local solo para descifrar trazos; transcríbelo literal con errores del estudiante si aplica.
+
+5) LENGUAJE RESPONSABLE: No afirmes que el estudiante "no respondió" si hay evidencia visible o en la transcripción OCR.
+
+---
+PAUTA DE PUNTAJES POR ÍTEM (referencia del docente; NO la uses para calcular puntaje):
+${pautaEstructurada || "No especificada"}
+
+--- TRANSCRIPCIÓN OCR ---
+${textoExtraido}
+--- FIN TRANSCRIPCIÓN ---
+
+Tipo de prueba: SOLO DESARROLLO. Nivel: ${nivelEducativo}. Área: ${areaConocimiento}.
+
+Responde ÚNICAMENTE con este JSON (sin markdown):
+{
+  "nombreEstudiante": "nombre encontrado en el texto o null",
+  "respuestas_cerradas": [],
+  ${buildSoloDesarrolloRespuestasDesarrolloJsonExample(pedagogicalEvidencePlan!)},
+  "retroalimentacion": {
+    "fortalezas": "Aspectos POSITIVOS concretos citando al estudiante.",
+    "areas_mejora": "Orientaciones de mejora con tono de apoyo.",
+    "correccion_detallada": [{"seccion": "Evidencia evaluada", "detalle": "explicación con cita o descripción observable"}]
+  }
+}
+${pedagogicalEvidencePlan ? buildPedagogicalEvidencePromptInstruction(pedagogicalEvidencePlan, puntajeTotal) : ""}`
+    : `Actúa como un profesor universitario riguroso pero justo. El objetivo es la EVALUACIÓN CUALITATIVA y la PUNTUACIÓN DIRECTA.
 
 Puntaje máximo de la evaluación: ${puntajeTotal} puntos. Exigencia para aprobar: ${porcentajeExigencia}%.
 
@@ -1233,6 +1310,7 @@ async function analyzeWithMistralVision(
   porcentajeExigencia: number,
   tipoPrueba: "mixta" | "solo_desarrollo" | "solo_alternativas" = "mixta",
   providerTraceOut?: ProviderTraceAcc,
+  pedagogicalEvidencePlan?: PedagogicalEvidenceUnitPlan,
 ): Promise<any> {
   const itemScores = parsePautaEstructurada(pautaEstructurada)
   const soloDesarrollo = tipoPrueba === "solo_desarrollo"
@@ -1261,7 +1339,12 @@ ${pautaEstructurada || "No especificada"}
 TAREA:
 1. Identifica el nombre del estudiante si está visible.
 ${soloDesarrollo ? "" : `2. EXTRAE ÚNICAMENTE lo que el estudiante marcó en esta hoja. Para cada pregunta de alternativas (SM, V/F, términos pareados): lee la letra o número que está marcado con X o relleno en la imagen. Responde SOLO con lo que VES marcado (A, B, C, D, E, V, F, o número). Si no hay marca clara, escribe "SIN_RESPUESTA". NO inventes ni uses ninguna lista de respuestas correctas: extrae solo lo que muestra la imagen.`}
-${soloAlternativas ? "" : `3. PREGUNTAS DE DESARROLLO (OBLIGATORIO):
+${soloAlternativas ? "" : soloDesarrollo ? `3. EVIDENCIA DE DESARROLLO (OBLIGATORIO — IA OBSERVA, NO CALCULA PUNTAJE):
+   - En "texto_estudiante" copia LITERALMENTE lo escrito o describe la evidencia observable (obra visual, etc.).
+   - Si una palabra no se puede leer, usa [ilegible]. NO inventes ni completes por contexto.
+   - Evalúa la rúbrica y devuelve "criterios_evaluados" con nivel_logro, evidencia y justificación por criterio.
+   - NO calcules puntaje X/Y; si incluyes "puntaje" por compatibilidad, será ignorado por el sistema.
+   - PROHIBIDO convertir criterios de rúbrica en preguntas P1, P2, P3 artificiales.` : `3. PREGUNTAS DE DESARROLLO (OBLIGATORIO):
    - En "texto_estudiante" DEBES copiar LITERALMENTE lo que el estudiante escribió. Si hay texto manuscrito visible, CÍTALO aquí.
    - Si una palabra no se puede leer, escribe [ilegible] exactamente en esa posición. NO inventes ni completes por contexto.
    - Puedes usar el contexto de palabras vecinas solo para descifrar caracteres dudosos; si el trazo apunta a una palabra específica, transcríbela tal cual (con sus errores del estudiante). NO reemplaces por una palabra "mejor".
@@ -1278,7 +1361,7 @@ FORMATO DE RESPUESTA (JSON estricto):
   "respuestas_cerradas": ${soloDesarrollo ? "[]" : `[
     {"pregunta": "SM1", "respuesta_detectada": "LETRA O NUMERO QUE VES MARCADO EN LA HOJA", "confianza": 0.95}
   ]`},
-  "respuestas_desarrollo": ${soloAlternativas ? "{}" : `{
+  "respuestas_desarrollo": ${soloAlternativas ? "{}" : soloDesarrollo && pedagogicalEvidencePlan ? buildSoloDesarrolloRespuestasDesarrolloJsonExample(pedagogicalEvidencePlan) : `{
     "P39": {
       "texto_estudiante": "CITA TEXTUAL EXACTA de lo que escribió el estudiante",
       "puntaje": "X/Y",
@@ -1295,13 +1378,16 @@ FORMATO DE RESPUESTA (JSON estricto):
 REGLA CRÍTICA PARA ALTERNATIVAS: En "respuesta_detectada" debes poner ÚNICAMENTE la letra o número que el estudiante marcó en esta hoja (lo que se ve en la imagen). No uses ninguna pauta de respuestas correctas para rellenar este campo. Si el estudiante marcó mal, debes poner lo que marcó, no la respuesta correcta.
 
 INSTRUCCIONES PARA PREGUNTAS DE DESARROLLO (si la prueba tiene desarrollo):
-1. BUSCA en la imagen el número de la pregunta y el texto manuscrito debajo.
+${soloDesarrollo ? `1. Observa la evidencia pedagógica real (texto u obra visual).
+2. Devuelve criterios_evaluados con nivel_logro por criterio de rúbrica; NO calcules puntaje final.
+3. En "texto_estudiante" copia literalmente o describe lo observable.
+4. PROHIBIDO dividir un ensayo/carta/informe en varias preguntas artificiales.` : `1. BUSCA en la imagen el número de la pregunta y el texto manuscrito debajo.
 2. En "texto_estudiante" COPIA EXACTAMENTE lo que escribió el estudiante (cita literal). Si hay texto visible, DEBE aparecer aquí; no resumas.
    Si una palabra es ilegible, usa [ilegible] y no la completes por contexto.
    Puedes usar contexto local para descifrar trazos; si identificas una palabra probable por trazo+contexto, escríbela literal como aparece (incluidos errores ortográficos del estudiante), sin corregirla.
 3. En "justificacion" explica POR QUÉ tiene ese puntaje e INCLUYE al menos una cita entre comillas de lo que escribió el estudiante.
 4. En "correccion_detallada" cada elemento en "detalle" DEBE contener al menos una cita entre comillas del texto del estudiante.
-5. PROHIBIDO: No escribas "Sin respuesta", "no contestó", "no respondió" ni "no hay texto escrito por el estudiante" en desarrollo si hay CUALQUIER texto manuscrito en la zona de esa pregunta. Solo usa "Sin respuesta" cuando la zona está realmente en blanco.`
+5. PROHIBIDO: No escribas "Sin respuesta", "no contestó", "no respondió" ni "no hay texto escrito por el estudiante" en desarrollo si hay CUALQUIER texto manuscrito en la zona de esa pregunta. Solo usa "Sin respuesta" cuando la zona está realmente en blanco.`}${soloDesarrollo && pedagogicalEvidencePlan ? buildPedagogicalEvidencePromptInstruction(pedagogicalEvidencePlan, puntajeTotal) : ""}`
 
   const { content, trace } = await requestEvaluationVisionCompletion({
     imageBase64,
@@ -1322,9 +1408,52 @@ async function analyzeDevelopmentOnly(
   pautaEstructurada: string,
   nivelEducativo: string,
   areaConocimiento: string,
+  puntajeTotal: number,
   providerTraceOut?: ProviderTraceAcc,
+  pedagogicalEvidencePlan?: PedagogicalEvidenceUnitPlan,
 ): Promise<{ respuestas_desarrollo: Record<string, any>; retroalimentacion: any }> {
-  const prompt = `Eres un evaluador experto con mirada pedagógica. Esta imagen es de una prueba con PREGUNTAS DE DESARROLLO (respuestas abiertas, escritas a mano).
+  const soloDesarrolloObservation = pedagogicalEvidencePlan?.applies === true
+
+  const prompt = soloDesarrolloObservation
+    ? `Eres un evaluador experto con mirada pedagógica. Esta imagen es de una prueba SOLO DESARROLLO.
+
+TU ROL: OBSERVAR evidencia y JUZGAR criterios según la rúbrica. NO calcules puntaje numérico.
+
+CITAS Y EVIDENCIA (obligatorio):
+- En "texto_estudiante" pon la CITA LITERAL o descripción observable de la evidencia del estudiante.
+- Si una palabra es ilegible, usa [ilegible]. NO inventes ni completes por contexto.
+- En cada criterio de "criterios_evaluados" incluye evidencia observada y justificación según la rúbrica.
+- Asigna nivel_logro: LOGRADO, PARCIALMENTE_LOGRADO, INSUFICIENTE o NO_OBSERVABLE.
+- NO calcules puntaje X/Y; si lo incluyes por compatibilidad, será ignorado.
+
+FORTALEZAS Y ÁREAS DE MEJORA (tono de educador):
+- "fortalezas": Reconoce logros citando evidencia concreta.
+- "areas_mejora": Orienta mejoras con tono de apoyo.
+
+PROHIBIDO: No digas "no contestó" si hay evidencia visible. No conviertas criterios de rúbrica en preguntas artificiales.
+
+RÚBRICA:
+${rubrica}
+
+PAUTA DE CORRECCIÓN (Desarrollo):
+${pauta || "No especificada"}
+
+PAUTA DE PUNTAJES (referencia; NO calcular):
+${pautaEstructurada || "No especificada"}
+
+Nivel: ${nivelEducativo}. Área: ${areaConocimiento}.
+
+Responde ÚNICAMENTE con este JSON:
+{
+  ${buildSoloDesarrolloRespuestasDesarrolloJsonExample(pedagogicalEvidencePlan!)},
+  "retroalimentacion": {
+    "fortalezas": "Logros citando evidencia observable.",
+    "areas_mejora": "Orientaciones de mejora con tono de apoyo.",
+    "correccion_detallada": [{"seccion": "Evidencia evaluada", "detalle": "explicación con cita o descripción observable"}]
+  }
+}
+${buildPedagogicalEvidencePromptInstruction(pedagogicalEvidencePlan!, puntajeTotal)}`
+    : `Eres un evaluador experto con mirada pedagógica. Esta imagen es de una prueba con PREGUNTAS DE DESARROLLO (respuestas abiertas, escritas a mano).
 
 CITAS OBLIGATORIAS EN DESARROLLO (no omitas ninguna):
 - En CADA "texto_estudiante" debes poner la CITA LITERAL de lo que el estudiante escribió. Si hay texto visible, copia el texto exacto; no resumas. Si la zona está en blanco, escribe "Sin respuesta".
@@ -1361,7 +1490,7 @@ Responde ÚNICAMENTE con este JSON (cada texto_estudiante y cada detalle con cit
     "correccion_detallada": [{"seccion": "Nombre pregunta", "detalle": "explicación con al menos una cita entre comillas del estudiante y por qué tuvo ese puntaje"}]
   }
 }
-Las claves de respuestas_desarrollo pueden ser P1, P2, P39, P40, etc. según los números de pregunta que veas. texto_estudiante DEBE ser el texto real escrito por el estudiante, no un resumen.`
+Las claves de respuestas_desarrollo pueden ser P1, P2, P39, P40, etc. según los números de pregunta que veas. texto_estudiante DEBE ser el texto real escrito por el estudiante, no un resumen.${pedagogicalEvidencePlan && !soloDesarrolloObservation ? buildPedagogicalEvidencePromptInstruction(pedagogicalEvidencePlan, puntajeTotal) : ""}`
 
   const { content, trace } = await requestEvaluationVisionCompletion({
     imageBase64,
@@ -1471,11 +1600,89 @@ function calculateFinalScore(
   }
 }
 
+/** Metadata segura para trazas solo_desarrollo: sin texto de estudiante ni justificaciones. */
+function summarizeDevelopmentForTrace(
+  respuestas_desarrollo: Record<string, unknown> | null | undefined,
+): { keys: string[]; scores: Record<string, string>; scoreSum: number; count: number } {
+  const keys: string[] = []
+  const scores: Record<string, string> = {}
+  let scoreSum = 0
+  let count = 0
+  if (!respuestas_desarrollo || typeof respuestas_desarrollo !== "object") {
+    return { keys, scores, scoreSum, count }
+  }
+  for (const [key, item] of Object.entries(respuestas_desarrollo)) {
+    if (item == null || typeof item !== "object") continue
+    count++
+    let scoreStr = "0/0"
+    const puntaje = (item as Record<string, unknown>).puntaje
+    if (typeof puntaje === "string" && puntaje.includes("/")) {
+      scoreStr = puntaje
+      scoreSum += parseInt(puntaje.split("/")[0], 10) || 0
+    } else if (typeof puntaje === "number") {
+      scoreStr = `${puntaje}/${puntaje}`
+      scoreSum += puntaje
+    } else if (
+      puntaje &&
+      typeof puntaje === "object" &&
+      typeof (puntaje as Record<string, unknown>).total === "number"
+    ) {
+      const t = (puntaje as Record<string, unknown>).total as number
+      scoreStr = `${t}/${t}`
+      scoreSum += t
+    }
+    keys.push(key)
+    scores[key] = scoreStr
+  }
+  keys.sort()
+  return { keys, scores, scoreSum, count }
+}
+
+function summarizeClosedForTrace(
+  respuestas_cerradas: Array<{ pregunta?: unknown; respuesta_detectada?: unknown }> | null | undefined,
+  alternativas_corregidas?: unknown[] | null,
+  studentClosedAnswersDetected?: Array<{ pregunta?: unknown }> | null,
+): {
+  closedKeys: string[]
+  alternativasCount: number
+  studentClosedAnswersDetectedCount: number
+  hasC1: boolean
+} {
+  const closedKeys: string[] = []
+  for (const r of respuestas_cerradas ?? []) {
+    const raw = String(r?.pregunta ?? "").trim()
+    const canon = normalizeToCanonicalId(raw) ?? raw.toUpperCase()
+    if (canon) closedKeys.push(canon)
+  }
+  const uniqueClosedKeys = [...new Set(closedKeys)].sort()
+  return {
+    closedKeys: uniqueClosedKeys,
+    alternativasCount: Array.isArray(alternativas_corregidas) ? alternativas_corregidas.length : 0,
+    studentClosedAnswersDetectedCount: Array.isArray(studentClosedAnswersDetected)
+      ? studentClosedAnswersDetected.length
+      : 0,
+    hasC1: uniqueClosedKeys.includes("C1"),
+  }
+}
+
+function countDevelopmentCriteria(
+  respuestas_desarrollo: Record<string, unknown> | null | undefined,
+): number {
+  if (!respuestas_desarrollo || typeof respuestas_desarrollo !== "object") return 0
+  let n = 0
+  for (const item of Object.values(respuestas_desarrollo)) {
+    if (item == null || typeof item !== "object") continue
+    const criterios = (item as Record<string, unknown>).criterios_evaluados
+    if (Array.isArray(criterios)) n += criterios.length
+  }
+  return n
+}
+
 /** Normaliza respuestas_desarrollo para que cada ítem tenga puntaje como string "X/Y" (evita [object Object] y permite calcular nota). */
 function normalizeRespuestasDesarrollo(
   respuestasDesarrollo: Record<string, any> | null | undefined
-): Record<string, { texto_estudiante?: string; cita_estudiante?: string; puntaje: string; justificacion?: string }> {
-  const out: Record<string, { texto_estudiante?: string; cita_estudiante?: string; puntaje: string; justificacion?: string }> = {}
+): Record<string, { texto_estudiante?: string; cita_estudiante?: string; puntaje: string; justificacion?: string; criterios_evaluados?: unknown }> {
+  const out: Record<string, { texto_estudiante?: string; cita_estudiante?: string; puntaje: string; justificacion?: string; criterios_evaluados?: unknown }> = {}
   if (!respuestasDesarrollo || typeof respuestasDesarrollo !== "object") return out
   for (const [key, item] of Object.entries(respuestasDesarrollo)) {
     if (item == null || typeof item !== "object") continue
@@ -1493,12 +1700,16 @@ function normalizeRespuestasDesarrollo(
     }
     const texto = item.texto_estudiante ?? item.cita_estudiante ?? ""
     const justif = typeof item.justificacion === "string" ? item.justificacion : (item.justificacion ? JSON.stringify(item.justificacion) : "")
-    out[key] = {
+    const normalized: { texto_estudiante?: string; cita_estudiante?: string; puntaje: string; justificacion?: string; criterios_evaluados?: unknown } = {
       texto_estudiante: texto,
       cita_estudiante: texto,
       puntaje: puntajeStr,
       justificacion: justif,
     }
+    if (Array.isArray(item.criterios_evaluados) && item.criterios_evaluados.length > 0) {
+      normalized.criterios_evaluados = item.criterios_evaluados
+    }
+    out[key] = normalized
   }
   return out
 }
@@ -1586,6 +1797,7 @@ function finalizeEvaluateSuccessResponseHttp200(resultadoFinal: Record<string, u
  * Usa cookies/Auth del request actual de Next (misma invocación que el POST del batch).
  */
 export async function executeEvaluatePostBody(body: unknown): Promise<NextResponse> {
+  console.info("[ROUTE-TRACE] executeEvaluatePostBody hit")
   /** Si el fallo ocurre antes de completar una fase con estado OMR real, el catch no debe inventar flags. */
   let omrDebugSnapshotForCatch: Record<string, unknown> | null = null
   const providerTraceAcc: ProviderTraceAcc = { current: { ...DEFAULT_EVALUATION_PROVIDER_TRACE } }
@@ -1659,6 +1871,9 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
     let officialOmrFallbackReason: string | null = null
     const officialOmrAllowFallbackToLegacy = officialOmrAllowFallbackToLegacyIn !== false
     let officialOmrPerQuestionRaw: any[] = []
+    /** Sprint 26: merge multipágina seguro; default false = comportamiento previo. */
+    const omrMultipageSafeMergeEnabled = isOmrMultipageSafeMergeEnabled()
+    const omrMultipagePageContributions: OmrPageContribution[] = []
     let officialOmrDetectedAnswersPreview: Array<{ pregunta: string; respuesta_detectada: string; confianza: number }> = []
     let officialOmrQuestionCountFromPipeline = 0
     let officialOmrDetectedAnswersCount = 0
@@ -1774,7 +1989,42 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         .join("; ")
     }
     const tipoPruebaReal = tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta"
+    console.info("[PAYLOAD-TYPE-TRACE]", {
+      raw_tipoPrueba: tipoPrueba,
+      tipoPruebaReal,
+      areaConocimiento,
+      evaluation_subject: evaluationSubjectBody,
+      source_exam_context_active: sourceExamContextActiveBody,
+      hasPautaEstructurada: Boolean(String(pautaEstructurada || "").trim()),
+      puntajeTotal,
+    })
     const tieneAlternativas = tipoPruebaReal !== "solo_desarrollo"
+    const pedagogicalEvidencePlan = resolvePedagogicalEvidenceUnitPlan({
+      tipoPruebaReal,
+      areaConocimiento,
+      rubrica,
+      pautaEstructurada,
+      puntajeTotal: Number(puntajeTotal),
+    })
+    if (pedagogicalEvidencePlan.applies) {
+      console.info("[evaluate][pedagogical-evidence] plan resolved", {
+        applies: pedagogicalEvidencePlan.applies,
+        mode: pedagogicalEvidencePlan.mode,
+        scoringMode: pedagogicalEvidencePlan.scoringMode,
+        allowOmr: pedagogicalEvidencePlan.allowOmr,
+        reason: pedagogicalEvidencePlan.reason,
+      })
+    }
+    if (tipoPruebaReal === "solo_desarrollo") {
+      console.info("[evaluate][trace-solo-dev][01-plan]", {
+        tipoPruebaReal,
+        mode: pedagogicalEvidencePlan.mode,
+        scoringMode: pedagogicalEvidencePlan.scoringMode,
+        allowOmr: pedagogicalEvidencePlan.allowOmr,
+        puntajeTotal: Number(puntajeTotal),
+        areaConocimiento,
+      })
+    }
     if (
       typeof sourceExamIdBody === "string" &&
       sourceExamIdBody.trim() &&
@@ -1896,6 +2146,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           Number(flexibilidad) || 3,
           typeof nombreEstudianteBody === "string" ? nombreEstudianteBody.trim() || undefined : undefined,
           providerTraceAcc,
+          pedagogicalEvidencePlan,
         )
         omrDebugSnapshotForCatch = {
           evaluationInputKind: "azure_document_text",
@@ -1946,8 +2197,22 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       )
     }
 
+    const shouldRunServerOmr =
+      imageBase64List.length > 0 && pedagogicalEvidencePlan.allowOmr
+    if (!pedagogicalEvidencePlan.allowOmr && imageBase64List.length > 0) {
+      console.info("[evaluate][omr] skipped: tipoPruebaReal=solo_desarrollo")
+    }
+    if (tipoPruebaReal === "solo_desarrollo") {
+      console.info("[evaluate][trace-solo-dev][02-before-omr]", {
+        shouldRunServerOmr,
+        imageCount: imageBase64List.length,
+        tipoPruebaReal,
+        allowOmr: pedagogicalEvidencePlan.allowOmr,
+      })
+    }
+
     // Extraer respuestas cerradas desde la imagen del estudiante (OMR dedicado), independiente de si hay pauta.
-    if (imageBase64List.length > 0) {
+    if (shouldRunServerOmr) {
       const teacherAnswerKeyBase = Array.isArray(answerKeyFromTemplate?.respuestas)
         ? answerKeyFromTemplate.respuestas
         : []
@@ -2125,6 +2390,46 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         }
       }
 
+      /** Sprint 26: con flag, acumula contribución de página; sin flag, ingest legacy intacto. */
+      const recordPageOmrResult = (params: {
+        pageIndex: number
+        extraidas: { pregunta: string; respuesta_detectada: string; confianza: number }[]
+        fromLegacyPipeline: boolean
+        azureRaw?: any[] | null
+        engine: string
+        variant?: string
+      }) => {
+        if (!omrMultipageSafeMergeEnabled) {
+          if (params.azureRaw && Array.isArray(params.azureRaw)) {
+            officialOmrPerQuestionRaw = params.azureRaw
+          }
+          ingestExtradas(params.extraidas, params.fromLegacyPipeline)
+          return
+        }
+        if (params.azureRaw && Array.isArray(params.azureRaw) && params.azureRaw.length > 0) {
+          omrMultipagePageContributions.push(
+            buildOmrPageContributionFromAzureRaw({
+              page_index: params.pageIndex,
+              officialOmrPerQuestionRaw: params.azureRaw,
+              closedQuestionIds: officialClosedOrderIds,
+              engine: params.engine,
+              variant: params.variant,
+            }),
+          )
+          // Conservar último raw Azure solo para recovery de página con error (no es consolidación final).
+          officialOmrPerQuestionRaw = params.azureRaw
+        } else {
+          omrMultipagePageContributions.push(
+            buildOmrPageContributionFromDetectedAnswers({
+              page_index: params.pageIndex,
+              detectedAnswers: params.extraidas,
+              engine: params.engine,
+              variant: params.variant,
+            }),
+          )
+        }
+      }
+
       for (let i = 0; i < imageBase64List.length; i++) {
         try {
           const studentBase64 = imageBase64List[i]
@@ -2182,20 +2487,27 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             })
             officialOmrAdapterMode = "legacy_extract_student_only"
             officialOmrEngineUsed = "legacy"
-            ingestExtradas(extraidas, true)
+            recordPageOmrResult({
+              pageIndex: i,
+              extraidas,
+              fromLegacyPipeline: true,
+              engine: "legacy",
+              variant: omrTemplateVariantLegacyDual,
+            })
           } else if (tryOfficialAzure) {
             const teacherAnswerKey = teacherAnswerKeyBase.map((r: any) => ({
               pregunta: String(r?.pregunta ?? ""),
               respuestaCorrecta: String(r?.respuestaCorrecta ?? ""),
             }))
-            const expectedOptionCount = Math.max(
-              2,
-              new Set(
-                teacherAnswerKey
-                  .map((r: any) => String(r?.respuestaCorrecta ?? "").trim().toUpperCase())
-                  .filter((v: any) => /^[A-Z]$/.test(v))
-              ).size || 4
-            )
+            // Clásico: opción count desde templateKey (…_4 → A–D). No usar letras únicas
+            // de la clave docente: subset A/B/C colapsaba k-means a 3 y desplazaba D→C, C→B.
+            // Intercalado: conserva inferencia legacy hasta auditoría propia (sin cambio de rama).
+            const expectedOptionCountLegacyUnique =
+              omrExpectedOptionCountFromTeacherKeyUniqueLetters(teacherAnswerKey)
+            const expectedOptionCountClassic = omrExpectedOptionCountFromTemplateKey(templateKeyUsed)
+            const expectedOptionCount = useInterleavedAzureOmr
+              ? expectedOptionCountLegacyUnique
+              : expectedOptionCountClassic
             const expectedQuestionCountUsed = Math.max(1, omrExpectedQuestionCount)
             officialOmrExpectedQuestionCountUsed = expectedQuestionCountUsed
             officialOmrTemplateKeyUsed = templateKeyUsed
@@ -2288,7 +2600,6 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                   : 0,
                 interleavedBranch: useInterleavedAzureOmr,
               })
-              officialOmrPerQuestionRaw = azureOfficial.officialOmrPerQuestionRaw
               officialOmrDetectedAnswersPreview = azureOfficial.officialOmrDetectedAnswersPreview
               officialOmrQuestionCountFromPipeline = azureOfficial.officialOmrQuestionCountFromPipeline
               officialOmrDetectedAnswersCount = azureOfficial.officialOmrDetectedAnswersCount
@@ -2312,7 +2623,14 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                 officialOmrEngineUsed = "azure_layout_family"
               }
               azureSuccessfulPages++
-              ingestExtradas(extraidas, false)
+              recordPageOmrResult({
+                pageIndex: i,
+                extraidas,
+                fromLegacyPipeline: false,
+                azureRaw: azureOfficial.officialOmrPerQuestionRaw,
+                engine: officialOmrEngineUsed,
+                variant: officialOmrTemplateVariantUsed,
+              })
             } else {
               if (isForcedInterleaved && useInterleavedAzureOmr) {
                 throw new Error(
@@ -2346,7 +2664,16 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                   lastAzureErr instanceof Error ? lastAzureErr.message : String(lastAzureErr),
               })
               officialOmrAdapterMode = "legacy_extract_student_only"
-              ingestExtradas(extraidas, true)
+              officialOmrFallbackUsed = true
+              officialOmrFallbackReason =
+                lastAzureErr instanceof Error ? lastAzureErr.message : String(lastAzureErr)
+              recordPageOmrResult({
+                pageIndex: i,
+                extraidas,
+                fromLegacyPipeline: true,
+                engine: "legacy",
+                variant: omrTemplateVariantLegacyDual,
+              })
             }
           } else {
             const legacyRaw = await extractStudentClosedAnswersOnly(
@@ -2363,7 +2690,14 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               extraidasCount: extraidas.length,
             })
             officialOmrAdapterMode = "legacy_extract_student_only"
-            ingestExtradas(extraidas, true)
+            officialOmrEngineUsed = "legacy"
+            recordPageOmrResult({
+              pageIndex: i,
+              extraidas,
+              fromLegacyPipeline: true,
+              engine: "legacy",
+              variant: omrTemplateVariantLegacyDual,
+            })
           }
         } catch (e) {
           if (isForcedInterleaved) {
@@ -2382,10 +2716,14 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                 "[EVALUATE_RECOVERY] OMR página con error; se aplican respuestas reconstruidas desde officialOmrPerQuestionRaw",
                 { page: i + 1, err: e instanceof Error ? e.message : String(e) },
               )
-              ingestExtradas(
-                recoveredFromRaw.map(({ source: _s, recovery: _r, ...rest }) => rest),
-                false,
-              )
+              if (!omrMultipageSafeMergeEnabled) {
+                ingestExtradas(
+                  recoveredFromRaw.map(({ source: _s, recovery: _r, ...rest }) => rest),
+                  false,
+                )
+              }
+              // Con safe merge: no reinyectar raw de otra página como contribución de esta;
+              // las páginas previas ya están en omrMultipagePageContributions.
               continue
             }
             return NextResponse.json(
@@ -2465,6 +2803,66 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           console.warn("[Evaluate] OMR dedicado falló para imagen", i, e)
         }
       }
+
+      // Sprint 26: consolidación única (raw + detected) cuando flag activo.
+      if (omrMultipageSafeMergeEnabled) {
+        try {
+          const merged = mergeMultipageOmrContributions(omrMultipagePageContributions)
+          const mergedRaw = buildOfficialOmrPerQuestionRawFromMerged(merged)
+          const mergedDetected = buildDetectedAnswersFromMerged(merged)
+          const invariant = assertOmrRawMatchesDetected(mergedRaw, mergedDetected)
+          if (!invariant.ok) {
+            console.error("[OMR_INTEGRATION_INVARIANT_FAILED]", {
+              mismatches: invariant.mismatches,
+              summary: merged.summary,
+            })
+            // No puntuar letras contradictorias; no tumbar el flujo (Desarrollo puede continuar).
+            officialOmrPerQuestionRaw = []
+            detectedByPregunta.clear()
+            officialOmrDetectedAnswersPreview = []
+            officialOmrDetectedAnswersCount = 0
+            officialOmrQuestionCountFromPipeline = 0
+          } else {
+            officialOmrPerQuestionRaw = mergedRaw
+            detectedByPregunta.clear()
+            for (const row of mergedDetected) {
+              const canon = normalizeToCanonicalId(row.pregunta)
+              const pid = canon ?? cerradaMapKeyFromPregunta(row.pregunta)
+              detectedByPregunta.set(pid, {
+                pregunta: canon ?? row.pregunta,
+                respuesta_detectada: row.respuesta_detectada,
+                confianza: row.confianza,
+              })
+              omrLegacyByPreguntaUpper.set(pid, false)
+            }
+            officialOmrDetectedAnswersPreview = mergedDetected.slice(0, 12)
+            officialOmrDetectedAnswersCount = mergedDetected.length
+            officialOmrQuestionCountFromPipeline = mergedRaw.length
+            if (merged.conflicts.length > 0) {
+              console.warn("[MULTIPAGE_OMR_CONFLICT]", {
+                conflicts: merged.conflicts,
+                ignored_pages: merged.ignored_pages,
+              })
+            }
+            console.info("[trace][omr_official][multipage_safe_merge]", {
+              enabled: true,
+              summary: merged.summary,
+              ignored_pages: merged.ignored_pages.map((p) => p.page_index),
+              conflicts: merged.conflicts.length,
+              provenanceSample: Object.fromEntries(
+                Object.entries(merged.provenance_by_question).slice(0, 5),
+              ),
+            })
+          }
+        } catch (mergeErr) {
+          console.error("[OMR_INTEGRATION_INVARIANT_FAILED] merge_exception", mergeErr)
+          officialOmrPerQuestionRaw = []
+          detectedByPregunta.clear()
+          officialOmrDetectedAnswersPreview = []
+          officialOmrDetectedAnswersCount = 0
+        }
+      }
+
       respuestasCerradasDesdeOMR = sortDetectedCerradasByOfficialClosedOrder(
         Array.from(detectedByPregunta.values()),
         officialClosedOrderIds,
@@ -2547,6 +2945,14 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         officialOmrFallbackUsed,
       })
     }
+    if (tipoPruebaReal === "solo_desarrollo") {
+      const omrClosedTrace = summarizeClosedForTrace(respuestasCerradasDesdeOMR)
+      console.info("[evaluate][trace-solo-dev][03-after-omr]", {
+        respuestasCerradasKeys: omrClosedTrace.closedKeys,
+        alternativasCorregidasCount: omrClosedTrace.alternativasCount,
+        studentClosedAnswersDetectedCount: respuestasCerradasDesdeOMR.length,
+      })
+    }
 
     // Procesar cada imagen (Mistral Vision + desarrollo dedicado), salvo solo_alternativas: solo OMR + pauta.
     combinedAnalysis = {
@@ -2583,6 +2989,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             Number(porcentajeExigencia),
             tipoPrueba === "solo_desarrollo" || tipoPrueba === "solo_alternativas" ? tipoPrueba : "mixta",
             providerTraceAcc,
+            pedagogicalEvidencePlan,
           )
         } catch (e) {
           if (e instanceof EvaluationIaUnavailableError) throw e
@@ -2599,13 +3006,32 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
           })
           analysis = emptyMistralVisionAnalysis()
         }
+        if (tipoPruebaReal === "solo_desarrollo") {
+          const devTrace = summarizeDevelopmentForTrace(
+            (analysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+          )
+          const closedTrace = summarizeClosedForTrace(analysis.respuestas_cerradas)
+          console.info("[evaluate][trace-solo-dev][04-after-vision]", {
+            developmentKeys: devTrace.keys,
+            developmentScores: devTrace.scores,
+            closedKeys: closedTrace.closedKeys,
+            hasC1: closedTrace.hasC1,
+            criteriaCount: countDevelopmentCriteria(
+              (analysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+            ),
+          })
+        }
 
         // Combinar resultados
         if (analysis.nombreEstudiante && !combinedAnalysis.nombreEstudiante) {
           combinedAnalysis.nombreEstudiante = analysis.nombreEstudiante
         }
 
-        if (analysis.respuestas_cerradas && respuestasCerradasDesdeOMR.length === 0) {
+        if (
+          analysis.respuestas_cerradas &&
+          respuestasCerradasDesdeOMR.length === 0 &&
+          pedagogicalEvidencePlan.allowOmr
+        ) {
           // Evitar duplicados al combinar respuestas de multiples paginas
           for (const resp of analysis.respuestas_cerradas) {
             const key = cerradaMapKeyFromPregunta(resp.pregunta)
@@ -2644,12 +3070,39 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               pautaEstructurada,
               nivelEducativo,
               areaConocimiento,
+              Number(puntajeTotal),
               providerTraceAcc,
+              pedagogicalEvidencePlan,
             )
+            if (tipoPruebaReal === "solo_desarrollo") {
+              const devTrace = summarizeDevelopmentForTrace(
+                (devResult.respuestas_desarrollo || {}) as Record<string, unknown>,
+              )
+              const closedTrace = summarizeClosedForTrace(analysis.respuestas_cerradas)
+              console.info("[evaluate][trace-solo-dev][05-after-dedicated]", {
+                developmentKeys: devTrace.keys,
+                developmentScores: devTrace.scores,
+                closedKeys: closedTrace.closedKeys,
+                hasC1: closedTrace.hasC1,
+                criteriaCount: countDevelopmentCriteria(
+                  (devResult.respuestas_desarrollo || {}) as Record<string, unknown>,
+                ),
+              })
+            }
             pageMergedDev = mergeVisionAndDedicatedDesarrollo(
               (analysis.respuestas_desarrollo || {}) as Record<string, unknown>,
               (devResult.respuestas_desarrollo || {}) as Record<string, unknown>
             )
+            if (tipoPruebaReal === "solo_desarrollo") {
+              const devTrace = summarizeDevelopmentForTrace(pageMergedDev)
+              const closedTrace = summarizeClosedForTrace(analysis.respuestas_cerradas)
+              console.info("[evaluate][trace-solo-dev][06-after-merge]", {
+                developmentKeys: devTrace.keys,
+                developmentScores: devTrace.scores,
+                closedKeys: closedTrace.closedKeys,
+                hasC1: closedTrace.hasC1,
+              })
+            }
             if (devResult.retroalimentacion && (devResult.retroalimentacion.fortalezas || devResult.retroalimentacion.areas_mejora || (Array.isArray(devResult.retroalimentacion.correccion_detallada) && devResult.retroalimentacion.correccion_detallada.length > 0))) {
               if (i === 0) {
                 combinedAnalysis.retroalimentacion = {
@@ -2793,11 +3246,13 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         .map((it) => normalizeToCanonicalId(it.id))
         .filter((x): x is string => x != null),
     )
-    for (const it of officialClosedSortedForBlank) {
-      const canon = normalizeToCanonicalId(it.id)
-      if (!canon) continue
-      if (!byId.has(canon)) {
-        byId.set(canon, { pregunta: canon, respuesta_detectada: "BLANK", confianza: 0 })
+    if (tipoPruebaReal !== "solo_desarrollo") {
+      for (const it of officialClosedSortedForBlank) {
+        const canon = normalizeToCanonicalId(it.id)
+        if (!canon) continue
+        if (!byId.has(canon)) {
+          byId.set(canon, { pregunta: canon, respuesta_detectada: "BLANK", confianza: 0 })
+        }
       }
     }
     if (
@@ -2853,6 +3308,10 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       officialOmrFallbackReason,
     })
 
+    if (tipoPruebaReal === "solo_desarrollo") {
+      combinedAnalysis.respuestas_cerradas = []
+    }
+
     // FASE 3.5: claves canónicas P{n} + orden estable (PDF/Word e imagen convergen aquí antes de normalizar).
     combinedAnalysis.respuestas_desarrollo = orderCanonicalDesarrolloRecord(
       collapseDevelopmentKeysToCanonical((combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>)
@@ -2875,16 +3334,164 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       studentAnswersSource = RESPUESTAS_FINALES_ESTUDIANTE
     }
 
+    const applyDevelopmentStage = (
+      stage: string,
+      nextValue: unknown,
+    ): void => {
+      const before =
+        combinedAnalysis.respuestas_desarrollo &&
+        typeof combinedAnalysis.respuestas_desarrollo === "object" &&
+        !Array.isArray(combinedAnalysis.respuestas_desarrollo)
+          ? (combinedAnalysis.respuestas_desarrollo as Record<string, unknown>)
+          : {}
+      const beforeTrace = summarizeDevelopmentForTrace(before)
+      const beforeCount = beforeTrace.keys.length
+
+      const candidate =
+        nextValue && typeof nextValue === "object" && !Array.isArray(nextValue)
+          ? (nextValue as Record<string, unknown>)
+          : {}
+      const candidateTrace = summarizeDevelopmentForTrace(candidate)
+      const afterCount = candidateTrace.keys.length
+
+      if (tipoPruebaReal === "solo_desarrollo" && beforeCount > 0 && afterCount === 0) {
+        console.warn("[evaluate][dev-recovery] prevented_empty_development_overwrite", {
+          stage,
+          beforeCount,
+          afterCount,
+        })
+      } else {
+        combinedAnalysis.respuestas_desarrollo = candidate as typeof combinedAnalysis.respuestas_desarrollo
+      }
+
+      const finalTrace = summarizeDevelopmentForTrace(
+        (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      )
+      if (tipoPruebaReal === "solo_desarrollo") {
+        console.info("[evaluate][dev-recovery][after-stage]", {
+          stage,
+          developmentKeys: finalTrace.keys,
+          developmentCount: finalTrace.keys.length,
+          scores: finalTrace.scores,
+        })
+      }
+    }
+
     // Normalizar respuestas_desarrollo para que puntaje sea siempre string "X/Y" (evita [object Object] y permite calcular nota)
-    combinedAnalysis.respuestas_desarrollo = normalizeRespuestasDesarrollo(combinedAnalysis.respuestas_desarrollo)
+    applyDevelopmentStage(
+      "normalizeRespuestasDesarrollo",
+      normalizeRespuestasDesarrollo(combinedAnalysis.respuestas_desarrollo),
+    )
+    if (tipoPruebaReal === "solo_desarrollo") {
+      const devTrace = summarizeDevelopmentForTrace(
+        (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      )
+      const closedTrace = summarizeClosedForTrace(combinedAnalysis.respuestas_cerradas)
+      console.info("[evaluate][trace-solo-dev][07-after-normalize]", {
+        developmentKeys: devTrace.keys,
+        developmentScores: devTrace.scores,
+        closedKeys: closedTrace.closedKeys,
+        hasC1: closedTrace.hasC1,
+      })
+    }
 
     // Excluir del detalle de desarrollo los ordinales que en pauta estructurada son solo cerrados (p. ej. SM1 → 1 vs P1 mal colapsado).
     const pautaRowsForDesarrolloFilter = parsePautaEstructurada(pautaEstructurada)
-    combinedAnalysis.respuestas_desarrollo = filterDesarrolloExcludingClosedPautaSlots(
-      (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
-      pautaRowsForDesarrolloFilter,
+    const skipClosedPautaSlotFilterForSoloDesarrollo =
+      tipoPruebaReal === "solo_desarrollo" &&
+      officialClosedItems.length === 0 &&
+      (!Array.isArray(respuestasAlternativas) || respuestasAlternativas.length === 0)
+    if (skipClosedPautaSlotFilterForSoloDesarrollo) {
+      console.info("[evaluate][solo-desarrollo] skip filterDesarrolloExcludingClosedPautaSlots", {
+        reason: "no_closed_inventory_no_student_alternatives",
+        pautaRowCount: pautaRowsForDesarrolloFilter.length,
+        developmentKeysBefore: summarizeDevelopmentForTrace(
+          (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+        ).keys,
+      })
+    }
+    applyDevelopmentStage(
+      "filterDesarrolloExcludingClosedPautaSlots",
+      skipClosedPautaSlotFilterForSoloDesarrollo
+        ? ((combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>)
+        : filterDesarrolloExcludingClosedPautaSlots(
+            (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+            pautaRowsForDesarrolloFilter,
+            tipoPruebaReal,
+          ),
+    )
+
+    const desarrolloDedup = deduplicateDevelopmentAnswersForSoloDesarrollo({
+      respuestasDesarrollo: (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
       tipoPruebaReal,
-    ) as typeof combinedAnalysis.respuestas_desarrollo
+    })
+    applyDevelopmentStage(
+      "deduplicateDevelopmentAnswersForSoloDesarrollo",
+      desarrolloDedup.respuestasDesarrollo,
+    )
+
+    const evidencePlanApplied = applyPedagogicalEvidencePlanToDevelopmentAnswers({
+      respuestasDesarrollo: (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      plan: pedagogicalEvidencePlan,
+      puntajeTotal: Number(puntajeTotal),
+    })
+    applyDevelopmentStage(
+      "applyPedagogicalEvidencePlanToDevelopmentAnswers",
+      evidencePlanApplied.respuestasDesarrollo,
+    )
+    if (tipoPruebaReal === "solo_desarrollo") {
+      const devTrace = summarizeDevelopmentForTrace(
+        (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      )
+      const closedTrace = summarizeClosedForTrace(combinedAnalysis.respuestas_cerradas)
+      console.info("[evaluate][trace-solo-dev][08-after-plan-apply]", {
+        developmentKeys: devTrace.keys,
+        developmentScores: devTrace.scores,
+        closedKeys: closedTrace.closedKeys,
+        hasC1: closedTrace.hasC1,
+      })
+    }
+
+    if (tipoPruebaReal === "solo_desarrollo") {
+      applyDevelopmentStage(
+        "reconcileSoloDesarrolloScoringGranularity",
+        reconcileSoloDesarrolloScoringGranularity({
+          respuestasDesarrollo: (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+          tipoPruebaReal,
+          puntajeTotal: Number(puntajeTotal),
+          pautaEstructurada,
+        }),
+      )
+    }
+
+    const mechanicalScoreApplied = applyMechanicalDevelopmentScoreToAnalysis({
+      respuestasDesarrollo: (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      rubrica,
+      pautaEstructurada,
+      puntajeTotal: Number(puntajeTotal),
+      plan: pedagogicalEvidencePlan,
+    })
+    applyDevelopmentStage(
+      "applyMechanicalDevelopmentScoreToAnalysis",
+      mechanicalScoreApplied.respuestasDesarrollo,
+    )
+    if (tipoPruebaReal === "solo_desarrollo") {
+      const devTrace = summarizeDevelopmentForTrace(
+        (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      )
+      const closedTrace = summarizeClosedForTrace(combinedAnalysis.respuestas_cerradas)
+      console.info("[evaluate][trace-solo-dev][09-after-mechanical]", {
+        developmentKeys: devTrace.keys,
+        developmentScores: devTrace.scores,
+        scoreSum: devTrace.scoreSum,
+        puntajeTotal: Number(puntajeTotal),
+        closedKeys: closedTrace.closedKeys,
+        hasC1: closedTrace.hasC1,
+        criteriaCount: countDevelopmentCriteria(
+          (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+        ),
+      })
+    }
 
     removeCorreccionEntriesForClosedPautaSlots(combinedAnalysis.retroalimentacion, pautaRowsForDesarrolloFilter)
 
@@ -2907,11 +3514,79 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       combinedAnalysis.retroalimentacion = retroalimentacionEjecutivaSoloAlternativas()
     }
 
+    const soloDesarrolloFinalInvariants = enforceSoloDesarrolloFinalInvariants({
+      tipoPruebaReal,
+      respuestasCerradas: Array.isArray(combinedAnalysis.respuestas_cerradas)
+        ? combinedAnalysis.respuestas_cerradas.map((r: any) => ({ ...r }))
+        : [],
+      respuestasDesarrollo: (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      plan: pedagogicalEvidencePlan,
+      rubrica,
+      pautaEstructurada,
+      puntajeTotal: Number(puntajeTotal),
+    })
+    if (soloDesarrolloFinalInvariants.audit.enforced) {
+      combinedAnalysis.respuestas_cerradas = soloDesarrolloFinalInvariants.respuestasCerradas
+      applyDevelopmentStage(
+        "enforceSoloDesarrolloFinalInvariants",
+        soloDesarrolloFinalInvariants.respuestasDesarrollo,
+      )
+    }
+    if (tipoPruebaReal === "solo_desarrollo") {
+      const devTrace = summarizeDevelopmentForTrace(
+        (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      )
+      const closedTrace = summarizeClosedForTrace(combinedAnalysis.respuestas_cerradas)
+      console.info("[evaluate][trace-solo-dev][10-after-final-invariants]", {
+        developmentKeys: devTrace.keys,
+        developmentScores: devTrace.scores,
+        scoreSum: devTrace.scoreSum,
+        puntajeTotal: Number(puntajeTotal),
+        closedKeys: closedTrace.closedKeys,
+        hasC1: closedTrace.hasC1,
+        auditEnforced: soloDesarrolloFinalInvariants.audit.enforced,
+        auditReason: soloDesarrolloFinalInvariants.audit.reason,
+        droppedKeys: soloDesarrolloFinalInvariants.audit.droppedDevelopmentKeys,
+        keptKeys: devTrace.keys,
+      })
+    }
+
+    const soloDesarrolloRepair = repairSoloDesarrolloMechanicalScoreIfNeeded({
+      tipoPruebaReal,
+      combinedAnalysis,
+      puntajeTotal: Number(puntajeTotal),
+      rubrica,
+      pautaEstructurada,
+      areaConocimiento,
+    })
+    if (soloDesarrolloRepair.repaired) {
+      applyDevelopmentStage(
+        "repairSoloDesarrolloMechanicalScoreIfNeeded",
+        soloDesarrolloRepair.combinedAnalysis.respuestas_desarrollo,
+      )
+    }
+    if (tipoPruebaReal === "solo_desarrollo") {
+      const devTrace = summarizeDevelopmentForTrace(
+        (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      )
+      console.info("[evaluate][trace-solo-dev][10b-after-zero-score-repair]", {
+        developmentKeys: devTrace.keys,
+        developmentScores: devTrace.scores,
+        scoreSum: devTrace.scoreSum,
+        puntajeTotal: Number(puntajeTotal),
+        repaired: soloDesarrolloRepair.repaired,
+        repairAudit: soloDesarrolloRepair.audit,
+      })
+    }
+
     // Copias defensivas y separación explícita de fuentes (teacher key vs student OMR read).
     const teacherClosedAnswersForScoring = JSON.parse(JSON.stringify(pautaAlternativasFinal))
-    const studentClosedAnswersDetected = Array.isArray(combinedAnalysis.respuestas_cerradas)
-      ? combinedAnalysis.respuestas_cerradas.map((r: any) => ({ ...r }))
-      : []
+    const studentClosedAnswersDetected =
+      tipoPruebaReal === "solo_desarrollo"
+        ? soloDesarrolloFinalInvariants.respuestasCerradas.map((r) => ({ ...r }))
+        : Array.isArray(combinedAnalysis.respuestas_cerradas)
+          ? combinedAnalysis.respuestas_cerradas.map((r: any) => ({ ...r }))
+          : []
     console.info("[trace][omr_official][student_before_calculateFinalScore]", {
       teacherAnswersSource,
       studentAnswersSource,
@@ -2933,6 +3608,32 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         { status: 500 }
       )
     }
+    if (tipoPruebaReal === "solo_desarrollo") {
+      const devTrace = summarizeDevelopmentForTrace(
+        (combinedAnalysis.respuestas_desarrollo || {}) as Record<string, unknown>,
+      )
+      const closedTrace = summarizeClosedForTrace(
+        studentClosedAnswersDetected,
+        undefined,
+        studentClosedAnswersDetected,
+      )
+      console.info("[evaluate][dev-recovery][before-final-score]", {
+        tipoPruebaReal,
+        developmentKeys: devTrace.keys,
+        developmentCount: devTrace.keys.length,
+        closedCount: studentClosedAnswersDetected.length,
+        puntajeTotal: Number(puntajeTotal),
+      })
+      console.info("[evaluate][trace-solo-dev][11-before-calculateFinalScore]", {
+        developmentKeys: devTrace.keys,
+        developmentScores: devTrace.scores,
+        scoreSum: devTrace.scoreSum,
+        puntajeTotal: Number(puntajeTotal),
+        closedAnswersCount: studentClosedAnswersDetected.length,
+        closedKeys: closedTrace.closedKeys,
+        hasC1: closedTrace.hasC1,
+      })
+    }
 
     // Calcular puntaje final
     const scores = calculateFinalScore(
@@ -2943,6 +3644,21 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       Number(puntajeTotal),
       Number(porcentajeExigencia)
     )
+    if (tipoPruebaReal === "solo_desarrollo") {
+      const altRows = (scores.alternativas_corregidas || []).map((a) => ({
+        pregunta: a.pregunta,
+        respuesta_detectada: a.respuesta_estudiante,
+      }))
+      const altTrace = summarizeClosedForTrace(altRows, scores.alternativas_corregidas)
+      console.info("[evaluate][trace-solo-dev][12-after-calculateFinalScore]", {
+        resultPuntaje: scores.puntaje,
+        scoreDesarrollo: scores.scoreDesarrollo,
+        scoreAlternativas: scores.scoreAlternativas,
+        alternativasCount: altTrace.alternativasCount,
+        alternativasKeys: altTrace.closedKeys,
+        hasC1: altTrace.hasC1,
+      })
+    }
     console.info("[evaluate] closed scoring completed", {
       nota: scores.nota,
       puntaje: scores.puntaje,
@@ -2965,8 +3681,14 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               fortalezas: combinedAnalysis.retroalimentacion?.fortalezas || "Análisis pendiente",
               areas_mejora: combinedAnalysis.retroalimentacion?.areas_mejora || "Análisis pendiente",
             },
-            retroalimentacion_alternativas: scores.alternativas_corregidas,
+            retroalimentacion_alternativas:
+              tipoPruebaReal === "solo_desarrollo" ? [] : scores.alternativas_corregidas,
           })
+
+    const alternativasCorregidasFinal =
+      tipoPruebaReal === "solo_desarrollo"
+        ? soloDesarrolloFinalInvariants.alternativasCorregidas
+        : scores.alternativas_corregidas
 
     const result = {
       success: true,
@@ -2976,7 +3698,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       puntosAprobacion: scores.puntosAprobacion,
       puntosMaximos: scores.puntosMaximos,
       detalle_desarrollo: tipoPruebaReal === "solo_alternativas" ? {} : combinedAnalysis.respuestas_desarrollo,
-      alternativas_corregidas: scores.alternativas_corregidas,
+      alternativas_corregidas: alternativasCorregidasFinal,
       // SNAPSHOT_NATIONAL_ANALYTICS_V1:
       // Original: nombreEstudianteDetectado: combinedAnalysis.nombreEstudiante,
       nombreEstudianteDetectado: normalizeDetectedStudentName(combinedAnalysis.nombreEstudiante),

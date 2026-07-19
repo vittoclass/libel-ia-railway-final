@@ -9,6 +9,8 @@ import { AzureKeyCredential, DocumentAnalysisClient } from "@azure/ai-form-recog
 import type { AnalyzeResult, DocumentPage, DocumentTable } from "@azure/ai-form-recognizer"
 import mammoth from "mammoth"
 import { extractTextFromPdf } from "@/app/lib/extract-text-from-pdf"
+import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
+import type { CostAuditContext, EvaluationCostAuditOperation } from "@/app/lib/cost-audit/types"
 
 export type StructuredLine = {
   page: number
@@ -75,6 +77,25 @@ const DEBUG = process.env.NODE_ENV !== "production"
 export type SourceDocumentMeta = {
   filename: string
   mimeType: string
+  cost_audit?: {
+    context?: CostAuditContext
+    operation_prefix?: "smart_extract_azure" | "validate_practice_azure" | "extract_pdf_text_azure"
+  }
+}
+
+function resolveAzureStructuredOperation(
+  prefix: "smart_extract_azure" | "validate_practice_azure" | "extract_pdf_text_azure" | undefined,
+  model: "prebuilt-layout" | "prebuilt-read",
+): EvaluationCostAuditOperation {
+  if (!prefix) return "document_structured_azure"
+  const isRead = model === "prebuilt-read"
+  if (prefix === "smart_extract_azure") {
+    return isRead ? "smart_extract_azure_read_fallback" : "smart_extract_azure_layout"
+  }
+  if (prefix === "validate_practice_azure") {
+    return isRead ? "validate_practice_azure_read_fallback" : "validate_practice_azure_layout"
+  }
+  return isRead ? "extract_pdf_text_azure_read_fallback" : "extract_pdf_text_azure_layout"
 }
 
 function detectKind(meta: SourceDocumentMeta): "pdf" | "docx" {
@@ -379,6 +400,15 @@ async function extractWithAzure(buffer: Buffer, meta: SourceDocumentMeta): Promi
   console.log(
     `[extract-document-text] Azure OK ${Date.now() - t0}ms kind=${kind} pages=${built.pageCount} lines=${built.extraction.lines_total} blocks=${built.extraction.blocks_total} tables=${tables_detected} paragraphs=${paragraphs_detected} words≈${words_approx_total} chars_final=${built.raw_text.length}`,
   )
+
+  recordAzureDiCostAuditShadow({
+    operation: resolveAzureStructuredOperation(meta.cost_audit?.operation_prefix, modelUsed),
+    model: modelUsed,
+    pagesProcessed: built.pageCount,
+    filesProcessed: 1,
+    durationMs: Date.now() - t0,
+    costAuditContext: meta.cost_audit?.context,
+  })
 
   const forensic: DocumentForensic = {
     filename: meta.filename,

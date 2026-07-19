@@ -3,6 +3,7 @@
  * No importa ni modifica app/lib/omr/experimental/azure-layout-omr-pipeline.ts
  */
 import sharp from "sharp"
+import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
 import type { LayoutMark } from "./types"
 
 export type AnalyzeLine = { content?: string; polygon?: number[] }
@@ -61,6 +62,7 @@ export async function analyzeLayoutWithAzure(params: {
   )
   const flavors: Array<"documentintelligence" | "formrecognizer"> = ["documentintelligence", "formrecognizer"]
   const attemptErrors: string[] = []
+  const t0 = Date.now()
 
   for (const version of versions) {
     for (const flavor of flavors) {
@@ -101,6 +103,13 @@ export async function analyzeLayoutWithAzure(params: {
         }
         const ar = data.analyzeResult ?? data.result
         if (data.status === "succeeded" && ar) {
+          recordAzureDiCostAuditShadow({
+            operation: "omr_interleaved_azure_layout",
+            model: "prebuilt-layout",
+            pagesProcessed: ar.pages?.length ?? 1,
+            filesProcessed: 1,
+            durationMs: Date.now() - t0,
+          })
           return {
             ok: true,
             analyzeResult: ar,
