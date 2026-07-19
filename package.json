@@ -10,7 +10,10 @@
     "build": "next build && node scripts/copy-standalone-assets.cjs",
     "start": "node .next/standalone/server.js",
     "lint": "next lint",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "worker:evaluate": "tsx scripts/evaluation-worker.ts",
+    "worker:evaluate:selftest": "tsx scripts/evaluation-worker.ts --selftest",
+    "worker:evaluate:validate": "tsx scripts/evaluation-worker.ts --validate-only"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.88.0",
@@ -90,6 +93,7 @@
     "string-similarity": "^4.0.4",
     "tailwind-merge": "^2.6.0",
     "tailwindcss-animate": "^1.0.7",
+    "tsx": "^4.19.4",
     "vaul": "^1.1.2",
     "xlsx": "^0.18.5",
     "zod": "^3.23.8"

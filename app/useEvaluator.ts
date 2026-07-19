@@ -1,8 +1,218 @@
 // useEvaluator.ts
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { buildTeacherAnswerKeyFromFormPauta } from '@/app/lib/evaluation-base';
+
+/**
+ * Feature flag cliente (default false). Solo elige ruta UI → /api/evaluate/start.
+ * No autoriza backend: el servidor exige ASYNC_EVALUATION_WRAPPER_ENABLED=true|1.
+ * Ambos flags deben estar activos para usar async. Sin fallback automático a sync
+ * tras un start fallido.
+ */
+function isAsyncEvaluationWrapperEnabled(): boolean {
+  const v = process.env.NEXT_PUBLIC_ASYNC_EVALUATION_WRAPPER_ENABLED?.trim().toLowerCase();
+  return v === 'true' || v === '1';
+}
+
+const ASYNC_JOB_SESSION_KEY = 'libelia_async_eval_job_v1';
+
+type AsyncJobSession = {
+  client_request_id: string;
+  job_id: string;
+  started_at: string;
+};
+
+export type AsyncEvaluationUiStatus = {
+  phase: 'idle' | 'starting' | 'pending' | 'processing' | 'completed' | 'failed' | 'waiting_timeout';
+  job_id?: string;
+  message?: string;
+  progress?: number;
+};
+
+/** Modo diagnóstico temporal: pantalla completa en el cliente con detalle del fetch a /api/evaluate */
+export type EvaluateDiagnosticPayload = Record<string, unknown> & {
+  mode?: 'LIBELIA_EVALUATE_DEBUG_V1';
+  timestamp?: string;
+};
+
+function serializeUnknown(err: unknown): unknown {
+  if (err instanceof Error) {
+    return { name: err.name, message: err.message, stack: err.stack };
+  }
+  return err;
+}
+
+function loadAsyncJobSession(): AsyncJobSession | null {
+  try {
+    const raw = sessionStorage.getItem(ASYNC_JOB_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as AsyncJobSession;
+    if (parsed?.client_request_id && parsed?.job_id) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveAsyncJobSession(session: AsyncJobSession) {
+  try {
+    sessionStorage.setItem(ASYNC_JOB_SESSION_KEY, JSON.stringify(session));
+  } catch {
+    // ignore
+  }
+}
+
+function clearAsyncJobSession() {
+  try {
+    sessionStorage.removeItem(ASYNC_JOB_SESSION_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function safeParseJsonResponse(
+  rawBody: string,
+  response: Response,
+  urlAttempted: string,
+): { ok: true; data: any } | { ok: false; error: string; diagnostic: EvaluateDiagnosticPayload } {
+  try {
+    const data = rawBody ? JSON.parse(rawBody) : {};
+    return { ok: true, data };
+  } catch (parseErr) {
+    return {
+      ok: false,
+      error: `Respuesta no JSON (status ${response.status}).`,
+      diagnostic: {
+        phase: 'parse_response_json',
+        urlAttempted,
+        method: 'GET',
+        responseStatus: response.status,
+        responseStatusText: response.statusText,
+        responseBodyFromServer: rawBody.slice(0, 120_000),
+        errorSerialized: serializeUnknown(parseErr),
+      },
+    };
+  }
+}
+
+async function pollAsyncEvaluationJob(args: {
+  jobId: string;
+  signal: AbortSignal;
+  onStatus?: (s: AsyncEvaluationUiStatus) => void;
+}): Promise<{ success: true; data: any } | { success: false; error: string; diagnostic?: EvaluateDiagnosticPayload }> {
+  const { jobId, signal, onStatus } = args;
+  let delayMs = 1500;
+  const maxDelayMs = 8000;
+  const uiTimeoutMs = 10 * 60 * 1000;
+  const started = Date.now();
+  let timedOutUi = false;
+
+  while (!signal.aborted) {
+    if (!timedOutUi && Date.now() - started > uiTimeoutMs) {
+      timedOutUi = true;
+      onStatus?.({
+        phase: 'waiting_timeout',
+        job_id: jobId,
+        message:
+          'La evaluación sigue en el servidor. Puedes esperar o revisar el historial más tarde.',
+        progress: 70,
+      });
+    }
+
+    const urlAttempted =
+      typeof window !== 'undefined'
+        ? `${window.location.origin}/api/evaluate/status?job_id=${encodeURIComponent(jobId)}`
+        : `/api/evaluate/status?job_id=${encodeURIComponent(jobId)}`;
+
+    let response: Response;
+    try {
+      response = await fetch(`/api/evaluate/status?job_id=${encodeURIComponent(jobId)}`, {
+        method: 'GET',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal,
+      });
+    } catch (netErr) {
+      if (signal.aborted) {
+        return { success: false, error: 'Polling cancelado (desmontaje local; el job sigue en servidor).' };
+      }
+      // Red intermitente: reintentar con backoff
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(maxDelayMs, Math.floor(delayMs * 1.4));
+      continue;
+    }
+
+    const rawBody = await response.text();
+    const contentType = response.headers.get('content-type') || '';
+    if (!response.ok && response.status !== 404) {
+      const parsed = safeParseJsonResponse(rawBody, response, urlAttempted);
+      const msg =
+        parsed.ok && parsed.data?.error
+          ? String(parsed.data.error)
+          : `Error consultando estado (HTTP ${response.status}).`;
+      if (response.status === 403) {
+        clearAsyncJobSession();
+        return { success: false, error: msg };
+      }
+    }
+
+    if (!contentType.includes('application/json') && rawBody && !rawBody.trim().startsWith('{')) {
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(maxDelayMs, Math.floor(delayMs * 1.4));
+      continue;
+    }
+
+    const parsed = safeParseJsonResponse(rawBody, response, urlAttempted);
+    if (!parsed.ok) {
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(maxDelayMs, Math.floor(delayMs * 1.4));
+      continue;
+    }
+
+    const data = parsed.data;
+    const status = String(data?.status || '');
+    if (status === 'pending' || status === 'processing') {
+      onStatus?.({
+        phase: status as 'pending' | 'processing',
+        job_id: jobId,
+        message: status === 'pending' ? 'En cola…' : 'Procesando evaluación…',
+        progress: typeof data.progress === 'number' ? data.progress : status === 'pending' ? 5 : 55,
+      });
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(maxDelayMs, Math.floor(delayMs * 1.25));
+      continue;
+    }
+
+    if (status === 'completed') {
+      clearAsyncJobSession();
+      onStatus?.({ phase: 'completed', job_id: jobId, progress: 100, message: 'Completada' });
+      // result exacto del motor (mismo JSON que /api/evaluate)
+      const result = data?.result !== undefined ? data.result : data;
+      return { success: true, data: result };
+    }
+
+    if (status === 'failed') {
+      clearAsyncJobSession();
+      const errMsg =
+        (data?.error && typeof data.error === 'object' && data.error.message) ||
+        data?.error ||
+        'La evaluación asíncrona falló';
+      onStatus?.({ phase: 'failed', job_id: jobId, progress: 100, message: String(errMsg) });
+      return { success: false, error: String(errMsg) };
+    }
+
+    if (response.status === 404) {
+      clearAsyncJobSession();
+      return { success: false, error: 'Trabajo de evaluación no encontrado' };
+    }
+
+    await new Promise((r) => setTimeout(r, delayMs));
+    delayMs = Math.min(maxDelayMs, Math.floor(delayMs * 1.25));
+  }
+
+  return { success: false, error: 'Polling cancelado (desmontaje local; el job sigue en servidor).' };
+}
 
 // Tipo para la plantilla de respuestas del profesor
 export interface AnswerKeyItem {
@@ -93,19 +303,6 @@ function shouldSkipClientOmr(payload: any): boolean {
   return false;
 }
 
-/** Modo diagnóstico temporal: pantalla completa en el cliente con detalle del fetch a /api/evaluate */
-export type EvaluateDiagnosticPayload = Record<string, unknown> & {
-  mode?: 'LIBELIA_EVALUATE_DEBUG_V1';
-  timestamp?: string;
-};
-
-function serializeUnknown(err: unknown): unknown {
-  if (err instanceof Error) {
-    return { name: err.name, message: err.message, stack: err.stack };
-  }
-  return err;
-}
-
 /** Detecta URLs/imagenes en el payload sin asumir un nombre único */
 function getPayloadFileUrls(payload: any): string[] | null {
   const candidates = [
@@ -127,6 +324,10 @@ export const useEvaluator = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [answerKey, setAnswerKey] = useState<AnswerKeyData | null>(null);
   const [evaluateDiagnostic, setEvaluateDiagnostic] = useState<EvaluateDiagnosticPayload | null>(null);
+  const [asyncEvaluationStatus, setAsyncEvaluationStatus] = useState<AsyncEvaluationUiStatus>({
+    phase: 'idle',
+  });
+  const pollAbortRef = useRef<AbortController | null>(null);
 
   const clearEvaluateDiagnostic = useCallback(() => {
     setEvaluateDiagnostic(null);
@@ -138,6 +339,27 @@ export const useEvaluator = () => {
       timestamp: new Date().toISOString(),
       ...partial,
     });
+  }, []);
+
+  // Al desmontar: detener polling local; NO cancelar job en servidor.
+  useEffect(() => {
+    return () => {
+      pollAbortRef.current?.abort();
+    };
+  }, []);
+
+  // Refresh: si hay job activo en sessionStorage, exponer estado para que la UI pueda retomar.
+  useEffect(() => {
+    if (!isAsyncEvaluationWrapperEnabled()) return;
+    const session = loadAsyncJobSession();
+    if (session?.job_id) {
+      setAsyncEvaluationStatus({
+        phase: 'processing',
+        job_id: session.job_id,
+        message: 'Hay una evaluación en curso. Reanudando seguimiento…',
+        progress: 40,
+      });
+    }
   }, []);
 
   // Funcion para guardar la plantilla del profesor (memorizada por el sistema)
@@ -323,6 +545,142 @@ export const useEvaluator = () => {
         return { success: false, error: msg, diagnostic };
       }
 
+      // ——— Flujo async (flag); default false = /api/evaluate idéntico ———
+      if (isAsyncEvaluationWrapperEnabled()) {
+        pollAbortRef.current?.abort();
+        const abort = new AbortController();
+        pollAbortRef.current = abort;
+
+        const existing = loadAsyncJobSession();
+        let jobId = existing?.job_id || '';
+        let clientRequestId = existing?.client_request_id || '';
+
+        if (!jobId) {
+          clientRequestId = crypto.randomUUID();
+          setAsyncEvaluationStatus({
+            phase: 'starting',
+            message: 'Encolando evaluación…',
+            progress: 2,
+          });
+
+          const startUrl =
+            typeof window !== 'undefined'
+              ? `${window.location.origin}/api/evaluate/start`
+              : '/api/evaluate/start';
+
+          let startResp: Response;
+          try {
+            startResp = await fetch('/api/evaluate/start', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ...payloadFinal, client_request_id: clientRequestId }),
+              cache: 'no-store',
+              credentials: 'same-origin',
+              signal: abort.signal,
+            });
+          } catch (netErr) {
+            const diagnostic: EvaluateDiagnosticPayload = {
+              phase: 'fetch_network_or_cors',
+              urlAttempted: startUrl,
+              method: 'POST',
+              fetchPathUsed: '/api/evaluate/start',
+              errorSerialized: serializeUnknown(netErr),
+              requestBodyBytes: bodyStr.length,
+              requestSummary: requestSummary(payloadFinal),
+            };
+            setEvaluateDiagnostic({
+              mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+              timestamp: new Date().toISOString(),
+              ...diagnostic,
+            });
+            setAsyncEvaluationStatus({ phase: 'failed', message: 'No se pudo iniciar la evaluación asíncrona' });
+            return {
+              success: false,
+              error: netErr instanceof Error ? netErr.message : 'fetch failed',
+              diagnostic,
+            };
+          }
+
+          const startRaw = await startResp.text();
+          const startParsed = safeParseJsonResponse(startRaw, startResp, startUrl);
+          if (!startParsed.ok) {
+            setEvaluateDiagnostic({
+              mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+              timestamp: new Date().toISOString(),
+              ...startParsed.diagnostic,
+            });
+            setAsyncEvaluationStatus({ phase: 'failed', message: startParsed.error });
+            return { success: false, error: startParsed.error, diagnostic: startParsed.diagnostic };
+          }
+
+          const startData = startParsed.data;
+          if (!startResp.ok || !startData?.success || !startData?.job_id) {
+            const msg = startData?.error || `Error al iniciar evaluación (status ${startResp.status}).`;
+            setAsyncEvaluationStatus({ phase: 'failed', message: String(msg) });
+            return { success: false, error: String(msg) };
+          }
+
+          jobId = String(startData.job_id);
+          clientRequestId = String(startData.client_request_id || clientRequestId);
+          saveAsyncJobSession({
+            client_request_id: clientRequestId,
+            job_id: jobId,
+            started_at: new Date().toISOString(),
+          });
+        } else {
+          setAsyncEvaluationStatus({
+            phase: 'processing',
+            job_id: jobId,
+            message: 'Reanudando evaluación en curso…',
+            progress: 40,
+          });
+        }
+
+        const polled = await pollAsyncEvaluationJob({
+          jobId,
+          signal: abort.signal,
+          onStatus: setAsyncEvaluationStatus,
+        });
+
+        if (!polled.success) {
+          if (polled.diagnostic) {
+            setEvaluateDiagnostic({
+              mode: 'LIBELIA_EVALUATE_DEBUG_V1',
+              timestamp: new Date().toISOString(),
+              ...polled.diagnostic,
+            });
+          }
+          return { success: false, error: polled.error, diagnostic: polled.diagnostic };
+        }
+
+        let data: any = polled.data;
+        console.log('DEBUG - Respuesta completa (async):', data);
+        if (!data?.success) {
+          const msg = data?.error || 'Error en la evaluación asíncrona.';
+          return { success: false, error: msg };
+        }
+
+        if (payloadFinal?.pauta && data?.respuestasExtraidas && typeof data.respuestasExtraidas === 'object') {
+          const pauta = parsePauta(payloadFinal.pauta);
+          const respuestasExtraidasSeguras = {
+            sm: Array.isArray((data as any)?.respuestasExtraidas?.sm)
+              ? (data as any).respuestasExtraidas.sm
+              : [],
+            vf: Array.isArray((data as any)?.respuestasExtraidas?.vf)
+              ? (data as any).respuestasExtraidas.vf
+              : [],
+          };
+          const correccion = corregirObjetivas(pauta, respuestasExtraidasSeguras);
+          data.retroalimentacion = {
+            ...(data?.retroalimentacion ?? {}),
+            correccion_objetiva: correccion,
+          };
+        }
+
+        return data;
+      }
+
+      // ——— Flujo sync histórico (flag false) ———
       const evaluateFetchInit: RequestInit = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -373,8 +731,12 @@ export const useEvaluator = () => {
       }
 
       const rawBody = await response.text();
+      const contentType = response.headers.get('content-type') || '';
       let data: any = {};
       try {
+        if (!response.ok && contentType && !contentType.includes('application/json') && rawBody && !rawBody.trim().startsWith('{') && !rawBody.trim().startsWith('[')) {
+          throw new Error('non-json');
+        }
         data = rawBody ? JSON.parse(rawBody) : {};
       } catch (parseErr) {
         const diagnostic: EvaluateDiagnosticPayload = {
@@ -424,7 +786,7 @@ export const useEvaluator = () => {
         return { success: false, error: msg, diagnostic };
       }
 
-      // Si hay pauta y respuestas extraídas, corrige autom��ticamente (tu lógica actual)
+      // Si hay pauta y respuestas extraídas, corrige automáticamente (tu lógica actual)
       if (payloadFinal?.pauta && data?.respuestasExtraidas && typeof data.respuestasExtraidas === "object") {
         const pauta = parsePauta(payloadFinal.pauta);
         const respuestasExtraidasSeguras = {
@@ -510,6 +872,8 @@ export const useEvaluator = () => {
     evaluateDiagnostic,
     clearEvaluateDiagnostic,
     reportEvaluateDiagnostic,
+    asyncEvaluationStatus,
+    asyncEvaluationWrapperEnabled: isAsyncEvaluationWrapperEnabled(),
     // Funciones para manejar la plantilla del profesor
     answerKey,
     saveAnswerKey,
