@@ -89,6 +89,16 @@ import {
 } from "@react-pdf/renderer"
 import { useEvaluator, AnswerKeyData } from "./useEvaluator"
 import {
+  bindVisualSessionJobIds,
+  clearEvaluationVisualSession,
+  loadEvaluationVisualSession,
+  pickPreservedVisualFiles,
+  rehydrateVisualFiles,
+  resolveReviewImageSrc,
+  saveEvaluationVisualSession,
+  serializeVisualFiles,
+} from "@/app/lib/evaluation-visual-context"
+import {
   type EvaluateBatchNdjsonMeta,
   isEvaluateBatchDoneMsg,
   isEvaluateBatchMetaMsg,
@@ -1111,7 +1121,9 @@ function mergeMobileBatchIntoEvaluatorState(
         f.fromMobileBatch &&
         f.mobileBatchPhotoId &&
         !apiIds.has(f.mobileBatchPhotoId) &&
-        !g.isEvaluated
+        // Proteger también durante evaluate async (ventana larga con isEvaluated=false).
+        !g.isEvaluated &&
+        !g.isEvaluating
       ) {
         try {
           URL.revokeObjectURL(f.previewUrl)
@@ -1293,6 +1305,7 @@ const ExigenciaVelocimeter = ({
 const ImageMagnifier = ({ src, alt }: { src: string; alt: string }) => {
   const [isOpen, setIsOpen] = useState(false)
   const [zoom, setZoom] = useState(1)
+  const safeSrc = src || "/placeholder.svg"
 
   return (
     <>
@@ -1326,7 +1339,7 @@ const ImageMagnifier = ({ src, alt }: { src: string; alt: string }) => {
             </div>
             <div className="p-4">
               <img
-                src={src || "/placeholder.svg"}
+                src={safeSrc}
                 alt={alt}
                 style={{ transform: `scale(${zoom})`, transformOrigin: "top left" }}
                 className="transition-transform"
@@ -1468,6 +1481,8 @@ export default function EvaluatorClient() {
     groups: [],
     unassigned: [],
   })
+  /** Snapshot visual por groupId: sobrevive al result async si sync móvil vacía files. */
+  const evaluationVisualFilesRef = useRef<Map<string, FilePreview[]>>(new Map())
   /** Sellado de lote (UUID); persiste en evaluations.batch_id. No interfiere con OMR. */
   const evaluationBatchIdRef = useRef<string | null>(null)
   const [evaluationBatchIdUi, setEvaluationBatchIdUi] = useState<string | null>(null)
@@ -1623,6 +1638,14 @@ export default function EvaluatorClient() {
     asyncEvaluationWrapperEnabled,
   } = useEvaluator()
   const { toast } = useToast()
+
+  // Enlazar job async → contexto visual (sessionStorage) cuando aparece job_id.
+  useEffect(() => {
+    const jobId = asyncEvaluationStatus.job_id
+    if (!jobId) return
+    bindVisualSessionJobIds({ job_id: jobId })
+  }, [asyncEvaluationStatus.job_id])
+
   const warnReportResolve = useCallback(
     (message: string) => {
       toast({ title: "Informe", description: message })
@@ -3748,8 +3771,34 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       if (canonical.pautaCorrectaAlternativas.trim()) pautaCorrectaAlternativasFinal = canonical.pautaCorrectaAlternativas
     }
 
-    const group = studentGroups.find((g) => g.id === groupId)
+    let group = studentGroups.find((g) => g.id === groupId)
+    // Refresh / pérdida durante async: rehidratar previews desde session si el grupo quedó sin files.
+    if (group && group.files.length === 0) {
+      const visualSession = loadEvaluationVisualSession()
+      if (visualSession && visualSession.group_id === groupId && visualSession.files.length > 0) {
+        const restored = await rehydrateVisualFiles(visualSession.files)
+        if (restored.length > 0) {
+          const restoredFiles = restored as FilePreview[]
+          evaluationVisualFilesRef.current.set(groupId, restoredFiles)
+          setStudentGroups((prev) =>
+            prev.map((g) => (g.id === groupId ? { ...g, files: restoredFiles } : g)),
+          )
+          group = { ...group, files: restoredFiles }
+        }
+      }
+    }
     if (!group || group.files.length === 0) return false
+
+    // Snapshot visual ANTES del evaluate async (fuente de verdad para la revisión OMR).
+    const visualSnapshot = group.files.map((f) => ({ ...f }))
+    evaluationVisualFilesRef.current.set(groupId, visualSnapshot)
+    saveEvaluationVisualSession({
+      version: 1,
+      group_id: groupId,
+      student_index: studentGroups.findIndex((g) => g.id === groupId),
+      saved_at: new Date().toISOString(),
+      files: serializeVisualFiles(visualSnapshot),
+    })
 
     const nominalCourse = resolveNominalCourseContext(form.getValues("curso"))
     await flushNominalMemoryForGroup({
@@ -3839,6 +3888,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       ...(resolvedSourceExamId ? { source_exam_id: resolvedSourceExamId } : {}),
       source_exam_context_active: sourceExamContextActive,
       ...(omrClosedLayoutMode === "auto" ? {} : { omrClosedLayoutMode }),
+      ui_group_id: groupId,
     }
 
     const result = await evaluate(payload)
@@ -3846,6 +3896,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     setStudentGroups((prev) =>
       prev.map((g) => {
         if (g.id !== groupId) return g
+        const files = pickPreservedVisualFiles(g.files, evaluationVisualFilesRef.current.get(groupId))
         if (result.success) {
             if (result.saved) {
             const evalId = (result as { evaluation_id?: string }).evaluation_id
@@ -3859,6 +3910,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               loadEvaluationsList()
               setShowRetrySaveButton(false)
               lastFailedSaveRef.current = null
+              clearEvaluationVisualSession()
               ;(async () => {
                 const finalStudentName = getFinalStudentNameForSync(group, null) || displayName
                 const finalStudentRut = getFinalStudentRutForSync(group, null)
@@ -3929,6 +3981,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               loadEvaluationsList()
               setShowRetrySaveButton(false)
               lastFailedSaveRef.current = null
+              clearEvaluationVisualSession()
             }
           } else {
             const saveErrorMsg = typeof (result as { save_error?: string }).save_error === "string" ? (result as { save_error: string }).save_error : "Error desconocido"
@@ -3961,6 +4014,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           return applyNominalObservationToGroup(
             {
               ...g,
+              files,
               isEvaluating: false,
               isEvaluated: true,
               isValidationStep: false,
@@ -3990,6 +4044,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         } else {
           return {
             ...g,
+            files,
             isEvaluating: false,
             shouldUseOfficialAzureOmr: result.shouldUseOfficialAzureOmr,
             officialOmrActivationReason: result.officialOmrActivationReason,
@@ -7689,8 +7744,8 @@ h-4 w-4 animate-spin"
                                           <div className="mb-4 flex gap-2 flex-wrap">
                                             {group.files.map((file, idx) => (
                                               <ImageMagnifier
-                                                key={idx}
-                                                src={file.previewUrl || "/placeholder.svg"}
+                                                key={file.id || idx}
+                                                src={resolveReviewImageSrc(file)}
                                                 alt={`Prueba ${formatStudentDisplayName(group.studentName) || group.studentName} - Página ${idx + 1}`}
                                               />
                                             ))}

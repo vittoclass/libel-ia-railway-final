@@ -21,6 +21,8 @@ type AsyncJobSession = {
   client_request_id: string;
   job_id: string;
   started_at: string;
+  /** Solo UI: enlaza el job async al grupo del evaluador (contexto visual). */
+  group_id?: string;
 };
 
 export type AsyncEvaluationUiStatus = {
@@ -69,6 +71,18 @@ function clearAsyncJobSession() {
   } catch {
     // ignore
   }
+  // Limpiar contexto visual UI ligado al job (no secrets; solo previews/rutas).
+  try {
+    // lazy require-free: clave compartida con evaluation-visual-context.ts
+    sessionStorage.removeItem('libelia_async_eval_visual_v1');
+  } catch {
+    // ignore
+  }
+}
+
+function peekAsyncSessionGroupId(): string | undefined {
+  const s = loadAsyncJobSession();
+  return s?.group_id;
 }
 
 function safeParseJsonResponse(
@@ -518,6 +532,14 @@ export const useEvaluator = () => {
         }
       }
 
+      // Solo UI: no enviar al motor / Redis.
+      const uiGroupId =
+        typeof payloadFinal.ui_group_id === 'string' && payloadFinal.ui_group_id.trim()
+          ? String(payloadFinal.ui_group_id).trim()
+          : peekAsyncSessionGroupId();
+      delete payloadFinal.ui_group_id;
+      delete payloadFinal.uiGroupId;
+
       // Llama a tu API para procesar imágenes y extraer texto (tu flujo actual)
       let bodyStr: string;
       try {
@@ -626,7 +648,35 @@ export const useEvaluator = () => {
             client_request_id: clientRequestId,
             job_id: jobId,
             started_at: new Date().toISOString(),
+            ...(uiGroupId ? { group_id: uiGroupId } : {}),
           });
+          // Enlazar contexto visual UI (sessionStorage) al job_id recién creado.
+          try {
+            const raw = sessionStorage.getItem('libelia_async_eval_visual_v1');
+            if (raw) {
+              const visual = JSON.parse(raw) as {
+                version?: number;
+                group_id?: string;
+                job_id?: string;
+                client_request_id?: string;
+              };
+              if (
+                visual?.version === 1 &&
+                (!uiGroupId || visual.group_id === uiGroupId)
+              ) {
+                sessionStorage.setItem(
+                  'libelia_async_eval_visual_v1',
+                  JSON.stringify({
+                    ...visual,
+                    job_id: jobId,
+                    client_request_id: clientRequestId,
+                  }),
+                );
+              }
+            }
+          } catch {
+            // ignore
+          }
         } else {
           setAsyncEvaluationStatus({
             phase: 'processing',
