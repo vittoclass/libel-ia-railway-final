@@ -441,7 +441,8 @@ export function CorrectionReportPdfDocument({
           <View style={{ marginBottom: 6 }}>
             <Text style={styles.sectionTitle}>Respuestas Alternativas</Text>
             <View style={styles.table}>
-              <View style={[styles.tableRow, { backgroundColor: "#F9FAFB" }]}>
+              {/* Encabezado indivisible: evita celdas sueltas al borde de página */}
+              <View wrap={false} style={[styles.tableRow, { backgroundColor: "#F9FAFB" }]}>
                 <View style={styles.col40}>
                   <Text style={styles.tableCellHeader}>Pregunta</Text>
                 </View>
@@ -459,7 +460,8 @@ export function CorrectionReportPdfDocument({
                   respuesta_correcta?: string
                 }>
               ).map((item, index) => (
-                <View key={String(index)} style={styles.tableRow}>
+                /* Fila indivisible: Pregunta + Est. + Correcta no pueden partirse entre páginas */
+                <View key={String(index)} wrap={false} style={styles.tableRow}>
                   <View style={styles.col40}>
                     <Text style={styles.tableCell}>{pdfSafe(item.pregunta)}</Text>
                   </View>
