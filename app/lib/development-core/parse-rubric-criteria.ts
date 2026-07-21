@@ -40,6 +40,7 @@ export interface ParseRubricCriteriaResult {
   format:
     | "numbered_tab_row"
     | "block_colon_scale"
+    | "numbered_line_blocks"
     | "holistic"
     | "none"
   criteria: ParsedRubricCriterion[]
@@ -193,6 +194,69 @@ function parseBlockColonScale(rubricText: string): ParsedRubricCriterion[] {
 }
 
 /**
+ * Bloques numerados en líneas (sin tabs), p. ej.:
+ * 1. Claridad del mensaje
+ * Logrado (2 pts): …
+ * 2. Composición
+ * Logrado (2 pts): …
+ *
+ * Evita que el fallback holístico colapse varios labels analíticos.
+ */
+function parseNumberedLineBlocks(rubricText: string): ParsedRubricCriterion[] {
+  const lines = rubricText.split(/\r?\n/)
+  const headers: Array<{
+    lineIndex: number
+    explicitId: string
+    label: string
+  }> = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const numbered = /^(\d{1,2})\s*[.)]\s*(.+)$/.exec(normalizeSpaces(lines[i] ?? ""))
+    if (!numbered) continue
+    const label = normalizeSpaces(numbered[2])
+    if (label.length < 3 || label.length > 160) continue
+    if (/^criterio$/i.test(label)) continue
+    // Evitar confundir un descriptor "1 pts" u otras numeraciones internas.
+    if (/^\d+\s*pts?\b/i.test(label)) continue
+    headers.push({
+      lineIndex: i,
+      explicitId: numbered[1],
+      label,
+    })
+  }
+
+  if (headers.length < 1) return []
+
+  const out: ParsedRubricCriterion[] = []
+  for (let h = 0; h < headers.length; h++) {
+    const start = headers[h].lineIndex
+    const end =
+      h + 1 < headers.length ? headers[h + 1].lineIndex : lines.length
+    const slice = lines.slice(start, end).join("\n").trim()
+    if (!slice) continue
+    const descriptors = splitDescriptorBands(slice)
+    const position = out.length + 1
+    out.push({
+      criterion_id: headers[h].explicitId,
+      criterion_label: headers[h].label,
+      criterion_id_source: "explicit_rubric_id",
+      position,
+      descriptors,
+      rubric_slice: slice,
+    })
+  }
+  return out
+}
+
+/**
+ * Detecta si hay varios encabezados de criterio explícitos (numerados).
+ * Usado para bloquear el colapso holístico.
+ */
+function countExplicitNumberedHeaders(rubricText: string): number {
+  return parseNumberedLineBlocks(rubricText).length
+}
+
+/**
  * Detecta rúbrica holística: un solo bloque de escala sin encabezados de criterio múltiples.
  */
 function tryHolistic(rubricText: string): ParsedRubricCriterion | null {
@@ -203,6 +267,21 @@ function tryHolistic(rubricText: string): ParsedRubricCriterion | null {
   if (blockCount >= 2) return null
   const tabCount = parseNumberedTabRows(rubricText).length
   if (tabCount >= 2) return null
+  // Varios criterios numerados explícitos → no colapsar a un solo holistic_item.
+  if (countExplicitNumberedHeaders(rubricText) >= 2) return null
+
+  // Si hay exactamente un encabezado numerado, preservar su label (no "holistic_item").
+  const numberedOnce = parseNumberedLineBlocks(rubricText)
+  if (numberedOnce.length === 1) {
+    return {
+      ...numberedOnce[0],
+      descriptors:
+        numberedOnce[0].descriptors.length >= 2
+          ? numberedOnce[0].descriptors
+          : descriptors,
+      rubric_slice: rubricText.trim(),
+    }
+  }
 
   return {
     criterion_id: "holistic_item",
@@ -247,6 +326,17 @@ export function parseRubricCriteria(rubricText: string): ParseRubricCriteriaResu
       status: "PARSED_EXPLICIT",
       format: "block_colon_scale",
       criteria: blocks,
+      warnings,
+    }
+  }
+
+  // Criterios analíticos numerados sin tabs / sin "Label: Logrado" en la misma línea.
+  const numberedBlocks = parseNumberedLineBlocks(text)
+  if (numberedBlocks.length >= 1) {
+    return {
+      status: "PARSED_EXPLICIT",
+      format: "numbered_line_blocks",
+      criteria: numberedBlocks,
       warnings,
     }
   }

@@ -82,6 +82,12 @@ import {
   requestEvaluationVisionCompletion,
   type EvaluationProviderTrace,
 } from "../../lib/ai-evaluation-provider"
+import {
+  criteriosEvaluadosAreValid,
+  projectCriteriosIntoRespuestasDesarrollo,
+  runMultimodalArtsEvaluation,
+  shouldRunMultimodalArtsPath,
+} from "../../lib/multimodal"
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY
 
@@ -2972,7 +2978,83 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         console.info("[evaluate] solo_alternativas: omitiendo analyzeWithMistralVision y analyzeDevelopmentOnly (informe ejecutivo)")
       }
     } else {
-      for (let i = 0; i < imageBase64List.length; i++) {
+      // Camino B — multimodal Artes (flag OFF = idéntico al flujo oficial).
+      const runMultimodalArts =
+        shouldRunMultimodalArtsPath({
+          areaConocimiento,
+          tipoPruebaReal,
+          allowOmr: pedagogicalEvidencePlan.allowOmr,
+        }) && imageBase64List.length > 0
+
+      let multimodalArtsSucceeded = false
+      if (runMultimodalArts) {
+        try {
+          const multimodalResult = await runMultimodalArtsEvaluation({
+            input: {
+              item_key: "P1",
+              question_text: String(pauta || "").trim() || "Evidencia visual de Artes",
+              rubric_text: String(rubrica || "").trim(),
+              student_text: undefined,
+              images: imageBase64List.map((b64, idx) => ({
+                image_id: `img_${idx + 1}`,
+                order: idx,
+                base64: b64,
+                role: idx === imageBase64List.length - 1 ? "FINAL" : "UNKNOWN",
+              })),
+              subject: String(areaConocimiento || "").trim() || undefined,
+              context: String(nivelEducativo || "").trim() || undefined,
+            },
+            areaConocimiento,
+            tipoPruebaReal,
+            allowOmr: pedagogicalEvidencePlan.allowOmr,
+          })
+          console.info("[evaluate][multimodal-arts]", {
+            ok: multimodalResult.ok,
+            fallback_recommended: multimodalResult.fallback_recommended,
+            provider_used: multimodalResult.provider_used ?? null,
+            criteria: multimodalResult.criterios_evaluados.length,
+            diagnostics: multimodalResult.diagnostics.slice(0, 12),
+          })
+          if (
+            multimodalResult.ok &&
+            criteriosEvaluadosAreValid(multimodalResult.criterios_evaluados)
+          ) {
+            combinedAnalysis.respuestas_desarrollo =
+              projectCriteriosIntoRespuestasDesarrollo({
+                itemKey: "P1",
+                criterios_evaluados: multimodalResult.criterios_evaluados,
+                texto_estudiante: multimodalResult.texto_estudiante,
+              }) as typeof combinedAnalysis.respuestas_desarrollo
+            combinedAnalysis.retroalimentacion = {
+              fortalezas:
+                "Evaluación multimodal Artes: criterios proyectados al contrato oficial.",
+              areas_mejora: "",
+              correccion_detallada: [
+                {
+                  seccion: "Evidencia visual",
+                  detalle:
+                    multimodalResult.texto_estudiante ||
+                    "Obra observada mediante capa multimodal.",
+                },
+              ],
+            }
+            multimodalArtsSucceeded = true
+          } else {
+            console.warn(
+              "[evaluate][multimodal-arts] fail-open → camino oficial Vision",
+              multimodalResult.diagnostics.slice(0, 8),
+            )
+          }
+        } catch (e) {
+          if (e instanceof EvaluationIaUnavailableError) throw e
+          console.warn(
+            "[evaluate][multimodal-arts] exception fail-open → camino oficial",
+            e instanceof Error ? e.message : e,
+          )
+        }
+      }
+
+      if (!multimodalArtsSucceeded) for (let i = 0; i < imageBase64List.length; i++) {
         const imageBase64 = imageBase64List[i]
 
         let analysis: Awaited<ReturnType<typeof analyzeWithMistralVision>>
