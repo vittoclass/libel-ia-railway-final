@@ -4,6 +4,7 @@ import type { NextRequest } from "next/server"
 import { createMiddlewareClient } from "@supabase/auth-helpers-nextjs"
 import { isDashboardInstitutionalRelaxEnabled } from "@/app/lib/dev-dashboard-relax"
 import { isMasterEmail } from "@/app/lib/master-access"
+import { envOriginHosts, logAuthDiag, safeRequestUrl } from "@/app/lib/auth-redirect-diag"
 
 function isPublicMobilePath(pathname: string): boolean {
   return pathname.startsWith("/escaneo/")
@@ -14,8 +15,37 @@ function isLocalHost(host: string): boolean {
   return h === "localhost" || h === "127.0.0.1" || h.endsWith(".local")
 }
 
+function logMwRedirect(req: NextRequest, tag: string, locationFinal: string, nextParam: string | null) {
+  logAuthDiag({
+    tag,
+    requestUrlSafe: safeRequestUrl(req.url),
+    host: req.headers.get("host"),
+    xForwardedHost: req.headers.get("x-forwarded-host"),
+    xForwardedProto: req.headers.get("x-forwarded-proto"),
+    nextUrlOrigin: req.nextUrl.origin,
+    nextParam,
+    locationFinal,
+    ...envOriginHosts(),
+  })
+}
+
 export async function middleware(req: NextRequest) {
   const pathname = req.nextUrl.pathname
+
+  // TEMP DIAG: log-only for auth surfaces (no session side-effects).
+  if (pathname === "/auth/callback" || pathname === "/login") {
+    logAuthDiag({
+      tag: `middleware:passthrough:${pathname}`,
+      requestUrlSafe: safeRequestUrl(req.url),
+      host: req.headers.get("host"),
+      xForwardedHost: req.headers.get("x-forwarded-host"),
+      xForwardedProto: req.headers.get("x-forwarded-proto"),
+      nextUrlOrigin: req.nextUrl.origin,
+      nextParam: req.nextUrl.searchParams.get("next"),
+      ...envOriginHosts(),
+    })
+    return NextResponse.next()
+  }
 
   // Captura móvil por QR: sin Supabase en middleware; normalizar HTTPS para proxy / cookies.
   if (isPublicMobilePath(pathname)) {
@@ -48,6 +78,7 @@ export async function middleware(req: NextRequest) {
     const url = new URL("/login", req.url)
     url.searchParams.set("next", "/evaluar")
     url.searchParams.set("message", "Debes iniciar sesión para usar LibelIA")
+    logMwRedirect(req, "middleware:redirect:evaluar→login", url.toString(), "/evaluar")
     return NextResponse.redirect(url)
   }
 
@@ -55,6 +86,7 @@ export async function middleware(req: NextRequest) {
     const url = new URL("/login", req.url)
     url.searchParams.set("next", "/perfil")
     url.searchParams.set("message", "Inicia sesión para ver tu perfil")
+    logMwRedirect(req, "middleware:redirect:perfil→login", url.toString(), "/perfil")
     return NextResponse.redirect(url)
   }
 
@@ -63,6 +95,7 @@ export async function middleware(req: NextRequest) {
     const nextPath = `${req.nextUrl.pathname}${req.nextUrl.search}`
     url.searchParams.set("next", nextPath)
     url.searchParams.set("message", "Inicia sesión para la estación o captura móvil")
+    logMwRedirect(req, "middleware:redirect:docente→login", url.toString(), nextPath)
     return NextResponse.redirect(url)
   }
 
@@ -133,5 +166,6 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/evaluar", "/perfil", "/dashboard/:path*", "/docente/:path*", "/escaneo/:path*"],
+  // TEMP DIAG: include /login and /auth/callback for origin tracing only.
+  matcher: ["/evaluar", "/perfil", "/dashboard/:path*", "/docente/:path*", "/escaneo/:path*", "/login", "/auth/callback"],
 }
