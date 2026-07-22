@@ -31,6 +31,10 @@ import { isCustomCropRect, type NormalizedCropRect } from "@/app/lib/development
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 const OMR_CAPTURE_GUIDE_ENABLED = process.env.NEXT_PUBLIC_OMR_CAPTURE_GUIDE === "1"
+/** Flag solo cliente. Default false → UI idéntica a producción (sin rangos). */
+const MOBILE_CAPTURE_RANGE_ENABLED = process.env.NEXT_PUBLIC_MOBILE_CAPTURE_RANGE_ENABLED === "true"
+/** Espejo cliente del tope de movil-upload (1..500). No modifica la API. */
+const MOBILE_CAPTURE_MAX_STUDENT_INDEX = 500
 
 const MOBILE_CURSOR_KEY_PREFIX = "libelia_mobile_capture_cursor_v1:"
 const MOBILE_CAPTURE_DEV = process.env.NODE_ENV === "development"
@@ -40,11 +44,85 @@ type MobileCaptureCursor = {
   studentIndex: number
   pageIndex: number
   imagesPerStudent: number
+  /** null = sin rango colaborativo (comportamiento histórico / flag off) */
+  rangeStart: number | null
+  rangeEnd: number | null
+  rangeCompleted: boolean
   updatedAt: string
 }
 
 function mobileCursorStorageKey(batchId: string): string {
   return `${MOBILE_CURSOR_KEY_PREFIX}${batchId}`
+}
+
+function parseOptionalPositiveInt(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null
+  const n = Math.floor(value)
+  return n >= 1 ? n : null
+}
+
+/** Rango colaborativo obligatorio: enteros 1..MAX, inicial ≤ final. */
+function parseRequiredCollaborativeRange(
+  startRaw: string,
+  endRaw: string,
+): { ok: true; rangeStart: number; rangeEnd: number } | { ok: false; error: string } {
+  const startTrim = startRaw.trim()
+  const endTrim = endRaw.trim()
+  if (!startTrim || !endTrim) {
+    return { ok: false, error: "Indique alumno inicial y alumno final." }
+  }
+  if (!/^\d+$/.test(startTrim) || !/^\d+$/.test(endTrim)) {
+    return { ok: false, error: "Los números de alumno deben ser enteros válidos." }
+  }
+  const start = Math.floor(Number(startTrim))
+  const end = Math.floor(Number(endTrim))
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < 1) {
+    return { ok: false, error: "Los números de alumno deben ser enteros ≥ 1." }
+  }
+  if (start > MOBILE_CAPTURE_MAX_STUDENT_INDEX || end > MOBILE_CAPTURE_MAX_STUDENT_INDEX) {
+    return {
+      ok: false,
+      error: `El alumno máximo permitido es ${MOBILE_CAPTURE_MAX_STUDENT_INDEX}.`,
+    }
+  }
+  if (start > end) {
+    return { ok: false, error: "El alumno inicial no puede ser mayor que el final." }
+  }
+  return { ok: true, rangeStart: start, rangeEnd: end }
+}
+
+/** Avanza cursor tras subida OK. Nunca produce studentIndex = rangeEnd + 1. */
+function advanceMobileCaptureAfterUpload(input: {
+  studentIndex: number
+  pageIndex: number
+  imagesPerStudent: number
+  rangeStart: number | null
+  rangeEnd: number | null
+}): {
+  studentIndex: number
+  pageIndex: number
+  rangeCompleted: boolean
+} {
+  const rangeActive = input.rangeStart != null && input.rangeEnd != null
+  if (input.pageIndex < input.imagesPerStudent) {
+    return {
+      studentIndex: input.studentIndex,
+      pageIndex: input.pageIndex + 1,
+      rangeCompleted: false,
+    }
+  }
+  if (rangeActive && input.studentIndex >= input.rangeEnd!) {
+    return {
+      studentIndex: input.studentIndex,
+      pageIndex: input.pageIndex,
+      rangeCompleted: true,
+    }
+  }
+  return {
+    studentIndex: input.studentIndex + 1,
+    pageIndex: 1,
+    rangeCompleted: false,
+  }
 }
 
 function readMobileCaptureCursor(batchId: string): MobileCaptureCursor | null {
@@ -59,11 +137,31 @@ function readMobileCaptureCursor(batchId: string): MobileCaptureCursor | null {
     const imagesPerStudent =
       typeof parsed.imagesPerStudent === "number" ? Math.floor(parsed.imagesPerStudent) : Number.NaN
     if (studentIndex < 1 || pageIndex < 1 || imagesPerStudent < 1) return null
+
+    // Cursors antiguos sin range*: siguen válidos (sin rango).
+    // Flag off: ignora rangos guardados → comportamiento de producción.
+    const rangeStart = MOBILE_CAPTURE_RANGE_ENABLED ? parseOptionalPositiveInt(parsed.rangeStart) : null
+    const rangeEnd = MOBILE_CAPTURE_RANGE_ENABLED ? parseOptionalPositiveInt(parsed.rangeEnd) : null
+    const hasRange =
+      MOBILE_CAPTURE_RANGE_ENABLED &&
+      rangeStart != null &&
+      rangeEnd != null &&
+      rangeStart <= rangeEnd &&
+      rangeEnd <= MOBILE_CAPTURE_MAX_STUDENT_INDEX
+    let nextStudent = studentIndex
+    if (hasRange) {
+      if (nextStudent < rangeStart!) nextStudent = rangeStart!
+      if (nextStudent > rangeEnd!) nextStudent = rangeEnd!
+    }
+
     return {
       batchId,
-      studentIndex,
+      studentIndex: nextStudent,
       pageIndex,
       imagesPerStudent,
+      rangeStart: hasRange ? rangeStart : null,
+      rangeEnd: hasRange ? rangeEnd : null,
+      rangeCompleted: hasRange && parsed.rangeCompleted === true,
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
     }
   } catch {
@@ -125,7 +223,18 @@ export function EstacionMovilClient({ batchId }: Props) {
   const [imagesPerStudent, setImagesPerStudent] = useState(2)
   const [studentIndex, setStudentIndex] = useState(1)
   const [pageIndex, setPageIndex] = useState(1)
+  /** null = sin rango (flujo histórico: empieza en 1, sin tope). */
+  const [rangeStart, setRangeStart] = useState<number | null>(null)
+  const [rangeEnd, setRangeEnd] = useState<number | null>(null)
+  const [rangeCompleted, setRangeCompleted] = useState(false)
+  const [rangeStartDraft, setRangeStartDraft] = useState("")
+  const [rangeEndDraft, setRangeEndDraft] = useState("")
+  const [rangeFormError, setRangeFormError] = useState<string | null>(null)
+  const [rangeEditorOpen, setRangeEditorOpen] = useState(false)
+  /** Flag on: rango ya confirmado en la pantalla inicial (antes de elegir páginas). */
+  const [rangeSetupConfirmed, setRangeSetupConfirmed] = useState(false)
   const persistedCursorRef = useRef(false)
+  const rangeActive = MOBILE_CAPTURE_RANGE_ENABLED && rangeStart != null && rangeEnd != null
 
   const [batchGateOk, setBatchGateOk] = useState<boolean | null>(null)
   const [batchGateError, setBatchGateError] = useState<string | null>(null)
@@ -195,12 +304,21 @@ export function EstacionMovilClient({ batchId }: Props) {
   useEffect(() => {
     persistedCursorRef.current = false
     setCaptureSessionActive(false)
+    setRangeFormError(null)
+    setRangeEditorOpen(false)
+    setRangeSetupConfirmed(false)
 
     const cursor = readMobileCaptureCursor(batchId)
     if (cursor) {
       setStudentIndex(cursor.studentIndex)
       setPageIndex(cursor.pageIndex)
       setImagesPerStudent(cursor.imagesPerStudent)
+      setRangeStart(cursor.rangeStart)
+      setRangeEnd(cursor.rangeEnd)
+      setRangeCompleted(cursor.rangeCompleted)
+      setRangeStartDraft(cursor.rangeStart != null ? String(cursor.rangeStart) : "")
+      setRangeEndDraft(cursor.rangeEnd != null ? String(cursor.rangeEnd) : "")
+      setRangeSetupConfirmed(MOBILE_CAPTURE_RANGE_ENABLED && cursor.rangeStart != null && cursor.rangeEnd != null)
       setPhase("scanner")
       setCaptureSessionActive(true)
       persistedCursorRef.current = true
@@ -211,6 +329,12 @@ export function EstacionMovilClient({ batchId }: Props) {
       setStudentIndex(1)
       setPageIndex(1)
       setImagesPerStudent(2)
+      setRangeStart(null)
+      setRangeEnd(null)
+      setRangeCompleted(false)
+      setRangeStartDraft("")
+      setRangeEndDraft("")
+      setRangeSetupConfirmed(false)
       setPhase("pages")
     }
   }, [batchId])
@@ -222,9 +346,22 @@ export function EstacionMovilClient({ batchId }: Props) {
       studentIndex,
       pageIndex,
       imagesPerStudent,
+      rangeStart: MOBILE_CAPTURE_RANGE_ENABLED ? rangeStart : null,
+      rangeEnd: MOBILE_CAPTURE_RANGE_ENABLED ? rangeEnd : null,
+      rangeCompleted: MOBILE_CAPTURE_RANGE_ENABLED ? rangeCompleted : false,
       updatedAt: new Date().toISOString(),
     })
-  }, [batchId, batchOk, captureSessionActive, studentIndex, pageIndex, imagesPerStudent])
+  }, [
+    batchId,
+    batchOk,
+    captureSessionActive,
+    studentIndex,
+    pageIndex,
+    imagesPerStudent,
+    rangeStart,
+    rangeEnd,
+    rangeCompleted,
+  ])
 
   useEffect(() => {
     if (developmentManualCropActive) {
@@ -326,9 +463,32 @@ export function EstacionMovilClient({ batchId }: Props) {
     void validateBatchGate()
   }, [validateBatchGate])
 
+  const confirmRangeSetup = useCallback(() => {
+    if (!MOBILE_CAPTURE_RANGE_ENABLED) return
+    const parsed = parseRequiredCollaborativeRange(rangeStartDraft, rangeEndDraft)
+    if (!parsed.ok) {
+      setRangeFormError(parsed.error)
+      return
+    }
+    setRangeFormError(null)
+    setRangeStart(parsed.rangeStart)
+    setRangeEnd(parsed.rangeEnd)
+    setRangeCompleted(false)
+    setStudentIndex(parsed.rangeStart)
+    setPageIndex(1)
+    setRangeSetupConfirmed(true)
+  }, [rangeStartDraft, rangeEndDraft])
+
   const goToScanner = useCallback(
     (n: number) => {
       if (n < 1 || n > MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT) return
+      if (MOBILE_CAPTURE_RANGE_ENABLED) {
+        if (!rangeSetupConfirmed || rangeStart == null || rangeEnd == null) {
+          setRangeFormError("Confirme el rango de alumnos antes de continuar.")
+          return
+        }
+      }
+      setRangeFormError(null)
       stopStream()
       setPendingPreview((prev) => {
         if (prev?.url) URL.revokeObjectURL(prev.url)
@@ -338,14 +498,45 @@ export function EstacionMovilClient({ batchId }: Props) {
       setCaptureSessionActive(true)
       setImagesPerStudent(n)
       setPageIndex(1)
+      if (MOBILE_CAPTURE_RANGE_ENABLED && rangeStart != null) {
+        setStudentIndex(rangeStart)
+        setRangeCompleted(false)
+      } else if (!persistedCursorRef.current) {
+        setStudentIndex(1)
+      }
       setPhase("scanner")
       setError(null)
       setLastOk(null)
       setCameraActivationError(null)
       setCameraErrorName(null)
+      setRangeEditorOpen(false)
     },
-    [stopStream, clearPostCapture],
+    [stopStream, clearPostCapture, rangeSetupConfirmed, rangeStart, rangeEnd],
   )
+
+  const applyRangeChangeWithConfirm = useCallback(() => {
+    if (!MOBILE_CAPTURE_RANGE_ENABLED) return
+    const parsed = parseRequiredCollaborativeRange(rangeStartDraft, rangeEndDraft)
+    if (!parsed.ok) {
+      setRangeFormError(parsed.error)
+      return
+    }
+    const ok = window.confirm(
+      `¿Cambiar el rango de este celular a alumnos ${parsed.rangeStart}–${parsed.rangeEnd}?\n\nCambiar el rango no moverá ni eliminará fotografías ya enviadas.`,
+    )
+    if (!ok) return
+    setRangeFormError(null)
+    setRangeStart(parsed.rangeStart)
+    setRangeEnd(parsed.rangeEnd)
+    setRangeCompleted(false)
+    setRangeSetupConfirmed(true)
+    setPageIndex(1)
+    setStudentIndex(parsed.rangeStart)
+    setLastOk(null)
+    setError(null)
+    setRangeEditorOpen(false)
+    setCaptureSessionActive(true)
+  }, [rangeStartDraft, rangeEndDraft])
 
   const activateScanner = useCallback(async () => {
     setCameraActivationError(null)
@@ -392,6 +583,15 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   const uploadFile = useCallback(
     async (file: File): Promise<boolean> => {
+      if (rangeCompleted) {
+        setError("Rango completado. No se pueden subir más fotos en este rango.")
+        return false
+      }
+      if (rangeActive && (studentIndex < rangeStart! || studentIndex > rangeEnd!)) {
+        setError("El alumno actual está fuera del rango configurado en este celular.")
+        return false
+      }
+
       setUploading(true)
       setError(null)
       setLastOk(null)
@@ -426,11 +626,20 @@ export function EstacionMovilClient({ batchId }: Props) {
               return next
             })
 
-            if (pageIndex < imagesPerStudent) {
-              setPageIndex((p) => p + 1)
+            const advanced = advanceMobileCaptureAfterUpload({
+              studentIndex,
+              pageIndex,
+              imagesPerStudent,
+              rangeStart: rangeActive ? rangeStart : null,
+              rangeEnd: rangeActive ? rangeEnd : null,
+            })
+            if (advanced.rangeCompleted) {
+              setRangeCompleted(true)
+              setLastOk("Rango completado")
+              stopStream()
             } else {
-              setStudentIndex((s) => s + 1)
-              setPageIndex(1)
+              setStudentIndex(advanced.studentIndex)
+              setPageIndex(advanced.pageIndex)
             }
             return true
           } catch (err) {
@@ -445,7 +654,7 @@ export function EstacionMovilClient({ batchId }: Props) {
         setUploading(false)
       }
     },
-    [batchId, studentIndex, pageIndex, imagesPerStudent],
+    [batchId, studentIndex, pageIndex, imagesPerStudent, rangeActive, rangeStart, rangeEnd, rangeCompleted, stopStream],
   )
 
   const revokePreview = useCallback((url: string | undefined) => {
@@ -477,11 +686,12 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   const { snapshot, reset: resetQuality, markCapturing } = useOmrCaptureQuality({
     enabled: OMR_CAPTURE_GUIDE_ENABLED,
-    active: scannerActive && !pendingPreview && phase === "scanner",
+    active: scannerActive && !pendingPreview && phase === "scanner" && !rangeCompleted,
     videoRef,
     captureDebug,
     onAutoCapture: () => {
       if (autoCaptureTimerRef.current) return
+      if (rangeCompleted) return
       markCapturing()
       autoCaptureTimerRef.current = setTimeout(() => {
         autoCaptureTimerRef.current = null
@@ -494,6 +704,10 @@ export function EstacionMovilClient({ batchId }: Props) {
     async (mode: "auto" | "manual" = "manual") => {
       const video = videoRef.current
       if (!video || !batchOk || batchGateOk !== true || shutterCooldown) return
+      if (rangeCompleted) {
+        setError("Rango completado. Cambie el rango solo si necesita capturar otros alumnos.")
+        return
+      }
       const w = video.videoWidth
       const h = video.videoHeight
       if (w < 2 || h < 2) {
@@ -586,6 +800,7 @@ export function EstacionMovilClient({ batchId }: Props) {
       markCapturing,
       resetQuality,
       developmentManualCropActive,
+      rangeCompleted,
     ],
   )
 
@@ -682,6 +897,14 @@ export function EstacionMovilClient({ batchId }: Props) {
     persistedCursorRef.current = false
     setStudentIndex(1)
     setPageIndex(1)
+    setRangeStart(null)
+    setRangeEnd(null)
+    setRangeCompleted(false)
+    setRangeStartDraft("")
+    setRangeEndDraft("")
+    setRangeFormError(null)
+    setRangeEditorOpen(false)
+    setRangeSetupConfirmed(false)
     setCaptureSessionActive(false)
     setPhase("pages")
     setLastOk(null)
@@ -751,56 +974,226 @@ export function EstacionMovilClient({ batchId }: Props) {
     )
   }
 
-  const guideActive = OMR_CAPTURE_GUIDE_ENABLED && scannerActive && !pendingPreview
+  const guideActive = OMR_CAPTURE_GUIDE_ENABLED && scannerActive && !pendingPreview && !rangeCompleted
 
   return (
     <main className="min-h-screen flex flex-col bg-slate-950 text-slate-100 p-4 pb-12">
       <div className="max-w-md mx-auto w-full flex-1 flex flex-col gap-6 pt-6">
         {phase === "pages" ? (
           <div className="space-y-6 flex-1 flex flex-col justify-center">
-            <p className="text-center text-sm font-medium text-slate-200">
-              Paso 1: ¿Cuántas fotos por alumno? (hasta {MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT})
-            </p>
-            {pcExpectedPages != null && pcExpectedPages > MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT ? (
-              <p className="text-center text-xs text-amber-300/95 px-1">
-                La estación PC indica <strong>{pcExpectedPages}</strong> foto{pcExpectedPages !== 1 ? "s" : ""} por alumno;
-                aquí puede elegir como máximo {MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT}. Ajuste el número en la estación o
-                reparta en más de un lote.
-              </p>
-            ) : pcExpectedPages != null ? (
-              <p className="text-center text-xs text-slate-500 px-1">
-                Sugerido según estación PC: <strong>{pcExpectedPages}</strong> (puede cambiar antes de capturar).
-              </p>
+            {MOBILE_CAPTURE_RANGE_ENABLED ? (
+              <div className="rounded-lg border border-slate-700/80 bg-slate-900/50 px-3 py-3 space-y-3">
+                <p className="text-center text-base font-semibold tracking-wide text-slate-100">
+                  CAPTURA COLABORATIVA
+                </p>
+                {!rangeSetupConfirmed ? (
+                  <>
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="flex flex-col gap-1 text-xs text-slate-400">
+                        Alumno inicial
+                        <input
+                          type="number"
+                          inputMode="numeric"
+                          min={1}
+                          max={MOBILE_CAPTURE_MAX_STUDENT_INDEX}
+                          step={1}
+                          value={rangeStartDraft}
+                          onChange={(e) => {
+                            setRangeStartDraft(e.target.value)
+                            setRangeFormError(null)
+                          }}
+                          placeholder="ej. 6"
+                          className="h-11 rounded-md border border-slate-600 bg-slate-950 px-3 text-base text-slate-100 placeholder:text-slate-600"
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1 text-xs text-slate-400">
+                        Alumno final
+                        <input
+                          type="number"
+                          inputMode="numeric"
+                          min={1}
+                          max={MOBILE_CAPTURE_MAX_STUDENT_INDEX}
+                          step={1}
+                          value={rangeEndDraft}
+                          onChange={(e) => {
+                            setRangeEndDraft(e.target.value)
+                            setRangeFormError(null)
+                          }}
+                          placeholder="ej. 10"
+                          className="h-11 rounded-md border border-slate-600 bg-slate-950 px-3 text-base text-slate-100 placeholder:text-slate-600"
+                        />
+                      </label>
+                    </div>
+                    {rangeFormError ? (
+                      <p className="text-center text-xs text-rose-300" role="alert">
+                        {rangeFormError}
+                      </p>
+                    ) : null}
+                    <Button type="button" className="w-full h-12" onClick={confirmRangeSetup}>
+                      Confirmar rango
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-center text-sm text-emerald-200/95 px-1" role="status">
+                      Este teléfono trabajará desde el alumno {rangeStart} hasta el alumno {rangeEnd}.
+                    </p>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="w-full text-slate-500"
+                      onClick={() => {
+                        setRangeSetupConfirmed(false)
+                        setRangeFormError(null)
+                      }}
+                    >
+                      Cambiar rango
+                    </Button>
+                  </>
+                )}
+              </div>
             ) : null}
-            <div className="grid grid-cols-4 gap-2 sm:gap-3 sm:grid-cols-7">
-              {MOBILE_CAPTURE_PAGE_CHOICES.map((n) => (
-                <Button
-                  key={n}
-                  type="button"
-                  variant={imagesPerStudent === n ? "default" : "secondary"}
-                  className="h-14 sm:h-16 text-lg sm:text-xl font-semibold min-w-0 px-1"
-                  onClick={() => goToScanner(n)}
-                >
-                  {n}
-                </Button>
-              ))}
-            </div>
+
+            {(!MOBILE_CAPTURE_RANGE_ENABLED || rangeSetupConfirmed) ? (
+              <>
+                <p className="text-center text-sm font-medium text-slate-200">
+                  Paso 1: ¿Cuántas fotos por alumno? (hasta {MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT})
+                </p>
+                {pcExpectedPages != null && pcExpectedPages > MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT ? (
+                  <p className="text-center text-xs text-amber-300/95 px-1">
+                    La estación PC indica <strong>{pcExpectedPages}</strong> foto{pcExpectedPages !== 1 ? "s" : ""} por alumno;
+                    aquí puede elegir como máximo {MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT}. Ajuste el número en la estación o
+                    reparta en más de un lote.
+                  </p>
+                ) : pcExpectedPages != null ? (
+                  <p className="text-center text-xs text-slate-500 px-1">
+                    Sugerido según estación PC: <strong>{pcExpectedPages}</strong> (puede cambiar antes de capturar).
+                  </p>
+                ) : null}
+                <div className="grid grid-cols-4 gap-2 sm:gap-3 sm:grid-cols-7">
+                  {MOBILE_CAPTURE_PAGE_CHOICES.map((n) => (
+                    <Button
+                      key={n}
+                      type="button"
+                      variant={imagesPerStudent === n ? "default" : "secondary"}
+                      className="h-14 sm:h-16 text-lg sm:text-xl font-semibold min-w-0 px-1"
+                      onClick={() => goToScanner(n)}
+                    >
+                      {n}
+                    </Button>
+                  ))}
+                </div>
+              </>
+            ) : null}
           </div>
         ) : (
           <div className="space-y-5 flex-1 flex flex-col">
-            <div className="rounded-lg border border-slate-700/80 bg-slate-900/60 px-3 py-2.5 text-center space-y-0.5">
-              <p className="text-sm font-semibold text-slate-100">
+            <div className="rounded-lg border border-slate-700/80 bg-slate-900/60 px-3 py-3 text-center space-y-1">
+              {rangeActive ? (
+                <p className="text-2xl font-bold tracking-tight text-indigo-200">
+                  Rango: {rangeStart}–{rangeEnd}
+                </p>
+              ) : null}
+              <p className="text-xl font-semibold text-slate-100">
                 Alumno actual: <span className="text-indigo-300">{studentIndex}</span>
               </p>
-              <p className="text-sm text-slate-300">
+              <p className="text-lg text-slate-300">
                 Página actual:{" "}
                 <span className="font-medium text-indigo-200">
-                  {pageIndex} de {imagesPerStudent}
+                  {pageIndex}
+                  {!rangeActive ? ` de ${imagesPerStudent}` : ""}
                 </span>
+                {rangeActive ? (
+                  <span className="text-base text-slate-400"> / {imagesPerStudent}</span>
+                ) : null}
               </p>
             </div>
 
-            {!scannerActive ? (
+            {rangeCompleted && rangeActive ? (
+              <div
+                className="rounded-lg border border-emerald-500/40 bg-emerald-950/50 px-3 py-4 text-center space-y-2"
+                role="status"
+                aria-live="polite"
+              >
+                <p className="text-xl font-semibold text-emerald-200">Rango completado</p>
+                <p className="text-sm text-emerald-100/95">
+                  Se capturaron los alumnos {rangeStart} al {rangeEnd}
+                </p>
+                <p className="text-xs text-emerald-300/90 leading-relaxed">
+                  No cierres esta pantalla hasta confirmar que las fotos aparecen en la estación.
+                </p>
+              </div>
+            ) : null}
+
+            {MOBILE_CAPTURE_RANGE_ENABLED && rangeEditorOpen ? (
+              <div className="rounded-lg border border-amber-700/50 bg-slate-900/70 px-3 py-3 space-y-3">
+                <p className="text-center text-sm font-medium text-amber-100">Cambiar rango</p>
+                <p className="text-center text-xs text-amber-200/80 px-1">
+                  Cambiar el rango no moverá ni eliminará fotografías ya enviadas.
+                </p>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="flex flex-col gap-1 text-xs text-slate-400">
+                    Alumno inicial
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min={1}
+                      max={MOBILE_CAPTURE_MAX_STUDENT_INDEX}
+                      step={1}
+                      value={rangeStartDraft}
+                      onChange={(e) => {
+                        setRangeStartDraft(e.target.value)
+                        setRangeFormError(null)
+                      }}
+                      className="h-11 rounded-md border border-slate-600 bg-slate-950 px-3 text-base text-slate-100"
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 text-xs text-slate-400">
+                    Alumno final
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min={1}
+                      max={MOBILE_CAPTURE_MAX_STUDENT_INDEX}
+                      step={1}
+                      value={rangeEndDraft}
+                      onChange={(e) => {
+                        setRangeEndDraft(e.target.value)
+                        setRangeFormError(null)
+                      }}
+                      className="h-11 rounded-md border border-slate-600 bg-slate-950 px-3 text-base text-slate-100"
+                    />
+                  </label>
+                </div>
+                {rangeFormError ? (
+                  <p className="text-center text-xs text-rose-300" role="alert">
+                    {rangeFormError}
+                  </p>
+                ) : null}
+                <div className="flex flex-col gap-2">
+                  <Button type="button" className="w-full" onClick={applyRangeChangeWithConfirm}>
+                    Confirmar nuevo rango
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="text-slate-500"
+                    onClick={() => {
+                      setRangeEditorOpen(false)
+                      setRangeFormError(null)
+                      setRangeStartDraft(rangeStart != null ? String(rangeStart) : "")
+                      setRangeEndDraft(rangeEnd != null ? String(rangeEnd) : "")
+                    }}
+                  >
+                    Cancelar
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+
+            {!rangeCompleted && !scannerActive ? (
               <>
                 <p className="text-center text-sm font-medium text-slate-200">Paso 2: Presiona &quot;Activar escáner&quot;.</p>
                 <Button
@@ -833,7 +1226,7 @@ export function EstacionMovilClient({ batchId }: Props) {
                   </p>
                 ) : null}
               </>
-            ) : (
+            ) : !rangeCompleted ? (
               <>
                 <p className="text-center text-sm font-medium text-indigo-200">
                   {validatingCapture
@@ -962,12 +1355,28 @@ export function EstacionMovilClient({ batchId }: Props) {
                   </Button>
                 </div>
               </>
-            )}
+            ) : null}
 
             <div className="flex flex-col gap-1">
               <Button type="button" variant="ghost" size="sm" className="text-slate-500" onClick={backToPages}>
                 Cambiar número de páginas
               </Button>
+              {MOBILE_CAPTURE_RANGE_ENABLED && !rangeEditorOpen ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-slate-500"
+                  onClick={() => {
+                    setRangeStartDraft(rangeStart != null ? String(rangeStart) : "")
+                    setRangeEndDraft(rangeEnd != null ? String(rangeEnd) : "")
+                    setRangeFormError(null)
+                    setRangeEditorOpen(true)
+                  }}
+                >
+                  Cambiar rango
+                </Button>
+              ) : null}
               <Button
                 type="button"
                 variant="ghost"
