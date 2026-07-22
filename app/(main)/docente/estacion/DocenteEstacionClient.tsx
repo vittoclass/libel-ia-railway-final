@@ -10,11 +10,19 @@ import {
   type BatchSessionStatusPayload,
 } from "@/app/components/docente/station/BatchMobileSyncPanel"
 import { BatchPhotoRealtimeGrid } from "@/app/components/docente/station/BatchPhotoRealtimeGrid"
+import { CollaborativeCaptureSection } from "@/app/components/docente/station/CollaborativeCaptureSection"
 import { type SourceExamPick } from "@/app/components/docente/station/SourceExamQuickPicker"
 import {
   TeacherAssignmentSelector,
   type TeacherAssignmentOption,
 } from "@/app/components/docente/station/TeacherAssignmentSelector"
+import {
+  COLLABORATIVE_QR_MAX,
+  COLLABORATIVE_QR_MIN,
+  COLLABORATIVE_QR_PRESETS,
+  clampCollaborativeQrCount,
+  type CollaborativeSlotLabel,
+} from "@/app/lib/docente/collaborative-capture"
 import { ENABLE_WIZARD } from "@/app/components/teacher-wizard/constants"
 import {
   isWizardSessionConfigValid,
@@ -54,6 +62,10 @@ export function DocenteEstacionClient() {
   const [pagesPerStudent, setPagesPerStudent] = useState(2)
   /** Con wizard activo, el QR y la grilla solo tras configuración válida guardada. */
   const [scanSectionUnlocked, setScanSectionUnlocked] = useState(!ENABLE_WIZARD)
+  /** Captura colaborativa: aditiva; el QR tradicional siempre visible. */
+  const [collaborativeOpen, setCollaborativeOpen] = useState(false)
+  const [collaborativeQrCount, setCollaborativeQrCount] = useState(10)
+  const [collaborativeLabel, setCollaborativeLabel] = useState<CollaborativeSlotLabel>("profesor")
 
   const loadAssignments = useCallback(async () => {
     try {
@@ -304,6 +316,113 @@ export function DocenteEstacionClient() {
               sourceExamId={sourceExam?.id ?? null}
               sessionContext={batchSessionContext}
             />
+
+            {!collaborativeOpen ? (
+              <div className="pt-1">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setCollaborativeOpen(true)}
+                >
+                  Abrir captura colaborativa
+                </Button>
+              </div>
+            ) : (
+              <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-4 shadow-sm">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <h3 className="font-semibold text-slate-900">Captura colaborativa</h3>
+                    <p className="text-xs text-slate-600 mt-1 max-w-prose">
+                      Opcional: varios QR del mismo lote. El QR tradicional de arriba sigue activo.
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setCollaborativeOpen(false)}
+                  >
+                    Cerrar captura colaborativa
+                  </Button>
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-sm font-medium text-slate-900">¿Cuántos QR desea generar?</p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {COLLABORATIVE_QR_PRESETS.map((n) => (
+                        <Button
+                          key={n}
+                          type="button"
+                          size="sm"
+                          variant={collaborativeQrCount === n ? "default" : "secondary"}
+                          onClick={() => setCollaborativeQrCount(n)}
+                        >
+                          {n}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-end gap-2">
+                    <div className="space-y-1">
+                      <Label htmlFor="collab-qr-custom-station" className="text-xs text-slate-700">
+                        Personalizado ({COLLABORATIVE_QR_MIN}–{COLLABORATIVE_QR_MAX})
+                      </Label>
+                      <Input
+                        id="collab-qr-custom-station"
+                        type="number"
+                        min={COLLABORATIVE_QR_MIN}
+                        max={COLLABORATIVE_QR_MAX}
+                        className="w-28"
+                        value={collaborativeQrCount}
+                        onChange={(e) =>
+                          setCollaborativeQrCount(clampCollaborativeQrCount(e.target.value))
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-sm font-medium text-slate-900">Etiqueta en pantalla</p>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={collaborativeLabel === "profesor" ? "default" : "secondary"}
+                        onClick={() => setCollaborativeLabel("profesor")}
+                      >
+                        Profesor
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={collaborativeLabel === "grupo" ? "default" : "secondary"}
+                        onClick={() => setCollaborativeLabel("grupo")}
+                      >
+                        Grupo
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+
+                {batchId ? (
+                  <CollaborativeCaptureSection
+                    batchId={batchId}
+                    slotCount={collaborativeQrCount}
+                    label={collaborativeLabel}
+                    expectedPagesPerStudent={pagesPerStudent}
+                    sourceExamId={sourceExam?.id ?? null}
+                    sessionContext={batchSessionContext}
+                    onBatchSessionStatus={handleBatchSessionStatus}
+                    onChangeMode={() => setCollaborativeOpen(false)}
+                  />
+                ) : (
+                  <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50/80 px-4 py-6 text-center text-sm text-slate-500">
+                    Preparando identificador de lote…
+                  </div>
+                )}
+              </div>
+            )}
           </section>
 
           <section className="space-y-4">

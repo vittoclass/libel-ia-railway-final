@@ -117,6 +117,7 @@ export function StationGuidedSessionPreScan({ onSyncPagesPerStudent }: Props) {
   const [liveDraft, setLiveDraft] = useState<TeacherWizardSessionDraft | null>(null)
   const [form, setForm] = useState<FormState>(emptyForm)
   const [editorOpen, setEditorOpen] = useState(true)
+  const [saveHint, setSaveHint] = useState<string | null>(null)
   const [sourceExamOptions, setSourceExamOptions] = useState<Array<{ id: string; title: string | null }>>([])
   const [sourceExamLoading, setSourceExamLoading] = useState(false)
   const didHydrateScrollToQr = useRef(false)
@@ -139,7 +140,9 @@ export function StationGuidedSessionPreScan({ onSyncPagesPerStudent }: Props) {
     if (!ENABLE_WIZARD) return
     const d = refreshFromStorage()
     setForm(draftToForm(d))
-    setEditorOpen(!d?.savedAt)
+    // Misma regla que DocenteEstacionClient / origin/main: el QR solo se desbloquea si
+    // isWizardSessionConfigValid. No marcar "lista" ni cerrar el editor con savedAt incompleto.
+    setEditorOpen(!isWizardSessionConfigValid(d))
     setHydrated(true)
   }, [refreshFromStorage])
 
@@ -205,6 +208,15 @@ export function StationGuidedSessionPreScan({ onSyncPagesPerStudent }: Props) {
     const saved = writeWizardSession(payload)
     setLiveDraft(saved)
     setForm(draftToForm(saved))
+    // Conserva la condición exacta de origin/main (curso + prueba + profesor + metas).
+    if (!isWizardSessionConfigValid(saved)) {
+      setEditorOpen(true)
+      setSaveHint(
+        "Para mostrar el QR complete: nombre profesor, nombre de la prueba, curso/nivel, y metas (≥1 evaluación e imágenes).",
+      )
+      return
+    }
+    setSaveHint(null)
     setEditorOpen(false)
     const ipp = saved.imagesPerStudent
     if (ipp >= 1 && ipp <= 50) onSyncPagesPerStudent?.(ipp)
@@ -220,14 +232,14 @@ export function StationGuidedSessionPreScan({ onSyncPagesPerStudent }: Props) {
     )
   }
 
-  const hasStored = Boolean(liveDraft?.savedAt)
+  const configReady = isWizardSessionConfigValid(liveDraft)
   const summaryDraft = liveDraft
 
   return (
     <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-4 dark:border-slate-700 dark:bg-slate-950/30">
       <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Paso 1: Configura la evaluación</h2>
 
-      {hasStored && !editorOpen && summaryDraft?.savedAt ? (
+      {configReady && !editorOpen && summaryDraft?.savedAt ? (
         <div className="space-y-2">
           <p className="text-sm font-medium text-emerald-800 dark:text-emerald-200">Configuración lista</p>
           <ul className="list-none space-y-1 text-sm text-slate-700 dark:text-slate-300">
@@ -289,7 +301,7 @@ export function StationGuidedSessionPreScan({ onSyncPagesPerStudent }: Props) {
 
       {editorOpen ? (
         <div className="space-y-4">
-          {hasStored ? (
+          {configReady ? (
             <div className="flex flex-wrap justify-end">
               <Button
                 type="button"
@@ -298,6 +310,7 @@ export function StationGuidedSessionPreScan({ onSyncPagesPerStudent }: Props) {
                 className="text-slate-600"
                 onClick={() => {
                   setForm(draftToForm(readWizardSession()))
+                  setSaveHint(null)
                   setEditorOpen(false)
                 }}
               >
@@ -483,16 +496,21 @@ export function StationGuidedSessionPreScan({ onSyncPagesPerStudent }: Props) {
             </Select>
           </div>
 
+          {saveHint ? (
+            <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">{saveHint}</p>
+          ) : null}
+
           <div className="flex flex-wrap gap-2">
             <Button type="button" onClick={handleSave}>
               Guardar
             </Button>
-            {hasStored ? (
+            {configReady ? (
               <Button
                 type="button"
                 variant="outline"
                 onClick={() => {
                   setForm(draftToForm(readWizardSession()))
+                  setSaveHint(null)
                   setEditorOpen(false)
                 }}
               >
