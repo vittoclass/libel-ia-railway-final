@@ -26,6 +26,13 @@ import {
   shouldOfferDevelopmentManualCrop,
   type DevelopmentTipoPrueba,
 } from "@/app/lib/development-crop/flags"
+import {
+  collaborativeMobileCursorStorageKey,
+  collaborativeSlotDisplayName,
+  parseCollaborativeLabelFromSearchParams,
+  parseCollaborativeSlotFromSearchParams,
+  type CollaborativeSlotLabel,
+} from "@/app/lib/docente/collaborative-capture"
 import { isCustomCropRect, type NormalizedCropRect } from "@/app/lib/development-crop/cropImageRegion"
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -34,6 +41,8 @@ const OMR_CAPTURE_GUIDE_ENABLED = process.env.NEXT_PUBLIC_OMR_CAPTURE_GUIDE === 
 
 const MOBILE_CURSOR_KEY_PREFIX = "libelia_mobile_capture_cursor_v1:"
 const MOBILE_CAPTURE_DEV = process.env.NODE_ENV === "development"
+/** Marcador local: este QR colaborativo ya envió todas sus fotos. */
+const COLLAB_SLOT_DONE_PREFIX = "libelia_mobile_collab_slot_done_v1:"
 
 type MobileCaptureCursor = {
   batchId: string
@@ -43,14 +52,46 @@ type MobileCaptureCursor = {
   updatedAt: string
 }
 
-function mobileCursorStorageKey(batchId: string): string {
+function mobileCursorStorageKey(batchId: string, lockedSlot: number | null): string {
+  if (lockedSlot != null) return collaborativeMobileCursorStorageKey(batchId, lockedSlot)
   return `${MOBILE_CURSOR_KEY_PREFIX}${batchId}`
 }
 
-function readMobileCaptureCursor(batchId: string): MobileCaptureCursor | null {
+function collabSlotDoneKey(batchId: string, slot: number): string {
+  return `${COLLAB_SLOT_DONE_PREFIX}${batchId}:s${slot}`
+}
+
+function readCollabSlotDone(batchId: string, slot: number): boolean {
+  if (typeof window === "undefined") return false
+  try {
+    return window.localStorage.getItem(collabSlotDoneKey(batchId, slot)) === "1"
+  } catch {
+    return false
+  }
+}
+
+function writeCollabSlotDone(batchId: string, slot: number): void {
+  if (typeof window === "undefined") return
+  try {
+    window.localStorage.setItem(collabSlotDoneKey(batchId, slot), "1")
+  } catch {
+    /* ignore */
+  }
+}
+
+function clearCollabSlotDone(batchId: string, slot: number): void {
+  if (typeof window === "undefined") return
+  try {
+    window.localStorage.removeItem(collabSlotDoneKey(batchId, slot))
+  } catch {
+    /* ignore */
+  }
+}
+
+function readMobileCaptureCursor(batchId: string, lockedSlot: number | null): MobileCaptureCursor | null {
   if (typeof window === "undefined") return null
   try {
-    const raw = localStorage.getItem(mobileCursorStorageKey(batchId))
+    const raw = localStorage.getItem(mobileCursorStorageKey(batchId, lockedSlot))
     if (!raw) return null
     const parsed = JSON.parse(raw) as Partial<MobileCaptureCursor>
     const studentIndex =
@@ -71,31 +112,31 @@ function readMobileCaptureCursor(batchId: string): MobileCaptureCursor | null {
   }
 }
 
-function writeMobileCaptureCursor(cursor: MobileCaptureCursor): void {
+function writeMobileCaptureCursor(cursor: MobileCaptureCursor, lockedSlot: number | null): void {
   if (typeof window === "undefined") return
   try {
-    localStorage.setItem(mobileCursorStorageKey(cursor.batchId), JSON.stringify(cursor))
+    localStorage.setItem(mobileCursorStorageKey(cursor.batchId, lockedSlot), JSON.stringify(cursor))
     if (MOBILE_CAPTURE_DEV) {
-      console.log("[mobile-capture] saved cursor", cursor)
+      console.log("[mobile-capture] saved cursor", cursor, { lockedSlot })
     }
   } catch {
     // quota / private mode
   }
 }
 
-function clearMobileCaptureCursor(batchId: string): void {
+function clearMobileCaptureCursor(batchId: string, lockedSlot: number | null): void {
   if (typeof window === "undefined") return
   try {
-    localStorage.removeItem(mobileCursorStorageKey(batchId))
+    localStorage.removeItem(mobileCursorStorageKey(batchId, lockedSlot))
     if (MOBILE_CAPTURE_DEV) {
-      console.log("[mobile-capture] reset local cursor", { batchId })
+      console.log("[mobile-capture] reset local cursor", { batchId, lockedSlot })
     }
   } catch {
     // ignore
   }
 }
 
-type Phase = "pages" | "scanner"
+type Phase = "pages" | "scanner" | "slot_done"
 
 type Props = {
   batchId: string
@@ -126,6 +167,10 @@ export function EstacionMovilClient({ batchId }: Props) {
   const [studentIndex, setStudentIndex] = useState(1)
   const [pageIndex, setPageIndex] = useState(1)
   const persistedCursorRef = useRef(false)
+  /** Slot fijado por QR colaborativo (?s=N). null = flujo tradicional. */
+  const [lockedSlot, setLockedSlot] = useState<number | null>(null)
+  const [slotLabel, setSlotLabel] = useState<CollaborativeSlotLabel>("profesor")
+  const [urlParamsReady, setUrlParamsReady] = useState(false)
 
   const [batchGateOk, setBatchGateOk] = useState<boolean | null>(null)
   const [batchGateError, setBatchGateError] = useState<string | null>(null)
@@ -190,41 +235,60 @@ export function EstacionMovilClient({ batchId }: Props) {
     const params = new URLSearchParams(window.location.search)
     setCaptureDebug(params.get("captureDebug") === "1")
     setTipoPrueba(parseTipoPruebaFromQuery(params.get("tipo")))
+    setLockedSlot(parseCollaborativeSlotFromSearchParams(params))
+    setSlotLabel(parseCollaborativeLabelFromSearchParams(params))
+    setUrlParamsReady(true)
   }, [])
 
   useEffect(() => {
+    if (!urlParamsReady) return
     persistedCursorRef.current = false
     setCaptureSessionActive(false)
 
-    const cursor = readMobileCaptureCursor(batchId)
+    const slot = lockedSlot
+    if (slot != null && readCollabSlotDone(batchId, slot)) {
+      setStudentIndex(slot)
+      setPageIndex(1)
+      setImagesPerStudent(2)
+      setPhase("slot_done")
+      setCaptureSessionActive(false)
+      return
+    }
+
+    const cursor = readMobileCaptureCursor(batchId, slot)
     if (cursor) {
-      setStudentIndex(cursor.studentIndex)
+      const restoredIndex = slot != null ? slot : cursor.studentIndex
+      setStudentIndex(restoredIndex)
       setPageIndex(cursor.pageIndex)
       setImagesPerStudent(cursor.imagesPerStudent)
       setPhase("scanner")
       setCaptureSessionActive(true)
       persistedCursorRef.current = true
       if (MOBILE_CAPTURE_DEV) {
-        console.log("[mobile-capture] restored cursor", cursor)
+        console.log("[mobile-capture] restored cursor", cursor, { lockedSlot: slot })
       }
     } else {
-      setStudentIndex(1)
+      setStudentIndex(slot != null ? slot : 1)
       setPageIndex(1)
       setImagesPerStudent(2)
       setPhase("pages")
     }
-  }, [batchId])
+  }, [batchId, lockedSlot, urlParamsReady])
 
   useEffect(() => {
     if (!batchOk || !captureSessionActive) return
-    writeMobileCaptureCursor({
-      batchId,
-      studentIndex,
-      pageIndex,
-      imagesPerStudent,
-      updatedAt: new Date().toISOString(),
-    })
-  }, [batchId, batchOk, captureSessionActive, studentIndex, pageIndex, imagesPerStudent])
+    if (phase === "slot_done") return
+    writeMobileCaptureCursor(
+      {
+        batchId,
+        studentIndex: lockedSlot != null ? lockedSlot : studentIndex,
+        pageIndex,
+        imagesPerStudent,
+        updatedAt: new Date().toISOString(),
+      },
+      lockedSlot,
+    )
+  }, [batchId, batchOk, captureSessionActive, studentIndex, pageIndex, imagesPerStudent, lockedSlot, phase])
 
   useEffect(() => {
     if (developmentManualCropActive) {
@@ -338,13 +402,14 @@ export function EstacionMovilClient({ batchId }: Props) {
       setCaptureSessionActive(true)
       setImagesPerStudent(n)
       setPageIndex(1)
+      if (lockedSlot != null) setStudentIndex(lockedSlot)
       setPhase("scanner")
       setError(null)
       setLastOk(null)
       setCameraActivationError(null)
       setCameraErrorName(null)
     },
-    [stopStream, clearPostCapture],
+    [stopStream, clearPostCapture, lockedSlot],
   )
 
   const activateScanner = useCallback(async () => {
@@ -405,7 +470,7 @@ export function EstacionMovilClient({ batchId }: Props) {
           try {
             const fd = new FormData()
             fd.set("batch_id", batchId)
-            fd.set("student_index", String(studentIndex))
+            fd.set("student_index", String(lockedSlot != null ? lockedSlot : studentIndex))
             fd.set("page_index", String(pageIndex))
             fd.set("file", file)
 
@@ -428,6 +493,14 @@ export function EstacionMovilClient({ batchId }: Props) {
 
             if (pageIndex < imagesPerStudent) {
               setPageIndex((p) => p + 1)
+            } else if (lockedSlot != null) {
+              // Captura colaborativa: este QR termina aquí. NO avanzar al siguiente alumno.
+              writeCollabSlotDone(batchId, lockedSlot)
+              clearMobileCaptureCursor(batchId, lockedSlot)
+              setCaptureSessionActive(false)
+              stopStream()
+              setPhase("slot_done")
+              setLastOk("✔ Captura recibida. Este QR ya terminó.")
             } else {
               setStudentIndex((s) => s + 1)
               setPageIndex(1)
@@ -445,7 +518,7 @@ export function EstacionMovilClient({ batchId }: Props) {
         setUploading(false)
       }
     },
-    [batchId, studentIndex, pageIndex, imagesPerStudent],
+    [batchId, studentIndex, pageIndex, imagesPerStudent, lockedSlot, stopStream],
   )
 
   const revokePreview = useCallback((url: string | undefined) => {
@@ -675,18 +748,21 @@ export function EstacionMovilClient({ batchId }: Props) {
 
   const resetLocalCaptureCursor = useCallback(() => {
     const ok = window.confirm(
-      "¿Reiniciar captura de este lote?\n\nEsto solo reinicia el contador de este celular. No borra fotos ya subidas.",
+      lockedSlot != null
+        ? "¿Reiniciar este código?\n\nEsto solo reinicia el contador de este celular. No borra fotos ya subidas."
+        : "¿Reiniciar captura de este lote?\n\nEsto solo reinicia el contador de este celular. No borra fotos ya subidas.",
     )
     if (!ok) return
-    clearMobileCaptureCursor(batchId)
+    clearMobileCaptureCursor(batchId, lockedSlot)
+    if (lockedSlot != null) clearCollabSlotDone(batchId, lockedSlot)
     persistedCursorRef.current = false
-    setStudentIndex(1)
+    setStudentIndex(lockedSlot != null ? lockedSlot : 1)
     setPageIndex(1)
     setCaptureSessionActive(false)
     setPhase("pages")
     setLastOk(null)
     setError(null)
-  }, [batchId])
+  }, [batchId, lockedSlot])
 
   const backToPages = useCallback(() => {
     stopStream()
@@ -752,14 +828,37 @@ export function EstacionMovilClient({ batchId }: Props) {
   }
 
   const guideActive = OMR_CAPTURE_GUIDE_ENABLED && scannerActive && !pendingPreview
+  const displaySlotName =
+    lockedSlot != null ? collaborativeSlotDisplayName(lockedSlot, slotLabel) : null
+
+  if (phase === "slot_done" && lockedSlot != null) {
+    return (
+      <main className="min-h-screen flex flex-col items-center justify-center bg-slate-950 p-6 text-slate-100 gap-5">
+        <CheckCircle2 className="h-16 w-16 text-emerald-400" aria-hidden />
+        <div className="text-center space-y-2 max-w-sm">
+          <p className="text-2xl font-bold text-emerald-200">✔ Captura recibida</p>
+          <p className="text-lg font-semibold text-slate-100">{displaySlotName}</p>
+          <p className="text-sm text-slate-400">Este QR ya terminó. No escanee otro código desde aquí.</p>
+        </div>
+        <Button type="button" variant="ghost" size="sm" className="text-slate-500" onClick={resetLocalCaptureCursor}>
+          Reiniciar este código
+        </Button>
+      </main>
+    )
+  }
 
   return (
     <main className="min-h-screen flex flex-col bg-slate-950 text-slate-100 p-4 pb-12">
       <div className="max-w-md mx-auto w-full flex-1 flex flex-col gap-6 pt-6">
         {phase === "pages" ? (
           <div className="space-y-6 flex-1 flex flex-col justify-center">
+            {displaySlotName ? (
+              <p className="text-center text-2xl font-bold text-indigo-200">{displaySlotName}</p>
+            ) : null}
             <p className="text-center text-sm font-medium text-slate-200">
-              Paso 1: ¿Cuántas fotos por alumno? (hasta {MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT})
+              {lockedSlot != null
+                ? `Cantidad de fotos (hasta ${MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT})`
+                : `Paso 1: ¿Cuántas fotos por alumno? (hasta ${MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT})`}
             </p>
             {pcExpectedPages != null && pcExpectedPages > MOBILE_CAPTURE_MAX_PAGES_PER_STUDENT ? (
               <p className="text-center text-xs text-amber-300/95 px-1">
@@ -790,7 +889,13 @@ export function EstacionMovilClient({ batchId }: Props) {
           <div className="space-y-5 flex-1 flex flex-col">
             <div className="rounded-lg border border-slate-700/80 bg-slate-900/60 px-3 py-2.5 text-center space-y-0.5">
               <p className="text-sm font-semibold text-slate-100">
-                Alumno actual: <span className="text-indigo-300">{studentIndex}</span>
+                {lockedSlot != null ? (
+                  <span className="text-indigo-300 text-lg">{displaySlotName}</span>
+                ) : (
+                  <>
+                    Alumno actual: <span className="text-indigo-300">{studentIndex}</span>
+                  </>
+                )}
               </p>
               <p className="text-sm text-slate-300">
                 Página actual:{" "}
@@ -975,7 +1080,7 @@ export function EstacionMovilClient({ batchId }: Props) {
                 className="text-slate-600 hover:text-amber-400/90 text-xs"
                 onClick={resetLocalCaptureCursor}
               >
-                Reiniciar captura de este lote
+                {lockedSlot != null ? "Reiniciar este código" : "Reiniciar captura de este lote"}
               </Button>
             </div>
 

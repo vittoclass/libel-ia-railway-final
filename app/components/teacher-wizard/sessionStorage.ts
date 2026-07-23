@@ -172,6 +172,28 @@ export function writeWizardSession(data: Omit<TeacherWizardSessionDraft, "savedA
   return draft
 }
 
+/**
+ * Escritura bidireccional de `studentCount` (fuente de verdad de la sesión).
+ * Dispara `WIZARD_SESSION_CHANGED_EVENT` vía `writeWizardSession`.
+ * `minFloor`: no baja de ese valor (p. ej. grupos con fotos / datos evaluados).
+ * Si no hay sesión guardada, no crea un draft incompleto.
+ */
+export function setWizardStudentCount(
+  n: number,
+  minFloor = 0,
+): TeacherWizardSessionDraft | null {
+  if (typeof window === "undefined") return null
+  const requested = Math.max(1, Math.floor(Number(n) || 1))
+  const floor = Math.max(0, Math.floor(Number(minFloor) || 0))
+  const nextCount = Math.max(requested, floor, 1)
+  const current = readWizardSession()
+  if (!current?.savedAt) return null
+  const previous = Math.max(0, Math.floor(current.studentCount) || 0)
+  if (previous === nextCount) return current
+  const { savedAt: _ignored, ...rest } = current
+  return writeWizardSession({ ...rest, studentCount: nextCount })
+}
+
 export function expectedImagesMeta(studentCount: number, imagesPerStudent: number): number {
   const s = Math.max(0, Math.floor(studentCount))
   const i = Math.max(0, Math.floor(imagesPerStudent))

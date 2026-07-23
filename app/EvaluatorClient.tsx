@@ -154,6 +154,7 @@ import { GuidedSessionEvaluatorContextBanner } from "@/app/components/teacher-wi
 import { ENABLE_WIZARD } from "@/app/components/teacher-wizard/constants"
 import {
   readWizardSession,
+  setWizardStudentCount,
   WIZARD_SESSION_CHANGED_EVENT,
   WIZARD_SESSION_STORAGE_KEY,
 } from "@/app/components/teacher-wizard/sessionStorage"
@@ -632,6 +633,11 @@ interface FilePreview {
   mobileBatchProcessedAt?: string | null
   /** Ruta en bucket batch-scans; permite POST liviano a /api/evaluate vía URL firmada. */
   batchScanStoragePath?: string | null
+  /**
+   * Índice de alumno del escáner móvil (`batch_photo_uploads.student_index`).
+   * Se conserva aunque el grupo destino aún no exista (no perder identidad al pasar a unassigned).
+   */
+  mobileStudentIndex?: number
 }
 
 /** Evita POST enormes: imágenes ya en batch-scans se envían como URL firmada a /api/evaluate. */
@@ -1104,6 +1110,54 @@ function applyNominalObservationToGroup(
   return { ...group, observedOcrName: nextObserved, studentName }
 }
 
+/** Índice móvil válido (>= 1). Fotos con este índice no entran al FIFO de agrupación automática. */
+function validMobileStudentIndex(f: FilePreview): number | null {
+  const n = f.mobileStudentIndex
+  if (n == null || !Number.isFinite(Number(n))) return null
+  const si = Math.floor(Number(n))
+  return si >= 1 ? si : null
+}
+
+function emptyStudentGroupSlot(indexZeroBased: number): StudentGroup {
+  return {
+    id: `student-${Date.now()}-${indexZeroBased}`,
+    studentName: `Alumno ${indexZeroBased + 1}`,
+    studentRut: "",
+    files: [],
+    isEvaluated: false,
+    isEvaluating: false,
+    decimasAdicionales: 0,
+  }
+}
+
+/** Expande grupos hasta minCount sin alterar grupos existentes ni sus fotos. */
+function ensureStudentGroupsMinCount(groups: StudentGroup[], minCount: number): StudentGroup[] {
+  const n = Math.max(1, Math.floor(Number(minCount) || 1))
+  if (groups.length >= n) return groups
+  const added = Array.from({ length: n - groups.length }, (_, i) =>
+    emptyStudentGroupSlot(groups.length + i),
+  )
+  return [...groups, ...added]
+}
+
+/** Último índice 1-based con fotos o datos evaluados (piso no destructivo de classSize). */
+function countGroupsWithData(groups: StudentGroup[]): number {
+  let last = 0
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i]
+    if (
+      g.files.length > 0 ||
+      g.isEvaluated ||
+      g.isEvaluating ||
+      Boolean(g.evaluation_id) ||
+      Boolean(g.promotedEvaluationId)
+    ) {
+      last = i + 1
+    }
+  }
+  return last
+}
+
 function mergeMobileBatchIntoEvaluatorState(
   prevGroups: StudentGroup[],
   prevUnassigned: FilePreview[],
@@ -1112,6 +1166,8 @@ function mergeMobileBatchIntoEvaluatorState(
   apiIds: Set<string>,
   photoMetaById?: Map<string, MobileBatchPhotoMeta>,
 ): { groups: StudentGroup[]; unassigned: FilePreview[] } {
+  // No expandir por student_index de fotos: classSize/studentCount mandan.
+  // Fotos con índice fuera de rango conservan mobileStudentIndex y quedan en unassigned.
   let next = prevGroups.map((g) => ({ ...g, files: [...g.files] }))
   for (let gi = 0; gi < next.length; gi++) {
     const g = next[gi]
@@ -1191,18 +1247,28 @@ function mergeMobileBatchIntoEvaluatorState(
   for (const item of placement) {
     const { preview, student_index, evaluation_id } = item
     if (next.some((g) => g.files.some((f) => f.id === preview.id))) continue
+    const preservedIndex =
+      student_index != null && student_index >= 1
+        ? Math.floor(student_index)
+        : validMobileStudentIndex(preview) ?? undefined
+    const previewWithIndex: FilePreview =
+      preservedIndex != null
+        ? { ...preview, mobileStudentIndex: preservedIndex }
+        : preview
     const gi =
-      student_index != null && student_index >= 1 && student_index <= next.length ? student_index - 1 : -1
+      preservedIndex != null && preservedIndex >= 1 && preservedIndex <= next.length
+        ? preservedIndex - 1
+        : -1
     if (gi >= 0) {
       const g = next[gi]
       if (g.isEvaluated) continue
       next[gi] = {
         ...g,
-        files: [...g.files, preview],
+        files: [...g.files, previewWithIndex],
         promotedEvaluationId: evaluation_id || g.promotedEvaluationId || null,
       }
     } else {
-      orphans.push(preview)
+      orphans.push(previewWithIndex)
     }
   }
 
@@ -1220,6 +1286,35 @@ function mergeMobileBatchIntoEvaluatorState(
   for (const p of orphans) {
     if (!unassigned.some((f) => f.id === p.id)) unassigned = [...unassigned, p]
   }
+
+  // Reconciliar fotos móviles ya conocidas cuyo grupo ahora existe (p. ej. tras expandir classSize).
+  const stillUnassigned: FilePreview[] = []
+  for (const f of unassigned) {
+    const si = validMobileStudentIndex(f)
+    if (si == null || si > next.length) {
+      stillUnassigned.push(f)
+      continue
+    }
+    if (
+      next.some(
+        (g) =>
+          g.files.some(
+            (x) =>
+              x.id === f.id ||
+              (f.mobileBatchPhotoId != null && x.mobileBatchPhotoId === f.mobileBatchPhotoId),
+          ),
+      )
+    ) {
+      continue
+    }
+    const g = next[si - 1]
+    if (g.isEvaluated) {
+      stillUnassigned.push(f)
+      continue
+    }
+    next[si - 1] = { ...g, files: [...g.files, f] }
+  }
+  unassigned = stillUnassigned
 
   next = next.map((g, groupIndex) => {
     const beforeIds = g.files.map((f) => f.id)
@@ -1583,7 +1678,11 @@ export default function EvaluatorClient() {
   const [closedAnswerTargetGroupId, setClosedAnswerTargetGroupId] = useState<string | null>(null)
 
   const [logoPreview, setLogoPreview] = useState<string | null>(null)
-  const [classSize, setClassSize] = useState(1)
+  /** Espejo UI de `studentCount` en la sesión wizard (localStorage). */
+  const [classSize, setClassSize] = useState(() => {
+    if (typeof window === "undefined") return 1
+    return Math.max(1, readWizardSession()?.studentCount ?? 1)
+  })
   /** Imágenes por estudiante para agrupación automática (solo UI, no altera contratos). */
   const [imagesPerStudent, setImagesPerStudent] = useState(1)
   const [isExtractingNames, setIsExtractingNames] = useState(false)
@@ -2475,6 +2574,10 @@ export default function EvaluatorClient() {
       (f) => form.getValues(f),
       (f, v) => form.setValue(f, v, { shouldDirty: true, shouldTouch: true }),
     )
+    if (draft.studentCount >= 1) {
+      const withData = countGroupsWithData(evaluatorStep2FilesRef.current.groups)
+      setClassSize(Math.max(1, Math.floor(draft.studentCount), withData))
+    }
     if (draft.savedAt) guidedAutoAppliedSavedAtRef.current = draft.savedAt
     if (r.filled.length > 0) {
       setWizardGuidedFilledFields((prev) => [...new Set([...prev, ...r.filled])])
@@ -2511,6 +2614,10 @@ export default function EvaluatorClient() {
       (f) => form.getValues(f),
       (f, v) => form.setValue(f, v, { shouldDirty: true, shouldTouch: true }),
     )
+    if (draft.studentCount >= 1) {
+      const withData = countGroupsWithData(evaluatorStep2FilesRef.current.groups)
+      setClassSize(Math.max(1, Math.floor(draft.studentCount), withData))
+    }
     guidedAutoAppliedSavedAtRef.current = draft.savedAt
     if (r.filled.length > 0) {
       setWizardGuidedFilledFields((prev) => [...new Set([...prev, ...r.filled])])
@@ -2530,6 +2637,15 @@ export default function EvaluatorClient() {
       window.removeEventListener("storage", onStorage)
     }
   }, [])
+
+  /** Rehidratación reactiva: estación / QR / otra pestaña → classSize. */
+  useEffect(() => {
+    const draft = readWizardSession()
+    const sessionCount =
+      draft?.studentCount != null && draft.studentCount >= 1 ? Math.floor(draft.studentCount) : 1
+    const withData = countGroupsWithData(evaluatorStep2FilesRef.current.groups)
+    setClassSize(Math.max(1, sessionCount, withData))
+  }, [wizardSessionRevision])
 
   const handleEvaluatorSourceExamSelect = useCallback(
     async (value: string): Promise<boolean> => {
@@ -2855,19 +2971,45 @@ export default function EvaluatorClient() {
     }
 
     const count = Math.max(1, classSize)
-    setStudentGroups(
-      Array.from({ length: count }, (_, i) => ({
-        id: `student-${Date.now()}-${i}`,
-        studentName: `Alumno ${i + 1}`,
-        studentRut: "",
-        files: [],
-        isEvaluated: false,
-        isEvaluating: false,
-        decimasAdicionales: 0,
-      })),
-    )
-    setUnassignedFiles([])
+    setStudentGroups((prev) => {
+      if (prev.length === count) return prev
+      if (prev.length < count) return ensureStudentGroupsMinCount(prev, count)
+      const canShrink = prev
+        .slice(count)
+        .every((g) => g.files.length === 0 && !g.isEvaluated && !g.isEvaluating)
+      if (!canShrink) return prev
+      return prev.slice(0, count)
+    })
+    // No limpiar unassignedFiles: navegación / classSize no deben desconectar fotos del lote.
   }, [classSize])
+
+  // Reconciliar fotos móviles indexadas pendientes cuando existan suficientes grupos.
+  useEffect(() => {
+    const snap = evaluatorStep2FilesRef.current
+    const hasPending = snap.unassigned.some((f) => {
+      const si = validMobileStudentIndex(f)
+      return si != null && si <= snap.groups.length
+    })
+    if (!hasPending) return
+    const apiIds = new Set<string>()
+    for (const g of snap.groups) {
+      for (const f of g.files) {
+        if (f.mobileBatchPhotoId) apiIds.add(f.mobileBatchPhotoId)
+      }
+    }
+    for (const f of snap.unassigned) {
+      if (f.mobileBatchPhotoId) apiIds.add(f.mobileBatchPhotoId)
+    }
+    const { groups, unassigned } = mergeMobileBatchIntoEvaluatorState(
+      snap.groups,
+      snap.unassigned,
+      [],
+      [],
+      apiIds,
+    )
+    setStudentGroups(groups)
+    setUnassignedFiles(unassigned)
+  }, [classSize, studentGroups.length])
 
   const ensureEvaluationBatchId = useCallback((): string => {
     if (evaluationBatchIdRef.current) return evaluationBatchIdRef.current
@@ -3108,12 +3250,18 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       toast({ title: "Indica primero el Nº de estudiantes para crear los grupos.", variant: "default" })
       return
     }
-    if (unassignedFiles.length === 0) {
+    // Solo archivos realmente sin índice móvil: nunca reasignar fotos con mobileStudentIndex válido.
+    const fifoPool = unassignedFiles.filter((f) => validMobileStudentIndex(f) == null)
+    const indexedHeld = unassignedFiles.filter((f) => validMobileStudentIndex(f) != null)
+    if (fifoPool.length === 0) {
       const hasMobile = studentGroups.some((g) => g.files.some((f) => f.fromMobileBatch))
       toast({
-        title: hasMobile
-          ? "No hay archivos de PC pendientes. Las del móvil ya van a cada grupo según índice."
-          : "No hay archivos pendientes para agrupar.",
+        title:
+          indexedHeld.length > 0
+            ? "Hay fotos móviles indexadas pendientes de su alumno. No se reasignan automáticamente."
+            : hasMobile
+              ? "No hay archivos de PC pendientes. Las del móvil ya van a cada grupo según índice."
+              : "No hay archivos pendientes para agrupar.",
         variant: "default",
       })
       return
@@ -3123,13 +3271,13 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     for (const g of studentGroups) {
       if (g.isEvaluated) continue
       const need = Math.max(0, per - g.files.length)
-      for (let i = 0; i < need && idx < unassignedFiles.length; i++) {
-        toAssign.push({ fileId: unassignedFiles[idx].id, groupId: g.id })
+      for (let i = 0; i < need && idx < fifoPool.length; i++) {
+        toAssign.push({ fileId: fifoPool[idx].id, groupId: g.id })
         idx++
       }
     }
     const assignedFileIds = new Set(toAssign.map((x) => x.fileId))
-    const fileById = new Map(unassignedFiles.map((f) => [f.id, f]))
+    const fileById = new Map(fifoPool.map((f) => [f.id, f]))
     setUnassignedFiles((prev) => prev.filter((f) => !assignedFileIds.has(f.id)))
     setStudentGroups((prev) =>
       prev.map((g) => {
@@ -3359,6 +3507,9 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
             mobileBatchPageIndex: p.page_index ?? null,
             mobileBatchProcessedAt: p.processed_at ?? null,
             batchScanStoragePath: p.storage_path ?? null,
+            ...(p.student_index != null && p.student_index >= 1
+              ? { mobileStudentIndex: Math.floor(p.student_index) }
+              : {}),
           }
           placement.push({
             preview,
@@ -3372,8 +3523,16 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       }
 
       const snap = evaluatorStep2FilesRef.current
+      const draft = ENABLE_WIZARD ? readWizardSession() : null
+      const sessionCount =
+        draft?.studentCount != null && draft.studentCount >= 1 ? Math.floor(draft.studentCount) : 0
+      const minGroups = Math.max(snap.groups.length, classSize, sessionCount)
+      const groupsBeforeMerge = ensureStudentGroupsMinCount(snap.groups, minGroups)
+      if (minGroups > classSize) {
+        setClassSize(minGroups)
+      }
       const { groups: nextGroups, unassigned: nextUnassigned } = mergeMobileBatchIntoEvaluatorState(
-        snap.groups,
+        groupsBeforeMerge,
         snap.unassigned,
         placement,
         slotsFromApi,
@@ -3390,7 +3549,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         void syncMobileBatchPhotosRef.current()
       }
     }
-  }, [toast])
+  }, [toast, classSize])
 
   useEffect(() => {
     if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
@@ -5505,7 +5664,13 @@ w-8"
                           id="class-size"
                           type="number"
                           value={classSize}
-                          onChange={(e) => setClassSize(Number(e.target.value) || 1)}
+                          onChange={(e) => {
+                            const n = Math.max(1, Math.floor(Number(e.target.value) || 1))
+                            const withData = countGroupsWithData(studentGroups)
+                            const effective = Math.max(n, withData)
+                            setClassSize(effective)
+                            setWizardStudentCount(effective, withData)
+                          }}
                           className="w-24 text-base"
                           min={1}
                         />
@@ -6498,7 +6663,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           type="button"
                           variant="default"
                           onClick={applyAutoGroup}
-                          disabled={unassignedFiles.length === 0}
+                          disabled={unassignedFiles.filter((f) => validMobileStudentIndex(f) == null).length === 0}
                         >
                           Agrupar automáticamente
                         </Button>
