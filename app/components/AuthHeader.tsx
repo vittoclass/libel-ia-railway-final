@@ -34,15 +34,6 @@ export default function AuthHeader() {
   }, [supabase.auth])
 
   const handleSignOut = async () => {
-    console.info(
-      "[AUTH_REDIRECT_DIAG]",
-      JSON.stringify({
-        tag: "AuthHeader:signOut",
-        host: typeof window !== "undefined" ? window.location.host : "(ssr)",
-        origin: typeof window !== "undefined" ? window.location.origin : "(ssr)",
-        nextPush: "/login",
-      })
-    )
     await supabase.auth.signOut()
     try {
       await fetch("/api/auth/logout", { method: "POST" })

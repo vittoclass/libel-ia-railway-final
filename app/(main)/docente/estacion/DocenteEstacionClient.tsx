@@ -37,7 +37,6 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { TestOriginBanner } from "@/app/components/TestOriginBanner"
 
 /** Solo UI estación: no mostrar el aviso de migración PASO A; el fetch y el estado siguen igual. */
 function isTeacherAssignmentsTableMigrationUiNoise(w: string | null): boolean {
@@ -206,8 +205,6 @@ export function DocenteEstacionClient() {
   }, [])
 
   return (
-    <>
-    <TestOriginBanner />
     <div className="mx-auto max-w-6xl px-4 py-8 space-y-8">
       {debugError != null ? (
         <div
@@ -448,6 +445,5 @@ export function DocenteEstacionClient() {
         </>
       ) : null}
     </div>
-    </>
   )
 }

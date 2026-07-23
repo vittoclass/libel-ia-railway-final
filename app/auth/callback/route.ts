@@ -3,7 +3,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { createRouteHandlerClient } from "@supabase/auth-helpers-nextjs"
 import { cookies } from "next/headers"
-import { envOriginHosts, logAuthDiag, safeRequestUrl } from "@/app/lib/auth-redirect-diag"
 
 export const dynamic = "force-dynamic"
 
@@ -38,37 +37,14 @@ function sanitizeNextPath(next: string | null): string {
   return "/evaluar"
 }
 
-function diagBase(request: NextRequest, next: string) {
-  return {
-    requestUrlSafe: safeRequestUrl(request.url),
-    host: request.headers.get("host"),
-    xForwardedHost: request.headers.get("x-forwarded-host"),
-    xForwardedProto: request.headers.get("x-forwarded-proto"),
-    nextUrlOrigin: request.nextUrl.origin,
-    nextParam: next,
-    ...envOriginHosts(),
-  }
-}
-
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
   const code = searchParams.get("code")
   const next = sanitizeNextPath(searchParams.get("next"))
   const origin = resolvePublicOrigin(request)
-  const base = diagBase(request, next)
 
   if (!code) {
-    const locationFinal = `${origin}/login?message=${encodeURIComponent("No se pudo completar el inicio de sesión")}`
-    logAuthDiag({
-      tag: "auth/callback:no-code",
-      ...base,
-      hasCode: false,
-      resolvedOrigin: origin,
-      locationFinal,
-      exchangeOk: null,
-      exchangeErrorName: null,
-    })
-    return NextResponse.redirect(locationFinal)
+    return NextResponse.redirect(`${origin}/login?message=${encodeURIComponent("No se pudo completar el inicio de sesión")}`)
   }
 
   try {
@@ -77,41 +53,15 @@ export async function GET(request: NextRequest) {
     const { error } = await supabase.auth.exchangeCodeForSession(code)
     if (error) {
       console.error("[auth/callback] exchangeCodeForSession:", error.message)
-      const locationFinal = `${origin}/login?message=${encodeURIComponent("Error al iniciar sesión. Intenta de nuevo.")}`
-      logAuthDiag({
-        tag: "auth/callback:exchange-error",
-        ...base,
-        hasCode: true,
-        resolvedOrigin: origin,
-        locationFinal,
-        exchangeOk: false,
-        exchangeErrorName: error.name || "AuthError",
-      })
-      return NextResponse.redirect(locationFinal)
+      return NextResponse.redirect(
+        `${origin}/login?message=${encodeURIComponent("Error al iniciar sesión. Intenta de nuevo.")}`
+      )
     }
-    const locationFinal = `${origin}${next}`
-    logAuthDiag({
-      tag: "auth/callback:ok",
-      ...base,
-      hasCode: true,
-      resolvedOrigin: origin,
-      locationFinal,
-      exchangeOk: true,
-      exchangeErrorName: null,
-    })
-    return NextResponse.redirect(locationFinal)
+    return NextResponse.redirect(`${origin}${next}`)
   } catch (e) {
     console.error("[auth/callback]", e)
-    const locationFinal = `${origin}/login?message=${encodeURIComponent("Error inesperado al completar el inicio de sesión")}`
-    logAuthDiag({
-      tag: "auth/callback:exception",
-      ...base,
-      hasCode: true,
-      resolvedOrigin: origin,
-      locationFinal,
-      exchangeOk: false,
-      exchangeErrorName: e instanceof Error ? e.name : "unknown",
-    })
-    return NextResponse.redirect(locationFinal)
+    return NextResponse.redirect(
+      `${origin}/login?message=${encodeURIComponent("Error inesperado al completar el inicio de sesión")}`
+    )
   }
 }
