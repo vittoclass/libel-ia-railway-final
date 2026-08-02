@@ -88,6 +88,7 @@ import {
   runMultimodalArtsEvaluation,
   shouldRunMultimodalArtsPath,
 } from "../../lib/multimodal"
+import { safeDiagnosticEvent } from "../../lib/diagnostics/photo-omr-pipeline-diag"
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY
 
@@ -2439,6 +2440,21 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
       for (let i = 0; i < imageBase64List.length; i++) {
         try {
           const studentBase64 = imageBase64List[i]
+          let diagnosticPageEngine:
+            | "legacy"
+            | "azure_layout_family"
+            | "azure_layout_omr_interleaved"
+            | undefined = undefined
+          safeDiagnosticEvent({
+            schemaVersion: 1,
+            event: "IMAGE_ENTERING_OMR",
+            timestamp: new Date().toISOString(),
+            evaluationBatchId: evaluationBatchIdBody,
+            batchStudentIndex: batchStudentIndexBody,
+            pageIndex: i,
+            totalImages: imageBase64List.length,
+            totalQuestions: omrExpectedQuestionCount,
+          })
           let templateBase64: string | undefined = cachedTemplateBase64
           if (!templateBase64 && templateImageUrl && typeof templateImageUrl === "string") {
             try {
@@ -2493,6 +2509,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             })
             officialOmrAdapterMode = "legacy_extract_student_only"
             officialOmrEngineUsed = "legacy"
+            diagnosticPageEngine = "legacy"
             recordPageOmrResult({
               pageIndex: i,
               extraidas,
@@ -2624,9 +2641,11 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                 }
                 omrSuccessfulAzureWasInterleaved = true
                 officialOmrEngineUsed = "azure_layout_omr_interleaved"
+                diagnosticPageEngine = "azure_layout_omr_interleaved"
               } else {
                 officialOmrTemplateVariantUsed = omrTemplateVariantRequested
                 officialOmrEngineUsed = "azure_layout_family"
+                diagnosticPageEngine = "azure_layout_family"
               }
               azureSuccessfulPages++
               recordPageOmrResult({
@@ -2673,6 +2692,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               officialOmrFallbackUsed = true
               officialOmrFallbackReason =
                 lastAzureErr instanceof Error ? lastAzureErr.message : String(lastAzureErr)
+              diagnosticPageEngine = "legacy"
               recordPageOmrResult({
                 pageIndex: i,
                 extraidas,
@@ -2697,6 +2717,7 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
             })
             officialOmrAdapterMode = "legacy_extract_student_only"
             officialOmrEngineUsed = "legacy"
+            diagnosticPageEngine = "legacy"
             recordPageOmrResult({
               pageIndex: i,
               extraidas,
@@ -2705,6 +2726,17 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               variant: omrTemplateVariantLegacyDual,
             })
           }
+          safeDiagnosticEvent({
+            schemaVersion: 1,
+            event: "OMR_PAGE_RESULT",
+            timestamp: new Date().toISOString(),
+            evaluationBatchId: evaluationBatchIdBody,
+            batchStudentIndex: batchStudentIndexBody,
+            pageIndex: i,
+            totalImages: imageBase64List.length,
+            engine: diagnosticPageEngine,
+            totalQuestions: omrExpectedQuestionCount,
+          })
         } catch (e) {
           if (isForcedInterleaved) {
             const teacherKeyForOm = teacherAnswerKeyBase.map((r: any) => ({
@@ -2949,6 +2981,16 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
         studentClosedAnswersCount: respuestasCerradasDesdeOMR.length,
         officialOmrEngineUsed,
         officialOmrFallbackUsed,
+      })
+      safeDiagnosticEvent({
+        schemaVersion: 1,
+        event: "EVALUATION_DIAGNOSTIC_COMPLETE",
+        timestamp: new Date().toISOString(),
+        evaluationBatchId: evaluationBatchIdBody,
+        batchStudentIndex: batchStudentIndexBody,
+        totalImages: imageBase64List.length,
+        engine: officialOmrEngineUsed,
+        totalQuestions: omrExpectedQuestionCount,
       })
     }
     if (tipoPruebaReal === "solo_desarrollo") {
