@@ -4,6 +4,7 @@
  */
 import sharp from "sharp"
 import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
+import { recordAzureRawSnapshot } from "@/app/lib/diagnostics/azure-raw-snapshot-recorder"
 import type { LayoutMark } from "./types"
 
 export type AnalyzeLine = { content?: string; polygon?: number[] }
@@ -110,6 +111,9 @@ export async function analyzeLayoutWithAzure(params: {
             filesProcessed: 1,
             durationMs: Date.now() - t0,
           })
+          // FASE R.7: snapshot pasivo local de selectionMarks crudos (antes de OMR).
+          // Fail-soft; no muta ar; flag LIBELIA_AZURE_RAW_SNAPSHOT=1.
+          recordAzureRawSnapshot(ar)
           return {
             ok: true,
             analyzeResult: ar,
