@@ -4,6 +4,7 @@
  */
 import sharp from "sharp"
 import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
+import { recordAzureRawSnapshot } from "@/app/lib/diagnostics/azure-raw-snapshot-recorder"
 import { mapDualPanelsWithPautaOrchestrator } from "./azure-layout-omr-pauta-orchestrator"
 
 export type OmrTemplateVariant = "odd_even_dual_column" | "sequential_dual_column" | "single_column"
@@ -412,6 +413,10 @@ export async function runAzureLayoutOmrPipeline(params: {
     pagesProcessed: analyze.analyzeResult.pages?.length ?? 1,
     filesProcessed: 1,
   })
+
+  // FASE R.13: snapshot pasivo local de selectionMarks crudos (antes de parseMarks/OMR).
+  // Fail-soft; no muta analyzeResult; flag LIBELIA_AZURE_RAW_SNAPSHOT=1.
+  recordAzureRawSnapshot(analyze.analyzeResult)
 
   const parsed = parseMarks(analyze.analyzeResult)
   const normalizeMarksAffine = (marks: Mark[]): Mark[] => {
