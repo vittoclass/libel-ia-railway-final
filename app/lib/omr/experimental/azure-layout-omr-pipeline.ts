@@ -5,6 +5,10 @@
 import sharp from "sharp"
 import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
 import { recordAzureRawSnapshot } from "@/app/lib/diagnostics/azure-raw-snapshot-recorder"
+import {
+  resolveVisualBlankRescueModeFromEnv,
+  runAzureVisualBlankRescue,
+} from "@/app/lib/omr-shared/azure-visual-blank-rescue"
 import { mapDualPanelsWithPautaOrchestrator } from "./azure-layout-omr-pauta-orchestrator"
 
 export type OmrTemplateVariant = "odd_even_dual_column" | "sequential_dual_column" | "single_column"
@@ -517,6 +521,36 @@ export async function runAzureLayoutOmrPipeline(params: {
     }
   }
   out.sort((a, b) => Number(a.questionNumber) - Number(b.questionNumber))
+
+  // FASE R.20: rescate visual anti-BLANK — SHADOW only; APPLY hard-blocked (never mutates out).
+  try {
+    const rescueMode = resolveVisualBlankRescueModeFromEnv()
+    if (rescueMode !== "off") {
+      const meta = await sharp(orientation.buffer).metadata()
+      const imageWidth = meta.width ?? 0
+      const imageHeight = meta.height ?? 0
+      // R.20: even if APPLY=1 by mistake, force shadow so out is never modified.
+      await runAzureVisualBlankRescue({
+        imageBuffer: orientation.buffer,
+        imageWidth,
+        imageHeight,
+        marks: parsed.marks,
+        rows: out.map((row) => ({
+          questionNumber: Number(row.questionNumber),
+          selectedAnswer: typeof row.selectedAnswer === "string" ? row.selectedAnswer : undefined,
+          inferredBlank: row.inferredBlank === true,
+          completedByExpectation: row.completedByExpectation === true,
+        })),
+        expectedQuestionCount: expected ?? out.length,
+        expectedOptionCount,
+        variant,
+        mode: "shadow",
+      })
+      // Intentionally ignore proposedRows; do not assign to out.
+    }
+  } catch {
+    // fail-soft
+  }
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${params.canonicalWidth}" height="${params.canonicalHeight}" viewBox="0 0 ${params.canonicalWidth} ${params.canonicalHeight}">${parsed.marks
     .map((m) => {
