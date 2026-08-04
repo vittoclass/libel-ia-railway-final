@@ -234,6 +234,273 @@ test("15. una letra existente nunca cambia en proposedRows", async () => {
   assert.equal(result.proposedRows?.[1]?.selectedAnswer, "C")
 })
 
+/** R.25 — helpers de telemetría absoluta (sin cambiar umbrales del algoritmo). */
+async function grayPng(
+  paint: (set: (x: number, y: number, g: number) => void) => void
+): Promise<Buffer> {
+  const buf = Buffer.alloc(width * height, 255)
+  const set = (x: number, y: number, g: number) => {
+    if (x >= 0 && x < width && y >= 0 && y < height) buf[y * width + x] = g
+  }
+  paint(set)
+  return sharp(buf, { raw: { width, height, channels: 1 } }).png().toBuffer()
+}
+
+function fillDisk(
+  set: (x: number, y: number, g: number) => void,
+  cx: number,
+  cy: number,
+  r: number,
+  g: number
+): void {
+  for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
+    for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
+      if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r) set(x, y, g)
+    }
+  }
+}
+
+function fillDiskPattern(
+  set: (x: number, y: number, g: number) => void,
+  cx: number,
+  cy: number,
+  r: number,
+  darkG: number,
+  fraction: number
+): void {
+  for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
+    for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
+      if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r) {
+        const h = ((x * 73856093) ^ (y * 19349663)) >>> 0
+        set(x, y, h % 1000 < fraction * 1000 ? darkG : 255)
+      }
+    }
+  }
+}
+
+function parseShadowDecision(line: string): Record<string, unknown> {
+  assert.ok(line.startsWith("[AZURE_VISUAL_BLANK_RESCUE_SHADOW] "))
+  const payload = JSON.parse(line.slice("[AZURE_VISUAL_BLANK_RESCUE_SHADOW] ".length)) as {
+    decisions: Array<Record<string, unknown>>
+  }
+  const d = payload.decisions[0]
+  assert.ok(d)
+  return d
+}
+
+function bestSecondFromMetrics(metrics: {
+  perOption: Array<{ letter: string; darkRatio: number; contrast: number }>
+  bestLetter: string | null
+  secondLetter: string | null
+}): {
+  bestDarkRatio: number
+  bestContrast: number
+  secondDarkRatio: number | undefined
+  secondContrast: number | undefined
+} {
+  const best = metrics.perOption.find((o) => o.letter === metrics.bestLetter)
+  assert.ok(best)
+  const second =
+    metrics.secondLetter != null
+      ? metrics.perOption.find((o) => o.letter === metrics.secondLetter)
+      : undefined
+  return {
+    bestDarkRatio: best.darkRatio,
+    bestContrast: best.contrast,
+    secondDarkRatio: second?.darkRatio,
+    secondContrast: second?.contrast,
+  }
+}
+
+test("R.25-1. abstain por darkRatio: failedAbsoluteDark=true, contrast=false", async () => {
+  const lines: string[] = []
+  __setVisualBlankRescueEmitForTests((line) => lines.push(line))
+  const result = await runAzureVisualBlankRescue(
+    await input({ imageBuffer: await grayPng((set) => fillDisk(set, xs[2]!, ys[0]!, 7, 230)) })
+  )
+  const d0 = result.decisions[0]
+  assert.equal(d0?.action, "abstain")
+  assert.equal(d0?.action === "abstain" && d0.reason, "insufficient_absolute_evidence")
+  assert.ok(d0 && d0.action === "abstain" && d0.metrics)
+  const abs = bestSecondFromMetrics(d0.metrics)
+  assert.ok(abs.bestDarkRatio < 0.22)
+  assert.ok(abs.bestContrast >= 18)
+  const log = parseShadowDecision(lines[0]!)
+  assert.equal(log.failedAbsoluteDark, true)
+  assert.equal(log.failedAbsoluteContrast, false)
+  assert.equal(log.bestDarkRatio, abs.bestDarkRatio)
+  assert.equal(log.bestContrast, abs.bestContrast)
+  assert.equal(log.secondDarkRatio, abs.secondDarkRatio)
+  assert.equal(log.secondContrast, abs.secondContrast)
+  assert.equal(log.action, "abstain")
+  assert.equal(log.reason, "insufficient_absolute_evidence")
+})
+
+test("R.25-2. abstain por contraste: failedAbsoluteDark=false, contrast=true", async () => {
+  const lines: string[] = []
+  __setVisualBlankRescueEmitForTests((line) => lines.push(line))
+  const result = await runAzureVisualBlankRescue(
+    await input({
+      imageBuffer: await grayPng((set) => fillDiskPattern(set, xs[2]!, ys[0]!, 7, 200, 0.3)),
+    })
+  )
+  const d0 = result.decisions[0]
+  assert.equal(d0?.action, "abstain")
+  assert.equal(d0?.action === "abstain" && d0.reason, "insufficient_absolute_evidence")
+  assert.ok(d0 && d0.action === "abstain" && d0.metrics)
+  const abs = bestSecondFromMetrics(d0.metrics)
+  assert.ok(abs.bestDarkRatio >= 0.22)
+  assert.ok(abs.bestContrast < 18)
+  const log = parseShadowDecision(lines[0]!)
+  assert.equal(log.failedAbsoluteDark, false)
+  assert.equal(log.failedAbsoluteContrast, true)
+  assert.equal(log.bestDarkRatio, abs.bestDarkRatio)
+  assert.equal(log.bestContrast, abs.bestContrast)
+  assert.equal(log.action, d0.action)
+  assert.equal(log.reason, d0.reason)
+})
+
+test("R.25-3. abstain por ambos absolutos", async () => {
+  const lines: string[] = []
+  __setVisualBlankRescueEmitForTests((line) => lines.push(line))
+  const result = await runAzureVisualBlankRescue(
+    await input({ imageBuffer: await grayPng(() => {}) })
+  )
+  const d0 = result.decisions[0]
+  assert.equal(d0?.action, "abstain")
+  assert.equal(d0?.action === "abstain" && d0.reason, "insufficient_absolute_evidence")
+  assert.ok(d0 && d0.action === "abstain" && d0.metrics)
+  const abs = bestSecondFromMetrics(d0.metrics)
+  assert.ok(abs.bestDarkRatio < 0.22)
+  assert.ok(abs.bestContrast < 18)
+  const log = parseShadowDecision(lines[0]!)
+  assert.equal(log.failedAbsoluteDark, true)
+  assert.equal(log.failedAbsoluteContrast, true)
+  assert.equal(log.bestDarkRatio, abs.bestDarkRatio)
+  assert.equal(log.bestContrast, abs.bestContrast)
+})
+
+test("R.25-4. métricas absolutas aparecen en log abstain y coinciden con d.metrics", async () => {
+  const lines: string[] = []
+  __setVisualBlankRescueEmitForTests((line) => lines.push(line))
+  const result = await runAzureVisualBlankRescue(
+    await input({ imageBuffer: await grayPng((set) => fillDisk(set, xs[2]!, ys[0]!, 7, 230)) })
+  )
+  const d0 = result.decisions[0]
+  assert.ok(d0 && d0.action === "abstain" && d0.metrics)
+  const abs = bestSecondFromMetrics(d0.metrics)
+  const log = parseShadowDecision(lines[0]!)
+  for (const key of [
+    "bestDarkRatio",
+    "bestContrast",
+    "secondDarkRatio",
+    "secondContrast",
+    "failedAbsoluteDark",
+    "failedAbsoluteContrast",
+    "bestLetter",
+    "secondLetter",
+    "marginDarkRatio",
+    "marginContrast",
+  ] as const) {
+    assert.ok(key in log, `falta ${key} en log`)
+  }
+  assert.equal(log.bestLetter, d0.metrics.bestLetter)
+  assert.equal(log.secondLetter, d0.metrics.secondLetter)
+  assert.equal(log.marginDarkRatio, d0.metrics.marginDarkRatio)
+  assert.equal(log.marginContrast, d0.metrics.marginContrast)
+  assert.equal(log.bestDarkRatio, abs.bestDarkRatio)
+  assert.equal(log.bestContrast, abs.bestContrast)
+  assert.equal(log.secondDarkRatio, abs.secondDarkRatio)
+  assert.equal(log.secondContrast, abs.secondContrast)
+  assert.equal(log.failedAbsoluteDark, abs.bestDarkRatio < 0.22)
+  assert.equal(log.failedAbsoluteContrast, abs.bestContrast < 18)
+})
+
+test("R.25-5. decisiones y reason idénticos; respuesta oficial intacta (rescued sintético)", async () => {
+  const lines: string[] = []
+  __setVisualBlankRescueEmitForTests((line) => lines.push(line))
+  const original = await input()
+  const rowsBefore = JSON.parse(JSON.stringify(original.rows))
+  const result = await runAzureVisualBlankRescue(original)
+  assert.equal(result.decisions[0]?.action, "rescued_answer")
+  assert.equal(
+    result.decisions[0]?.action === "rescued_answer" && result.decisions[0].letter,
+    "C"
+  )
+  assert.equal(
+    result.decisions[0]?.action === "rescued_answer" && result.decisions[0].reason,
+    "visual_dominant_clear"
+  )
+  assert.equal(result.proposedRows, null)
+  assert.deepEqual(original.rows, rowsBefore)
+  assert.ok(lines[0]?.startsWith("[AZURE_VISUAL_BLANK_RESCUE_SHADOW] "))
+  const log = parseShadowDecision(lines[0]!)
+  assert.equal(log.action, "rescued_answer")
+  assert.equal(log.reason, "visual_dominant_clear")
+  assert.equal("failedAbsoluteDark" in log, false)
+})
+
+test("R.25-6. página sana conserva no_action; grilla incompleta no_op", async () => {
+  const sana = await runAzureVisualBlankRescue(
+    await input({ marks: marks([
+      [0, 0],
+      [1, 0],
+    ]) })
+  )
+  assert.equal(sana.pageGatesPassed, false)
+  assert.equal(sana.pageAbstainReason, "no_selected_deficit")
+  assert.ok(sana.decisions.every((d) => d.action === "no_action"))
+
+  const incomplete = await runAzureVisualBlankRescue(
+    await input({ marks: marks().slice(0, 5) })
+  )
+  assert.equal(incomplete.pageAction, "no_op")
+  assert.equal(incomplete.pageAbstainReason, "grid_incomplete")
+})
+
+test("R.25-7. inputs no mutados tras abstain absoluto", async () => {
+  const original = await input({
+    imageBuffer: await grayPng((set) => fillDisk(set, xs[2]!, ys[0]!, 7, 230)),
+  })
+  const before = {
+    marks: JSON.parse(JSON.stringify(original.marks)),
+    rows: JSON.parse(JSON.stringify(original.rows)),
+    image: Buffer.from(original.imageBuffer),
+  }
+  await runAzureVisualBlankRescue(original)
+  assert.deepEqual(original.marks, before.marks)
+  assert.deepEqual(original.rows, before.rows)
+  assert.deepEqual(original.imageBuffer, before.image)
+})
+
+test("R.25-8. Shadow apagado: cero telemetría", async () => {
+  const lines: string[] = []
+  __setVisualBlankRescueEmitForTests((line) => lines.push(line))
+  const result = await runAzureVisualBlankRescue(await input({ mode: "off" }))
+  assert.equal(result.pageAction, "no_op")
+  assert.equal(lines.length, 0)
+})
+
+test("R.25-9. APPLY sin efecto en call site existente (fuerza shadow, ignora proposedRows)", async () => {
+  const fs = await import("node:fs")
+  const path = await import("node:path")
+  const pipelinePath = path.join(
+    process.cwd(),
+    "app/lib/omr/experimental/azure-layout-omr-pipeline.ts"
+  )
+  const src = fs.readFileSync(pipelinePath, "utf8")
+  assert.ok(src.includes('mode: "shadow"'))
+  assert.ok(src.includes("Intentionally ignore proposedRows; do not assign to out."))
+  assert.ok(src.includes("force shadow so out is never modified"))
+  withFlags("1", "1", () => {
+    assert.equal(resolveVisualBlankRescueModeFromEnv(), "apply")
+  })
+  const moduleApply = await runAzureVisualBlankRescue(await input({ mode: "apply" }))
+  assert.equal(moduleApply.pageAction, "apply_proposals")
+  assert.ok(moduleApply.proposedRows)
+  assert.equal(moduleApply.proposedRows?.[0]?.selectedAnswer, "C")
+})
+
 async function run(): Promise<void> {
   for (const t of tests) {
     __setVisualBlankRescueEmitForTests(() => {})

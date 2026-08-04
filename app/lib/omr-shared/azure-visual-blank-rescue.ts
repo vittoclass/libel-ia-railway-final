@@ -637,6 +637,21 @@ function emitShadowTelemetry(result: VisualBlankRescuePageResult): void {
           base.secondLetter = d.metrics.secondLetter
           base.marginDarkRatio = d.metrics.marginDarkRatio
           base.marginContrast = d.metrics.marginContrast
+          const bestOpt = d.metrics.perOption.find((o) => o.letter === d.metrics!.bestLetter)
+          const secondOpt =
+            d.metrics.secondLetter != null
+              ? d.metrics.perOption.find((o) => o.letter === d.metrics!.secondLetter)
+              : undefined
+          if (bestOpt) {
+            base.bestDarkRatio = bestOpt.darkRatio
+            base.bestContrast = bestOpt.contrast
+            base.failedAbsoluteDark = bestOpt.darkRatio < MIN_DARK_RATIO
+            base.failedAbsoluteContrast = bestOpt.contrast < MIN_CONTRAST
+          }
+          if (secondOpt) {
+            base.secondDarkRatio = secondOpt.darkRatio
+            base.secondContrast = secondOpt.contrast
+          }
         }
         return base
       }),
