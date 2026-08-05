@@ -522,15 +522,15 @@ export async function runAzureLayoutOmrPipeline(params: {
   }
   out.sort((a, b) => Number(a.questionNumber) - Number(b.questionNumber))
 
-  // FASE R.20: rescate visual anti-BLANK — SHADOW only; APPLY hard-blocked (never mutates out).
+  // PASO 1: rescate visual anti-BLANK — shadow por defecto; apply solo si APPLY=1.
+  // Solo fusiona rescued_answer vía proposedRows; no reemplaza out completo.
   try {
     const rescueMode = resolveVisualBlankRescueModeFromEnv()
     if (rescueMode !== "off") {
       const meta = await sharp(orientation.buffer).metadata()
       const imageWidth = meta.width ?? 0
       const imageHeight = meta.height ?? 0
-      // R.20: even if APPLY=1 by mistake, force shadow so out is never modified.
-      await runAzureVisualBlankRescue({
+      const rescueResult = await runAzureVisualBlankRescue({
         imageBuffer: orientation.buffer,
         imageWidth,
         imageHeight,
@@ -544,9 +544,24 @@ export async function runAzureLayoutOmrPipeline(params: {
         expectedQuestionCount: expected ?? out.length,
         expectedOptionCount,
         variant,
-        mode: "shadow",
+        mode: rescueMode,
       })
-      // Intentionally ignore proposedRows; do not assign to out.
+      if (rescueMode === "apply" && rescueResult.proposedRows) {
+        const proposedByQ = new Map(
+          rescueResult.proposedRows.map((r) => [Number(r.questionNumber), r] as const)
+        )
+        for (let i = 0; i < out.length; i++) {
+          const proposed = proposedByQ.get(Number(out[i].questionNumber))
+          if (!proposed || proposed.visualBlankRescue !== true) continue
+          if (typeof proposed.selectedAnswer !== "string") continue
+          out[i] = {
+            ...out[i],
+            selectedAnswer: proposed.selectedAnswer,
+            visualBlankRescue: true,
+            visualBlankRescueLetter: proposed.visualBlankRescueLetter,
+          }
+        }
+      }
     }
   } catch {
     // fail-soft

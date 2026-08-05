@@ -481,7 +481,7 @@ test("R.25-8. Shadow apagado: cero telemetría", async () => {
   assert.equal(lines.length, 0)
 })
 
-test("R.25-9. APPLY sin efecto en call site existente (fuerza shadow, ignora proposedRows)", async () => {
+test("PASO 1. call site respeta APPLY: mode rescueMode + merge proposedRows (solo rescued_answer)", async () => {
   const fs = await import("node:fs")
   const path = await import("node:path")
   const pipelinePath = path.join(
@@ -489,9 +489,12 @@ test("R.25-9. APPLY sin efecto en call site existente (fuerza shadow, ignora pro
     "app/lib/omr/experimental/azure-layout-omr-pipeline.ts"
   )
   const src = fs.readFileSync(pipelinePath, "utf8")
-  assert.ok(src.includes('mode: "shadow"'))
-  assert.ok(src.includes("Intentionally ignore proposedRows; do not assign to out."))
-  assert.ok(src.includes("force shadow so out is never modified"))
+  assert.ok(src.includes("mode: rescueMode"))
+  assert.ok(src.includes('rescueMode === "apply"'))
+  assert.ok(src.includes("proposed.visualBlankRescue !== true"))
+  assert.ok(!src.includes('mode: "shadow"'))
+  assert.ok(!src.includes("Intentionally ignore proposedRows; do not assign to out."))
+  assert.ok(!src.includes("force shadow so out is never modified"))
   withFlags("1", "1", () => {
     assert.equal(resolveVisualBlankRescueModeFromEnv(), "apply")
   })
@@ -499,6 +502,7 @@ test("R.25-9. APPLY sin efecto en call site existente (fuerza shadow, ignora pro
   assert.equal(moduleApply.pageAction, "apply_proposals")
   assert.ok(moduleApply.proposedRows)
   assert.equal(moduleApply.proposedRows?.[0]?.selectedAnswer, "C")
+  assert.equal(moduleApply.proposedRows?.[0]?.visualBlankRescue, true)
 })
 
 async function run(): Promise<void> {
