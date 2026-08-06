@@ -5,6 +5,7 @@
 import sharp from "sharp"
 import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
 import { recordAzureRawSnapshot } from "@/app/lib/diagnostics/azure-raw-snapshot-recorder"
+import { recordVisualVerificationPrevalence } from "@/app/lib/diagnostics/visual-verification-prevalence-recorder"
 import {
   resolveVisualBlankRescueModeFromEnv,
   runAzureVisualBlankRescue,
@@ -12,6 +13,19 @@ import {
 import { mapDualPanelsWithPautaOrchestrator } from "./azure-layout-omr-pauta-orchestrator"
 
 export type OmrTemplateVariant = "odd_even_dual_column" | "sequential_dual_column" | "single_column"
+
+/**
+ * Contexto técnico readonly para correlación exacta (PASO 2 / prevalencia).
+ * Todos los campos opcionales; sin defaults inventados. No debe alterar control flow ni resultados.
+ * diagnosticRunId: una sola vez por executeEvaluatePostBody (no por página/attempt).
+ */
+export type AzureLayoutOmrDiagnosticContext = Readonly<{
+  diagnosticRunId?: string
+  evaluationBatchId?: string
+  batchStudentIndex?: number
+  pageIndex?: number
+  attempt?: number
+}>
 
 type Mark = {
   state: "selected" | "unselected"
@@ -378,6 +392,11 @@ export async function runAzureLayoutOmrPipeline(params: {
   omrTemplateVariant?: OmrTemplateVariant
   /** Orden pauta (solo isDevelopment): orquestador Y sin tocar parseMarks/clusterRowsByY. */
   pautaSegmentationItems?: Array<{ isDevelopment: boolean }>
+  /**
+   * Contexto técnico readonly (PASO 2). Solo passthrough para correlación futura.
+   * No altera pipeline, Shadow, APPLY, respuestas ni retorno.
+   */
+  diagnosticContext?: AzureLayoutOmrDiagnosticContext
 }): Promise<Record<string, unknown>> {
   const endpoint = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
   const key = process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY
@@ -562,6 +581,16 @@ export async function runAzureLayoutOmrPipeline(params: {
           }
         }
       }
+      // PASO 2 / FASE 2A-2: telemetría pasiva de prevalencia (fail-soft; no muta out/decisions).
+      recordVisualVerificationPrevalence({
+        diagnosticContext: params.diagnosticContext,
+        rescueMode,
+        rescueResult,
+        expectedQuestionCount: expected ?? out.length,
+        expectedOptionCount,
+        imageAvailableInMemory:
+          Buffer.isBuffer(orientation.buffer) && orientation.buffer.length > 0,
+      })
     }
   } catch {
     // fail-soft

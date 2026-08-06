@@ -2,6 +2,7 @@
 // Endpoint principal para evaluar pruebas de estudiantes
 // Integra OMR para respuestas cerradas con retroalimentación IA
 // Soporta imágenes, PDF y Word: si hay PDF/Word se usa Azure OCR + Mistral texto; si solo imágenes, Mistral Vision.
+import { randomUUID } from "node:crypto"
 import { NextResponse } from "next/server"
 import { AzureKeyCredential, DocumentAnalysisClient } from "@azure/ai-form-recognizer"
 // FIX_BUILD_PATH_REVERSIBLE: usar rutas relativas robustas (Railway case-sensitive + build context)
@@ -11,7 +12,10 @@ import { extractTextFromFiles } from "./utils"
 import { persistEvaluation } from "../../lib/persist-evaluation"
 import { getAuthUser } from "../../lib/supabase-route"
 import { getSupabaseServer } from "../../lib/supabase-server"
-import { runAzureLayoutOmrPipeline } from "../../lib/omr/experimental/azure-layout-omr-pipeline"
+import {
+  runAzureLayoutOmrPipeline,
+  type AzureLayoutOmrDiagnosticContext,
+} from "../../lib/omr/experimental/azure-layout-omr-pipeline"
 import {
   assertOmrRawMatchesDetected,
   buildDetectedAnswersFromMerged,
@@ -1180,6 +1184,11 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
   pautaItemsForOmSegmentation?: Array<{ isDevelopment: boolean }>
   templateKey: string
   templateVariant?: OmrTemplateVariantInterleaved
+  /**
+   * Contexto técnico readonly (PASO 2). Passthrough hacia runAzureLayoutOmrPipeline.
+   * No altera respuestas, scoring ni persistencia.
+   */
+  diagnosticContext?: AzureLayoutOmrDiagnosticContext
 }): Promise<{
   detectedAnswers: { pregunta: string; respuesta_detectada: string; confianza: number }[]
   officialOmrPerQuestionRaw: any[]
@@ -1206,6 +1215,9 @@ async function extractStudentClosedAnswersAzureLayoutOfficial(params: {
     omrTemplateVariant: params.templateVariant ?? "odd_even_dual_column",
     ...(Array.isArray(params.pautaItemsForOmSegmentation) && params.pautaItemsForOmSegmentation.length > 0
       ? { pautaSegmentationItems: params.pautaItemsForOmSegmentation }
+      : {}),
+    ...(params.diagnosticContext !== undefined
+      ? { diagnosticContext: params.diagnosticContext }
       : {}),
   })
   if (!azure || (azure as any).success !== true) {
@@ -1805,6 +1817,12 @@ function finalizeEvaluateSuccessResponseHttp200(resultadoFinal: Record<string, u
  */
 export async function executeEvaluatePostBody(body: unknown): Promise<NextResponse> {
   console.info("[ROUTE-TRACE] executeEvaluatePostBody hit")
+  /**
+   * Identidad diagnóstica de esta ejecución (PASO 2). Una sola vez por llamada.
+   * No se persiste, no se devuelve al frontend, no afecta scoring/control flow.
+   * Solo deduplicación de telemetría de prevalencia.
+   */
+  const diagnosticRunId = randomUUID()
   /** Si el fallo ocurre antes de completar una fase con estado OMR real, el catch no debe inventar flags. */
   let omrDebugSnapshotForCatch: Record<string, unknown> | null = null
   const providerTraceAcc: ProviderTraceAcc = { current: { ...DEFAULT_EVALUATION_PROVIDER_TRACE } }
@@ -2592,9 +2610,22 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
                     hybridStructuredQuestionOrder,
                   })
                 } else {
+                  const diagnosticContext: AzureLayoutOmrDiagnosticContext = {
+                    diagnosticRunId,
+                    ...(typeof evaluationBatchIdBody === "string"
+                      ? { evaluationBatchId: evaluationBatchIdBody }
+                      : {}),
+                    ...(typeof batchStudentIndexBody === "number" &&
+                    Number.isFinite(batchStudentIndexBody)
+                      ? { batchStudentIndex: batchStudentIndexBody }
+                      : {}),
+                    pageIndex: i,
+                    attempt,
+                  }
                   azureOfficial = await extractStudentClosedAnswersAzureLayoutOfficial({
                     ...azureParams,
                     studentImageBase64: imgForAttempt ?? studentBase64,
+                    diagnosticContext,
                   })
                 }
                 if (attempt === 1) azureRecoveredAfterImageEnhance = true
