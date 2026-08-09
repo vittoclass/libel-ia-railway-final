@@ -4,7 +4,10 @@
  */
 import sharp from "sharp"
 import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
-import { recordAzureRawSnapshot } from "@/app/lib/diagnostics/azure-raw-snapshot-recorder"
+import {
+  computeAzureInputSha256,
+  recordAzureRawSnapshot,
+} from "@/app/lib/diagnostics/azure-raw-snapshot-recorder"
 import { recordVisualVerificationPrevalence } from "@/app/lib/diagnostics/visual-verification-prevalence-recorder"
 import {
   resolveVisualBlankRescueModeFromEnv,
@@ -437,10 +440,6 @@ export async function runAzureLayoutOmrPipeline(params: {
     filesProcessed: 1,
   })
 
-  // FASE R.13: snapshot pasivo local de selectionMarks crudos (antes de parseMarks/OMR).
-  // Fail-soft; no muta analyzeResult; flag LIBELIA_AZURE_RAW_SNAPSHOT=1.
-  recordAzureRawSnapshot(analyze.analyzeResult)
-
   const parsed = parseMarks(analyze.analyzeResult)
   const normalizeMarksAffine = (marks: Mark[]): Mark[] => {
     if (!marks.length) return marks
@@ -540,6 +539,28 @@ export async function runAzureLayoutOmrPipeline(params: {
     }
   }
   out.sort((a, b) => Number(a.questionNumber) - Number(b.questionNumber))
+
+  // FASE N2-A.3: snapshot forense pasivo (selectionMarks crudos + SHA input Azure + dims + OMR).
+  // Se emite tras OMR layout y ANTES del rescate visual (Nivel 1), sin mutar out/analyzeResult.
+  // Fail-soft; flag LIBELIA_AZURE_RAW_SNAPSHOT=1.
+  try {
+    const dc = params.diagnosticContext
+    recordAzureRawSnapshot(analyze.analyzeResult, {
+      diagnosticRunId: dc?.diagnosticRunId,
+      evaluationBatchId: dc?.evaluationBatchId,
+      batchStudentIndex: dc?.batchStudentIndex,
+      pageIndex: dc?.pageIndex,
+      attempt: dc?.attempt,
+      azureInputSha256: computeAzureInputSha256(orientation.buffer),
+      omrPerQuestion: out.map((row) => ({
+        questionNumber: Number(row.questionNumber),
+        selectedAnswer:
+          typeof row.selectedAnswer === "string" ? row.selectedAnswer : undefined,
+      })),
+    })
+  } catch {
+    // invisible
+  }
 
   // PASO 1: rescate visual anti-BLANK — shadow por defecto; apply solo si APPLY=1.
   // Solo fusiona rescued_answer vía proposedRows; no reemplaza out completo.

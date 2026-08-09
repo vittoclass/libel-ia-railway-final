@@ -1,23 +1,43 @@
 /**
- * Azure Raw Snapshot Recorder (FASE R.10 — pasivo, stdout, reversible).
+ * Azure Raw Snapshot Recorder (FASE R.10 + N2-A.3 — pasivo, stdout, reversible).
  *
- * Captura una instantánea diagnóstica mínima de selectionMarks crudos de Azure
- * ANTES de cualquier transformación OMR de LibelIA.
+ * Captura una instantánea diagnóstica forense mínima:
+ * - selectionMarks crudos de Azure (antes de transformaciones OMR)
+ * - identidad técnica (diagnosticRunId / batch / page / attempt)
+ * - SHA-256 del buffer EXACTO enviado a Azure (orientation.buffer post rotate/png)
+ * - width / height / unit de página Azure
+ * - omrPerQuestion (questionNumber + selectedAnswer) de esa ejecución
  *
  * Emisión únicamente con LIBELIA_AZURE_RAW_SNAPSHOT=1 (valor exacto).
- * Fail-soft absoluto: nunca lanza; no muta analyzeResult; no async.
+ * Fail-soft absoluto: nunca lanza; no muta analyzeResult/out; no async.
  * Salida: un console.log por página con prefijo [AZURE_RAW_SNAPSHOT] (sin archivos).
+ *
+ * Mapping de contrato (nombres canónicos ↔ payload):
+ *   diagnosticRunId     → diagnosticRunId
+ *   evaluationBatchId   → evaluationBatchId (legacy: technicalBatchId)
+ *   batchStudentIndex   → batchStudentIndex
+ *   pageIndex           → pageIndex (identidad lógica; context.pageIndex si 1 página)
+ *   azurePageIndex      → azurePageIndex (índice en analyzeResult.pages)
+ *   attempt             → attempt
+ *   azureInputSha256    → azureInputSha256
+ *   width/height/unit   → width / height / unit
+ *   selectionMarks      → polygon / state / confidence (+ index / pageNumber)
+ *   omrPerQuestion      → questionNumber / selectedAnswer
  */
+
+import { createHash } from "node:crypto"
 
 export const AZURE_RAW_SNAPSHOT_FLAG = "LIBELIA_AZURE_RAW_SNAPSHOT" as const
 
-export const AZURE_RAW_SNAPSHOT_SCHEMA_VERSION = 1 as const
+export const AZURE_RAW_SNAPSHOT_SCHEMA_VERSION = 2 as const
 
 const MAX_SNAPSHOTS_PER_PROCESS = 20
 const MAX_LOG_BYTES = 256 * 1024
 const MAX_POLYGON_NUMBERS = 64
 const MAX_MARKS_PER_PAGE = 2000
+const MAX_OMR_ROWS = 500
 const MAX_TECH_BATCH_LEN = 64
+const MAX_UNIT_LEN = 32
 const LOG_PREFIX = "[AZURE_RAW_SNAPSHOT]"
 
 export type AzureRawSnapshotMark = {
@@ -30,21 +50,45 @@ export type AzureRawSnapshotMark = {
   pageNumber?: number
 }
 
+export type AzureRawSnapshotOmrRow = {
+  questionNumber: number
+  selectedAnswer: string
+}
+
 export type AzureRawSnapshotPayload = {
   schemaVersion: typeof AZURE_RAW_SNAPSHOT_SCHEMA_VERSION
   timestamp: string
+  diagnosticRunId?: string
+  evaluationBatchId?: string
+  /** @deprecated Prefer evaluationBatchId. Conservado por compatibilidad. */
   technicalBatchId?: string
   batchStudentIndex?: number
   pageIndex: number
+  azurePageIndex?: number
+  attempt?: number
+  azureInputSha256?: string
+  width?: number
+  height?: number
+  /** Solo si Azure lo envió en runtime; nunca se inventa (p. ej. no asumir "pixel"). */
+  unit?: string
   selectionMarksTotal: number
   selectionMarks: AzureRawSnapshotMark[]
+  omrPerQuestion?: AzureRawSnapshotOmrRow[]
 }
 
 export type AzureRawSnapshotContext = {
+  diagnosticRunId?: string
+  evaluationBatchId?: string
+  /** @deprecated Prefer evaluationBatchId. */
   technicalBatchId?: string
   batchStudentIndex?: number
   /** Si se indica, se usa como pageIndex del snapshot (una sola página lógica). */
   pageIndex?: number
+  attempt?: number
+  /** SHA-256 hex del buffer exacto enviado a Azure (orientation.buffer). */
+  azureInputSha256?: string
+  /** Resultado OMR por pregunta de esa ejecución (letra / BLANK / MULTIPLE). */
+  omrPerQuestion?: ReadonlyArray<{ questionNumber?: unknown; selectedAnswer?: unknown }>
 }
 
 type EmitSnapshotFn = (line: string) => void
@@ -66,14 +110,30 @@ export function isAzureRawSnapshotEnabled(): boolean {
 }
 
 /**
+ * SHA-256 hexadecimal del buffer exacto enviado a Azure.
+ * Fail-soft: nunca lanza; no retiene el buffer.
+ */
+export function computeAzureInputSha256(buffer: unknown): string | undefined {
+  try {
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+      return undefined
+    }
+    return createHash("sha256").update(buffer).digest("hex")
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Construye un snapshot sanitizado de una página. No muta `page`.
- * Solo state / confidence / polygon|boundingRegion / pageNumber / índice.
+ * Solo state / confidence / polygon|boundingRegion / pageNumber / índice / dims / unit.
  */
 export function buildSanitizedAzureRawPageSnapshot(
   page: unknown,
   pageIndex: number,
   context?: AzureRawSnapshotContext,
   timestamp?: string,
+  azurePageIndex?: number,
 ): AzureRawSnapshotPayload | null {
   try {
     if (page === null || typeof page !== "object" || Array.isArray(page)) {
@@ -107,10 +167,35 @@ export function buildSanitizedAzureRawPageSnapshot(
       selectionMarks,
     }
 
+    if (
+      typeof azurePageIndex === "number" &&
+      Number.isInteger(azurePageIndex) &&
+      azurePageIndex >= 0
+    ) {
+      out.azurePageIndex = azurePageIndex
+    }
+
+    const width = readOptionalFiniteNumber(src.width)
+    if (width !== undefined) out.width = width
+    const height = readOptionalFiniteNumber(src.height)
+    if (height !== undefined) out.height = height
+    const unit = readOptionalUnit(src.unit)
+    if (unit !== undefined) out.unit = unit
+
+    const diagnosticRunId = readBoundedPlainId(context?.diagnosticRunId)
+    if (diagnosticRunId !== undefined) out.diagnosticRunId = diagnosticRunId
+
+    const evaluationBatchId = readBoundedPlainId(context?.evaluationBatchId)
+    if (evaluationBatchId !== undefined) out.evaluationBatchId = evaluationBatchId
+
     const batchId = readBoundedPlainId(context?.technicalBatchId)
     if (batchId !== undefined) {
       out.technicalBatchId = batchId
+      if (out.evaluationBatchId === undefined) {
+        out.evaluationBatchId = batchId
+      }
     }
+
     if (
       typeof context?.batchStudentIndex === "number" &&
       Number.isInteger(context.batchStudentIndex) &&
@@ -118,6 +203,20 @@ export function buildSanitizedAzureRawPageSnapshot(
     ) {
       out.batchStudentIndex = context.batchStudentIndex
     }
+
+    if (
+      typeof context?.attempt === "number" &&
+      Number.isInteger(context.attempt) &&
+      context.attempt >= 0
+    ) {
+      out.attempt = context.attempt
+    }
+
+    const sha = readSha256Hex(context?.azureInputSha256)
+    if (sha !== undefined) out.azureInputSha256 = sha
+
+    const omr = sanitizeOmrPerQuestion(context?.omrPerQuestion)
+    if (omr !== undefined) out.omrPerQuestion = omr
 
     return out
   } catch {
@@ -175,6 +274,7 @@ export function recordAzureRawSnapshot(
         effectivePageIndex,
         context,
         timestamp,
+        pageIndex,
       )
       if (snapshot === null) {
         continue
@@ -255,6 +355,37 @@ function sanitizeMark(
   }
 }
 
+function sanitizeOmrPerQuestion(
+  rows: AzureRawSnapshotContext["omrPerQuestion"],
+): AzureRawSnapshotOmrRow[] | undefined {
+  try {
+    if (!Array.isArray(rows) || rows.length === 0) return undefined
+    const out: AzureRawSnapshotOmrRow[] = []
+    const limit = Math.min(rows.length, MAX_OMR_ROWS)
+    for (let i = 0; i < limit; i++) {
+      const row = rows[i]
+      if (row === null || typeof row !== "object") continue
+      const qn = (row as { questionNumber?: unknown }).questionNumber
+      const ans = (row as { selectedAnswer?: unknown }).selectedAnswer
+      if (typeof qn !== "number" || !Number.isInteger(qn) || qn < 1) continue
+      if (typeof ans !== "string") continue
+      const selectedAnswer = normalizeOmrSelectedAnswer(ans)
+      if (selectedAnswer === undefined) continue
+      out.push({ questionNumber: qn, selectedAnswer })
+    }
+    return out.length > 0 ? out : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function normalizeOmrSelectedAnswer(value: string): string | undefined {
+  const t = value.trim().toUpperCase()
+  if (t === "BLANK" || t === "MULTIPLE") return t
+  if (/^[A-H]$/.test(t)) return t
+  return undefined
+}
+
 function normalizeState(value: unknown): "selected" | "unselected" | undefined {
   if (typeof value !== "string") return undefined
   const st = value.toLowerCase()
@@ -299,6 +430,28 @@ function readOptionalPositiveInt(value: unknown): number | undefined {
   return value
 }
 
+function readOptionalFiniteNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined
+  }
+  return value
+}
+
+function readOptionalUnit(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  if (trimmed.length === 0 || trimmed.length > MAX_UNIT_LEN) return undefined
+  if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) return undefined
+  return trimmed
+}
+
+function readSha256Hex(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const t = value.trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(t)) return undefined
+  return t
+}
+
 function readBoundedPlainId(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined
   const trimmed = value.trim()
@@ -322,4 +475,3 @@ export function __setAzureRawSnapshotEmitForTests(fn: EmitSnapshotFn | null): vo
 export function __getAzureRawSnapshotWrittenCountForTests(): number {
   return writtenCount
 }
-
