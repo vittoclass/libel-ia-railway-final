@@ -12,6 +12,10 @@
  * Fail-soft absoluto: nunca lanza; no muta analyzeResult/out; no async.
  * Salida: un console.log por página con prefijo [AZURE_RAW_SNAPSHOT] (sin archivos).
  *
+ * IMPORTANTE (N2-A.6B): RAW_SNAPSHOT=1 NO almacena bytes de imagen.
+ * El almacenamiento del buffer exacto requiere LIBELIA_AZURE_FORENSIC_BUFFER_CAPTURE=1
+ * (módulo azure-forensic-buffer-artifact; independiente).
+ *
  * Mapping de contrato (nombres canónicos ↔ payload):
  *   diagnosticRunId     → diagnosticRunId
  *   evaluationBatchId   → evaluationBatchId (legacy: technicalBatchId)

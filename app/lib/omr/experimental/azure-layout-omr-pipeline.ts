@@ -4,6 +4,7 @@
  */
 import sharp from "sharp"
 import { recordAzureDiCostAuditShadow } from "@/app/lib/cost-audit/recordAzureDiCostAuditShadow"
+import { recordAzureForensicPackage } from "@/app/lib/diagnostics/azure-forensic-buffer-artifact"
 import {
   computeAzureInputSha256,
   recordAzureRawSnapshot,
@@ -12,6 +13,7 @@ import { recordVisualVerificationPrevalence } from "@/app/lib/diagnostics/visual
 import {
   resolveVisualBlankRescueModeFromEnv,
   runAzureVisualBlankRescue,
+  type VisualBlankRescuePageResult,
 } from "@/app/lib/omr-shared/azure-visual-blank-rescue"
 import { mapDualPanelsWithPautaOrchestrator } from "./azure-layout-omr-pauta-orchestrator"
 
@@ -543,6 +545,8 @@ export async function runAzureLayoutOmrPipeline(params: {
   // FASE N2-A.3: snapshot forense pasivo (selectionMarks crudos + SHA input Azure + dims + OMR).
   // Se emite tras OMR layout y ANTES del rescate visual (Nivel 1), sin mutar out/analyzeResult.
   // Fail-soft; flag LIBELIA_AZURE_RAW_SNAPSHOT=1.
+  // RAW_SNAPSHOT sola NO almacena bytes de imagen (solo log JSON sanitizado).
+  const azureInputSha256ForDiag = computeAzureInputSha256(orientation.buffer)
   try {
     const dc = params.diagnosticContext
     recordAzureRawSnapshot(analyze.analyzeResult, {
@@ -551,7 +555,7 @@ export async function runAzureLayoutOmrPipeline(params: {
       batchStudentIndex: dc?.batchStudentIndex,
       pageIndex: dc?.pageIndex,
       attempt: dc?.attempt,
-      azureInputSha256: computeAzureInputSha256(orientation.buffer),
+      azureInputSha256: azureInputSha256ForDiag,
       omrPerQuestion: out.map((row) => ({
         questionNumber: Number(row.questionNumber),
         selectedAnswer:
@@ -562,8 +566,12 @@ export async function runAzureLayoutOmrPipeline(params: {
     // invisible
   }
 
+  // Copia diagnóstica pre-N1 (solo lectura) para paquete forense; no se usa en scoring.
+  const omrPreN1ForForensics: Array<Record<string, unknown>> = out.map((row) => ({ ...row }))
+
   // PASO 1: rescate visual anti-BLANK — shadow por defecto; apply solo si APPLY=1.
   // Solo fusiona rescued_answer vía proposedRows; no reemplaza out completo.
+  let n1ResultForForensics: VisualBlankRescuePageResult | undefined
   try {
     const rescueMode = resolveVisualBlankRescueModeFromEnv()
     if (rescueMode !== "off") {
@@ -586,6 +594,7 @@ export async function runAzureLayoutOmrPipeline(params: {
         variant,
         mode: rescueMode,
       })
+      n1ResultForForensics = rescueResult
       if (rescueMode === "apply" && rescueResult.proposedRows) {
         const proposedByQ = new Map(
           rescueResult.proposedRows.map((r) => [Number(r.questionNumber), r] as const)
@@ -615,6 +624,37 @@ export async function runAzureLayoutOmrPipeline(params: {
     }
   } catch {
     // fail-soft
+  }
+
+  // FASE N2-A.6B: captura forense del buffer exacto + metadata Pixel-Proof.
+  // Flag exclusiva LIBELIA_AZURE_FORENSIC_BUFFER_CAPTURE=1. OFF por defecto.
+  // Independiente de RAW_SNAPSHOT. Fail-soft; no muta out; no await bloqueante funcional.
+  try {
+    await recordAzureForensicPackage({
+      azureInputBuffer: orientation.buffer,
+      azureInputSha256: azureInputSha256ForDiag,
+      analyzeResult: analyze.analyzeResult,
+      marks: parsed.marks,
+      omrPreN1: omrPreN1ForForensics,
+      n1Result: n1ResultForForensics,
+      diagnosticContext: params.diagnosticContext,
+      layout: {
+        expectedQuestionCount: expected ?? out.length,
+        expectedOptionCount,
+        variant,
+        templateKey: params.templateKey,
+        canonicalWidth: params.canonicalWidth,
+        canonicalHeight: params.canonicalHeight,
+      },
+      transform: {
+        azureAnalyzeUsedNormalizedBuffer: orientation.azureAnalyzeUsedNormalizedBuffer,
+        azureAutoRotationApplied: orientation.azureAutoRotationApplied,
+        azureRotationDegreesApplied: orientation.azureRotationDegreesApplied,
+        azureOrientationNormalizationReason: orientation.azureOrientationNormalizationReason,
+      },
+    })
+  } catch {
+    // invisible
   }
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${params.canonicalWidth}" height="${params.canonicalHeight}" viewBox="0 0 ${params.canonicalWidth} ${params.canonicalHeight}">${parsed.marks
