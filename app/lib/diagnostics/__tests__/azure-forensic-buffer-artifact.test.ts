@@ -671,7 +671,9 @@ test("25b. sin sink configurado → fail-soft sink_not_configured", async () => 
     __setAzureForensicSinkForTests(null)
     __setAzureForensicEmitForTests((l) => lines.push(l))
     const prevDir = process.env.LIBELIA_AZURE_FORENSIC_SINK_DIR
+    const prevBucket = process.env.LIBELIA_AZURE_FORENSIC_BUCKET
     delete process.env.LIBELIA_AZURE_FORENSIC_SINK_DIR
+    delete process.env.LIBELIA_AZURE_FORENSIC_BUCKET
     try {
       const fixture = makeAnalyzeResult7x4()
       const buffer = synthPngBuffer("nosink")
@@ -690,6 +692,8 @@ test("25b. sin sink configurado → fail-soft sink_not_configured", async () => 
     } finally {
       if (prevDir === undefined) delete process.env.LIBELIA_AZURE_FORENSIC_SINK_DIR
       else process.env.LIBELIA_AZURE_FORENSIC_SINK_DIR = prevDir
+      if (prevBucket === undefined) delete process.env.LIBELIA_AZURE_FORENSIC_BUCKET
+      else process.env.LIBELIA_AZURE_FORENSIC_BUCKET = prevBucket
     }
   })
 })

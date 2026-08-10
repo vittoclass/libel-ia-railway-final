@@ -1,5 +1,5 @@
 /**
- * Azure Forensic Buffer Artifact (FASE N2-A.6B — diagnóstico, local, reversible).
+ * Azure Forensic Buffer Artifact (FASE N2-A.6B/A.8 — diagnóstico, local, reversible).
  *
  * Captura el buffer EXACTO enviado a Azure (orientation.buffer) + metadata forense
  * necesaria para Pixel-Proof N2 offline, SIN mutar evaluación.
@@ -7,8 +7,15 @@
  * Flag exclusiva: LIBELIA_AZURE_FORENSIC_BUFFER_CAPTURE === "1"
  * OFF por defecto. Independiente de LIBELIA_AZURE_RAW_SNAPSHOT.
  *
- * Sink: abstracción privada configurable. En local/tests → InMemory / LocalFs mock.
- * NO conecta bucket remoto en esta fase. Bucket sugerido futuro: libelia-omr-forensics.
+ * Sink (resolución diagnóstica):
+ *   1) sink explícito (tests / override)
+ *   2) remoto privado si LIBELIA_AZURE_FORENSIC_BUCKET está configurado (adapter A.8)
+ *   3) LocalFs solo en entorno NO productivo con LIBELIA_AZURE_FORENSIC_SINK_DIR absoluto
+ *      (nunca /tmp; nunca fallback silencioso en producción)
+ *   4) si nada → sink_not_configured (fail-soft)
+ *
+ * Bucket sugerido futuro: libelia-omr-forensics. PROHIBIDO batch-scans.
+ * NO activar captura ni crear bucket real sin GO separado.
  *
  * Retención diseñada (NO automatizada aquí): máximo 7 días.
  * Identificar: path diag/azure-input/.../{sha256}.png + .meta.json
@@ -27,6 +34,7 @@ import * as path from "node:path"
 import {
   computeAzureInputSha256,
 } from "@/app/lib/diagnostics/azure-raw-snapshot-recorder"
+import { tryCreateConfiguredRemoteForensicSink } from "@/app/lib/diagnostics/azure-forensic-remote-sink"
 import type { AzureLayoutOmrDiagnosticContext } from "@/app/lib/omr/experimental/azure-layout-omr-pipeline"
 import type { VisualBlankRescuePageResult } from "@/app/lib/omr-shared/azure-visual-blank-rescue"
 
@@ -234,8 +242,8 @@ let emitFn: EmitFn = (line) => {
 }
 
 /**
- * Sink activo: tests inyectan memoria; runtime usa resolveDefaultForensicSink().
- * Sin LIBELIA_AZURE_FORENSIC_SINK_DIR → fail-soft sink_not_configured (no finge persistencia).
+ * Sink activo: tests inyectan memoria; runtime usa resolveActiveForensicSink().
+ * Sin remoto/local configurado → fail-soft sink_not_configured (no finge persistencia).
  */
 let activeSink: AzureForensicSink | null = null
 let sinkOverrideForTests: AzureForensicSink | null = null
@@ -1055,22 +1063,55 @@ function resolveActiveForensicSink(): AzureForensicSink | null {
   if (sinkOverrideForTests) return sinkOverrideForTests
   if (activeSink) return activeSink
   try {
-    const dir = process.env[AZURE_FORENSIC_SINK_DIR_ENV]
-    if (typeof dir === "string" && dir.trim().length > 0) {
-      // Solo paths absolutos (evitar escribir relativo accidental en CWD de prod).
-      const trimmed = dir.trim()
-      if (
-        trimmed.startsWith("/") ||
-        /^[A-Za-z]:[\\/]/.test(trimmed)
-      ) {
-        activeSink = createLocalFsForensicSink(trimmed)
-        return activeSink
+    // 1) Remoto diagnóstico (LIBELIA_AZURE_FORENSIC_BUCKET). Fail-soft si falta/prohibido.
+    const remote = tryCreateConfiguredRemoteForensicSink()
+    if (remote) {
+      activeSink = remote
+      return activeSink
+    }
+
+    // 2) LocalFs solo fuera de producción, dir absoluto explícito, nunca /tmp.
+    //    Sin fallback silencioso a filesystem efímero en producción.
+    if (!isProductionRuntime()) {
+      const dir = process.env[AZURE_FORENSIC_SINK_DIR_ENV]
+      if (typeof dir === "string" && dir.trim().length > 0) {
+        const trimmed = dir.trim()
+        if (isForbiddenEphemeralSinkDir(trimmed)) {
+          return null
+        }
+        if (
+          trimmed.startsWith("/") ||
+          /^[A-Za-z]:[\\/]/.test(trimmed)
+        ) {
+          activeSink = createLocalFsForensicSink(trimmed)
+          return activeSink
+        }
       }
     }
   } catch {
     return null
   }
   return null
+}
+
+function isProductionRuntime(): boolean {
+  try {
+    return process.env.NODE_ENV === "production"
+  } catch {
+    return false
+  }
+}
+
+/** Rechaza /tmp (y equivalentes) como raíz de sink local. */
+function isForbiddenEphemeralSinkDir(dir: string): boolean {
+  try {
+    const n = dir.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
+    if (n === "/tmp" || n.startsWith("/tmp/")) return true
+    if (n === "/var/tmp" || n.startsWith("/var/tmp/")) return true
+    return false
+  } catch {
+    return true
+  }
 }
 
 /** Solo tests. */
