@@ -503,6 +503,7 @@ test("PASO 1. call site respeta APPLY: mode rescueMode + merge proposedRows (sol
   assert.ok(moduleApply.proposedRows)
   assert.equal(moduleApply.proposedRows?.[0]?.selectedAnswer, "C")
   assert.equal(moduleApply.proposedRows?.[0]?.visualBlankRescue, true)
+  assert.equal(moduleApply.proposedRows?.[0]?.visualBlankRescueSource, "N1")
 })
 
 async function run(): Promise<void> {

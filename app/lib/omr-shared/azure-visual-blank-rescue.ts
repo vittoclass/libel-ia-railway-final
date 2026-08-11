@@ -113,8 +113,9 @@ export type VisualBlankRescuePageResult = {
   decisions: VisualBlankRescueRowDecision[]
   proposedRows: ReadonlyArray<Record<string, unknown>> | null
   /**
-   * N2 Shadow only: observación tras N1. Nunca alimenta proposedRows/APPLY.
-   * Ausente cuando mode=off o page gates impiden análisis.
+   * Decisiones N2 certificadas (post-N1). En mode=shadow solo observación.
+   * En mode=apply, buildProposedRows puede consumir confirmed_answer elegibles
+   * (sin recalcular umbrales). Ausente cuando mode=off o page gates fallan.
    */
   n2Decisions?: ReadonlyArray<VisualBlankN2Decision>
 }
@@ -586,28 +587,60 @@ function decideRow(params: {
   }
 }
 
-function buildProposedRows(
+/**
+ * APPLY merge mínimo. Una sola fuente de verdad por motor:
+ * - N1: decisions.action === rescued_answer
+ * - N2: n2Decisions.action === confirmed_answer (ya gateado por evaluateVisualBlankN2)
+ * Precedencia: Azure válida > N1 > N2. No recalcula umbrales N2.
+ */
+export function buildVisualBlankRescueProposedRows(
   rows: ReadonlyArray<VisualBlankRescueRow>,
-  decisions: VisualBlankRescueRowDecision[]
+  decisions: ReadonlyArray<VisualBlankRescueRowDecision>,
+  n2Decisions?: ReadonlyArray<VisualBlankN2Decision>
 ): Record<string, unknown>[] {
-  const rescueByQ = new Map<number, string>()
+  const n1RescueByQ = new Map<number, string>()
+  const n1ByQ = new Map<number, VisualBlankRescueRowDecision>()
   for (const d of decisions) {
-    if (d.action === "rescued_answer") rescueByQ.set(d.questionNumber, d.letter)
+    n1ByQ.set(d.questionNumber, d)
+    if (d.action === "rescued_answer") n1RescueByQ.set(d.questionNumber, d.letter)
   }
-  return rows.map((row) => {
+
+  return rows.map((row, i) => {
     const copy: Record<string, unknown> = { ...row }
-    const letter = rescueByQ.get(row.questionNumber)
-    if (
-      letter &&
+    const blankEligible =
       isBlankLike(row.selectedAnswer) &&
       !isMultiple(row.selectedAnswer) &&
       !isLetterAnswer(row.selectedAnswer) &&
       row.inferredBlank !== true &&
       row.completedByExpectation !== true
-    ) {
-      copy.selectedAnswer = letter
+
+    if (!blankEligible) return copy
+
+    const n1Letter = n1RescueByQ.get(row.questionNumber)
+    if (n1Letter && /^[A-H]$/.test(n1Letter)) {
+      copy.selectedAnswer = n1Letter
       copy.visualBlankRescue = true
-      copy.visualBlankRescueLetter = letter
+      copy.visualBlankRescueLetter = n1Letter
+      copy.visualBlankRescueSource = "N1"
+      return copy
+    }
+
+    // N2 solo si N1 abstuvo por insufficient_absolute_evidence y N2 confirmó.
+    const n1 = n1ByQ.get(row.questionNumber) ?? decisions[i]
+    const n2 = n2Decisions?.[i]
+    if (
+      n1 &&
+      n1.action === "abstain" &&
+      n1.reason === "insufficient_absolute_evidence" &&
+      n2 &&
+      n2.action === "confirmed_answer" &&
+      typeof n2.bestLetter === "string" &&
+      /^[A-H]$/.test(n2.bestLetter)
+    ) {
+      copy.selectedAnswer = n2.bestLetter
+      copy.visualBlankRescue = true
+      copy.visualBlankRescueLetter = n2.bestLetter
+      copy.visualBlankRescueSource = "N2"
     }
     return copy
   })
@@ -665,7 +698,7 @@ function emitShadowTelemetry(result: VisualBlankRescuePageResult): void {
         }
         return base
       }),
-      // N2 Shadow: observación únicamente. Nunca altera proposedRows/APPLY.
+      // N2: telemetría de decisiones certificadas (APPLY las consume solo vía buildProposedRows).
       n2: (result.n2Decisions ?? []).map((d) => toN2ShadowTelemetry(d)),
     }
     emitShadowFn(`${LOG_PREFIX} ${JSON.stringify(payload)}`)
@@ -675,7 +708,8 @@ function emitShadowTelemetry(result: VisualBlankRescuePageResult): void {
 }
 
 /**
- * N2 Shadow post-N1. Fail-soft por fila. Nunca alimenta proposedRows.
+ * N2 post-N1. Fail-soft por fila. Produce decisiones certificadas;
+ * proposedRows solo las consume en mode=apply vía buildProposedRows.
  */
 function runN2ShadowAfterN1(params: {
   rows: ReadonlyArray<VisualBlankRescueRow>
@@ -831,8 +865,8 @@ export async function runAzureVisualBlankRescue(
       )
     }
 
-    // N2 Shadow: solo tras N1, con píxeles/mapping disponibles.
-    // NUNCA entra en buildProposedRows / APPLY (N2 no aplica respuestas).
+    // N2: solo tras N1, con píxeles/mapping disponibles.
+    // mode=shadow → observación; mode=apply → buildProposedRows puede consumir confirmed_answer.
     const n2Decisions = runN2ShadowAfterN1({
       rows,
       decisions,
@@ -843,7 +877,9 @@ export async function runAzureVisualBlankRescue(
     })
 
     const proposedRows =
-      input.mode === "apply" ? buildProposedRows(rows, decisions) : null
+      input.mode === "apply"
+        ? buildVisualBlankRescueProposedRows(rows, decisions, n2Decisions)
+        : null
 
     const result: VisualBlankRescuePageResult = {
       pageAction: input.mode === "apply" ? "apply_proposals" : "shadow_report",

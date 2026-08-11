@@ -11,15 +11,17 @@ import { fileURLToPath } from "node:url"
 import sharp from "sharp"
 import {
   __setVisualBlankRescueEmitForTests,
+  buildVisualBlankRescueProposedRows,
   runAzureVisualBlankRescue,
   type VisualBlankRescueMark,
-  type VisualBlankRescuePageInput,
   type VisualBlankRescueRow,
+  type VisualBlankRescueRowDecision,
 } from "../azure-visual-blank-rescue"
 import {
   evaluateVisualBlankN2,
   measureRowAbsoluteDominantClear,
   N2_PARAMS,
+  type VisualBlankN2Decision,
   type VisualBlankN2OptionInput,
 } from "../azure-visual-blank-rescue-n2"
 
@@ -356,9 +358,7 @@ test("SHADOW + APPLY=0 semántica: proposedRows null aunque N2 confirme", async 
   const lines: string[] = []
   __setVisualBlankRescueEmitForTests((line) => lines.push(line))
   try {
-    // Fila 1: marca débil/contaminada simulada → puede abstener N1; forzamos escenario
-    // con marca clara en D pero contrast local pobre es difícil en synth.
-    // Aquí verificamos: mode shadow → proposedRows siempre null; N2 no escribe APPLY.
+    // mode shadow → proposedRows siempre null; N2 observa pero no escribe APPLY.
     const result = await runAzureVisualBlankRescue({
       imageBuffer: await synthPageImage([[0, 3]]),
       imageWidth: W,
@@ -385,7 +385,153 @@ test("SHADOW + APPLY=0 semántica: proposedRows null aunque N2 confirme", async 
   }
 })
 
-test("APPLY mode: N2 nunca entra en proposedRows (solo N1 rescued)", async () => {
+// ---------------------------------------------------------------------------
+// APPLY N1+N2 — semántica conservadora (consume decisiones certificadas)
+// ---------------------------------------------------------------------------
+
+function n1AbstainInsufficient(q: number): VisualBlankRescueRowDecision {
+  return {
+    action: "abstain",
+    questionNumber: q,
+    reason: "insufficient_absolute_evidence",
+  }
+}
+
+function n2Confirmed(letter: string): VisualBlankN2Decision {
+  return {
+    evaluated: true,
+    action: "confirmed_answer",
+    reason: "row_absolute_dominant_clear",
+    bestLetter: letter,
+    algorithm: "row_absolute_dominant_clear",
+  }
+}
+
+test("APPLY=0 identidad: merge no se invoca en shadow (proposedRows null)", async () => {
+  const result = await runAzureVisualBlankRescue({
+    imageBuffer: await synthPageImage([[0, 3]]),
+    imageWidth: W,
+    imageHeight: H,
+    marks: marksAllUnselected(),
+    rows: [
+      { questionNumber: 1, selectedAnswer: "BLANK" },
+      { questionNumber: 2, selectedAnswer: "BLANK" },
+    ],
+    expectedQuestionCount: 2,
+    expectedOptionCount: 4,
+    variant: "single_column",
+    mode: "shadow",
+  })
+  assert.equal(result.proposedRows, null)
+  // Si se construyera merge con N2 confirmed, no afectaría shadow
+  const simulated = buildVisualBlankRescueProposedRows(
+    [
+      { questionNumber: 1, selectedAnswer: "BLANK" },
+      { questionNumber: 2, selectedAnswer: "BLANK" },
+    ],
+    [n1AbstainInsufficient(1), n1AbstainInsufficient(2)],
+    [n2Confirmed("D"), { evaluated: true, action: "abstain", reason: "insufficient_n2_evidence" }]
+  )
+  // Merge en isolation SÍ propondría D — pero shadow no lo aplica
+  assert.equal(simulated[0]?.selectedAnswer, "D")
+  assert.equal(result.proposedRows, null)
+})
+
+for (const letter of LETTERS) {
+  test(`APPLY merge: N1 abstain insufficient + N2 confirmed ${letter} → ${letter}`, () => {
+    const rows: VisualBlankRescueRow[] = [
+      { questionNumber: 10, selectedAnswer: "BLANK" },
+      { questionNumber: 11, selectedAnswer: "BLANK" },
+    ]
+    const decisions: VisualBlankRescueRowDecision[] = [
+      n1AbstainInsufficient(10),
+      n1AbstainInsufficient(11),
+    ]
+    const n2: VisualBlankN2Decision[] = [
+      n2Confirmed(letter),
+      { evaluated: true, action: "abstain", reason: "insufficient_n2_evidence:abs_contrast" },
+    ]
+    const proposed = buildVisualBlankRescueProposedRows(rows, decisions, n2)
+    assert.equal(proposed[0]?.selectedAnswer, letter)
+    assert.equal(proposed[0]?.visualBlankRescue, true)
+    assert.equal(proposed[0]?.visualBlankRescueLetter, letter)
+    assert.equal(proposed[0]?.visualBlankRescueSource, "N2")
+    assert.equal(proposed[1]?.selectedAnswer, "BLANK")
+    assert.equal(proposed[1]?.visualBlankRescue, undefined)
+  })
+}
+
+test("PRECEDENCIA N1: N1 rescued B no es sustituido por N2", () => {
+  const proposed = buildVisualBlankRescueProposedRows(
+    [{ questionNumber: 1, selectedAnswer: "BLANK" }],
+    [{ action: "rescued_answer", questionNumber: 1, letter: "B", reason: "visual_dominant_clear", metrics: { perOption: [], bestLetter: "B", secondLetter: "A", marginDarkRatio: 0.2, marginContrast: 20 } }],
+    [n2Confirmed("D")]
+  )
+  assert.equal(proposed[0]?.selectedAnswer, "B")
+  assert.equal(proposed[0]?.visualBlankRescueSource, "N1")
+})
+
+test("AZURE válida: letra existente nunca cambia (N1/N2)", () => {
+  const proposed = buildVisualBlankRescueProposedRows(
+    [{ questionNumber: 1, selectedAnswer: "C" }],
+    [{ action: "no_action", questionNumber: 1, reason: "already_selected" }],
+    [n2Confirmed("D")]
+  )
+  assert.equal(proposed[0]?.selectedAnswer, "C")
+  assert.equal(proposed[0]?.visualBlankRescue, undefined)
+})
+
+test("N2 abstain → BLANK permanece", () => {
+  const proposed = buildVisualBlankRescueProposedRows(
+    [{ questionNumber: 1, selectedAnswer: "BLANK" }],
+    [n1AbstainInsufficient(1)],
+    [{ evaluated: true, action: "abstain", reason: "insufficient_n2_evidence:margin_abs" }]
+  )
+  assert.equal(proposed[0]?.selectedAnswer, "BLANK")
+  assert.equal(proposed[0]?.visualBlankRescue, undefined)
+})
+
+test("N1 abstain por otra razón → N2 no aplica", () => {
+  const proposed = buildVisualBlankRescueProposedRows(
+    [{ questionNumber: 1, selectedAnswer: "BLANK" }],
+    [{ action: "abstain", questionNumber: 1, reason: "competitive_double_mark" }],
+    [n2Confirmed("A")]
+  )
+  assert.equal(proposed[0]?.selectedAnswer, "BLANK")
+})
+
+test("double mark / ambiguo → BLANK", () => {
+  const proposed = buildVisualBlankRescueProposedRows(
+    [{ questionNumber: 1, selectedAnswer: "BLANK" }],
+    [{ action: "abstain", questionNumber: 1, reason: "competitive_double_mark" }],
+    [{ evaluated: false, action: "skipped", reason: "not_blank_or_not_n1_insufficient" }]
+  )
+  assert.equal(proposed[0]?.selectedAnswer, "BLANK")
+})
+
+test("MULTIPLE → no apply", () => {
+  const proposed = buildVisualBlankRescueProposedRows(
+    [{ questionNumber: 1, selectedAnswer: "MULTIPLE" }],
+    [{ action: "abstain", questionNumber: 1, reason: "multiple" }],
+    [n2Confirmed("B")]
+  )
+  assert.equal(proposed[0]?.selectedAnswer, "MULTIPLE")
+})
+
+test("N2 skipped (invalid polygon / option count) → BLANK", () => {
+  for (const reason of ["invalid_polygon", "option_count_not_certified:3", "invalid_polygon_geom"]) {
+    const proposed = buildVisualBlankRescueProposedRows(
+      [{ questionNumber: 1, selectedAnswer: "BLANK" }],
+      [n1AbstainInsufficient(1)],
+      [{ evaluated: false, action: "skipped", reason }]
+    )
+    assert.equal(proposed[0]?.selectedAnswer, "BLANK", reason)
+  }
+})
+
+test("APPLY mode integración: proposedRows puede incluir N2 source cuando N1 abstains", async () => {
+  // Marca clara: N1 suele rescatar; si rescata → source N1; si abstiene + N2 confirma → source N2.
+  // Verificamos contrato: proposedRows no-null en apply, Azure A intacta, y source solo N1|N2.
   const result = await runAzureVisualBlankRescue({
     imageBuffer: await synthPageImage([[0, 2]]),
     imageWidth: W,
@@ -401,17 +547,15 @@ test("APPLY mode: N2 nunca entra en proposedRows (solo N1 rescued)", async () =>
     mode: "apply",
   })
   assert.ok(result.proposedRows)
-  for (const row of result.proposedRows!) {
-    assert.equal(
-      Object.prototype.hasOwnProperty.call(row, "visualBlankRescueN2"),
-      false
-    )
-    // Si hay rescue flag, solo de N1
-    if (row.visualBlankRescue === true) {
-      assert.ok(typeof row.visualBlankRescueLetter === "string")
-    }
+  assert.equal(result.proposedRows![1]?.selectedAnswer, "A")
+  assert.equal(result.proposedRows![1]?.visualBlankRescue, undefined)
+  const r0 = result.proposedRows![0]!
+  if (r0.visualBlankRescue === true) {
+    assert.ok(r0.visualBlankRescueSource === "N1" || r0.visualBlankRescueSource === "N2")
+    assert.ok(typeof r0.selectedAnswer === "string" && /^[A-H]$/.test(String(r0.selectedAnswer)))
+  } else {
+    assert.equal(r0.selectedAnswer, "BLANK")
   }
-  // N2 puede existir en telemetría/result pero no muta proposed por sí mismo
   assert.ok(Array.isArray(result.n2Decisions))
 })
 
@@ -546,6 +690,108 @@ test("REAL student2 Q1: N1 abstain → N2 CONFIRMED D + métricas offline", asyn
   assert.equal(d.largestComponent, 170)
   assert.ok(d.marginAbs != null && Math.abs(d.marginAbs - 43.1526) < 0.05)
   assert.equal(d.secondLetter, "C")
+
+  // APPLY simulado local: shadow→null; apply merge→D sin hardcode de pregunta en el motor
+  const rowBlank = { questionNumber: 1, selectedAnswer: "BLANK" as const }
+  const n1Dec: VisualBlankRescueRowDecision = {
+    action: "abstain",
+    questionNumber: 1,
+    reason: "insufficient_absolute_evidence",
+  }
+  assert.equal(
+    buildVisualBlankRescueProposedRows([rowBlank], [n1Dec], [d])[0]?.selectedAnswer,
+    "D"
+  )
+  // APPLY=0 / shadow: no hay proposedRows desde el runtime shadow (identidad)
+  // (merge solo se usa cuando mode=apply)
+})
+
+test("REAL student2 APPLY simulado: Q1→D; Q2/Q3 N1 rescued se conservan; Azure selected intactas", async () => {
+  const loaded = await loadStudent2()
+  if (!loaded) return
+  const { gray, width, height, meta } = loaded
+
+  const rows: VisualBlankRescueRow[] = meta.omrPreN1.map((r) => ({
+    questionNumber: r.questionNumber,
+    selectedAnswer: r.selectedAnswer,
+  }))
+  const decisions: VisualBlankRescueRowDecision[] = []
+  const n2Decisions: VisualBlankN2Decision[] = []
+
+  for (const row of rows) {
+    const n1Meta = meta.n1?.decisions?.find((d) => d.questionNumber === row.questionNumber)
+    if (n1Meta?.action === "rescued_answer" && n1Meta.bestLetter) {
+      decisions.push({
+        action: "rescued_answer",
+        questionNumber: row.questionNumber,
+        letter: n1Meta.bestLetter,
+        reason: "visual_dominant_clear",
+        metrics: {
+          perOption: [],
+          bestLetter: n1Meta.bestLetter,
+          secondLetter: null,
+          marginDarkRatio: 0.2,
+          marginContrast: 20,
+        },
+      })
+      n2Decisions.push({
+        evaluated: false,
+        action: "skipped",
+        reason: "not_blank_or_not_n1_insufficient",
+      })
+      continue
+    }
+    if (n1Meta?.action === "abstain" && n1Meta.reason === "insufficient_absolute_evidence") {
+      decisions.push({
+        action: "abstain",
+        questionNumber: row.questionNumber,
+        reason: "insufficient_absolute_evidence",
+      })
+      n2Decisions.push(
+        evaluateVisualBlankN2({
+          gray,
+          width,
+          height,
+          options: optionsForQ(meta, row.questionNumber),
+          currentAnswer: row.selectedAnswer,
+          n1Action: "abstain",
+          n1Reason: "insufficient_absolute_evidence",
+        })
+      )
+      continue
+    }
+    decisions.push({
+      action: "no_action",
+      questionNumber: row.questionNumber,
+      reason: n1Meta?.reason ?? "already_selected",
+    })
+    n2Decisions.push({
+      evaluated: false,
+      action: "skipped",
+      reason: "not_blank_or_not_n1_insufficient",
+    })
+  }
+
+  const proposed = buildVisualBlankRescueProposedRows(rows, decisions, n2Decisions)
+  const byQ = new Map(proposed.map((r) => [Number(r.questionNumber), r]))
+
+  // Q1: N2 confirmó D
+  assert.equal(byQ.get(1)?.selectedAnswer, "D")
+  assert.equal(byQ.get(1)?.visualBlankRescueSource, "N2")
+
+  // Q2/Q3: N1 rescued se conservan (precedencia N1)
+  assert.equal(byQ.get(2)?.selectedAnswer, "B")
+  assert.equal(byQ.get(2)?.visualBlankRescueSource, "N1")
+  assert.equal(byQ.get(3)?.selectedAnswer, "C")
+  assert.equal(byQ.get(3)?.visualBlankRescueSource, "N1")
+
+  // Controles negativos: Azure selected no cambian
+  for (const q of [4, 5, 6, 7]) {
+    const azure = meta.omrPreN1.find((r) => r.questionNumber === q)?.selectedAnswer
+    assert.ok(azure && azure !== "BLANK")
+    assert.equal(byQ.get(q)?.selectedAnswer, azure)
+    assert.equal(byQ.get(q)?.visualBlankRescue, undefined)
+  }
 })
 
 test("REAL student2 Q2: N1 RESCUED B → N2 SKIPPED", async () => {

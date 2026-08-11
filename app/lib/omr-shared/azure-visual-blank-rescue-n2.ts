@@ -1,8 +1,11 @@
 /**
- * N2-B.2 — Segundo observador visual Shadow (row_absolute_dominant_clear).
+ * N2-B.2 — Motor visual row_absolute_dominant_clear.
  *
  * Cubre el agujero de clase: BLANK + N1 abstain(insufficient_absolute_evidence).
- * Solo observación/telemetría. NUNCA modifica selectedAnswer / proposedRows / scoring.
+ * Este módulo SOLO decide (confirmed_answer / abstain / skipped).
+ * No muta selectedAnswer, scoring ni persistencia.
+ * APPLY (si está activo) consume la decisión certificada desde azure-visual-blank-rescue
+ * sin recalcular umbrales aquí.
  *
  * Universales: no usa questionNumber, studentId, teacher_key, pauta ni letter hardcode.
  * Certificado offline para filas de exactamente 4 alternativas.
