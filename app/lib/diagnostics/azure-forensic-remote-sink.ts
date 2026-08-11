@@ -5,6 +5,9 @@
  * en un bucket diagnóstico configurable (futuro: libelia-omr-forensics).
  *
  * Contrato: reutiliza AzureForensicSink.write; expone además read/remove.
+ * remove(): éxito solo si Storage remove sin error API Y post-delete confirma
+ * que PNG + .meta.json exactos ya no son recuperables (download → not found).
+ * Si error:null pero el objeto sigue descargable → delete_not_effective.
  *
  * Política de consistencia (escritura parcial detectable):
  *   1) upload PNG (contentType=image/png, upsert=false)
@@ -349,6 +352,15 @@ async function readRemoteArtifact(
   }
 }
 
+/**
+ * Post-delete: Storage puede devolver error:null sin borrar de verdad
+ * (incidente N2-A.9B) o mostrar ausencia retardada breve.
+ * Verificación acotada vía download de paths exactos — sin recursive/prefix.
+ * Delays totales ≪ 1s; adapter diagnóstico (no bloquea evaluación real).
+ */
+const POST_DELETE_VERIFY_ATTEMPTS = 3 as const
+const POST_DELETE_RETRY_DELAYS_MS: readonly number[] = [0, 50, 100]
+
 async function removeRemoteArtifact(
   client: ForensicRemoteStorageClient,
   bucketName: string,
@@ -358,17 +370,94 @@ async function removeRemoteArtifact(
     return { ok: false, errorCode: "path_rejected" }
   }
   // Paths exactos únicamente. NO prefijos. NO recursive delete.
-  const exactPaths = [input.path, input.metaPath]
+  const exactPaths = [input.path, input.metaPath] as const
   const bucket = client.storage.from(bucketName)
   try {
-    const result = await bucket.remove(exactPaths)
+    const result = await bucket.remove([...exactPaths])
     if (result.error) {
       return { ok: false, errorCode: "remove_failed" }
     }
-    return { ok: true }
   } catch {
     return { ok: false, errorCode: "remove_failed" }
   }
+
+  try {
+    const absent = await confirmExactPathsAbsent(bucket, exactPaths)
+    if (!absent) {
+      return { ok: false, errorCode: "delete_not_effective" }
+    }
+    return { ok: true }
+  } catch {
+    return { ok: false, errorCode: "delete_not_effective" }
+  }
+}
+
+async function confirmExactPathsAbsent(
+  bucket: ForensicRemoteStorageBucket,
+  paths: readonly string[],
+): Promise<boolean> {
+  for (let attempt = 0; attempt < POST_DELETE_VERIFY_ATTEMPTS; attempt++) {
+    const delayMs = POST_DELETE_RETRY_DELAYS_MS[attempt] ?? 100
+    if (delayMs > 0) {
+      await sleepMs(delayMs)
+    }
+    let allAbsent = true
+    for (const path of paths) {
+      const probe = await probePathAbsent(bucket, path)
+      if (!probe) {
+        allAbsent = false
+        break
+      }
+    }
+    if (allAbsent) return true
+  }
+  return false
+}
+
+/**
+ * Ausencia válida: not found / data null con error de ausencia.
+ * Si aún hay bytes recuperables → no ausente.
+ * Error de red u otro (no not-found) → no certificado ausente (fail-soft).
+ */
+async function probePathAbsent(
+  bucket: ForensicRemoteStorageBucket,
+  path: string,
+): Promise<boolean> {
+  let downloadResult: {
+    data: Blob | ArrayBuffer | Buffer | Uint8Array | null
+    error: ForensicRemoteStorageError | null
+  }
+  try {
+    downloadResult = await bucket.download(path)
+  } catch {
+    return false
+  }
+  if (downloadResult.data != null) {
+    return false
+  }
+  if (!downloadResult.error) {
+    return true
+  }
+  return isNotFoundStorageError(downloadResult.error)
+}
+
+function isNotFoundStorageError(error: ForensicRemoteStorageError): boolean {
+  const status = String(error.statusCode ?? "")
+  const msg = String(error.message ?? "").toLowerCase()
+  const name = String(error.name ?? "").toLowerCase()
+  return (
+    status === "404" ||
+    msg.includes("not found") ||
+    msg.includes("object not found") ||
+    msg.includes("does not exist") ||
+    name.includes("notfound")
+  )
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
 }
 
 function isAlreadyExistsError(error: ForensicRemoteStorageError): boolean {

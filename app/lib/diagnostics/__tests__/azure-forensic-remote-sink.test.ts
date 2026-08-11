@@ -55,18 +55,32 @@ function createMockClient(opts?: {
   failDownload?: boolean
   failRemove?: boolean
   corruptDownload?: boolean
+  /** remove → error:null pero no borra (simula incidente N2-A.9B). */
+  removeNoOp?: boolean
+  /** remove solo borra paths que terminen con el sufijo indicado. */
+  removeOnlySuffix?: ".png" | ".meta.json"
+  /**
+   * remove → error:null sin borrar; tras N downloads de paths ghost,
+   * los elimina (consistencia eventual corta).
+   */
+  removeGhostUntilDownloadCount?: number
 }): ForensicRemoteStorageClient & {
   objects: Map<string, Buffer>
   uploadCalls: MockUploadCall[]
   removeCalls: string[][]
+  downloadCalls: string[]
   fromCalls: string[]
   publicUrlCalls: number
 } {
   const objects = new Map<string, Buffer>()
   const uploadCalls: MockUploadCall[] = []
   const removeCalls: string[][] = []
+  const downloadCalls: string[] = []
   const fromCalls: string[] = []
   let publicUrlCalls = 0
+  let ghostMode = false
+  let ghostPaths = new Set<string>()
+  let downloadsSinceGhostRemove = 0
 
   const bucketApi: ForensicRemoteStorageBucket & {
     getPublicUrl?: (path: string) => unknown
@@ -95,11 +109,23 @@ function createMockClient(opts?: {
       return { data: { path }, error: null }
     },
     async download(path) {
+      downloadCalls.push(path)
+      if (ghostMode && ghostPaths.has(path)) {
+        downloadsSinceGhostRemove += 1
+        const threshold = opts?.removeGhostUntilDownloadCount ?? 0
+        if (threshold > 0 && downloadsSinceGhostRemove >= threshold) {
+          for (const gp of ghostPaths) objects.delete(gp)
+          ghostMode = false
+          ghostPaths = new Set()
+        }
+      }
       if (opts?.failDownload) {
         return { data: null, error: { message: "download error" } }
       }
       const found = objects.get(path)
-      if (!found) return { data: null, error: { message: "not found" } }
+      if (!found) {
+        return { data: null, error: { message: "not found", statusCode: "404" } }
+      }
       if (opts?.corruptDownload) {
         return { data: Buffer.from("CORRUPTED"), error: null }
       }
@@ -109,6 +135,21 @@ function createMockClient(opts?: {
       removeCalls.push([...paths])
       if (opts?.failRemove) {
         return { data: null, error: { message: "remove error" } }
+      }
+      if (opts?.removeNoOp) {
+        return { data: paths.map((p) => ({ name: p })), error: null }
+      }
+      if (typeof opts?.removeGhostUntilDownloadCount === "number") {
+        ghostMode = true
+        ghostPaths = new Set(paths)
+        downloadsSinceGhostRemove = 0
+        return { data: paths.map((p) => ({ name: p })), error: null }
+      }
+      if (opts?.removeOnlySuffix) {
+        for (const p of paths) {
+          if (p.endsWith(opts.removeOnlySuffix)) objects.delete(p)
+        }
+        return { data: paths.map((p) => ({ name: p })), error: null }
       }
       for (const p of paths) objects.delete(p)
       return { data: paths.map((p) => ({ name: p })), error: null }
@@ -123,6 +164,7 @@ function createMockClient(opts?: {
     objects,
     uploadCalls,
     removeCalls,
+    downloadCalls,
     fromCalls,
     get publicUrlCalls() {
       return publicUrlCalls
@@ -431,6 +473,10 @@ test("18-20. remove PNG+meta exactos, no recursive", async () => {
   // No prefijo recursive: solo exactamente 2 paths
   assert.equal(client.removeCalls[0]!.length, 2)
   assert.equal(client.removeCalls[0]!.some((x) => x.endsWith("/")), false)
+  // Post-delete verificó ambos paths vía download (no public URL)
+  assert.ok(client.downloadCalls.includes(p.path))
+  assert.ok(client.downloadCalls.includes(p.metaPath))
+  assert.equal(client.publicUrlCalls, 0)
 })
 
 test("21. upload error fail-soft", async () => {
@@ -472,7 +518,7 @@ test("22. download error fail-soft", async () => {
   if (!rd.ok) assert.equal(rd.errorCode, "download_failed")
 })
 
-test("23. remove error fail-soft", async () => {
+test("23. remove API error → fail-soft (no throw)", async () => {
   const client = createMockClient({ failRemove: true })
   const created = createRemoteForensicSink({
     bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
@@ -486,6 +532,230 @@ test("23. remove error fail-soft", async () => {
   })
   assert.equal(rm.ok, false)
   if (!rm.ok) assert.equal(rm.errorCode, "remove_failed")
+})
+
+test("N2-A.9B-1. remove error:null + objeto ausente → PASS", async () => {
+  const client = createMockClient()
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("rm-ok")
+  const p = pathsFor({ runId: "run-rm-ok", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, true)
+  assert.equal(client.objects.has(p.path), false)
+  assert.equal(client.objects.has(p.metaPath), false)
+})
+
+test("N2-A.9B-2. remove error:null + objeto todavía descargable → FAIL delete_not_effective", async () => {
+  const client = createMockClient({ removeNoOp: true })
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("rm-noop")
+  const p = pathsFor({ runId: "run-rm-noop", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, false)
+  if (!rm.ok) assert.equal(rm.errorCode, "delete_not_effective")
+  assert.equal(client.objects.has(p.path), true)
+  assert.equal(client.objects.has(p.metaPath), true)
+  // Aún recuperable vía read
+  const rd = await created.sink.read({ path: p.path, azureInputSha256: p.azureInputSha256 })
+  assert.equal(rd.ok, true)
+})
+
+test("N2-A.9B-3. objeto desaparece después de retry corto → PASS", async () => {
+  // 1er round verifica 2 paths (aún presentes); al 3er download ghost limpia → PASS en retry
+  const client = createMockClient({ removeGhostUntilDownloadCount: 3 })
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("rm-delay")
+  const p = pathsFor({ runId: "run-rm-delay", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, true)
+  assert.equal(client.objects.has(p.path), false)
+  assert.equal(client.objects.has(p.metaPath), false)
+})
+
+test("N2-A.9B-4. objeto nunca desaparece → FAIL delete_not_effective", async () => {
+  const client = createMockClient({ removeNoOp: true })
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("rm-never")
+  const p = pathsFor({ runId: "run-rm-never", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, false)
+  if (!rm.ok) assert.equal(rm.errorCode, "delete_not_effective")
+  // Verificación acotada: varios probes, sin loop infinito
+  assert.ok(client.downloadCalls.length >= 2)
+  assert.ok(client.downloadCalls.length <= 12)
+})
+
+test("N2-A.9B-5. PNG borrado / meta sigue → FAIL", async () => {
+  const client = createMockClient({ removeOnlySuffix: ".png" })
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("rm-png-only")
+  const p = pathsFor({ runId: "run-rm-png", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, false)
+  if (!rm.ok) assert.equal(rm.errorCode, "delete_not_effective")
+  assert.equal(client.objects.has(p.path), false)
+  assert.equal(client.objects.has(p.metaPath), true)
+})
+
+test("N2-A.9B-6. meta borrada / PNG sigue → FAIL", async () => {
+  const client = createMockClient({ removeOnlySuffix: ".meta.json" })
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("rm-meta-only")
+  const p = pathsFor({ runId: "run-rm-meta", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, false)
+  if (!rm.ok) assert.equal(rm.errorCode, "delete_not_effective")
+  assert.equal(client.objects.has(p.path), true)
+  assert.equal(client.objects.has(p.metaPath), false)
+})
+
+test("N2-A.9B-7. ambos desaparecen → PASS", async () => {
+  const client = createMockClient()
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("rm-both")
+  const p = pathsFor({ runId: "run-rm-both", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, true)
+  const missingPng = await created.sink.read({
+    path: p.path,
+    azureInputSha256: p.azureInputSha256,
+  })
+  assert.equal(missingPng.ok, false)
+})
+
+test("N2-A.9B-8. no recursive delete / solo paths exactos / no batch-scans / no public URL / no PII / no throw", async () => {
+  const client = createMockClient()
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  assert.equal(isForensicBucketAllowed("batch-scans"), false)
+  const buf = synthPng("rm-guards")
+  const p = pathsFor({ runId: "run-rm-guards", student: 1, page: 0, attempt: 0, buf })
+  const otherStudent = pathsFor({ runId: "run-rm-guards", student: 9, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  await created.sink.write({
+    path: otherStudent.path,
+    metaPath: otherStudent.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: otherStudent.azureInputSha256 }),
+    azureInputSha256: otherStudent.azureInputSha256,
+  })
+  let threw = false
+  let rm: Awaited<ReturnType<typeof created.sink.remove>> | null = null
+  try {
+    rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  } catch {
+    threw = true
+  }
+  assert.equal(threw, false)
+  assert.ok(rm)
+  assert.equal(rm!.ok, true)
+  assert.deepEqual(client.removeCalls[0], [p.path, p.metaPath])
+  assert.equal(client.removeCalls[0]!.length, 2)
+  assert.equal(
+    client.removeCalls.some((call) => call.some((x) => x.endsWith("/") || x.includes("*"))),
+    false,
+  )
+  assert.equal(client.objects.has(otherStudent.path), true)
+  assert.equal(client.objects.has(otherStudent.metaPath), true)
+  assert.equal(client.publicUrlCalls, 0)
+  assert.equal(client.fromCalls.includes("batch-scans"), false)
+  const meta = client.objects.get(otherStudent.metaPath)!.toString("utf8")
+  assert.equal(meta.includes("@"), false)
+  assert.equal(meta.toLowerCase().includes("teacher_key"), false)
 })
 
 test("24. meta upload failure → partial_artifact (sin auto-delete)", async () => {
