@@ -14,6 +14,11 @@
  */
 
 import sharp from "sharp"
+import {
+  evaluateVisualBlankN2,
+  toN2ShadowTelemetry,
+  type VisualBlankN2Decision,
+} from "./azure-visual-blank-rescue-n2"
 
 export const VISUAL_BLANK_RESCUE_SHADOW_FLAG =
   "LIBELIA_AZURE_VISUAL_BLANK_RESCUE_SHADOW" as const
@@ -107,6 +112,11 @@ export type VisualBlankRescuePageResult = {
   blankRowCountBefore: number
   decisions: VisualBlankRescueRowDecision[]
   proposedRows: ReadonlyArray<Record<string, unknown>> | null
+  /**
+   * N2 Shadow only: observación tras N1. Nunca alimenta proposedRows/APPLY.
+   * Ausente cuando mode=off o page gates impiden análisis.
+   */
+  n2Decisions?: ReadonlyArray<VisualBlankN2Decision>
 }
 
 type InternalMark = VisualBlankRescueMark & {
@@ -655,11 +665,63 @@ function emitShadowTelemetry(result: VisualBlankRescuePageResult): void {
         }
         return base
       }),
+      // N2 Shadow: observación únicamente. Nunca altera proposedRows/APPLY.
+      n2: (result.n2Decisions ?? []).map((d) => toN2ShadowTelemetry(d)),
     }
     emitShadowFn(`${LOG_PREFIX} ${JSON.stringify(payload)}`)
   } catch {
     // fail-soft: nunca romper por telemetría
   }
+}
+
+/**
+ * N2 Shadow post-N1. Fail-soft por fila. Nunca alimenta proposedRows.
+ */
+function runN2ShadowAfterN1(params: {
+  rows: ReadonlyArray<VisualBlankRescueRow>
+  decisions: ReadonlyArray<VisualBlankRescueRowDecision>
+  assoc: Map<number, Array<{ letter: string; mark: InternalMark }>>
+  gray: Buffer
+  imageWidth: number
+  imageHeight: number
+}): VisualBlankN2Decision[] {
+  const out: VisualBlankN2Decision[] = []
+  for (let i = 0; i < params.rows.length; i++) {
+    const row = params.rows[i]!
+    const d = params.decisions[i]
+    try {
+      if (!d) {
+        out.push({
+          evaluated: false,
+          action: "skipped",
+          reason: "missing_n1_decision",
+        })
+        continue
+      }
+      const options = params.assoc.get(row.questionNumber) ?? []
+      out.push(
+        evaluateVisualBlankN2({
+          gray: params.gray,
+          width: params.imageWidth,
+          height: params.imageHeight,
+          options: options.map((o) => ({
+            letter: o.letter,
+            polygonNorm: o.mark.polygonNorm,
+          })),
+          currentAnswer: row.selectedAnswer,
+          n1Action: d.action,
+          n1Reason: d.reason,
+        })
+      )
+    } catch {
+      out.push({
+        evaluated: false,
+        action: "skipped",
+        reason: "n2_internal_error_fail_soft",
+      })
+    }
+  }
+  return out
 }
 
 /**
@@ -769,6 +831,17 @@ export async function runAzureVisualBlankRescue(
       )
     }
 
+    // N2 Shadow: solo tras N1, con píxeles/mapping disponibles.
+    // NUNCA entra en buildProposedRows / APPLY (N2 no aplica respuestas).
+    const n2Decisions = runN2ShadowAfterN1({
+      rows,
+      decisions,
+      assoc,
+      gray: data,
+      imageWidth: input.imageWidth,
+      imageHeight: input.imageHeight,
+    })
+
     const proposedRows =
       input.mode === "apply" ? buildProposedRows(rows, decisions) : null
 
@@ -781,6 +854,7 @@ export async function runAzureVisualBlankRescue(
       blankRowCountBefore,
       decisions,
       proposedRows,
+      n2Decisions,
     }
     emitShadowTelemetry(result)
     return result
