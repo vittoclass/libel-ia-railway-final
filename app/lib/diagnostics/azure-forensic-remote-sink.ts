@@ -5,9 +5,15 @@
  * en un bucket diagnóstico configurable (futuro: libelia-omr-forensics).
  *
  * Contrato: reutiliza AzureForensicSink.write; expone además read/remove.
- * remove(): éxito solo si Storage remove sin error API Y post-delete confirma
- * que PNG + .meta.json exactos ya no son recuperables (download → not found).
- * Si error:null pero el objeto sigue descargable → delete_not_effective.
+ *
+ * remove() — N2-A.9G: separar ORIGIN_DELETED de CDN_RESIDUAL_READABLE.
+ *   1) Storage.remove(paths exactos) sin error API
+ *   2) Verificar AUSENCIA en ORIGEN vía list(folder,{search:name}) + match exacto
+ *      (NO download/exists/HEAD de /object/ — susceptibles a CDN HIT)
+ *   3) Probar residual CDN vía download solo como señal informativa
+ * Si origen ausente → ok:true (aunque CDN aún sirva copia).
+ * Si origen aún presente → ok:false errorCode=delete_not_effective.
+ * Nunca afirmar "bytes destruidos" si cdnResidualReadable===true.
  *
  * Política de consistencia (escritura parcial detectable):
  *   1) upload PNG (contentType=image/png, upsert=false, cacheControl=0)
@@ -53,6 +59,11 @@ export type ForensicRemoteStorageError = {
   name?: string
 }
 
+/** Entrada mínima de list() (catálogo de origen; no CDN de /object/). */
+export type ForensicRemoteStorageListEntry = Readonly<{
+  name: string
+}>
+
 /** Superficie mínima de Storage (inyectable / mockeable). Sin URL pública. */
 export type ForensicRemoteStorageBucket = {
   upload(
@@ -66,6 +77,17 @@ export type ForensicRemoteStorageBucket = {
   remove(
     paths: string[],
   ): Promise<{ data: unknown; error: ForensicRemoteStorageError | null }>
+  /**
+   * Catálogo de origen (POST /object/list). Autoridad de existencia post-delete.
+   * Si falta → origin_verify_failed (no fallback a download CDN).
+   */
+  list?(
+    path?: string,
+    options?: { limit?: number; search?: string },
+  ): Promise<{
+    data: ForensicRemoteStorageListEntry[] | null
+    error: ForensicRemoteStorageError | null
+  }>
 }
 
 export type ForensicRemoteStorageClient = {
@@ -96,9 +118,21 @@ export type ForensicRemoteSinkRemoveInput = Readonly<{
   metaPath: string
 }>
 
+/** Residual CDN: true=GET aún sirve bytes; false=not found; unknown=probe falló. */
+export type ForensicCdnResidualReadable = boolean | "unknown"
+
 export type ForensicRemoteSinkRemoveResult =
-  | Readonly<{ ok: true }>
-  | Readonly<{ ok: false; errorCode: string }>
+  | Readonly<{
+      ok: true
+      originDeleted: true
+      cdnResidualReadable: ForensicCdnResidualReadable
+    }>
+  | Readonly<{
+      ok: false
+      errorCode: string
+      originDeleted?: boolean
+      cdnResidualReadable?: ForensicCdnResidualReadable
+    }>
 
 export type AzureForensicRemoteSink = AzureForensicSink & {
   readonly kind: "configured_private"
@@ -355,14 +389,10 @@ async function readRemoteArtifact(
 }
 
 /**
- * Post-delete: Storage puede devolver error:null sin borrar de verdad
- * (incidente N2-A.9B) o mostrar ausencia retardada breve.
- * Verificación acotada vía download de paths exactos — sin recursive/prefix.
- * Delays totales ≪ 1s; adapter diagnóstico (no bloquea evaluación real).
+ * Post-delete N2-A.9G: autoridad = catálogo ORIGEN (list exacto por path/nombre).
+ * download() NO decide éxito — solo informa CDN residual.
+ * Sin retries arbitrarios; sin recursive/prefix delete.
  */
-const POST_DELETE_VERIFY_ATTEMPTS = 3 as const
-const POST_DELETE_RETRY_DELAYS_MS: readonly number[] = [0, 50, 100]
-
 async function removeRemoteArtifact(
   client: ForensicRemoteStorageClient,
   bucketName: string,
@@ -384,63 +414,138 @@ async function removeRemoteArtifact(
   }
 
   try {
-    const absent = await confirmExactPathsAbsent(bucket, exactPaths)
-    if (!absent) {
-      return { ok: false, errorCode: "delete_not_effective" }
-    }
-    return { ok: true }
-  } catch {
-    return { ok: false, errorCode: "delete_not_effective" }
-  }
-}
-
-async function confirmExactPathsAbsent(
-  bucket: ForensicRemoteStorageBucket,
-  paths: readonly string[],
-): Promise<boolean> {
-  for (let attempt = 0; attempt < POST_DELETE_VERIFY_ATTEMPTS; attempt++) {
-    const delayMs = POST_DELETE_RETRY_DELAYS_MS[attempt] ?? 100
-    if (delayMs > 0) {
-      await sleepMs(delayMs)
-    }
-    let allAbsent = true
-    for (const path of paths) {
-      const probe = await probePathAbsent(bucket, path)
-      if (!probe) {
-        allAbsent = false
-        break
+    const origin = await confirmExactPathsAbsentAtOrigin(bucket, exactPaths)
+    if (origin === "unknown") {
+      return {
+        ok: false,
+        errorCode: "origin_verify_failed",
+        originDeleted: false,
+        cdnResidualReadable: "unknown",
       }
     }
-    if (allAbsent) return true
+    if (origin === "present") {
+      const cdnResidualReadable = await probeCdnResidualReadable(bucket, exactPaths)
+      return {
+        ok: false,
+        errorCode: "delete_not_effective",
+        originDeleted: false,
+        cdnResidualReadable,
+      }
+    }
+    // ORIGIN_DELETED. CDN residual es señal separada (no convierte en fail).
+    const cdnResidualReadable = await probeCdnResidualReadable(bucket, exactPaths)
+    return {
+      ok: true,
+      originDeleted: true,
+      cdnResidualReadable,
+    }
+  } catch {
+    return {
+      ok: false,
+      errorCode: "origin_verify_failed",
+      originDeleted: false,
+      cdnResidualReadable: "unknown",
+    }
   }
-  return false
 }
 
 /**
- * Ausencia válida: not found / data null con error de ausencia.
- * Si aún hay bytes recuperables → no ausente.
- * Error de red u otro (no not-found) → no certificado ausente (fail-soft).
+ * Ausencia en ORIGEN: list(folder, { search: name }) + nombre exacto.
+ * No usa download/exists/HEAD (CDN de /object/).
  */
-async function probePathAbsent(
+async function confirmExactPathsAbsentAtOrigin(
+  bucket: ForensicRemoteStorageBucket,
+  paths: readonly string[],
+): Promise<"absent" | "present" | "unknown"> {
+  if (typeof bucket.list !== "function") {
+    return "unknown"
+  }
+  let anyPresent = false
+  for (const path of paths) {
+    const probe = await probeOriginPathState(bucket, path)
+    if (probe === "unknown") return "unknown"
+    if (probe === "present") anyPresent = true
+  }
+  return anyPresent ? "present" : "absent"
+}
+
+async function probeOriginPathState(
   bucket: ForensicRemoteStorageBucket,
   path: string,
-): Promise<boolean> {
-  let downloadResult: {
-    data: Blob | ArrayBuffer | Buffer | Uint8Array | null
+): Promise<"absent" | "present" | "unknown"> {
+  const listFn = bucket.list
+  if (typeof listFn !== "function") return "unknown"
+  const parts = splitExactObjectPath(path)
+  if (!parts) return "unknown"
+  let listResult: {
+    data: ForensicRemoteStorageListEntry[] | null
     error: ForensicRemoteStorageError | null
   }
   try {
-    downloadResult = await bucket.download(path)
+    listResult = await listFn.call(bucket, parts.folder, {
+      limit: 100,
+      search: parts.name,
+    })
   } catch {
-    return false
+    return "unknown"
   }
-  if (downloadResult.data != null) {
-    return false
+  if (listResult.error) {
+    return "unknown"
   }
-  if (!downloadResult.error) {
-    return true
+  const entries = listResult.data ?? []
+  // Match EXACTO de nombre — no prefijo, no recursive.
+  const found = entries.some((e) => e && typeof e.name === "string" && e.name === parts.name)
+  return found ? "present" : "absent"
+}
+
+/**
+ * Señal informativa CDN/edge: download puede devolver HIT tras ORIGIN delete.
+ * No decide ok del remove. true = aún hay bytes; false = not found; unknown = error.
+ */
+async function probeCdnResidualReadable(
+  bucket: ForensicRemoteStorageBucket,
+  paths: readonly string[],
+): Promise<ForensicCdnResidualReadable> {
+  let sawBytes = false
+  let sawUnknown = false
+  for (const path of paths) {
+    let downloadResult: {
+      data: Blob | ArrayBuffer | Buffer | Uint8Array | null
+      error: ForensicRemoteStorageError | null
+    }
+    try {
+      downloadResult = await bucket.download(path)
+    } catch {
+      sawUnknown = true
+      continue
+    }
+    if (downloadResult.data != null) {
+      sawBytes = true
+      continue
+    }
+    if (!downloadResult.error) {
+      continue
+    }
+    if (!isNotFoundStorageError(downloadResult.error)) {
+      sawUnknown = true
+    }
   }
-  return isNotFoundStorageError(downloadResult.error)
+  if (sawBytes) return true
+  if (sawUnknown) return "unknown"
+  return false
+}
+
+function splitExactObjectPath(
+  path: string,
+): { folder: string; name: string } | null {
+  if (typeof path !== "string" || path.length === 0) return null
+  const lastSlash = path.lastIndexOf("/")
+  if (lastSlash < 0) {
+    return { folder: "", name: path }
+  }
+  const name = path.slice(lastSlash + 1)
+  if (!name) return null
+  return { folder: path.slice(0, lastSlash), name }
 }
 
 function isNotFoundStorageError(error: ForensicRemoteStorageError): boolean {
@@ -454,12 +559,6 @@ function isNotFoundStorageError(error: ForensicRemoteStorageError): boolean {
     msg.includes("does not exist") ||
     name.includes("notfound")
   )
-}
-
-function sleepMs(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms)
-  })
 }
 
 function isAlreadyExistsError(error: ForensicRemoteStorageError): boolean {
