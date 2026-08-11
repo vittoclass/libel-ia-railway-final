@@ -10,7 +10,7 @@
  * Si error:null pero el objeto sigue descargable → delete_not_effective.
  *
  * Política de consistencia (escritura parcial detectable):
- *   1) upload PNG (contentType=image/png, upsert=false)
+ *   1) upload PNG (contentType=image/png, upsert=false, cacheControl=0)
  *   2) upload .meta.json (contentType=application/json, upsert=false)
  * Si (2) falla tras (1): errorCode=partial_artifact.
  * NO se borra automáticamente el PNG (evitar empeorar el estado);
@@ -58,7 +58,7 @@ export type ForensicRemoteStorageBucket = {
   upload(
     path: string,
     body: Buffer,
-    options: { contentType: string; upsert: boolean },
+    options: { contentType: string; upsert: boolean; cacheControl?: string },
   ): Promise<{ data: unknown; error: ForensicRemoteStorageError | null }>
   download(
     path: string,
@@ -264,11 +264,13 @@ async function writeRemoteArtifact(
   const bucket = client.storage.from(bucketName)
 
   // 1) PNG exacto — upsert=false obligatorio (no overwrite).
+  // cacheControl:'0' — evita CDN HIT residual tras delete (N2-A.9D/9E).
   let pngResult: { data: unknown; error: ForensicRemoteStorageError | null }
   try {
     pngResult = await bucket.upload(input.path, input.bytes, {
       contentType: PNG_CONTENT_TYPE,
       upsert: false,
+      cacheControl: "0",
     })
   } catch {
     return { ok: false, errorCode: "upload_failed" }

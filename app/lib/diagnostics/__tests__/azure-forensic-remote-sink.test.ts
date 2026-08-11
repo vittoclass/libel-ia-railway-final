@@ -47,7 +47,7 @@ function test(name: string, fn: TestFn): void {
 type MockUploadCall = {
   path: string
   body: Buffer
-  options: { contentType: string; upsert: boolean }
+  options: { contentType: string; upsert: boolean; cacheControl?: string }
 }
 
 function createMockClient(opts?: {
@@ -317,8 +317,10 @@ test("4-8. upload PNG+meta correctos (contentType, upsert=false, bytes)", async 
   assert.equal(client.uploadCalls.length, 2)
   assert.equal(client.uploadCalls[0]!.options.contentType, "image/png")
   assert.equal(client.uploadCalls[0]!.options.upsert, false)
+  assert.equal(client.uploadCalls[0]!.options.cacheControl, "0")
   assert.equal(client.uploadCalls[1]!.options.contentType, "application/json")
   assert.equal(client.uploadCalls[1]!.options.upsert, false)
+  assert.equal(client.uploadCalls[1]!.options.cacheControl, undefined)
   assert.equal(Buffer.compare(client.objects.get(p.path)!, buf), 0)
   assert.equal(client.objects.get(p.metaPath)!.toString("utf8"), meta)
   assert.deepEqual(client.fromCalls, [AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET])
@@ -1064,6 +1066,216 @@ test("E2E sintético: WRITE/READ/SHA/DELETE/NO_OVERWRITE/PRIVATE/NO_BATCH_SCANS"
 
   const missing = await created.sink.read({ path: p.path, azureInputSha256: p.azureInputSha256 })
   assert.equal(missing.ok, false)
+})
+
+// --- N2-A.9E: cacheControl='0' exclusivo del PNG forense ---
+test("N2-A.9E-1. PNG upload usa cacheControl='0' + contentType=image/png + upsert=false", async () => {
+  const client = createMockClient()
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("cc0")
+  const p = pathsFor({ runId: "run-cc0", student: 1, page: 0, attempt: 0, buf })
+  const wr = await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256, byteLength: buf.byteLength }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  assert.equal(wr.ok, true, "WRITE PASS")
+  const pngUpload = client.uploadCalls.find((c) => c.path === p.path)
+  assert.ok(pngUpload)
+  assert.equal(pngUpload!.options.cacheControl, "0")
+  assert.equal(pngUpload!.options.contentType, "image/png")
+  assert.equal(pngUpload!.options.upsert, false)
+})
+
+test("N2-A.9E-2. meta no recibe cacheControl; bucket funcional y batch-scans intactos", async () => {
+  const client = createMockClient()
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("cc-meta")
+  const p = pathsFor({ runId: "run-cc-meta", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const metaUpload = client.uploadCalls.find((c) => c.path === p.metaPath)
+  assert.ok(metaUpload)
+  assert.equal(metaUpload!.options.cacheControl, undefined)
+  assert.equal(metaUpload!.options.contentType, "application/json")
+  assert.equal(metaUpload!.options.upsert, false)
+  assert.equal(client.fromCalls.includes("batch-scans"), false)
+  assert.equal(client.fromCalls.includes("utp-audit-private"), false)
+  assert.deepEqual(client.fromCalls, [AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET])
+  assert.equal(isForensicBucketAllowed("batch-scans"), false)
+  const forbidden = createRemoteForensicSink({
+    bucketName: "batch-scans",
+    client: createMockClient(),
+  })
+  assert.equal(forbidden.ok, false)
+})
+
+test("N2-A.9E-3. metadata sin PII + flag OFF no ejecuta sink", async () => {
+  const client = createMockClient()
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("cc-pii")
+  const p = pathsFor({ runId: "run-cc-pii", student: 1, page: 0, attempt: 0, buf })
+  const meta = metaJson({ azureInputSha256: p.azureInputSha256, byteLength: buf.byteLength })
+  assert.equal(meta.includes("@"), false)
+  assert.equal(meta.toLowerCase().includes("teacher_key"), false)
+  assert.equal(meta.includes("data:image"), false)
+  assert.equal(meta.includes("https://"), false)
+  assert.equal(meta.toLowerCase().includes("base64"), false)
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: meta,
+    azureInputSha256: p.azureInputSha256,
+  })
+  const storedMeta = client.objects.get(p.metaPath)!.toString("utf8")
+  assert.equal(storedMeta.includes("@"), false)
+  assert.equal(storedMeta.toLowerCase().includes("teacher_key"), false)
+  assert.equal(storedMeta.includes("data:image"), false)
+
+  await withEnv(
+    {
+      [AZURE_FORENSIC_BUFFER_CAPTURE_FLAG]: "0",
+      [AZURE_FORENSIC_BUCKET_ENV]: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+      NODE_ENV: "test",
+    },
+    async () => {
+      resetResolvers()
+      const offClient = createMockClient()
+      __setForensicRemoteClientForTests(offClient)
+      const ref = await recordAzureForensicPackage(minimalCaptureInput(synthPng("flagoff-cc")))
+      assert.equal(ref, null)
+      assert.equal(offClient.objects.size, 0)
+      assert.equal(offClient.uploadCalls.length, 0)
+    },
+  )
+})
+
+test("N2-A.9E-4. write/read/SHA/no-overwrite/remove siguen PASS", async () => {
+  const client = createMockClient()
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("cc-cycle")
+  const p = pathsFor({ runId: "run-cc-cycle", student: 1, page: 0, attempt: 0, buf })
+  const meta = metaJson({ azureInputSha256: p.azureInputSha256, byteLength: buf.byteLength })
+  const wr = await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: meta,
+    azureInputSha256: p.azureInputSha256,
+  })
+  assert.equal(wr.ok, true, "WRITE PASS")
+  assert.equal(client.uploadCalls[0]!.options.cacheControl, "0")
+
+  const rd = await created.sink.read({ path: p.path, azureInputSha256: p.azureInputSha256 })
+  assert.equal(rd.ok, true, "READ PASS")
+  if (rd.ok) {
+    assert.equal(rd.azureInputSha256, p.azureInputSha256, "SHA PASS")
+    assert.equal(Buffer.compare(rd.bytes, buf), 0)
+  }
+
+  const ow = await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: meta,
+    azureInputSha256: p.azureInputSha256,
+  })
+  assert.equal(ow.ok, false, "NO OVERWRITE PASS")
+  if (!ow.ok) assert.equal(ow.errorCode, "already_exists")
+
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, true, "REMOVE PASS")
+  assert.equal(client.objects.has(p.path), false)
+  assert.equal(client.objects.has(p.metaPath), false)
+})
+
+test("N2-A.9E-5. delete_not_effective si bytes siguen; no public URL; no base64", async () => {
+  const client = createMockClient({ removeNoOp: true })
+  const created = createRemoteForensicSink({
+    bucketName: AZURE_FORENSIC_REMOTE_SUGGESTED_BUCKET,
+    client,
+  })
+  assert.ok(created.ok)
+  if (!created.ok) return
+  const buf = synthPng("cc-dne")
+  const p = pathsFor({ runId: "run-cc-dne", student: 1, page: 0, attempt: 0, buf })
+  await created.sink.write({
+    path: p.path,
+    metaPath: p.metaPath,
+    bytes: buf,
+    metaJson: metaJson({ azureInputSha256: p.azureInputSha256 }),
+    azureInputSha256: p.azureInputSha256,
+  })
+  const rm = await created.sink.remove({ path: p.path, metaPath: p.metaPath })
+  assert.equal(rm.ok, false)
+  if (!rm.ok) assert.equal(rm.errorCode, "delete_not_effective")
+  assert.equal(client.objects.has(p.path), true)
+  const still = await created.sink.read({ path: p.path, azureInputSha256: p.azureInputSha256 })
+  assert.equal(still.ok, true)
+  assert.equal(client.publicUrlCalls, 0)
+  const fs = await import("node:fs")
+  const path = await import("node:path")
+  const src = fs.readFileSync(
+    path.join(process.cwd(), "app/lib/diagnostics/azure-forensic-remote-sink.ts"),
+    "utf8",
+  )
+  assert.equal(/getPublicUrl\s*\(/.test(src), false)
+  assert.equal(/createSignedUrl\s*\(/.test(src), false)
+  assert.equal(/toString\(\s*["']base64["']\s*\)/.test(src), false)
+})
+
+test("N2-A.9E-6. read/remove sin cambio funcional; cacheControl solo en upload PNG", async () => {
+  const fs = await import("node:fs")
+  const path = await import("node:path")
+  const src = fs.readFileSync(
+    path.join(process.cwd(), "app/lib/diagnostics/azure-forensic-remote-sink.ts"),
+    "utf8",
+  )
+  const pngUploadIdx = src.indexOf("contentType: PNG_CONTENT_TYPE")
+  const metaUploadIdx = src.indexOf('contentType: "application/json"')
+  const cacheIdx = src.indexOf('cacheControl: "0"')
+  assert.ok(pngUploadIdx > 0)
+  assert.ok(metaUploadIdx > pngUploadIdx)
+  assert.ok(cacheIdx > pngUploadIdx)
+  assert.ok(cacheIdx < metaUploadIdx)
+  assert.equal(src.includes("POST_DELETE_VERIFY_ATTEMPTS = 3"), true)
+  assert.equal(src.includes("POST_DELETE_RETRY_DELAYS_MS"), true)
+  // cacheControl solo en tipo upload + PNG; no en read/remove.
+  const readFn = src.slice(
+    src.indexOf("async function readRemoteArtifact"),
+    src.indexOf("async function removeRemoteArtifact"),
+  )
+  const removeFn = src.slice(src.indexOf("async function removeRemoteArtifact"))
+  assert.equal(readFn.includes("cacheControl"), false)
+  assert.equal(removeFn.includes("cacheControl"), false)
 })
 
 test("identidad funcional flags OFF: record retorna null sin side-effects", async () => {
