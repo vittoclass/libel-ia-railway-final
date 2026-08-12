@@ -11,6 +11,65 @@ const hasServiceRole = !!process.env.SUPABASE_SERVICE_ROLE_KEY
 const supabaseHost = supabaseUrl ? new URL(supabaseUrl).host : "(no url)"
 
 /**
+ * Conservador: `.in("evaluation_id", chunk)` vía PostgREST construye URL GET.
+ * HeadersOverflow / UND_ERR_HEADERS_OVERFLOW aparece ~400 UUIDs (~15–22 KB).
+ * 100 IDs deja margen amplio y evita paralelismo agresivo.
+ * Nota: no exportar helpers desde route.ts (Next.js solo permite exports de route).
+ */
+const EVALUATION_ID_IN_CHUNK = 100
+
+function chunkIds<T>(ids: T[], chunkSize: number = EVALUATION_ID_IN_CHUNK): T[][] {
+  if (ids.length === 0) return []
+  const size = Math.max(1, Math.floor(chunkSize))
+  const out: T[][] = []
+  for (let i = 0; i < ids.length; i += size) {
+    out.push(ids.slice(i, i + size))
+  }
+  return out
+}
+
+/** Estimación del tamaño del filtro `in=(...)` en la querystring PostgREST. */
+function estimateInFilterBytes(ids: string[]): number {
+  if (ids.length === 0) return 0
+  const joined = ids.join(",")
+  return "evaluation_id=in.(".length + joined.length + 1
+}
+
+type ChunkQueryError = { message: string; details?: string | null } | null
+
+/**
+ * Ejecuta la misma query por lotes secuenciales y concatena filas.
+ * abortOnError=true: primer error detiene (summaries).
+ * abortOnError=false: ignora error de chunk y usa data ?? [] (students, comportamiento previo).
+ */
+async function fetchInEvaluationIdChunks<T>(
+  ids: string[],
+  fetchChunk: (chunk: string[]) => Promise<{ data: T[] | null; error: ChunkQueryError }>,
+  opts?: { chunkSize?: number; abortOnError?: boolean },
+): Promise<{ data: T[]; error: ChunkQueryError; chunkCount: number; maxInFilterBytes: number }> {
+  const chunkSize = opts?.chunkSize ?? EVALUATION_ID_IN_CHUNK
+  const abortOnError = opts?.abortOnError ?? true
+  if (ids.length === 0) {
+    return { data: [], error: null, chunkCount: 0, maxInFilterBytes: 0 }
+  }
+  const chunks = chunkIds(ids, chunkSize)
+  const out: T[] = []
+  let maxInFilterBytes = 0
+  for (const chunk of chunks) {
+    maxInFilterBytes = Math.max(maxInFilterBytes, estimateInFilterBytes(chunk))
+    const res = await fetchChunk(chunk)
+    if (res.error) {
+      if (abortOnError) {
+        return { data: out, error: res.error, chunkCount: chunks.length, maxInFilterBytes }
+      }
+      continue
+    }
+    if (res.data?.length) out.push(...res.data)
+  }
+  return { data: out, error: null, chunkCount: chunks.length, maxInFilterBytes }
+}
+
+/**
  * GET /api/evaluations/list
  * Query: course_id, subject, status, from_date, to_date, search (título).
  * Autentica con cookies; re-lee profile desde BD.
@@ -155,10 +214,15 @@ export async function GET(req: NextRequest) {
   let studentCounts: Map<string, number> = new Map()
   let firstStudentNames: Map<string, string> = new Map()
   if (ids.length > 0) {
-    const sumRes = await supabase
-      .from("evaluation_summaries")
-      .select("evaluation_id, grade_chile, student_name_raw, raw")
-      .in("evaluation_id", ids)
+    const sumRes = await fetchInEvaluationIdChunks(
+      ids,
+      async (chunk) =>
+        supabase
+          .from("evaluation_summaries")
+          .select("evaluation_id, grade_chile, student_name_raw, raw")
+          .in("evaluation_id", chunk),
+      { abortOnError: true },
+    )
     if (sumRes.error) {
       return NextResponse.json(
         {
@@ -171,10 +235,16 @@ export async function GET(req: NextRequest) {
       )
     }
     summaries = sumRes.data ?? []
-    const studentsRes = await supabase
-      .from("evaluation_students")
-      .select("evaluation_id, student_name")
-      .in("evaluation_id", ids)
+    // Misma semántica previa: no abortar por error de students; data ?? [] por chunk.
+    const studentsRes = await fetchInEvaluationIdChunks(
+      ids,
+      async (chunk) =>
+        supabase
+          .from("evaluation_students")
+          .select("evaluation_id, student_name")
+          .in("evaluation_id", chunk),
+      { abortOnError: false },
+    )
     const studentRows = (studentsRes.data ?? []) as Array<{ evaluation_id: string; student_name: string | null }>
     const byEval = new Map<string, Array<string>>()
     studentRows.forEach((r) => {
