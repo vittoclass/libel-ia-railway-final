@@ -1,14 +1,20 @@
 /**
  * Orquestador mínimo: auth interno + executeEvaluatePostBody SIN modificarlo.
  * No scoring, no persistencia manual, no copia de lógica pedagógica.
+ *
+ * SCALE-B0: identidad de persistencia = job_id (ALS → persistEvaluation).
+ * Checkpoint evaluation_id en Redis antes de markJobCompleted para reconciliar
+ * crash post-persist / pre-completed sin re-ejecutar el motor.
  */
 import { NextResponse } from "next/server"
 import { executeEvaluatePostBody } from "@/app/api/evaluate/evaluation-logic"
 import { runWithInternalAuthUser } from "@/app/lib/supabase-route"
 import {
   extractEvaluationIdFromResult,
+  isUuid,
   safeErrorMessage,
 } from "@/app/lib/evaluation-job-contract"
+import { runWithEvaluationJobPersistIdentity } from "@/app/lib/persist-evaluation"
 import {
   markJobCompleted,
   markJobFailed,
@@ -18,6 +24,7 @@ import {
   releaseJobLock,
   removeFromProcessing,
   tryAcquireJobLock,
+  writeJob,
 } from "@/app/api/evaluate/jobStore"
 
 export type RunEvaluationJobOutcome =
@@ -98,6 +105,22 @@ export async function runEvaluationJobOnce(args: {
       }
     }
 
+    // SCALE-B0: crash post-persist / pre-completed → reconciliar sin re-ejecutar motor
+    if (
+      job.status !== "failed" &&
+      typeof job.evaluation_id === "string" &&
+      isUuid(job.evaluation_id)
+    ) {
+      const reconciledBody =
+        job.result !== undefined && job.result !== null
+          ? job.result
+          : { success: true, evaluation_id: job.evaluation_id, reconciled_after_persist: true }
+      const processing =
+        job.status === "processing" ? job : await markJobProcessing(job)
+      await markJobCompleted(processing, reconciledBody, job.evaluation_id)
+      return { ok: true, jobId, statusCode: 200, result: reconciledBody }
+    }
+
     const payload = await readPayload(jobId)
     if (payload == null) {
       await markJobFailed(job, {
@@ -115,15 +138,22 @@ export async function runEvaluationJobOnce(args: {
     const processing = await markJobProcessing(job)
 
     // Única invocación del motor (o runner de prueba): mismo camino auth interno
-    const response = await runWithInternalAuthUser({ userId: processing.owner_user_id }, async () => {
-      if (executeFn) return executeFn(payload)
-      return executeEvaluatePostBody(payload)
-    })
+    // + identidad de persistencia = job_id (idempotencia PK sin schema).
+    const response = await runWithEvaluationJobPersistIdentity(jobId, () =>
+      runWithInternalAuthUser({ userId: processing.owner_user_id }, async () => {
+        if (executeFn) return executeFn(payload)
+        return executeEvaluatePostBody(payload)
+      }),
+    )
 
     const parsed = await nextResponseToJson(response)
 
     if (parsed.ok) {
       const evaluationId = extractEvaluationIdFromResult(parsed.body)
+      // Checkpoint durable antes de markJobCompleted (ventana crash P0).
+      if (evaluationId && isUuid(evaluationId)) {
+        await writeJob({ ...processing, evaluation_id: evaluationId })
+      }
       await markJobCompleted(processing, parsed.body, evaluationId)
       return { ok: true, jobId, statusCode: parsed.status, result: parsed.body }
     }

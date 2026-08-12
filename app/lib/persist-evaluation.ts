@@ -2,7 +2,11 @@
  * Persistencia de evaluación en Supabase.
  * Usa cliente con SERVICE_ROLE_KEY (bypass RLS). Nunca falla en silencio: devuelve
  * { saved: true, evaluation_id, status } o { saved: false, error: { message, step, details? } }.
+ *
+ * SCALE-B0: bajo contexto de job async, evaluations.id = job_id (PK) para idempotencia
+ * atómica ante retry/crash post-persist sin schema nuevo.
  */
+import { AsyncLocalStorage } from "node:async_hooks"
 import { getSupabaseServer } from "@/app/lib/supabase-server"
 import {
   ensureStudentProfile,
@@ -69,13 +73,115 @@ export interface EvaluationResultForPersist {
   >
 }
 
+export type PersistOutcome = "persisted_new" | "persisted_existing_idempotent"
+
 export type PersistResult =
-  | { saved: true; success: true; evaluation_id: string; status: string }
+  | {
+      saved: true
+      success: true
+      evaluation_id: string
+      status: string
+      persist_outcome?: PersistOutcome
+    }
   | { saved: false; success: false; error: { step: string; message: string }; reason?: string }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 function isValidUUID(s: string | null | undefined): boolean {
   return typeof s === "string" && s.trim() !== "" && UUID_REGEX.test(s.trim())
+}
+
+type PersistJobIdentityStore = { jobId: string }
+
+/**
+ * Identidad lógica SCALE-B0: job_id del Evaluation Job V1.
+ * Solo el runner async la establece; sync / retry-save siguen con UUID aleatorio.
+ */
+const persistJobIdentityAls = new AsyncLocalStorage<PersistJobIdentityStore>()
+
+/** Envuelve la ejecución del motor para que persistEvaluation use job_id como PK. */
+export function runWithEvaluationJobPersistIdentity<T>(
+  jobId: string,
+  fn: () => T | Promise<T>,
+): T | Promise<T> {
+  return persistJobIdentityAls.run({ jobId }, fn)
+}
+
+export function peekEvaluationJobPersistIdentity(): string | null {
+  const id = persistJobIdentityAls.getStore()?.jobId?.trim()
+  return id && isValidUUID(id) ? id : null
+}
+
+/** Resuelve evaluations.id: determinístico (job_id) bajo job async; aleatorio en path sync. */
+export function resolveEvaluationPersistId(): { evaluationId: string; deterministic: boolean } {
+  const jobId = peekEvaluationJobPersistIdentity()
+  if (jobId) return { evaluationId: jobId, deterministic: true }
+  return { evaluationId: crypto.randomUUID(), deterministic: false }
+}
+
+export function isPgUniqueViolation(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false
+  const code = "code" in err ? String((err as { code?: unknown }).code ?? "") : ""
+  if (code === "23505") return true
+  const message = "message" in err ? String((err as { message?: unknown }).message ?? "") : ""
+  return /duplicate key|unique constraint|already exists/i.test(message)
+}
+
+/**
+ * Fail-soft ante conflicto PK cuando la identidad es determinística:
+ * reutilizar fila existente; si no se puede confirmar, NO inventar otro id.
+ */
+export async function resolveDeterministicInsertConflict(args: {
+  deterministic: boolean
+  attemptedId: string
+  insertError: unknown
+  fetchExisting: () => Promise<{ id: string; status?: string | null } | null>
+}): Promise<
+  | { kind: "not_conflict" }
+  | { kind: "existing"; evaluation_id: string; status: string }
+  | { kind: "fail"; error: { step: string; message: string } }
+> {
+  if (!args.deterministic || !isPgUniqueViolation(args.insertError)) {
+    return { kind: "not_conflict" }
+  }
+  try {
+    const existing = await args.fetchExisting()
+    if (existing?.id && isValidUUID(existing.id) && existing.id === args.attemptedId) {
+      return {
+        kind: "existing",
+        evaluation_id: existing.id,
+        status: existing.status != null && String(existing.status).trim() !== "" ? String(existing.status) : "draft",
+      }
+    }
+  } catch (fetchErr) {
+    return {
+      kind: "fail",
+      error: {
+        step: "insert_evaluations_idempotent_lookup",
+        message: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+      },
+    }
+  }
+  return {
+    kind: "fail",
+    error: {
+      step: "insert_evaluations_idempotent_ambiguous",
+      message:
+        "Conflicto de identidad de persistencia sin fila confirmada; no se crea una segunda evaluación.",
+    },
+  }
+}
+
+/**
+ * Modelo in-memory del INSERT idempotente por PK (tests SCALE-B0 offline).
+ * Simula atomicidad de unique/PK: la primera escritura gana.
+ */
+export function memoryInsertEvaluationIdempotent(
+  store: Map<string, { id: string; status: string }>,
+  evaluationId: string,
+): PersistOutcome {
+  if (store.has(evaluationId)) return "persisted_existing_idempotent"
+  store.set(evaluationId, { id: evaluationId, status: "draft" })
+  return "persisted_new"
 }
 
 function isValidBatchStudentIndex(n: unknown): n is number {
@@ -210,7 +316,8 @@ const isDev = process.env.NODE_ENV !== "production"
   const rawCourse = opts.course_id != null && String(opts.course_id).trim() !== "" ? String(opts.course_id).trim() : null
   const safeCourseLabel = rawCourse ?? "Sin curso"
   const evaluationCourseId = isValidUUID(rawCourse) ? rawCourse!.trim() : null
-  const generatedEvaluationId = crypto.randomUUID()
+  const { evaluationId: generatedEvaluationId, deterministic: deterministicPersistId } =
+    resolveEvaluationPersistId()
 
   const confirmedStudents: string[] = []
   if (Array.isArray(opts.student_names) && opts.student_names.length > 0) {
@@ -306,6 +413,37 @@ const isDev = process.env.NODE_ENV !== "production"
     .single()
 
   if (evalError || !evaluation?.id) {
+    const conflict = await resolveDeterministicInsertConflict({
+      deterministic: deterministicPersistId,
+      attemptedId: generatedEvaluationId,
+      insertError: evalError,
+      fetchExisting: async () => {
+        const { data, error } = await supabase
+          .from("evaluations")
+          .select("id, status")
+          .eq("id", generatedEvaluationId)
+          .maybeSingle()
+        if (error) throw error
+        if (!data?.id) return null
+        return { id: String(data.id), status: (data as { status?: string | null }).status ?? null }
+      },
+    })
+    if (conflict.kind === "existing") {
+      console.info("[persist] persisted_existing_idempotent", {
+        evaluation_id: conflict.evaluation_id,
+      })
+      return {
+        saved: true,
+        success: true,
+        evaluation_id: conflict.evaluation_id,
+        status: conflict.status,
+        persist_outcome: "persisted_existing_idempotent",
+      }
+    }
+    if (conflict.kind === "fail") {
+      if (isDev) console.error("[save] evaluations idempotent FAIL", conflict.error.message)
+      return { saved: false, success: false, error: conflict.error }
+    }
     const msg = evalError?.message ?? String(evalError ?? "No id returned")
     if (isDev) console.error("[save] evaluations insert FAIL", evalError?.message ?? evalError)
     return {
@@ -325,6 +463,7 @@ const isDev = process.env.NODE_ENV !== "production"
     }
   }
   if (isDev) console.info("[persist] evaluation created", evaluationId)
+  console.info("[persist] persisted_new", { evaluation_id: evaluationId, deterministic: deterministicPersistId })
 
   if (!evaluationCourseId && batchPeerCourse.course_id && isValidUUID(batchPeerCourse.course_id)) {
     const { error: patchCourseErr } = await supabase
@@ -674,5 +813,11 @@ const isDev = process.env.NODE_ENV !== "production"
     }
   }
 
-  return { saved: true, success: true, evaluation_id: evaluationId, status: "draft" }
+  return {
+    saved: true,
+    success: true,
+    evaluation_id: evaluationId,
+    status: "draft",
+    persist_outcome: "persisted_new",
+  }
 }
