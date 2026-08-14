@@ -64,6 +64,13 @@ export function mergeEvaluationProviderTrace(
 const MISTRAL_CHAT_URL = "https://api.mistral.ai/v1/chat/completions"
 const MISTRAL_FETCH_TIMEOUT_MS = 25_000
 const MISTRAL_FETCH_TIMEOUT_MS_VISION = 40_000
+/** Piso exclusivo de requestEvaluationTextCompletion. Visión no lo usa. */
+export const EVALUATION_TEXT_TIMEOUT_FLOOR_MS = 40_000
+
+/** Timeout efectivo de Mistral texto: max(solicitado/default 25s, piso 40s). */
+export function resolveEvaluationTextTimeoutMs(requestedTimeoutMs?: number): number {
+  return Math.max(requestedTimeoutMs ?? MISTRAL_FETCH_TIMEOUT_MS, EVALUATION_TEXT_TIMEOUT_FLOOR_MS)
+}
 
 function primaryAiProvider(): string {
   return (process.env.AI_PROVIDER ?? "mistral").trim().toLowerCase() || "mistral"
@@ -373,7 +380,7 @@ export async function requestEvaluationTextCompletion(
             max_tokens: params.maxTokens,
           }),
         },
-        { timeoutMs: params.timeoutMs ?? MISTRAL_FETCH_TIMEOUT_MS },
+        { timeoutMs: resolveEvaluationTextTimeoutMs(params.timeoutMs) },
       )
       const data = await res.json()
       recordProviderCostAuditShadow({
