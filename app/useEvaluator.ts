@@ -85,6 +85,270 @@ function peekAsyncSessionGroupId(): string | undefined {
   return s?.group_id;
 }
 
+/** SCALE-R2: reintento selectivo (quién se encola). No cambia cómo se evalúa. */
+export const SELECTIVE_RETRY_COMPLETED_KEY = 'libelia_selective_retry_completed_v1';
+
+export type SelectiveRetryKvStore = {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+};
+
+export type SelectiveRetryGroupSnapshot = {
+  id: string;
+  hasFiles: boolean;
+  isEvaluated: boolean;
+  isEvaluating: boolean;
+  evaluationId?: string | null;
+  promotedEvaluationId?: string | null;
+  error?: string | null;
+  isValidationStep?: boolean;
+};
+
+export type SelectiveRetryClass =
+  | 'COMPLETED'
+  | 'IN_FLIGHT'
+  | 'FAILED_RETRYABLE'
+  | 'FAILED_NON_RETRYABLE'
+  | 'NEVER_EVALUATED'
+  | 'AMBIGUOUS';
+
+export type SelectiveRetryCompletedState = {
+  batchId: string;
+  groupCount: number;
+  completedByIndex: Record<string, string>;
+};
+
+export function createSyncOnceGuard(): { tryAcquire: () => boolean; release: () => void; isLocked: () => boolean } {
+  let locked = false;
+  return {
+    tryAcquire(): boolean {
+      if (locked) return false;
+      locked = true;
+      return true;
+    },
+    release(): void {
+      locked = false;
+    },
+    isLocked(): boolean {
+      return locked;
+    },
+  };
+}
+
+function trimId(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+export function groupHasPersistedEvaluationId(g: Pick<SelectiveRetryGroupSnapshot, 'evaluationId' | 'promotedEvaluationId'>): boolean {
+  return trimId(g.evaluationId).length > 0 || trimId(g.promotedEvaluationId).length > 0;
+}
+
+export function classifyEvaluateError(error: string | null | undefined): 'retryable' | 'non_retryable' | 'unknown' {
+  if (error == null) return 'unknown';
+  const raw = String(error).trim();
+  if (!raw) return 'unknown';
+  const lower = raw.toLowerCase();
+
+  if (lower === 'evaluate_in_flight') return 'unknown';
+
+  if (/\b401\b/.test(raw) || /\b403\b/.test(raw)) return 'non_retryable';
+  if (
+    lower.includes('no autorizado') ||
+    lower.includes('unauthorized') ||
+    lower.includes('forbidden') ||
+    lower.includes('ownership') ||
+    lower.includes('no pertenece')
+  ) {
+    return 'non_retryable';
+  }
+  if (
+    lower.includes('input ausente') ||
+    lower.includes('payload ausente') ||
+    lower.includes('sin archivos') ||
+    lower.includes('no hay archivos') ||
+    lower.includes('foto inexistente') ||
+    lower.includes('foto inválida') ||
+    lower.includes('imagen inválida') ||
+    lower.includes('invalid image') ||
+    lower.includes('invalid payload')
+  ) {
+    return 'non_retryable';
+  }
+
+  const http4 = raw.match(/\b(?:HTTP\s*)?(4\d\d)\b/i);
+  if (http4) {
+    const code = Number(http4[1]);
+    if (code === 408 || code === 429) return 'retryable';
+    if (code >= 400 && code < 500) return 'non_retryable';
+  }
+
+  if (
+    /\b5\d\d\b/.test(raw) ||
+    lower.includes('timeout') ||
+    lower.includes('timed out') ||
+    lower.includes('network') ||
+    lower.includes('fetch failed') ||
+    lower.includes('econnreset') ||
+    lower.includes('en cola') ||
+    lower.includes('no se pudo iniciar') ||
+    lower.includes('evaluación asíncrona falló') ||
+    lower.includes('error en la evaluación') ||
+    lower.includes('error consultando estado') ||
+    lower.includes('trabajo de evaluación no encontrado') ||
+    lower.includes('polling cancelado') ||
+    lower.includes('falló') ||
+    lower.includes('failed')
+  ) {
+    return 'retryable';
+  }
+
+  return 'unknown';
+}
+
+export function classifySelectiveRetryGroup(g: SelectiveRetryGroupSnapshot): SelectiveRetryClass {
+  if (groupHasPersistedEvaluationId(g)) return 'COMPLETED';
+  if (g.isEvaluating) return 'IN_FLIGHT';
+  if (g.isEvaluated && !g.error) return 'COMPLETED';
+  if (g.isEvaluated && g.error) return 'AMBIGUOUS';
+
+  if (g.error) {
+    if (!g.hasFiles) return 'FAILED_NON_RETRYABLE';
+    const kind = classifyEvaluateError(g.error);
+    if (kind === 'non_retryable') return 'FAILED_NON_RETRYABLE';
+    if (kind === 'retryable') return 'FAILED_RETRYABLE';
+    return 'AMBIGUOUS';
+  }
+
+  if (!g.hasFiles) return 'AMBIGUOUS';
+  return 'NEVER_EVALUATED';
+}
+
+export function shouldEnqueueSelectiveRetry(klass: SelectiveRetryClass): boolean {
+  return klass === 'FAILED_RETRYABLE' || klass === 'NEVER_EVALUATED';
+}
+
+export function selectGroupIdsToEvaluate(groups: SelectiveRetryGroupSnapshot[]): string[] {
+  const out: string[] = [];
+  for (const g of groups) {
+    if (shouldEnqueueSelectiveRetry(classifySelectiveRetryGroup(g))) out.push(g.id);
+  }
+  return out;
+}
+
+function parseCompletedState(raw: string | null): SelectiveRetryCompletedState | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<SelectiveRetryCompletedState>;
+    const batchId = trimId(parsed.batchId);
+    if (!batchId) return null;
+    const groupCount = Number(parsed.groupCount);
+    const completedByIndex =
+      parsed.completedByIndex && typeof parsed.completedByIndex === 'object' && !Array.isArray(parsed.completedByIndex)
+        ? parsed.completedByIndex
+        : {};
+    const clean: Record<string, string> = {};
+    for (const [k, v] of Object.entries(completedByIndex)) {
+      const id = trimId(v);
+      if (id) clean[String(k)] = id;
+    }
+    return {
+      batchId,
+      groupCount: Number.isFinite(groupCount) && groupCount > 0 ? groupCount : 0,
+      completedByIndex: clean,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function readSelectiveRetryCompletedState(
+  store: SelectiveRetryKvStore | null | undefined,
+  batchId: string,
+): SelectiveRetryCompletedState | null {
+  if (!store) return null;
+  const want = trimId(batchId);
+  if (!want) return null;
+  try {
+    const parsed = parseCompletedState(store.getItem(SELECTIVE_RETRY_COMPLETED_KEY));
+    if (!parsed || parsed.batchId !== want) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeSelectiveRetryCompletedState(store: SelectiveRetryKvStore, state: SelectiveRetryCompletedState): void {
+  store.setItem(SELECTIVE_RETRY_COMPLETED_KEY, JSON.stringify(state));
+}
+
+export function rememberSelectiveRetryGroupCount(
+  store: SelectiveRetryKvStore | null | undefined,
+  batchId: string,
+  groupCount: number,
+): void {
+  if (!store) return;
+  const bid = trimId(batchId);
+  if (!bid || !(groupCount > 0)) return;
+  try {
+    const prev = parseCompletedState(store.getItem(SELECTIVE_RETRY_COMPLETED_KEY));
+    const completedByIndex = prev && prev.batchId === bid ? prev.completedByIndex : {};
+    writeSelectiveRetryCompletedState(store, { batchId: bid, groupCount, completedByIndex });
+  } catch {
+    // storage lleno o bloqueado
+  }
+}
+
+export function rememberSelectiveRetryCompletedSlot(
+  store: SelectiveRetryKvStore | null | undefined,
+  args: { batchId: string; studentIndex: number; evaluationId: string; groupCount: number },
+): void {
+  if (!store) return;
+  const batchId = trimId(args.batchId);
+  const evaluationId = trimId(args.evaluationId);
+  const studentIndex = Number(args.studentIndex);
+  if (!batchId || !evaluationId || !Number.isFinite(studentIndex) || studentIndex < 1) return;
+  try {
+    const prev = parseCompletedState(store.getItem(SELECTIVE_RETRY_COMPLETED_KEY));
+    const completedByIndex = prev && prev.batchId === batchId ? { ...prev.completedByIndex } : {};
+    completedByIndex[String(studentIndex)] = evaluationId;
+    const groupCount =
+      args.groupCount > 0 ? args.groupCount : prev && prev.batchId === batchId ? prev.groupCount : studentIndex;
+    writeSelectiveRetryCompletedState(store, { batchId, groupCount, completedByIndex });
+  } catch {
+    // storage lleno o bloqueado
+  }
+}
+
+export function applySelectiveRetryCompletedHydration<T extends SelectiveRetryGroupSnapshot>(
+  groups: T[],
+  completedByIndex: Record<string, string> | null | undefined,
+): T[] {
+  if (!completedByIndex) return groups;
+  let changed = false;
+  const next = groups.map((g, i) => {
+    if (groupHasPersistedEvaluationId(g)) return g;
+    const id = trimId(completedByIndex[String(i + 1)]);
+    if (!id) return g;
+    changed = true;
+    return {
+      ...g,
+      evaluationId: id,
+      isEvaluated: true,
+      error: undefined,
+    };
+  });
+  return changed ? next : groups;
+}
+
+export function getSelectiveRetrySessionStore(): SelectiveRetryKvStore | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
 function safeParseJsonResponse(
   rawBody: string,
   response: Response,
@@ -342,6 +606,7 @@ export const useEvaluator = () => {
     phase: 'idle',
   });
   const pollAbortRef = useRef<AbortController | null>(null);
+  const evaluateInFlightRef = useRef(false);
 
   const clearEvaluateDiagnostic = useCallback(() => {
     setEvaluateDiagnostic(null);
@@ -427,6 +692,10 @@ export const useEvaluator = () => {
   }, []);
 
   const evaluate = useCallback(async (payload: any): Promise<any> => {
+    if (evaluateInFlightRef.current) {
+      return { success: false, error: 'EVALUATE_IN_FLIGHT', skippedDuplicate: true };
+    }
+    evaluateInFlightRef.current = true;
     setIsLoading(true);
     setEvaluateDiagnostic(null);
     const urlAttempted =
@@ -871,6 +1140,7 @@ export const useEvaluator = () => {
       });
       return { success: false, error: msg, diagnostic };
     } finally {
+      evaluateInFlightRef.current = false;
       setIsLoading(false);
     }
   }, [loadAnswerKey, answerKeyToPauta]);

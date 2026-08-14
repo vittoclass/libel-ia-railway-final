@@ -87,7 +87,19 @@ import {
   PDFViewer,
   pdf,
 } from "@react-pdf/renderer"
-import { useEvaluator, AnswerKeyData } from "./useEvaluator"
+import {
+  useEvaluator,
+  AnswerKeyData,
+  applySelectiveRetryCompletedHydration,
+  classifySelectiveRetryGroup,
+  getSelectiveRetrySessionStore,
+  rememberSelectiveRetryCompletedSlot,
+  rememberSelectiveRetryGroupCount,
+  readSelectiveRetryCompletedState,
+  selectGroupIdsToEvaluate,
+  shouldEnqueueSelectiveRetry,
+  type SelectiveRetryGroupSnapshot,
+} from "./useEvaluator"
 import {
   bindVisualSessionJobIds,
   clearEvaluationVisualSession,
@@ -912,6 +924,50 @@ function studentGroupHasLocalPedagogicalReportPayload(g: StudentGroup): boolean 
   return hasPuntaje && (hasAlts || hasDev)
 }
 
+function studentGroupToSelectiveRetrySnapshot(g: StudentGroup): SelectiveRetryGroupSnapshot {
+  return {
+    id: g.id,
+    hasFiles: Array.isArray(g.files) && g.files.length > 0,
+    isEvaluated: g.isEvaluated === true,
+    isEvaluating: g.isEvaluating === true,
+    evaluationId: g.evaluation_id,
+    promotedEvaluationId: g.promotedEvaluationId,
+    error: g.error,
+    isValidationStep: g.isValidationStep,
+  }
+}
+
+function applySelectiveRetryHydrationToStudentGroups(
+  groups: StudentGroup[],
+  completedByIndex: Record<string, string> | null | undefined,
+): StudentGroup[] {
+  if (!completedByIndex) return groups
+  const snaps = groups.map(studentGroupToSelectiveRetrySnapshot)
+  const hydrated = applySelectiveRetryCompletedHydration(snaps, completedByIndex)
+  if (hydrated === snaps) return groups
+  return groups.map((g, i) => {
+    const h = hydrated[i]
+    if (!h || groupHasPersistedIdUnchanged(g, h)) return g
+    const evalId = typeof h.evaluationId === "string" ? h.evaluationId.trim() : ""
+    if (!evalId) return g
+    return {
+      ...g,
+      evaluation_id: evalId,
+      isEvaluated: true,
+      error: undefined,
+    }
+  })
+}
+
+function groupHasPersistedIdUnchanged(
+  g: StudentGroup,
+  h: SelectiveRetryGroupSnapshot,
+): boolean {
+  const before = typeof g.evaluation_id === "string" ? g.evaluation_id.trim() : ""
+  const after = typeof h.evaluationId === "string" ? h.evaluationId.trim() : ""
+  return before === after && g.isEvaluated === h.isEvaluated
+}
+
 type ReportDocumentGroup = StudentGroup | CorrectionReportGroupForPdf
 
 /** Mismo criterio que ZIP masivo: payload local completo o GET por evaluation_id. */
@@ -1548,6 +1604,10 @@ export default function EvaluatorClient() {
     const p = readDocenteActiveBatchId()
     if (p) {
       setEvaluationBatchIdUi((prev) => prev ?? p)
+      const hydration = readSelectiveRetryCompletedState(getSelectiveRetrySessionStore(), p)
+      if (hydration && hydration.groupCount > 1) {
+        setClassSize((prev) => (prev === 1 ? hydration.groupCount : prev))
+      }
     }
   }, [])
 
@@ -1614,8 +1674,10 @@ export default function EvaluatorClient() {
   const mobileBatchSyncPendingRef = useRef(false)
   /** En navegador `setTimeout` devuelve number; evita choque con tipo Node `Timeout`. */
   const mobileBatchRealtimeDebounceRef = useRef<number | null>(null)
+  const evaluateAllGuardRef = useRef(false)
+  const evaluatingGroupIdsRef = useRef<Set<string>>(new Set())
   type SyncMobileBatchPhotosResult =
-    | { ok: true; newlyRecovered: number }
+    | { ok: true; newlyRecovered: number; groups: StudentGroup[] }
     | { ok: false; reason: "no_batch" }
     | { ok: false; reason: "busy" }
     | { ok: false; reason: "api_error"; message?: string }
@@ -2855,16 +2917,22 @@ export default function EvaluatorClient() {
     }
 
     const count = Math.max(1, classSize)
+    const batchId = evaluationBatchIdRef.current ?? readDocenteActiveBatchId()
+    const hydration = batchId ? readSelectiveRetryCompletedState(getSelectiveRetrySessionStore(), batchId) : null
     setStudentGroups(
-      Array.from({ length: count }, (_, i) => ({
-        id: `student-${Date.now()}-${i}`,
-        studentName: `Alumno ${i + 1}`,
-        studentRut: "",
-        files: [],
-        isEvaluated: false,
-        isEvaluating: false,
-        decimasAdicionales: 0,
-      })),
+      Array.from({ length: count }, (_, i) => {
+        const evalId = hydration?.completedByIndex[String(i + 1)]
+        return {
+          id: `student-${Date.now()}-${i}`,
+          studentName: `Alumno ${i + 1}`,
+          studentRut: "",
+          files: [],
+          isEvaluated: Boolean(evalId),
+          isEvaluating: false,
+          decimasAdicionales: 0,
+          ...(evalId ? { evaluation_id: evalId } : {}),
+        }
+      }),
     )
     setUnassignedFiles([])
   }, [classSize])
@@ -3382,7 +3450,22 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       )
       setStudentGroups(nextGroups)
       setUnassignedFiles(nextUnassigned)
-      return { ok: true, newlyRecovered: placement.length }
+      {
+        const store = getSelectiveRetrySessionStore()
+        rememberSelectiveRetryGroupCount(store, batchId, nextGroups.length)
+        for (let i = 0; i < nextGroups.length; i++) {
+          const evalId = nextGroups[i].evaluation_id ?? nextGroups[i].promotedEvaluationId
+          if (typeof evalId === "string" && evalId.trim()) {
+            rememberSelectiveRetryCompletedSlot(store, {
+              batchId,
+              studentIndex: i + 1,
+              evaluationId: evalId.trim(),
+              groupCount: nextGroups.length,
+            })
+          }
+        }
+      }
+      return { ok: true, newlyRecovered: placement.length, groups: nextGroups }
     } finally {
       mobileBatchSyncingRef.current = false
       if (mobileBatchSyncPendingRef.current) {
@@ -3730,6 +3813,9 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   // Función para manejar la evaluación de un solo grupo (usada para confirmación OMR individual)
   const handleEvaluateSingleGroup = async (groupId: string) => {
+    if (evaluatingGroupIdsRef.current.has(groupId)) return false
+    evaluatingGroupIdsRef.current.add(groupId)
+    try {
     if (!evaluationBatchIdRef.current) {
       evaluationBatchIdRef.current = crypto.randomUUID()
       setEvaluationBatchIdUi(evaluationBatchIdRef.current)
@@ -3771,7 +3857,9 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       if (canonical.pautaCorrectaAlternativas.trim()) pautaCorrectaAlternativasFinal = canonical.pautaCorrectaAlternativas
     }
 
-    let group = studentGroups.find((g) => g.id === groupId)
+    let group =
+      evaluatorStep2FilesRef.current.groups.find((g) => g.id === groupId) ??
+      studentGroups.find((g) => g.id === groupId)
     // Refresh / pérdida durante async: rehidratar previews desde session si el grupo quedó sin files.
     if (group && group.files.length === 0) {
       const visualSession = loadEvaluationVisualSession()
@@ -3788,6 +3876,9 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       }
     }
     if (!group || group.files.length === 0) return false
+
+    const retryClass = classifySelectiveRetryGroup(studentGroupToSelectiveRetrySnapshot(group))
+    if (!shouldEnqueueSelectiveRetry(retryClass)) return false
 
     // Snapshot visual ANTES del evaluate async (fuente de verdad para la revisión OMR).
     const visualSnapshot = group.files.map((f) => ({ ...f }))
@@ -3892,6 +3983,27 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     }
 
     const result = await evaluate(payload)
+
+    if (result?.skippedDuplicate) {
+      setStudentGroups((prev) =>
+        prev.map((g) => (g.id === groupId ? { ...g, isEvaluating: false } : g)),
+      )
+      return false
+    }
+
+    const persistedEvalId =
+      result?.success && typeof (result as { evaluation_id?: string }).evaluation_id === "string"
+        ? String((result as { evaluation_id: string }).evaluation_id).trim()
+        : ""
+    if (persistedEvalId) {
+      const studentIndex = studentGroups.findIndex((g) => g.id === groupId) + 1
+      rememberSelectiveRetryCompletedSlot(getSelectiveRetrySessionStore(), {
+        batchId: evaluationBatchIdRef.current ?? "",
+        studentIndex,
+        evaluationId: persistedEvalId,
+        groupCount: studentGroups.length,
+      })
+    }
 
     setStudentGroups((prev) =>
       prev.map((g) => {
@@ -4061,6 +4173,9 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       }),
     )
     return !!result.success
+    } finally {
+      evaluatingGroupIdsRef.current.delete(groupId)
+    }
   }
 
   // Función para manejar evaluación masiva: servidor ejecuta un estudiante tras otro (sin fetch interno)
@@ -4555,7 +4670,11 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   }
 
   const handleEvaluateGroupsSequential = async (groupIDsToEvaluate: string[]) => {
-    const validGroups = studentGroups.filter(
+    const sourceGroups =
+      evaluatorStep2FilesRef.current.groups.length > 0
+        ? evaluatorStep2FilesRef.current.groups
+        : studentGroups
+    const validGroups = sourceGroups.filter(
       (g) => groupIDsToEvaluate.includes(g.id) && g.files.length > 0,
     )
     if (validGroups.length === 0) return
@@ -4609,10 +4728,34 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
   }
 
   const onEvaluateAll = async () => {
-    if (batchProgress.isActive || isLoading) return
-    const groupsToEvaluate = studentGroups
-      .filter((g) => g.files.length > 0 && !g.isEvaluated && !g.isEvaluating)
-      .map((g) => g.id)
+    if (batchProgress.isActive || isLoading || evaluateAllGuardRef.current) return
+    evaluateAllGuardRef.current = true
+    try {
+    const syncResult = await syncMobileBatchPhotos()
+    const groupsSnapshot =
+      syncResult.ok && Array.isArray(syncResult.groups)
+        ? syncResult.groups
+        : evaluatorStep2FilesRef.current.groups
+    const batchId = evaluationBatchIdRef.current ?? readDocenteActiveBatchId()
+    const hydration = batchId
+      ? readSelectiveRetryCompletedState(getSelectiveRetrySessionStore(), batchId)
+      : null
+    const hydratedGroups = applySelectiveRetryHydrationToStudentGroups(
+      groupsSnapshot,
+      hydration?.completedByIndex,
+    )
+    if (hydratedGroups !== groupsSnapshot) {
+      setStudentGroups(hydratedGroups)
+    }
+    evaluatorStep2FilesRef.current = {
+      groups: hydratedGroups,
+      unassigned: evaluatorStep2FilesRef.current.unassigned,
+    }
+    if (batchId) {
+      rememberSelectiveRetryGroupCount(getSelectiveRetrySessionStore(), batchId, hydratedGroups.length)
+    }
+
+    const groupsToEvaluate = selectGroupIdsToEvaluate(hydratedGroups.map(studentGroupToSelectiveRetrySnapshot))
 
     if (groupsToEvaluate.length === 0) {
       alert("No hay grupos con archivos para evaluar o todos ya han sido evaluados.")
@@ -4620,11 +4763,14 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     }
 
     // Si algún grupo está en el paso de validación OMR, solo evaluamos ese grupo (individual).
-    const validationGroup = studentGroups.find((g) => g.isValidationStep)
+    const validationGroup = hydratedGroups.find((g) => g.isValidationStep)
     if (validationGroup) {
       await handleEvaluateSingleGroup(validationGroup.id)
     } else {
       await handleEvaluateGroupsSequential(groupsToEvaluate)
+    }
+    } finally {
+      evaluateAllGuardRef.current = false
     }
   }
 
@@ -4687,6 +4833,9 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   const isCurrentlyEvaluatingAny = studentGroups.some((g) => g.isEvaluating)
   const isCurrentlyValidatingAny = studentGroups.some((g) => g.isValidationStep) // 🚨 NUEVO: Comprobar si estamos en paso de validación
+  const selectiveRetryEligibleIds = selectGroupIdsToEvaluate(
+    studentGroups.map(studentGroupToSelectiveRetrySnapshot),
+  )
   const handlePreview = async (groupId: string) => {
     const group = studentGroups.find((g) => g.id === groupId)
     if (!group) return
@@ -6609,7 +6758,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         <Users className="text-green-500" />
                         Grupos de Estudiantes
                         <span className="text-sm font-normal text-[var(--text-secondary)]">
-                          ({studentGroups.filter((g) => g.files.length > 0).length} con archivos · {studentGroups.filter((g) => g.files.length > 0 && !g.isEvaluated && !g.isEvaluating).length} listos para evaluar)
+                          ({studentGroups.filter((g) => g.files.length > 0).length} con archivos · {selectiveRetryEligibleIds.length} listos para evaluar)
                         </span>
                       </CardTitle>
                       <Button
@@ -6781,7 +6930,10 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                                 isLoading ||
                                 batchProgress.isActive ||
                                 (isCurrentlyEvaluatingAny && !group.isEvaluating) ||
-                                isCurrentlyValidatingAny
+                                isCurrentlyValidatingAny ||
+                                !shouldEnqueueSelectiveRetry(
+                                  classifySelectiveRetryGroup(studentGroupToSelectiveRetrySnapshot(group)),
+                                )
                               }
                               onClick={() => void handleEvaluateSingleGroup(group.id)}
                             >
@@ -6884,7 +7036,7 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                         </>
                       ) : (
                         <>
-                          <Sparkles className="mr-2 h-4 w-4" /> {"Evaluar Todo (" + studentGroups.filter((g) => g.files.length > 0 && !g.isEvaluated).length + " pendientes)"}
+                          <Sparkles className="mr-2 h-4 w-4" /> {"Evaluar Todo (" + selectiveRetryEligibleIds.length + " pendientes)"}
                         </>
                       )}
                     </Button>
