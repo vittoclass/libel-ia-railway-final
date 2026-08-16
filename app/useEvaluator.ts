@@ -85,8 +85,9 @@ function peekAsyncSessionGroupId(): string | undefined {
   return s?.group_id;
 }
 
-/** SCALE-R2: reintento selectivo (quién se encola). No cambia cómo se evalúa. */
+/** SCALE-R2/R4: reintento selectivo (quién se encola). No cambia cómo se evalúa. */
 export const SELECTIVE_RETRY_COMPLETED_KEY = 'libelia_selective_retry_completed_v1';
+export const SELECTIVE_RETRY_STATE_VERSION = 2 as const;
 
 export type SelectiveRetryKvStore = {
   getItem(key: string): string | null;
@@ -102,6 +103,14 @@ export type SelectiveRetryGroupSnapshot = {
   promotedEvaluationId?: string | null;
   error?: string | null;
   isValidationStep?: boolean;
+  /** SCALE-R4: intento actual (estable en refresh; nuevo en «Nuevo lote»). */
+  currentAttemptId?: string | null;
+  /** Fingerprint del input actual (archivos / foto móvil). */
+  inputFingerprint?: string | null;
+  /** Intento al que pertenece el completed record hidratado o en sesión. */
+  completedAttemptId?: string | null;
+  /** Fingerprint del input que produjo el completed record. */
+  completedFingerprint?: string | null;
 };
 
 export type SelectiveRetryClass =
@@ -112,10 +121,19 @@ export type SelectiveRetryClass =
   | 'NEVER_EVALUATED'
   | 'AMBIGUOUS';
 
+export type SelectiveRetryCompletedSlot = {
+  evaluationId: string;
+  fingerprint: string;
+  attemptId: string;
+};
+
 export type SelectiveRetryCompletedState = {
+  v: 1 | 2;
   batchId: string;
+  attemptId: string;
   groupCount: number;
-  completedByIndex: Record<string, string>;
+  isLegacy: boolean;
+  completedByIndex: Record<string, SelectiveRetryCompletedSlot>;
 };
 
 export function createSyncOnceGuard(): { tryAcquire: () => boolean; release: () => void; isLocked: () => boolean } {
@@ -205,11 +223,69 @@ export function classifyEvaluateError(error: string | null | undefined): 'retrya
   return 'unknown';
 }
 
+export type SelectiveRetryFingerprintFile = {
+  name?: string;
+  size?: number;
+  lastModified?: number;
+  type?: string;
+  mobileBatchPhotoId?: string | null;
+  file?: { name?: string; size?: number; lastModified?: number; type?: string } | null;
+};
+
+export function computeSelectiveRetryFileFingerprint(file: SelectiveRetryFingerprintFile | null | undefined): string {
+  if (!file) return '';
+  const mobile = trimId(file.mobileBatchPhotoId);
+  if (mobile) return `m:${mobile}`;
+  const f = file.file;
+  const name = String(f?.name ?? file.name ?? '');
+  const size = Number(f?.size ?? file.size ?? 0);
+  const lastModified = Number(f?.lastModified ?? file.lastModified ?? 0);
+  const type = String(f?.type ?? file.type ?? '');
+  if (!name && !size && !lastModified && !type) return '';
+  return `f:${name}|${Number.isFinite(size) ? size : 0}|${Number.isFinite(lastModified) ? lastModified : 0}|${type}`;
+}
+
+export function computeSelectiveRetryGroupFingerprint(
+  files: Array<SelectiveRetryFingerprintFile | null | undefined> | null | undefined,
+): string {
+  if (!Array.isArray(files) || files.length === 0) return '';
+  return files.map((f) => computeSelectiveRetryFileFingerprint(f)).filter(Boolean).join('||');
+}
+
+function isForeignAttempt(g: SelectiveRetryGroupSnapshot): boolean {
+  const cur = trimId(g.currentAttemptId);
+  const rec = trimId(g.completedAttemptId);
+  if (!cur || !rec) return false;
+  return cur !== rec;
+}
+
+function isDifferentInput(g: SelectiveRetryGroupSnapshot): boolean {
+  const a = trimId(g.inputFingerprint);
+  const b = trimId(g.completedFingerprint);
+  if (!a || !b) return false;
+  return a !== b;
+}
+
+/** evaluation_id histórica sin attempt identity: no puede bloquear una corrida actual. */
+function isLegacyUnscopedPersistedId(g: SelectiveRetryGroupSnapshot): boolean {
+  return groupHasPersistedEvaluationId(g) && trimId(g.currentAttemptId).length > 0 && trimId(g.completedAttemptId).length === 0;
+}
+
+function persistedIdBelongsToCurrentAttempt(g: SelectiveRetryGroupSnapshot): boolean {
+  if (!groupHasPersistedEvaluationId(g)) return false;
+  if (isForeignAttempt(g) || isDifferentInput(g) || isLegacyUnscopedPersistedId(g)) return false;
+  return true;
+}
+
 export function classifySelectiveRetryGroup(g: SelectiveRetryGroupSnapshot): SelectiveRetryClass {
-  if (groupHasPersistedEvaluationId(g)) return 'COMPLETED';
   if (g.isEvaluating) return 'IN_FLIGHT';
-  if (g.isEvaluated && !g.error) return 'COMPLETED';
-  if (g.isEvaluated && g.error) return 'AMBIGUOUS';
+
+  const foreign = isForeignAttempt(g);
+  const differentInput = isDifferentInput(g);
+
+  if (persistedIdBelongsToCurrentAttempt(g)) return 'COMPLETED';
+  if (g.isEvaluated && !g.error && !foreign && !differentInput) return 'COMPLETED';
+  if (g.isEvaluated && g.error && !foreign && !differentInput) return 'AMBIGUOUS';
 
   if (g.error) {
     if (!g.hasFiles) return 'FAILED_NON_RETRYABLE';
@@ -235,27 +311,75 @@ export function selectGroupIdsToEvaluate(groups: SelectiveRetryGroupSnapshot[]):
   return out;
 }
 
+function mintAttemptId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `att-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function normalizeCompletedSlot(raw: unknown): SelectiveRetryCompletedSlot | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const rec = raw as Partial<SelectiveRetryCompletedSlot>;
+  const evaluationId = trimId(rec.evaluationId);
+  const fingerprint = trimId(rec.fingerprint);
+  const attemptId = trimId(rec.attemptId);
+  if (!evaluationId || !fingerprint || !attemptId) return null;
+  return { evaluationId, fingerprint, attemptId };
+}
+
 function parseCompletedState(raw: string | null): SelectiveRetryCompletedState | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as Partial<SelectiveRetryCompletedState>;
-    const batchId = trimId(parsed.batchId);
-    if (!batchId) return null;
-    const groupCount = Number(parsed.groupCount);
-    const completedByIndex =
-      parsed.completedByIndex && typeof parsed.completedByIndex === 'object' && !Array.isArray(parsed.completedByIndex)
-        ? parsed.completedByIndex
-        : {};
-    const clean: Record<string, string> = {};
-    for (const [k, v] of Object.entries(completedByIndex)) {
-      const id = trimId(v);
-      if (id) clean[String(k)] = id;
-    }
-    return {
-      batchId,
-      groupCount: Number.isFinite(groupCount) && groupCount > 0 ? groupCount : 0,
-      completedByIndex: clean,
+    const parsed = JSON.parse(raw) as {
+      v?: unknown;
+      batchId?: unknown;
+      attemptId?: unknown;
+      groupCount?: unknown;
+      completedByIndex?: unknown;
     };
+    const batchId = typeof parsed.batchId === 'string' ? parsed.batchId.trim() : '';
+    const attemptId = typeof parsed.attemptId === 'string' ? parsed.attemptId.trim() : '';
+    const v = parsed.v === 2 ? 2 : 1;
+    const groupCount = Number(parsed.groupCount);
+    const rawMap =
+      parsed.completedByIndex && typeof parsed.completedByIndex === 'object' && !Array.isArray(parsed.completedByIndex)
+        ? (parsed.completedByIndex as Record<string, unknown>)
+        : {};
+
+    const clean: Record<string, SelectiveRetryCompletedSlot> = {};
+    let sawLegacyEntry = false;
+    for (const [k, val] of Object.entries(rawMap)) {
+      if (typeof val === 'string') {
+        sawLegacyEntry = true;
+        continue;
+      }
+      const slot = normalizeCompletedSlot(val);
+      if (slot) clean[String(k)] = slot;
+      else sawLegacyEntry = true;
+    }
+
+    const isLegacy = v !== 2 || !attemptId || sawLegacyEntry;
+    if (!attemptId && !batchId) return null;
+    return {
+      v,
+      batchId,
+      attemptId,
+      groupCount: Number.isFinite(groupCount) && groupCount > 0 ? groupCount : 0,
+      isLegacy,
+      completedByIndex: isLegacy ? {} : clean,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function readSelectiveRetryCurrentState(
+  store: SelectiveRetryKvStore | null | undefined,
+): SelectiveRetryCompletedState | null {
+  if (!store) return null;
+  try {
+    return parseCompletedState(store.getItem(SELECTIVE_RETRY_COMPLETED_KEY));
   } catch {
     return null;
   }
@@ -278,21 +402,124 @@ export function readSelectiveRetryCompletedState(
 }
 
 function writeSelectiveRetryCompletedState(store: SelectiveRetryKvStore, state: SelectiveRetryCompletedState): void {
-  store.setItem(SELECTIVE_RETRY_COMPLETED_KEY, JSON.stringify(state));
+  store.setItem(
+    SELECTIVE_RETRY_COMPLETED_KEY,
+    JSON.stringify({
+      v: SELECTIVE_RETRY_STATE_VERSION,
+      batchId: state.batchId,
+      attemptId: state.attemptId,
+      groupCount: state.groupCount,
+      completedByIndex: state.completedByIndex,
+    }),
+  );
+}
+
+function sameAttemptState(
+  prev: SelectiveRetryCompletedState | null,
+  batchId: string,
+  attemptId: string,
+): boolean {
+  if (!prev || prev.isLegacy || !attemptId || prev.attemptId !== attemptId) return false;
+  if (!prev.batchId || !batchId) return true;
+  return prev.batchId === batchId;
+}
+
+export function beginSelectiveRetryAttempt(
+  store: SelectiveRetryKvStore | null | undefined,
+  args?: { batchId?: string | null; groupCount?: number; attemptId?: string | null },
+): string {
+  const attemptId = trimId(args?.attemptId) || mintAttemptId();
+  const batchId = trimId(args?.batchId);
+  const groupCount = args?.groupCount && args.groupCount > 0 ? args.groupCount : 0;
+  if (store) {
+    try {
+      writeSelectiveRetryCompletedState(store, {
+        v: 2,
+        batchId,
+        attemptId,
+        groupCount,
+        isLegacy: false,
+        completedByIndex: {},
+      });
+    } catch {
+      // storage lleno o bloqueado
+    }
+  }
+  return attemptId;
+}
+
+export function ensureSelectiveRetryAttempt(
+  store: SelectiveRetryKvStore | null | undefined,
+  args?: { batchId?: string | null; groupCount?: number },
+): { attemptId: string; state: SelectiveRetryCompletedState } {
+  const bid = trimId(args?.batchId);
+  const groupCount = args?.groupCount && args.groupCount > 0 ? args.groupCount : 0;
+  const prev = store ? parseCompletedState(store.getItem(SELECTIVE_RETRY_COMPLETED_KEY)) : null;
+  if (prev && !prev.isLegacy && prev.attemptId) {
+    const batchCompatible = !bid || !prev.batchId || prev.batchId === bid;
+    if (batchCompatible) {
+      const state: SelectiveRetryCompletedState = {
+        v: 2,
+        batchId: bid || prev.batchId,
+        attemptId: prev.attemptId,
+        groupCount: groupCount || prev.groupCount,
+        isLegacy: false,
+        completedByIndex: prev.completedByIndex,
+      };
+      if (store && (state.batchId !== prev.batchId || state.groupCount !== prev.groupCount)) {
+        try {
+          writeSelectiveRetryCompletedState(store, state);
+        } catch {
+          // storage lleno o bloqueado
+        }
+      }
+      return { attemptId: prev.attemptId, state };
+    }
+  }
+  const attemptId = mintAttemptId();
+  const state: SelectiveRetryCompletedState = {
+    v: 2,
+    batchId: bid,
+    attemptId,
+    groupCount,
+    isLegacy: false,
+    completedByIndex: {},
+  };
+  if (store) {
+    try {
+      writeSelectiveRetryCompletedState(store, state);
+    } catch {
+      // storage lleno o bloqueado
+    }
+  }
+  return { attemptId, state };
 }
 
 export function rememberSelectiveRetryGroupCount(
   store: SelectiveRetryKvStore | null | undefined,
   batchId: string,
   groupCount: number,
+  attemptId?: string,
 ): void {
   if (!store) return;
   const bid = trimId(batchId);
   if (!bid || !(groupCount > 0)) return;
   try {
     const prev = parseCompletedState(store.getItem(SELECTIVE_RETRY_COMPLETED_KEY));
-    const completedByIndex = prev && prev.batchId === bid ? prev.completedByIndex : {};
-    writeSelectiveRetryCompletedState(store, { batchId: bid, groupCount, completedByIndex });
+    const aid = trimId(attemptId) || (prev && !prev.isLegacy ? prev.attemptId : '');
+    if (!aid) {
+      ensureSelectiveRetryAttempt(store, { batchId: bid, groupCount });
+      return;
+    }
+    const keep = sameAttemptState(prev, bid, aid);
+    writeSelectiveRetryCompletedState(store, {
+      v: 2,
+      batchId: bid,
+      attemptId: aid,
+      groupCount,
+      isLegacy: false,
+      completedByIndex: keep && prev ? prev.completedByIndex : {},
+    });
   } catch {
     // storage lleno o bloqueado
   }
@@ -300,20 +527,37 @@ export function rememberSelectiveRetryGroupCount(
 
 export function rememberSelectiveRetryCompletedSlot(
   store: SelectiveRetryKvStore | null | undefined,
-  args: { batchId: string; studentIndex: number; evaluationId: string; groupCount: number },
+  args: {
+    batchId: string;
+    studentIndex: number;
+    evaluationId: string;
+    groupCount: number;
+    attemptId: string;
+    fingerprint: string;
+  },
 ): void {
   if (!store) return;
   const batchId = trimId(args.batchId);
   const evaluationId = trimId(args.evaluationId);
+  const attemptId = trimId(args.attemptId);
+  const fingerprint = trimId(args.fingerprint);
   const studentIndex = Number(args.studentIndex);
-  if (!batchId || !evaluationId || !Number.isFinite(studentIndex) || studentIndex < 1) return;
+  if (!batchId || !evaluationId || !attemptId || !fingerprint || !Number.isFinite(studentIndex) || studentIndex < 1) return;
   try {
     const prev = parseCompletedState(store.getItem(SELECTIVE_RETRY_COMPLETED_KEY));
-    const completedByIndex = prev && prev.batchId === batchId ? { ...prev.completedByIndex } : {};
-    completedByIndex[String(studentIndex)] = evaluationId;
+    const keep = sameAttemptState(prev, batchId, attemptId);
+    const completedByIndex = keep && prev ? { ...prev.completedByIndex } : {};
+    completedByIndex[String(studentIndex)] = { evaluationId, fingerprint, attemptId };
     const groupCount =
-      args.groupCount > 0 ? args.groupCount : prev && prev.batchId === batchId ? prev.groupCount : studentIndex;
-    writeSelectiveRetryCompletedState(store, { batchId, groupCount, completedByIndex });
+      args.groupCount > 0 ? args.groupCount : keep && prev && prev.groupCount > 0 ? prev.groupCount : studentIndex;
+    writeSelectiveRetryCompletedState(store, {
+      v: 2,
+      batchId,
+      attemptId,
+      groupCount,
+      isLegacy: false,
+      completedByIndex,
+    });
   } catch {
     // storage lleno o bloqueado
   }
@@ -321,20 +565,32 @@ export function rememberSelectiveRetryCompletedSlot(
 
 export function applySelectiveRetryCompletedHydration<T extends SelectiveRetryGroupSnapshot>(
   groups: T[],
-  completedByIndex: Record<string, string> | null | undefined,
+  completedByIndex:
+    | Record<string, string | SelectiveRetryCompletedSlot>
+    | SelectiveRetryCompletedState['completedByIndex']
+    | null
+    | undefined,
+  ctx?: { currentAttemptId?: string | null; isLegacy?: boolean },
 ): T[] {
-  if (!completedByIndex) return groups;
+  if (!completedByIndex || ctx?.isLegacy) return groups;
+  const currentAttemptId = trimId(ctx?.currentAttemptId);
   let changed = false;
   const next = groups.map((g, i) => {
     if (groupHasPersistedEvaluationId(g)) return g;
-    const id = trimId(completedByIndex[String(i + 1)]);
-    if (!id) return g;
+    const raw = completedByIndex[String(i + 1)];
+    const slot = typeof raw === 'string' ? null : normalizeCompletedSlot(raw);
+    if (!slot) return g;
+    if (currentAttemptId && slot.attemptId !== currentAttemptId) return g;
+    const fp = trimId(g.inputFingerprint);
+    if (!fp || fp !== slot.fingerprint) return g;
     changed = true;
     return {
       ...g,
-      evaluationId: id,
+      evaluationId: slot.evaluationId,
       isEvaluated: true,
       error: undefined,
+      completedAttemptId: slot.attemptId,
+      completedFingerprint: slot.fingerprint,
     };
   });
   return changed ? next : groups;
@@ -347,6 +603,52 @@ export function getSelectiveRetrySessionStore(): SelectiveRetryKvStore | null {
   } catch {
     return null;
   }
+}
+
+/** QR-R4: generación capturada al iniciar sync móvil vs estado al aplicar. */
+export type QrSyncGeneration = {
+  attemptId?: string | null
+  batchId?: string | null
+}
+
+export function compareQrSyncGeneration(
+  started: QrSyncGeneration,
+  current: QrSyncGeneration,
+): { sameAttempt: boolean; sameBatch: boolean } {
+  const startAttempt = trimId(started.attemptId)
+  const curAttempt = trimId(current.attemptId)
+  const startBatch = trimId(started.batchId)
+  const curBatch = trimId(current.batchId)
+  return {
+    sameAttempt: startAttempt.length > 0 && startAttempt === curAttempt,
+    sameBatch: startBatch.length > 0 && startBatch === curBatch,
+  }
+}
+
+export function shouldApplyQrSyncPhotos(gen: { sameBatch: boolean }): boolean {
+  return gen.sameBatch === true
+}
+
+/**
+ * QR-R4 current-attempt completed gate.
+ * API `is_evaluated` es historial del batch/slot, no completed de la corrida actual.
+ * Solo se conserva completed ya ganado en sesión.
+ */
+export function shouldPromoteApiIsEvaluatedToCurrentAttempt(args: {
+  apiIsEvaluated: boolean
+  sameAttempt: boolean
+  sameBatch: boolean
+  groupAlreadyCompletedInCurrentAttempt: boolean
+}): boolean {
+  if (args.groupAlreadyCompletedInCurrentAttempt) return true
+  if (!args.sameAttempt || !args.sameBatch) return false
+  void args.apiIsEvaluated
+  return false
+}
+
+/** Historial de batch-evaluar-sync nunca escribe sessionStorage completed. */
+export function shouldRememberCompletedFromQrSyncHistory(): boolean {
+  return false
 }
 
 function safeParseJsonResponse(

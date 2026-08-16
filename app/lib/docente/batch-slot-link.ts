@@ -27,6 +27,44 @@ export type LinkFinalEvaluationToBatchSlotResult = {
   relinkedPhotoCount?: number
 }
 
+function gradeChileIsPresent(row: { grade_chile?: unknown } | null | undefined): boolean {
+  return row != null && row.grade_chile != null
+}
+
+/**
+ * Evaluación REAL si hay al menos un item o grade_chile != null.
+ * Si la evidencia no puede consultarse: fail-safe → tratar como REAL (no archivar).
+ */
+async function occupantIsRealEvaluation(
+  supabase: SupabaseClient,
+  occupantId: string,
+): Promise<boolean> {
+  const { data: itemRows, error: itemsErr } = await supabase
+    .from("evaluation_items")
+    .select("id")
+    .eq("evaluation_id", occupantId)
+    .limit(1)
+
+  if (itemsErr) {
+    return true
+  }
+
+  const hasItems = Array.isArray(itemRows) && itemRows.length > 0
+
+  const { data: summaryRow, error: summaryErr } = await supabase
+    .from("evaluation_summaries")
+    .select("grade_chile")
+    .eq("evaluation_id", occupantId)
+    .maybeSingle()
+
+  if (summaryErr) {
+    return true
+  }
+
+  const hasGrade = gradeChileIsPresent(summaryRow as { grade_chile?: unknown } | null)
+  return hasItems || hasGrade
+}
+
 export async function linkFinalEvaluationToBatchSlot(
   input: LinkFinalEvaluationToBatchSlotInput,
 ): Promise<LinkFinalEvaluationToBatchSlotResult> {
@@ -60,7 +98,7 @@ export async function linkFinalEvaluationToBatchSlot(
     return { ok: false, skipped: true, reason: "final_evaluation_not_found", finalEvaluationId }
   }
 
-  const { data: draftRows, error: draftErr } = await supabase
+  const { data: occupantRows, error: occupantErr } = await supabase
     .from("evaluations")
     .select("id")
     .eq("batch_id", batchId)
@@ -69,11 +107,11 @@ export async function linkFinalEvaluationToBatchSlot(
     .neq("id", finalEvaluationId)
     .limit(1)
 
-  if (draftErr) {
-    return { ok: false, reason: draftErr.message, finalEvaluationId }
+  if (occupantErr) {
+    return { ok: false, reason: occupantErr.message, finalEvaluationId }
   }
 
-  const draftEvaluationId = draftRows?.[0]?.id ? String(draftRows[0].id) : null
+  const draftEvaluationId = occupantRows?.[0]?.id ? String(occupantRows[0].id) : null
 
   const { data: slotPhotos, error: photosErr } = await supabase
     .from("batch_photo_uploads")
@@ -112,16 +150,19 @@ export async function linkFinalEvaluationToBatchSlot(
     }
   }
 
+  let occupantIsReal = true
   if (draftEvaluationId) {
-    const { error: archiveErr } = await supabase
+    occupantIsReal = await occupantIsRealEvaluation(supabase, draftEvaluationId)
+
+    const { error: freeErr } = await supabase
       .from("evaluations")
-      .update({ batch_student_index: null, status: "archived" })
+      .update({ batch_student_index: null })
       .eq("id", draftEvaluationId)
       .eq("teacher_id", teacherId)
       .eq("batch_id", batchId)
 
-    if (archiveErr) {
-      return { ok: false, reason: archiveErr.message, draftEvaluationId, finalEvaluationId }
+    if (freeErr) {
+      return { ok: false, reason: freeErr.message, draftEvaluationId, finalEvaluationId }
     }
   }
 
@@ -162,6 +203,25 @@ export async function linkFinalEvaluationToBatchSlot(
       return { ok: false, reason: relinkErr.message, draftEvaluationId, finalEvaluationId }
     }
     relinkedPhotoCount = (relinkedRows ?? []).length
+  }
+
+  if (draftEvaluationId && !occupantIsReal) {
+    const { error: archiveErr } = await supabase
+      .from("evaluations")
+      .update({ status: "archived" })
+      .eq("id", draftEvaluationId)
+      .eq("teacher_id", teacherId)
+      .eq("batch_id", batchId)
+
+    if (archiveErr) {
+      return {
+        ok: false,
+        reason: archiveErr.message,
+        draftEvaluationId,
+        finalEvaluationId,
+        relinkedPhotoCount,
+      }
+    }
   }
 
   return {

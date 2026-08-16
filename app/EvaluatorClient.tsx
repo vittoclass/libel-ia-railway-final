@@ -91,13 +91,21 @@ import {
   useEvaluator,
   AnswerKeyData,
   applySelectiveRetryCompletedHydration,
+  beginSelectiveRetryAttempt,
   classifySelectiveRetryGroup,
+  compareQrSyncGeneration,
+  computeSelectiveRetryGroupFingerprint,
+  ensureSelectiveRetryAttempt,
   getSelectiveRetrySessionStore,
   rememberSelectiveRetryCompletedSlot,
   rememberSelectiveRetryGroupCount,
   readSelectiveRetryCompletedState,
+  readSelectiveRetryCurrentState,
   selectGroupIdsToEvaluate,
+  shouldApplyQrSyncPhotos,
   shouldEnqueueSelectiveRetry,
+  shouldPromoteApiIsEvaluatedToCurrentAttempt,
+  type SelectiveRetryCompletedState,
   type SelectiveRetryGroupSnapshot,
 } from "./useEvaluator"
 import {
@@ -901,6 +909,10 @@ interface StudentGroup {
   evaluation_id?: string | null
   /** Evaluación ya creada al promocionar/vincular foto del lote móvil (mismo batch). */
   promotedEvaluationId?: string | null
+  /** SCALE-R4: intento en el que este grupo quedó completed (sesión actual). */
+  selectiveRetryAttemptId?: string | null
+  /** SCALE-R4: fingerprint del input que produjo el completed en sesión. */
+  selectiveRetryInputFingerprint?: string | null
   shouldUseOfficialAzureOmr?: boolean
   officialOmrActivationReason?: string
   officialOmrIntegrationEnabled?: boolean
@@ -924,26 +936,55 @@ function studentGroupHasLocalPedagogicalReportPayload(g: StudentGroup): boolean 
   return hasPuntaje && (hasAlts || hasDev)
 }
 
-function studentGroupToSelectiveRetrySnapshot(g: StudentGroup): SelectiveRetryGroupSnapshot {
+function studentGroupToSelectiveRetrySnapshot(
+  g: StudentGroup,
+  index = 0,
+  ctx?: { attemptId?: string | null; state?: SelectiveRetryCompletedState | null },
+): SelectiveRetryGroupSnapshot {
+  const inputFingerprint = computeSelectiveRetryGroupFingerprint(
+    g.files.map((f) => ({ file: f.file, mobileBatchPhotoId: f.mobileBatchPhotoId })),
+  )
+  const attemptId = typeof ctx?.attemptId === "string" ? ctx.attemptId.trim() : ""
+  const slot =
+    ctx?.state && !ctx.state.isLegacy ? ctx.state.completedByIndex[String(index + 1)] : undefined
+  const slotApplies =
+    !!slot &&
+    !!attemptId &&
+    slot.attemptId === attemptId &&
+    (!inputFingerprint || !slot.fingerprint || slot.fingerprint === inputFingerprint)
+  const inSessionAttempt =
+    typeof g.selectiveRetryAttemptId === "string" ? g.selectiveRetryAttemptId.trim() : ""
+  const inSessionFp =
+    typeof g.selectiveRetryInputFingerprint === "string" ? g.selectiveRetryInputFingerprint.trim() : ""
   return {
     id: g.id,
     hasFiles: Array.isArray(g.files) && g.files.length > 0,
     isEvaluated: g.isEvaluated === true,
     isEvaluating: g.isEvaluating === true,
-    evaluationId: g.evaluation_id,
+    evaluationId: g.evaluation_id ?? (slotApplies ? slot.evaluationId : undefined),
     promotedEvaluationId: g.promotedEvaluationId,
     error: g.error,
     isValidationStep: g.isValidationStep,
+    currentAttemptId: attemptId || undefined,
+    inputFingerprint: inputFingerprint || undefined,
+    completedAttemptId: slotApplies ? slot.attemptId : inSessionAttempt || undefined,
+    completedFingerprint: slotApplies ? slot.fingerprint : inSessionFp || undefined,
   }
 }
 
 function applySelectiveRetryHydrationToStudentGroups(
   groups: StudentGroup[],
-  completedByIndex: Record<string, string> | null | undefined,
+  state: SelectiveRetryCompletedState | null | undefined,
+  currentAttemptId: string | null | undefined,
 ): StudentGroup[] {
-  if (!completedByIndex) return groups
-  const snaps = groups.map(studentGroupToSelectiveRetrySnapshot)
-  const hydrated = applySelectiveRetryCompletedHydration(snaps, completedByIndex)
+  if (!state || state.isLegacy) return groups
+  const snaps = groups.map((g, i) =>
+    studentGroupToSelectiveRetrySnapshot(g, i, { attemptId: currentAttemptId, state }),
+  )
+  const hydrated = applySelectiveRetryCompletedHydration(snaps, state.completedByIndex, {
+    currentAttemptId,
+    isLegacy: state.isLegacy,
+  })
   if (hydrated === snaps) return groups
   return groups.map((g, i) => {
     const h = hydrated[i]
@@ -955,6 +996,8 @@ function applySelectiveRetryHydrationToStudentGroups(
       evaluation_id: evalId,
       isEvaluated: true,
       error: undefined,
+      selectiveRetryAttemptId: h.completedAttemptId ?? currentAttemptId ?? g.selectiveRetryAttemptId,
+      selectiveRetryInputFingerprint: h.completedFingerprint ?? g.selectiveRetryInputFingerprint,
     }
   })
 }
@@ -1167,6 +1210,7 @@ function mergeMobileBatchIntoEvaluatorState(
   slots: MobileBatchSlot[],
   apiIds: Set<string>,
   photoMetaById?: Map<string, MobileBatchPhotoMeta>,
+  opts?: { sameAttempt?: boolean; sameBatch?: boolean },
 ): { groups: StudentGroup[]; unassigned: FilePreview[] } {
   let next = prevGroups.map((g) => ({ ...g, files: [...g.files] }))
   for (let gi = 0; gi < next.length; gi++) {
@@ -1213,20 +1257,27 @@ function mergeMobileBatchIntoEvaluatorState(
       ...g,
       studentName: newName,
       studentRut: newRut,
-      promotedEvaluationId: slot.evaluation_id || g.promotedEvaluationId || null,
     }
-    if (slot.is_evaluated === true) {
+    const promoteHistoricalCompleted = shouldPromoteApiIsEvaluatedToCurrentAttempt({
+      apiIsEvaluated: slot.is_evaluated === true,
+      sameAttempt: opts?.sameAttempt === true,
+      sameBatch: opts?.sameBatch === true,
+      groupAlreadyCompletedInCurrentAttempt: g.isEvaluated === true,
+    })
+    if (promoteHistoricalCompleted) {
       merged = {
         ...merged,
-        isEvaluated: true,
-        evaluation_id: slot.evaluation_id ?? merged.evaluation_id ?? null,
-        ...(slot.grade_chile != null ? { nota: slot.grade_chile } : {}),
+        isEvaluated: g.isEvaluated,
+        evaluation_id: g.evaluation_id,
+        error: g.error,
+        isEvaluating: g.isEvaluating,
       }
+    } else if (slot.is_evaluated === true) {
       if (
         typeof process !== "undefined" &&
         process.env.NODE_ENV === "development"
       ) {
-        console.info("[evaluator][batch-sync] hydrated evaluated slot", {
+        console.info("[evaluator][batch-sync] historical slot kept as metadata", {
           student_index: si,
           evaluation_id: slot.evaluation_id,
           student_name: slot.student_name,
@@ -1245,7 +1296,7 @@ function mergeMobileBatchIntoEvaluatorState(
 
   const orphans: FilePreview[] = []
   for (const item of placement) {
-    const { preview, student_index, evaluation_id } = item
+    const { preview, student_index } = item
     if (next.some((g) => g.files.some((f) => f.id === preview.id))) continue
     const gi =
       student_index != null && student_index >= 1 && student_index <= next.length ? student_index - 1 : -1
@@ -1255,7 +1306,6 @@ function mergeMobileBatchIntoEvaluatorState(
       next[gi] = {
         ...g,
         files: [...g.files, preview],
-        promotedEvaluationId: evaluation_id || g.promotedEvaluationId || null,
       }
     } else {
       orphans.push(preview)
@@ -1542,6 +1592,8 @@ export default function EvaluatorClient() {
   /** Sellado de lote (UUID); persiste en evaluations.batch_id. No interfiere con OMR. */
   const evaluationBatchIdRef = useRef<string | null>(null)
   const [evaluationBatchIdUi, setEvaluationBatchIdUi] = useState<string | null>(null)
+  /** SCALE-R4: identidad de INTENTO/corrida. Estable en refresh; nueva en «Nuevo lote». */
+  const evaluationAttemptIdRef = useRef<string | null>(null)
   /** Embudo UTP → Dirección: pending_utp | validated | rejected | null si sin fila. */
   const [batchInstitutionalStatus, setBatchInstitutionalStatus] = useState<string | null>(null)
   const [batchUtpObservations, setBatchUtpObservations] = useState<string | null>(null)
@@ -1601,10 +1653,18 @@ export default function EvaluatorClient() {
 
   /** Al abrir /evaluar, reutilizar el mismo lote que la estación docente (QR / grilla). */
   useEffect(() => {
+    const store = getSelectiveRetrySessionStore()
+    const current = readSelectiveRetryCurrentState(store)
+    if (current?.attemptId && !current.isLegacy) {
+      evaluationAttemptIdRef.current = current.attemptId
+    }
     const p = readDocenteActiveBatchId()
     if (p) {
       setEvaluationBatchIdUi((prev) => prev ?? p)
-      const hydration = readSelectiveRetryCompletedState(getSelectiveRetrySessionStore(), p)
+      const hydration = readSelectiveRetryCompletedState(store, p)
+      if (hydration?.attemptId && !hydration.isLegacy) {
+        evaluationAttemptIdRef.current = hydration.attemptId
+      }
       if (hydration && hydration.groupCount > 1) {
         setClassSize((prev) => (prev === 1 ? hydration.groupCount : prev))
       }
@@ -2917,20 +2977,16 @@ export default function EvaluatorClient() {
     }
 
     const count = Math.max(1, classSize)
-    const batchId = evaluationBatchIdRef.current ?? readDocenteActiveBatchId()
-    const hydration = batchId ? readSelectiveRetryCompletedState(getSelectiveRetrySessionStore(), batchId) : null
     setStudentGroups(
       Array.from({ length: count }, (_, i) => {
-        const evalId = hydration?.completedByIndex[String(i + 1)]
         return {
           id: `student-${Date.now()}-${i}`,
           studentName: `Alumno ${i + 1}`,
           studentRut: "",
           files: [],
-          isEvaluated: Boolean(evalId),
+          isEvaluated: false,
           isEvaluating: false,
           decimasAdicionales: 0,
-          ...(evalId ? { evaluation_id: evalId } : {}),
         }
       }),
     )
@@ -2952,6 +3008,37 @@ export default function EvaluatorClient() {
     return fresh
   }, [])
 
+  const ensureEvaluationAttemptId = useCallback((batchId?: string | null): string => {
+    const bid = (batchId ?? evaluationBatchIdRef.current ?? readDocenteActiveBatchId() ?? "").trim()
+    if (evaluationAttemptIdRef.current) {
+      if (bid) {
+        rememberSelectiveRetryGroupCount(
+          getSelectiveRetrySessionStore(),
+          bid,
+          Math.max(1, evaluatorStep2FilesRef.current.groups.length),
+          evaluationAttemptIdRef.current,
+        )
+      }
+      return evaluationAttemptIdRef.current
+    }
+    const ensured = ensureSelectiveRetryAttempt(getSelectiveRetrySessionStore(), {
+      batchId: bid,
+      groupCount: evaluatorStep2FilesRef.current.groups.length,
+    })
+    evaluationAttemptIdRef.current = ensured.attemptId
+    return ensured.attemptId
+  }, [])
+
+  const buildSelectiveRetrySnapshots = useCallback((groups: StudentGroup[]): SelectiveRetryGroupSnapshot[] => {
+    const batchId = evaluationBatchIdRef.current ?? readDocenteActiveBatchId()
+    const store = getSelectiveRetrySessionStore()
+    const state = batchId
+      ? readSelectiveRetryCompletedState(store, batchId)
+      : readSelectiveRetryCurrentState(store)
+    const attemptId = evaluationAttemptIdRef.current ?? state?.attemptId ?? null
+    return groups.map((g, i) => studentGroupToSelectiveRetrySnapshot(g, i, { attemptId, state }))
+  }, [])
+
   const processFiles = (files: File[]) => {
     const validTypes = [
       "image/jpeg",
@@ -2968,7 +3055,8 @@ export default function EvaluatorClient() {
       return false
     })
     if (validFiles.length === 0) return
-    ensureEvaluationBatchId()
+    const batchId = ensureEvaluationBatchId()
+    ensureEvaluationAttemptId(batchId)
     validFiles.forEach((file) => {
       const reader = new FileReader()
       reader.onload = (e) => {
@@ -3015,6 +3103,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           dataUrl,
         }
         ensureEvaluationBatchId()
+        ensureEvaluationAttemptId()
         setUnassignedFiles((prev) => [...prev, filePreview])
         handleOpenClosedAnswerOMR(dataUrl)
       })
@@ -3268,6 +3357,8 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       return { ok: false, reason: "busy" }
     }
     mobileBatchSyncingRef.current = true
+    const batchAtStart = evaluationBatchIdRef.current
+    const attemptAtStart = evaluationAttemptIdRef.current ?? ensureEvaluationAttemptId(batchAtStart)
     try {
       const snapPre = evaluatorStep2FilesRef.current
       const knownMobilePhotoIds = new Set<string>()
@@ -3315,7 +3406,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
           try {
             timeoutId = window.setTimeout(() => controller.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
             r = await fetch(
-              `/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}&offset=${offset}&limit=${pageSize}`,
+              `/api/docente/batch-evaluar-sync?batch_id=${encodeURIComponent(batchId)}&offset=${offset}&limit=${pageSize}&include_evaluated_photos=1`,
               { signal: controller.signal },
             )
             j = (await r.json().catch(() => ({}))) as typeof j
@@ -3383,11 +3474,12 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         await new Promise<void>((res) => window.setTimeout(res, 0))
       }
 
-      const evaluatedStudentIndexes = new Set<number>()
-      for (const slot of slotsFromApi) {
-        if (slot.is_evaluated === true && slot.student_index != null && slot.student_index >= 1) {
-          evaluatedStudentIndexes.add(slot.student_index)
-        }
+      const genAfterFetch = compareQrSyncGeneration(
+        { attemptId: attemptAtStart, batchId: batchAtStart },
+        { attemptId: evaluationAttemptIdRef.current, batchId: evaluationBatchIdRef.current },
+      )
+      if (!shouldApplyQrSyncPhotos(genAfterFetch)) {
+        return { ok: true, newlyRecovered: 0, groups: evaluatorStep2FilesRef.current.groups }
       }
 
       const photoMetaById = new Map<string, MobileBatchPhotoMeta>()
@@ -3403,7 +3495,6 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       for (const p of allPhotos) {
         if (!p.signed_url) continue
         if (knownMobilePhotoIds.has(p.id)) continue
-        if (p.student_index != null && evaluatedStudentIndexes.has(p.student_index)) continue
         try {
           const photoController = new AbortController()
           const photoTimeoutId = window.setTimeout(() => photoController.abort(), MOBILE_BATCH_SYNC_TIMEOUT_MS)
@@ -3439,6 +3530,21 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         }
       }
 
+      const gen = compareQrSyncGeneration(
+        { attemptId: attemptAtStart, batchId: batchAtStart },
+        { attemptId: evaluationAttemptIdRef.current, batchId: evaluationBatchIdRef.current },
+      )
+      if (!shouldApplyQrSyncPhotos(gen)) {
+        for (const item of placement) {
+          try {
+            URL.revokeObjectURL(item.preview.previewUrl)
+          } catch {
+            /* noop */
+          }
+        }
+        return { ok: true, newlyRecovered: 0, groups: evaluatorStep2FilesRef.current.groups }
+      }
+
       const snap = evaluatorStep2FilesRef.current
       const { groups: nextGroups, unassigned: nextUnassigned } = mergeMobileBatchIntoEvaluatorState(
         snap.groups,
@@ -3447,25 +3553,20 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         slotsFromApi,
         apiIds,
         photoMetaById,
+        { sameAttempt: gen.sameAttempt, sameBatch: gen.sameBatch },
       )
-      setStudentGroups(nextGroups)
-      setUnassignedFiles(nextUnassigned)
-      {
-        const store = getSelectiveRetrySessionStore()
-        rememberSelectiveRetryGroupCount(store, batchId, nextGroups.length)
-        for (let i = 0; i < nextGroups.length; i++) {
-          const evalId = nextGroups[i].evaluation_id ?? nextGroups[i].promotedEvaluationId
-          if (typeof evalId === "string" && evalId.trim()) {
-            rememberSelectiveRetryCompletedSlot(store, {
-              batchId,
-              studentIndex: i + 1,
-              evaluationId: evalId.trim(),
-              groupCount: nextGroups.length,
-            })
-          }
-        }
+      const store = getSelectiveRetrySessionStore()
+      const liveBatchId = evaluationBatchIdRef.current ?? batchId
+      const attemptId = evaluationAttemptIdRef.current ?? ensureEvaluationAttemptId(liveBatchId)
+      rememberSelectiveRetryGroupCount(store, liveBatchId, nextGroups.length, attemptId)
+      let groupsOut = nextGroups
+      if (gen.sameAttempt && gen.sameBatch) {
+        const hydration = readSelectiveRetryCompletedState(store, liveBatchId)
+        groupsOut = applySelectiveRetryHydrationToStudentGroups(nextGroups, hydration, attemptId)
       }
-      return { ok: true, newlyRecovered: placement.length, groups: nextGroups }
+      setStudentGroups(groupsOut)
+      setUnassignedFiles(nextUnassigned)
+      return { ok: true, newlyRecovered: placement.length, groups: groupsOut }
     } finally {
       mobileBatchSyncingRef.current = false
       if (mobileBatchSyncPendingRef.current) {
@@ -3473,7 +3574,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         void syncMobileBatchPhotosRef.current()
       }
     }
-  }, [toast])
+  }, [toast, ensureEvaluationAttemptId])
 
   useEffect(() => {
     if (activeTab !== "evaluator" || !evaluationBatchIdUi) return
@@ -3820,6 +3921,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       evaluationBatchIdRef.current = crypto.randomUUID()
       setEvaluationBatchIdUi(evaluationBatchIdRef.current)
     }
+    const attemptId = ensureEvaluationAttemptId(evaluationBatchIdRef.current)
     const {
       rubrica,
       pauta,
@@ -3877,7 +3979,18 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
     }
     if (!group || group.files.length === 0) return false
 
-    const retryClass = classifySelectiveRetryGroup(studentGroupToSelectiveRetrySnapshot(group))
+    const retryClass = classifySelectiveRetryGroup(
+      studentGroupToSelectiveRetrySnapshot(
+        group,
+        studentGroups.findIndex((g) => g.id === groupId),
+        {
+          attemptId,
+          state: evaluationBatchIdRef.current
+            ? readSelectiveRetryCompletedState(getSelectiveRetrySessionStore(), evaluationBatchIdRef.current)
+            : readSelectiveRetryCurrentState(getSelectiveRetrySessionStore()),
+        },
+      ),
+    )
     if (!shouldEnqueueSelectiveRetry(retryClass)) return false
 
     // Snapshot visual ANTES del evaluate async (fuente de verdad para la revisión OMR).
@@ -3997,12 +4110,19 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         : ""
     if (persistedEvalId) {
       const studentIndex = studentGroups.findIndex((g) => g.id === groupId) + 1
-      rememberSelectiveRetryCompletedSlot(getSelectiveRetrySessionStore(), {
-        batchId: evaluationBatchIdRef.current ?? "",
-        studentIndex,
-        evaluationId: persistedEvalId,
-        groupCount: studentGroups.length,
-      })
+      const fingerprint = computeSelectiveRetryGroupFingerprint(
+        group.files.map((f) => ({ file: f.file, mobileBatchPhotoId: f.mobileBatchPhotoId })),
+      )
+      if (fingerprint) {
+        rememberSelectiveRetryCompletedSlot(getSelectiveRetrySessionStore(), {
+          batchId: evaluationBatchIdRef.current ?? "",
+          studentIndex,
+          evaluationId: persistedEvalId,
+          groupCount: studentGroups.length,
+          attemptId,
+          fingerprint,
+        })
+      }
     }
 
     setStudentGroups((prev) =>
@@ -4149,6 +4269,10 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
               evaluationTrace: { payload: evaluationTracePayload },
               error: undefined,
               evaluation_id: (result as { evaluation_id?: string }).evaluation_id ?? undefined,
+              selectiveRetryAttemptId: attemptId,
+              selectiveRetryInputFingerprint: computeSelectiveRetryGroupFingerprint(
+                group.files.map((f) => ({ file: f.file, mobileBatchPhotoId: f.mobileBatchPhotoId })),
+              ),
             },
             pickObservedNameFromUnknown(result),
             { fillManualIfGeneric: false },
@@ -4737,12 +4861,14 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
         ? syncResult.groups
         : evaluatorStep2FilesRef.current.groups
     const batchId = evaluationBatchIdRef.current ?? readDocenteActiveBatchId()
+    const attemptId = ensureEvaluationAttemptId(batchId)
     const hydration = batchId
       ? readSelectiveRetryCompletedState(getSelectiveRetrySessionStore(), batchId)
-      : null
+      : readSelectiveRetryCurrentState(getSelectiveRetrySessionStore())
     const hydratedGroups = applySelectiveRetryHydrationToStudentGroups(
       groupsSnapshot,
-      hydration?.completedByIndex,
+      hydration,
+      attemptId,
     )
     if (hydratedGroups !== groupsSnapshot) {
       setStudentGroups(hydratedGroups)
@@ -4752,10 +4878,15 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       unassigned: evaluatorStep2FilesRef.current.unassigned,
     }
     if (batchId) {
-      rememberSelectiveRetryGroupCount(getSelectiveRetrySessionStore(), batchId, hydratedGroups.length)
+      rememberSelectiveRetryGroupCount(
+        getSelectiveRetrySessionStore(),
+        batchId,
+        hydratedGroups.length,
+        attemptId,
+      )
     }
 
-    const groupsToEvaluate = selectGroupIdsToEvaluate(hydratedGroups.map(studentGroupToSelectiveRetrySnapshot))
+    const groupsToEvaluate = selectGroupIdsToEvaluate(buildSelectiveRetrySnapshots(hydratedGroups))
 
     if (groupsToEvaluate.length === 0) {
       alert("No hay grupos con archivos para evaluar o todos ya han sido evaluados.")
@@ -4833,9 +4964,7 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
 
   const isCurrentlyEvaluatingAny = studentGroups.some((g) => g.isEvaluating)
   const isCurrentlyValidatingAny = studentGroups.some((g) => g.isValidationStep) // 🚨 NUEVO: Comprobar si estamos en paso de validación
-  const selectiveRetryEligibleIds = selectGroupIdsToEvaluate(
-    studentGroups.map(studentGroupToSelectiveRetrySnapshot),
-  )
+  const selectiveRetryEligibleIds = selectGroupIdsToEvaluate(buildSelectiveRetrySnapshots(studentGroups))
   const handlePreview = async (groupId: string) => {
     const group = studentGroups.find((g) => g.id === groupId)
     if (!group) return
@@ -6567,6 +6696,13 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                                 return true
                               }),
                               promotedEvaluationId: null,
+                              evaluation_id: undefined,
+                              isEvaluated: false,
+                              isEvaluating: false,
+                              isValidationStep: false,
+                              error: undefined,
+                              selectiveRetryAttemptId: null,
+                              selectiveRetryInputFingerprint: null,
                             })),
                           )
                           setUnassignedFiles((prev) =>
@@ -6585,6 +6721,10 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                           evaluationBatchIdRef.current = null
                           setEvaluationBatchIdUi(null)
                           writeDocenteActiveBatchId(null)
+                          evaluationAttemptIdRef.current = beginSelectiveRetryAttempt(
+                            getSelectiveRetrySessionStore(),
+                            { batchId: "", groupCount: 0 },
+                          )
                           setBatchInstitutionalStatus(null)
                           setBatchUtpObservations(null)
                         }}
@@ -6932,7 +7072,21 @@ La IA usará una escala 0-10 por criterio de desarrollo."
                                 (isCurrentlyEvaluatingAny && !group.isEvaluating) ||
                                 isCurrentlyValidatingAny ||
                                 !shouldEnqueueSelectiveRetry(
-                                  classifySelectiveRetryGroup(studentGroupToSelectiveRetrySnapshot(group)),
+                                  classifySelectiveRetryGroup(
+                                    studentGroupToSelectiveRetrySnapshot(
+                                      group,
+                                      studentGroups.findIndex((g) => g.id === group.id),
+                                      {
+                                        attemptId: evaluationAttemptIdRef.current,
+                                        state: evaluationBatchIdRef.current
+                                          ? readSelectiveRetryCompletedState(
+                                              getSelectiveRetrySessionStore(),
+                                              evaluationBatchIdRef.current,
+                                            )
+                                          : readSelectiveRetryCurrentState(getSelectiveRetrySessionStore()),
+                                      },
+                                    ),
+                                  ),
                                 )
                               }
                               onClick={() => void handleEvaluateSingleGroup(group.id)}
