@@ -37,11 +37,11 @@ import {
 import {
   buildDraftFromParsedLines,
   buildDraftFromParsedLinesWithSmartMeta,
-  confirmDraftItem,
+  applyBulkConfirmToDrafts,
   draftRowToParsedLine,
   draftsApplyMergeOverlay,
   draftsToParsedLines,
-  isDraftRowCompleteForBulkConfirm,
+  formatBulkConfirmMissingDescription,
   mergeParsedLineIntoDraft,
   summarizeDraftsForImport,
   teacherFacingRowStatus,
@@ -311,6 +311,7 @@ export default function SourceExamItemsImportDialog({
 
   /** UX Paso 2: tras “Confirmar todo”, mensaje visible + siguiente paso (importar). */
   const [showReadyToImportBanner, setShowReadyToImportBanner] = useState(false)
+  const [confirmBannerKind, setConfirmBannerKind] = useState<"all" | "partial">("all")
   const [emphasizeImportCta, setEmphasizeImportCta] = useState(false)
   const [postConfirmImportPromptOpen, setPostConfirmImportPromptOpen] = useState(false)
   const [massScorePopoverOpen, setMassScorePopoverOpen] = useState(false)
@@ -318,6 +319,7 @@ export default function SourceExamItemsImportDialog({
 
   const resetImportReadyHints = useCallback(() => {
     setShowReadyToImportBanner(false)
+    setConfirmBannerKind("all")
     setEmphasizeImportCta(false)
     setPostConfirmImportPromptOpen(false)
   }, [])
@@ -343,27 +345,39 @@ export default function SourceExamItemsImportDialog({
   }, [])
 
   const confirmAllCompleteDraftRows = useCallback(() => {
-    let hadConfirmable = false
-    setItemDrafts((prev) => {
-      if (!prev) return null
-      hadConfirmable = prev.some((d) => isDraftRowCompleteForBulkConfirm(d))
-      return prev.map((d) => (isDraftRowCompleteForBulkConfirm(d) ? confirmDraftItem(d) : d))
-    })
-    if (!hadConfirmable) {
+    if (!itemDrafts?.length) return
+    const result = applyBulkConfirmToDrafts(itemDrafts)
+    setItemDrafts(result.next)
+    if (result.confirmedCount === 0 && result.alreadyConfirmedCount === 0) {
+      const detail = formatBulkConfirmMissingDescription(result.missingFieldCounts)
       toast({
-        title: "Nada que confirmar aún",
-        description: "Complete enunciado, eje, habilidad y (si aplica) clave o puntaje según el tipo de ítem.",
-        variant: "default",
+        title: "No se pudo confirmar ninguna fila",
+        description: detail
+          ? `Falta: ${detail}.`
+          : "Ninguna fila tiene el enunciado mínimo para importar.",
       })
       return
     }
+    if (result.skippedCount > 0) {
+      const detail = formatBulkConfirmMissingDescription(result.missingFieldCounts)
+      toast({
+        title:
+          result.confirmedCount > 0
+            ? `Se confirmaron ${result.confirmedCount} fila${result.confirmedCount === 1 ? "" : "s"}`
+            : "Hay filas ya confirmadas",
+        description: detail
+          ? `No se confirmaron ${result.skippedCount}: falta ${detail}.`
+          : `${result.skippedCount} fila(s) siguen pendientes.`,
+      })
+    }
+    setConfirmBannerKind(result.skippedCount > 0 ? "partial" : "all")
     setShowReadyToImportBanner(true)
     setEmphasizeImportCta(true)
     queueMicrotask(() => {
       importCtaRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })
     })
     window.setTimeout(() => setPostConfirmImportPromptOpen(true), 480)
-  }, [toast])
+  }, [itemDrafts, toast])
 
   const handlePdfUpload = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1619,7 +1633,9 @@ export default function SourceExamItemsImportDialog({
               role="status"
               className="rounded-md border border-emerald-500/45 bg-emerald-500/10 px-3 py-2.5 text-sm text-emerald-950 dark:text-emerald-100 shrink-0"
             >
-              Todos los ítems están listos para importar.
+              {confirmBannerKind === "all"
+                ? "Todos los ítems están listos para importar."
+                : "Hay ítems confirmados listos para importar. Revise las filas pendientes."}
             </div>
           ) : null}
           <div className="flex flex-wrap gap-2 shrink-0 scroll-mt-24">

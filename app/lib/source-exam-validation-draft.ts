@@ -409,39 +409,145 @@ export function draftRowHasMissingCritical(d: SourceExamItemDraft): boolean {
   return false
 }
 
-/** Ítem “completo” para confirmación masiva: texto, tipo, puntaje, eje, habilidad, nivel; clave solo si aplica al tipo. */
-export function isDraftRowCompleteForBulkConfirm(d: SourceExamItemDraft): boolean {
-  if (emptyStr(d.item_text.value)) return false
-  if (emptyStr(d.question_type.value)) return false
-  if (d.max_score.value == null) return false
-  if (emptyStr(d.axis_label.value)) return false
-  if (emptyStr(d.skill_label.value)) return false
-  if (emptyStr(d.cognitive_level.value)) return false
+export type DraftConfirmRequiredField = "item_text" | "correct_answer"
+
+export type DraftConfirmWarningField =
+  | "max_score"
+  | "question_type"
+  | "axis_label"
+  | "skill_label"
+  | "cognitive_level"
+  | "merge_conflict"
+
+export type DraftRowConfirmability = {
+  confirmable: boolean
+  missingRequiredFields: DraftConfirmRequiredField[]
+  warnings: DraftConfirmWarningField[]
+}
+
+/** Etiquetas estables en español para toasts (no hardcodean un documento concreto). */
+export const DRAFT_CONFIRM_FIELD_LABELS: Record<
+  DraftConfirmRequiredField | DraftConfirmWarningField,
+  string
+> = {
+  item_text: "enunciado",
+  correct_answer: "respuesta correcta",
+  max_score: "puntaje",
+  question_type: "tipo de pregunta",
+  axis_label: "eje",
+  skill_label: "habilidad",
+  cognitive_level: "nivel cognitivo",
+  merge_conflict: "conflicto de fusión",
+}
+
+function closedTypeRequiresAnswer(qt: string | null | undefined): boolean {
+  return qt === "multiple_choice" || qt === "true_false"
+}
+
+function draftHasMergeOrReviewWarning(d: SourceExamItemDraft): boolean {
+  if (d.mergeConflictNotes && Object.keys(d.mergeConflictNotes).length > 0) return true
+  return (
+    d.correct_answer.status === "needs_review" ||
+    d.max_score.status === "needs_review" ||
+    d.rubric_text.status === "needs_review"
+  )
+}
+
+/**
+ * Única fuente semántica de confirmación masiva.
+ * Obligatorio: enunciado. Condicional: clave si el tipo ya es MC o V/F.
+ * No inventa tipo, puntaje, Bloom ni eje/habilidad; esos huecos son avisos.
+ */
+export function getDraftRowConfirmability(d: SourceExamItemDraft): DraftRowConfirmability {
+  const missingRequiredFields: DraftConfirmRequiredField[] = []
+  const warnings: DraftConfirmWarningField[] = []
+
+  if (emptyStr(d.item_text.value)) missingRequiredFields.push("item_text")
   const qt = d.question_type.value
-  if (qt === "multiple_choice" || qt === "true_false") {
-    if (emptyStr(d.correct_answer.value)) return false
+  if (closedTypeRequiresAnswer(qt) && emptyStr(d.correct_answer.value)) {
+    missingRequiredFields.push("correct_answer")
   }
-  return true
+
+  if (emptyStr(qt)) warnings.push("question_type")
+  if (d.max_score.value == null) warnings.push("max_score")
+  if (emptyStr(d.axis_label.value)) warnings.push("axis_label")
+  if (emptyStr(d.skill_label.value)) warnings.push("skill_label")
+  if (emptyStr(d.cognitive_level.value)) warnings.push("cognitive_level")
+  if (draftHasMergeOrReviewWarning(d)) warnings.push("merge_conflict")
+
+  return {
+    confirmable: missingRequiredFields.length === 0,
+    missingRequiredFields,
+    warnings,
+  }
+}
+
+/** Confirmable para “Confirmar todo”: mismo contrato que getDraftRowConfirmability. */
+export function isDraftRowCompleteForBulkConfirm(d: SourceExamItemDraft): boolean {
+  return getDraftRowConfirmability(d).confirmable
+}
+
+export type BulkConfirmResult = {
+  next: SourceExamItemDraft[]
+  confirmedCount: number
+  skippedCount: number
+  alreadyConfirmedCount: number
+  missingFieldCounts: Partial<Record<DraftConfirmRequiredField, number>>
+}
+
+export function applyBulkConfirmToDrafts(drafts: SourceExamItemDraft[]): BulkConfirmResult {
+  const missingFieldCounts: Partial<Record<DraftConfirmRequiredField, number>> = {}
+  let confirmedCount = 0
+  let skippedCount = 0
+  let alreadyConfirmedCount = 0
+  const next = drafts.map((d) => {
+    const c = getDraftRowConfirmability(d)
+    if (!c.confirmable) {
+      skippedCount++
+      for (const f of c.missingRequiredFields) {
+        missingFieldCounts[f] = (missingFieldCounts[f] ?? 0) + 1
+      }
+      return d
+    }
+    if (d.itemConfirmed) {
+      alreadyConfirmedCount++
+      return d
+    }
+    confirmedCount++
+    return confirmDraftItem(d)
+  })
+  return { next, confirmedCount, skippedCount, alreadyConfirmedCount, missingFieldCounts }
+}
+
+export function formatBulkConfirmMissingDescription(
+  missingFieldCounts: Partial<Record<DraftConfirmRequiredField, number>>,
+): string {
+  const parts: string[] = []
+  for (const key of ["item_text", "correct_answer"] as const) {
+    const n = missingFieldCounts[key]
+    if (!n) continue
+    const label = DRAFT_CONFIRM_FIELD_LABELS[key]
+    parts.push(`${label} en ${n} fila${n === 1 ? "" : "s"}`)
+  }
+  return parts.join("; ")
 }
 
 /** Estado único para la tabla docente (sin exponer FieldStatus internos). */
 export type TeacherFacingRowStatus = "Completo" | "Falta revisar" | "Sin puntaje" | "Sin respuesta"
 
+/**
+ * Completo ⇒ confirmable. Lo no confirmable nunca se muestra como Completo.
+ * Huecos opcionales visibles (puntaje / eje / habilidad / fusión) pueden avisar
+ * sin bloquear la confirmación.
+ */
 export function teacherFacingRowStatus(d: SourceExamItemDraft): TeacherFacingRowStatus {
+  const c = getDraftRowConfirmability(d)
+  if (c.missingRequiredFields.includes("item_text")) return "Falta revisar"
+  if (c.missingRequiredFields.includes("correct_answer")) return "Sin respuesta"
+  if (!c.confirmable) return "Falta revisar"
   if (d.max_score.value == null) return "Sin puntaje"
-  const qt = d.question_type.value
-  if ((qt === "multiple_choice" || qt === "true_false") && emptyStr(d.correct_answer.value)) {
-    return "Sin respuesta"
-  }
-  if (d.mergeConflictNotes && Object.keys(d.mergeConflictNotes).length > 0) return "Falta revisar"
-  if (
-    d.correct_answer.status === "needs_review" ||
-    d.max_score.status === "needs_review" ||
-    d.rubric_text.status === "needs_review"
-  ) {
-    return "Falta revisar"
-  }
-  if (emptyStr(d.axis_label.value) || emptyStr(d.skill_label.value)) return "Falta revisar"
+  if (c.warnings.includes("merge_conflict")) return "Falta revisar"
+  if (c.warnings.includes("axis_label") || c.warnings.includes("skill_label")) return "Falta revisar"
   return "Completo"
 }
 
