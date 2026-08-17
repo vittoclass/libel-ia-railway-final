@@ -61,7 +61,7 @@ export function buildMultimodalArtsPrompt(params: {
 
 REGLAS UNIVERSALES (obligatorias):
 1. Usa SOLO los criterios de la rúbrica entregada. NO inventes criterios.
-2. Conserva la escala original de la rúbrica (2/1/0, 3 niveles, 4 niveles o N). NO conviertas 3 niveles en 4 ni fuerces escalas.
+2. La rúbrica del profesor (criterios, descriptores, puntajes máximos) es la fuente pedagógica. Juzga la evidencia contra esos descriptores. DESPUÉS expresa el resultado en nivel_logro usando EXCLUSIVAMENTE el contrato técnico interno: LOGRADO, PARCIALMENTE_LOGRADO, INSUFICIENTE o NO_OBSERVABLE. NO copies al campo nivel_logro un nombre de banda de la rúbrica que no pertenezca a ese contrato. NO inventes equivalencias rígidas entre nombres externos y niveles canónicos. NO ignores los descriptores originales.
 3. NO uses pesos fijos universales ni lista fija de composición/color/creatividad salvo que aparezcan en la rúbrica.
 4. Separa observación de inferencia. Si inferiste, inference_used=true.
 5. NO infieras intención artística sin evidencia observable.
@@ -98,10 +98,19 @@ Incluye estos hechos en observed_content de cada criterio aplicable.
 
 === B. EVALUACIÓN POR CRITERIO ===
 Para CADA criterio de la rúbrica (y solo esos):
-- usa el label y descriptores reales;
+- usa el label y descriptores reales como fuente de juicio;
 - vincula observaciones de A;
-- asigna nivel_logro con la escala ORIGINAL de ese criterio;
+- determina el grado de cumplimiento observable respecto de esos descriptores;
+- asigna nivel_logro SOLO con el contrato técnico interno (LOGRADO | PARCIALMENTE_LOGRADO | INSUFICIENTE | NO_OBSERVABLE);
+- NO copies el nombre de banda original al campo nivel_logro;
+- NO inventes una tabla de equivalencias de nombres;
 - si no es observable: observation_status NOT_OBSERVABLE o IMAGE_QUALITY_INSUFFICIENT y nivel_logro NO_OBSERVABLE.
+
+Contrato técnico de nivel_logro (no deformar):
+- LOGRADO = evidencia suficiente de cumplimiento del criterio.
+- PARCIALMENTE_LOGRADO = evidencia observable de cumplimiento parcial/intermedio.
+- INSUFICIENTE = existe evidencia observable, pero el criterio no alcanza el nivel requerido.
+- NO_OBSERVABLE = la evidencia necesaria no puede observarse de manera suficiente. NO significa automáticamente trabajo malo. NO lo uses como fallback de una etiqueta desconocida. No generes etiquetas fuera de este contrato.
 
 FORMATO JSON ESTRICTO:
 {
