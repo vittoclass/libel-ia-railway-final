@@ -6,6 +6,7 @@
 
 import { parseRubricCriteria } from "@/app/lib/development-core/parse-rubric-criteria"
 import type { ImageQualityDiagnosis } from "@/app/lib/multimodal/image-quality"
+import { selectMultimodalVisionViews } from "@/app/lib/multimodal/multimodal-vision-provider"
 import type { MultimodalArtsEvaluationInput } from "@/app/lib/multimodal/types"
 
 export type MultimodalPromptBuildResult = {
@@ -42,20 +43,61 @@ export function buildMultimodalArtsPrompt(params: {
     })
     .join("\n")
 
+  const isMultiview = params.secondaryImageIds.length > 0
+  let view1Id: string | null = null
+  let view2Id: string | null = null
+  if (isMultiview) {
+    try {
+      const sel = selectMultimodalVisionViews(params.input.images)
+      if (sel.views.length >= 2) {
+        view1Id = sel.views[0]!.image_id
+        view2Id = sel.views[1]!.image_id
+      }
+    } catch {
+      view1Id = null
+      view2Id = null
+    }
+  }
+
   const imageIds = params.input.images
     .slice()
     .sort((a, b) => a.order - b.order)
-    .map(
-      (im) =>
-        `${im.image_id} (order=${im.order}, role=${im.role ?? "UNKNOWN"}${im.image_id === params.primaryImageId ? ", PRIMARY_SENT_TO_VISION" : ", metadata_only"})`,
-    )
+    .map((im) => {
+      if (isMultiview && view1Id && view2Id) {
+        const sent =
+          im.image_id === view1Id
+            ? ", VIEW_1_SENT_TO_VISION"
+            : im.image_id === view2Id
+              ? ", VIEW_2_SENT_TO_VISION"
+              : ", associated_not_sent_to_vision"
+        return `${im.image_id} (order=${im.order}, role=${im.role ?? "UNKNOWN"}${sent})`
+      }
+      return `${im.image_id} (order=${im.order}, role=${im.role ?? "UNKNOWN"}${im.image_id === params.primaryImageId ? ", PRIMARY_SENT_TO_VISION" : ", metadata_only"})`
+    })
     .join(", ")
 
   const studentText = String(params.input.student_text ?? "").trim()
-  const secondaryNote =
-    params.secondaryImageIds.length > 0
-      ? `Imágenes adicionales (solo metadatos/calidad en este mensaje; el proveedor oficial acepta 1 imagen por llamada): ${params.secondaryImageIds.join(", ")}.`
-      : ""
+  const secondaryNote = isMultiview
+    ? view1Id && view2Id
+      ? `Se envían exactamente dos vistas del mismo trabajo a Vision (VIEW_1=${view1Id}, VIEW_2=${view2Id}). Las fotografías adicionales, si existen, permanecen asociadas al trabajo y no se envían en esta llamada. No interpretes más fotografías como mayor puntaje.`
+      : `Imágenes adicionales (solo metadatos/calidad en este mensaje; el proveedor oficial acepta 1 imagen por llamada): ${params.secondaryImageIds.join(", ")}.`
+    : ""
+  const sourceImageIdsJson =
+    isMultiview && view1Id && view2Id
+      ? `["${view1Id}", "${view2Id}"]`
+      : `["${params.primaryImageId}"]`
+  const multiviewBlock = isMultiview
+    ? `REGLAS MULTIVISTA (obligatorias):
+- Estas imágenes son distintas vistas del MISMO trabajo físico.
+- No cuentes dos veces un elemento porque aparezca en ambas imágenes.
+- Utiliza todas las vistas únicamente para aumentar la evidencia observable.
+- Una vista puede confirmar, complementar o contradecir evidencia de otra.
+- No otorgues mayor nivel de logro por el simple hecho de existir más fotografías.
+- No asumas que una imagen diferente es un trabajo diferente.
+- Utiliza la vista más clara para resolver discrepancias.
+- No concluyas que un contenido no existe solamente porque no sea visible en una vista si otra vista podría contenerlo. Esto no cambia la semántica de NO_OBSERVABLE: si tras integrar las vistas la evidencia necesaria sigue sin poder observarse, usa NO_OBSERVABLE.
+`
+    : ""
 
   const prompt = `Eres un evaluador pedagógico multimodal de Artes. Una sola etapa estructurada con dos secciones claras.
 
@@ -71,7 +113,7 @@ REGLAS UNIVERSALES (obligatorias):
 9. Puede haber una o varias imágenes del MISMO estudiante/obra. No mezcles alumnos.
 10. Preserva provenance: source_image_ids con los image_id usados.
 11. NO calcules puntaje, porcentaje ni nota. LibelIA calculará el puntaje mecánicamente.
-
+${multiviewBlock}
 CONTEXTO:
 - item_key: ${params.input.item_key}
 - pregunta/consigna: ${params.input.question_text || "(no especificada)"}
@@ -125,7 +167,7 @@ FORMATO JSON ESTRICTO:
       "observation_status": "OBSERVED" | "PARTIALLY_OBSERVED" | "NOT_OBSERVABLE" | "IMAGE_QUALITY_INSUFFICIENT",
       "confidence": "LOW" | "MEDIUM" | "HIGH",
       "inference_used": false,
-      "source_image_ids": ["${params.primaryImageId}"],
+      "source_image_ids": ${sourceImageIdsJson},
       "justification": "por qué ese juicio según la rúbrica y la observación",
       "nivel_logro": "LOGRADO" | "PARCIALMENTE_LOGRADO" | "INSUFICIENTE" | "NO_OBSERVABLE"
     }

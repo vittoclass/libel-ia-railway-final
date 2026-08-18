@@ -479,3 +479,163 @@ export async function requestEvaluationVisionCompletion(
       }),
   )
 }
+
+/** Parte image_url idéntica al wrapper N=1. Solo sibling multi-image. */
+function visionPartMulti(imageRef: string): {
+  type: "image_url"
+  image_url: { url: string }
+} {
+  const s = String(imageRef ?? "").trim()
+  if (s.startsWith("http://") || s.startsWith("https://") || s.startsWith("data:")) {
+    return { type: "image_url" as const, image_url: { url: s } }
+  }
+  return { type: "image_url" as const, image_url: { url: `data:image/jpeg;base64,${s}` } }
+}
+
+export type EvaluationVisionMultiCompletionParams = {
+  imageBase64List: readonly [string, string]
+  prompt: string
+  maxTokens: number
+  temperature?: number
+  timeoutMs?: number
+  costAuditContext?: CostAuditContext
+}
+
+/** Payload Mistral: exactamente 2 image_url + 1 text. Aditivo Camino B N>=2. */
+export function buildMistralVisionMultiMessageContent(
+  imageBase64List: readonly [string, string],
+  prompt: string,
+): Array<{ type: "image_url"; image_url: { url: string } } | { type: "text"; text: string }> {
+  return [
+    visionPartMulti(imageBase64List[0]),
+    visionPartMulti(imageBase64List[1]),
+    { type: "text" as const, text: prompt },
+  ]
+}
+
+/** Payload Anthropic: exactamente 2 image blocks + 1 text. Aditivo Camino B N>=2. */
+export function buildAnthropicVisionMultiMessageContent(
+  imageBase64List: readonly [string, string],
+  prompt: string,
+): Array<
+  | { type: "image"; source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/webp"; data: string } }
+  | { type: "text"; text: string }
+> {
+  const a = normalizeVisionBase64(imageBase64List[0])
+  const b = normalizeVisionBase64(imageBase64List[1])
+  return [
+    { type: "image", source: { type: "base64", media_type: a.mediaType, data: a.data } },
+    { type: "image", source: { type: "base64", media_type: b.mediaType, data: b.data } },
+    { type: "text", text: prompt },
+  ]
+}
+
+async function callAnthropicVisionMulti(
+  imageBase64List: readonly [string, string],
+  prompt: string,
+  maxTokens: number,
+  auditMeta?: Pick<AnthropicCostAuditMeta, "costAuditContext">,
+): Promise<string> {
+  const apiKey = process.env.ANTHROPIC_API_KEY?.trim()
+  if (!apiKey) throw new EvaluationIaUnavailableError()
+  const content = buildAnthropicVisionMultiMessageContent(imageBase64List, prompt)
+  if (!content[0] || content[0].type !== "image" || !content[0].source.data) {
+    throw new EvaluationIaUnavailableError()
+  }
+  if (!content[1] || content[1].type !== "image" || !content[1].source.data) {
+    throw new EvaluationIaUnavailableError()
+  }
+  const anthropic = new Anthropic({ apiKey })
+  const model = anthropicEvaluationModel()
+  const startedAt = Date.now()
+  const msg = await anthropic.messages.create({
+    model,
+    max_tokens: maxTokens,
+    messages: [{ role: "user", content }],
+  })
+  recordProviderCostAuditShadow({
+    provider: "anthropic",
+    model,
+    operation: "anthropic_vision_fallback",
+    usage: msg.usage,
+    providerRequestId: typeof msg.id === "string" ? msg.id : null,
+    durationMs: Date.now() - startedAt,
+    costAuditContext: auditMeta?.costAuditContext,
+  })
+  const text = messageTextContent(msg)
+  if (!text) throw new EvaluationIaUnavailableError()
+  return text
+}
+
+/**
+ * Sibling aditivo exclusivo Camino B N>=2.
+ * No muta requestEvaluationVisionCompletion ni callAnthropicVision.
+ * Una solicitud, dos vistas, mismo contrato { content, trace }.
+ */
+export async function requestEvaluationVisionCompletionMulti(
+  params: EvaluationVisionMultiCompletionParams,
+): Promise<{ content: string; trace: EvaluationProviderTrace }> {
+  const imageBase64List = params.imageBase64List
+  if (imageBase64List.length !== 2) {
+    throw new Error("evaluation_vision_multi_requires_exactly_2_images")
+  }
+  const mistralKey = process.env.MISTRAL_API_KEY?.trim()
+
+  if (!mistralKey) {
+    if (!isAnthropicFallbackEnabled()) throw new EvaluationIaUnavailableError()
+    const content = await callAnthropicVisionMulti(
+      imageBase64List,
+      params.prompt,
+      params.maxTokens,
+      { costAuditContext: params.costAuditContext },
+    )
+    return { content, trace: anthropicFallbackTrace() }
+  }
+
+  return withAnthropicFallbackOnMistralAuth(
+    async () => {
+      const mistralModel = "pixtral-12b-2409"
+      const startedAt = Date.now()
+      const res = await fetchMistralWithRetry(
+        MISTRAL_CHAT_URL,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${mistralKey}`,
+          },
+          body: JSON.stringify({
+            model: mistralModel,
+            messages: [
+              {
+                role: "user",
+                content: buildMistralVisionMultiMessageContent(imageBase64List, params.prompt),
+              },
+            ],
+            temperature: params.temperature ?? 0.1,
+            response_format: { type: "json_object" },
+            max_tokens: params.maxTokens,
+          }),
+        },
+        { timeoutMs: params.timeoutMs ?? MISTRAL_FETCH_TIMEOUT_MS_VISION },
+      )
+      const data = await res.json()
+      recordProviderCostAuditShadow({
+        provider: "mistral",
+        model: mistralModel,
+        operation: "evaluate_vision",
+        usage: data?.usage,
+        providerRequestId: typeof data?.id === "string" ? data.id : null,
+        durationMs: Date.now() - startedAt,
+        costAuditContext: params.costAuditContext,
+      })
+      const content = data.choices?.[0]?.message?.content
+      if (!content) throw new Error("Respuesta vacía de Mistral Vision")
+      return { content: String(content), trace: DEFAULT_EVALUATION_PROVIDER_TRACE }
+    },
+    () =>
+      callAnthropicVisionMulti(imageBase64List, params.prompt, params.maxTokens, {
+        costAuditContext: params.costAuditContext,
+      }),
+  )
+}
