@@ -187,6 +187,28 @@ import {
   readDocenteActiveBatchId,
   writeDocenteActiveBatchId,
 } from "@/app/lib/docente/active-batch-id"
+import { isCourseContextsEnabled, shouldMountCourseContextSwitcher } from "@/app/lib/course-contexts/flag"
+import {
+  buildInstrumentFingerprint,
+  collectContextPreviewUrls,
+  createEmptyCourseContextsState,
+  deriveCourseContextSwitchBlocked,
+  displayContextStatus,
+  idleInFlightGuards,
+  isInstrumentLocked,
+  isRosterLocked,
+  revokeOwnedPreviewUrls,
+  shouldAdoptStorageActiveBatch,
+  SWITCH_BLOCKED_MESSAGES,
+} from "@/app/lib/course-contexts/helpers"
+import { confirmContext, createContext, deleteContext, executeSwitch, unconfirmContext } from "@/app/lib/course-contexts/store"
+import {
+  COURSE_CONTEXT_SCALE_KEY,
+  MAX_COURSE_CONTEXTS,
+  type CourseContextSnapshot,
+  type LiveWorkspace,
+} from "@/app/lib/course-contexts/types"
+import { CourseContextSwitcher } from "@/app/components/evaluator/CourseContextSwitcher"
 type ClosedAnswerOMRResult = any
 const SmartCameraModal = dynamic(() => import("@/components/smart-camera-modal"), {
   loading: () => <p>Cargando...</p>,
@@ -1704,6 +1726,10 @@ export default function EvaluatorClient() {
 
   const [logoPreview, setLogoPreview] = useState<string | null>(null)
   const [classSize, setClassSize] = useState(1)
+  const courseContextsEnabled = isCourseContextsEnabled()
+  const [courseContextsState, setCourseContextsState] = useState(() =>
+    createEmptyCourseContextsState<StudentGroup, FilePreview>(),
+  )
   /** Imágenes por estudiante para agrupación automática (solo UI, no altera contratos). */
   const [imagesPerStudent, setImagesPerStudent] = useState(1)
   const [isExtractingNames, setIsExtractingNames] = useState(false)
@@ -1736,6 +1762,8 @@ export default function EvaluatorClient() {
   const mobileBatchRealtimeDebounceRef = useRef<number | null>(null)
   const evaluateAllGuardRef = useRef(false)
   const evaluatingGroupIdsRef = useRef<Set<string>>(new Set())
+  const restoringCourseContextRef = useRef(false)
+  const switchingCourseContextRef = useRef(false)
   type SyncMobileBatchPhotosResult =
     | { ok: true; newlyRecovered: number; groups: StudentGroup[] }
     | { ok: false; reason: "no_batch" }
@@ -2655,6 +2683,13 @@ export default function EvaluatorClient() {
 
   const handleEvaluatorSourceExamSelect = useCallback(
     async (value: string): Promise<boolean> => {
+      if (isCourseContextsEnabled() && isInstrumentLocked(courseContextsState.contexts)) {
+        toast({
+          title: "Hay cursos confirmados. Desconfirme para cambiar la prueba base.",
+          variant: "destructive",
+        })
+        return false
+      }
       const id = value === "__none__" ? "" : value
       setSelectedEvaluatorSourceExamId(id)
       if (id) lastActiveEvaluatorSourceExamIdRef.current = id
@@ -2692,7 +2727,7 @@ export default function EvaluatorClient() {
         setEvaluatorSourceExamItemsLoading(false)
       }
     },
-    [evaluatorSourceExamOptions, toast],
+    [evaluatorSourceExamOptions, toast, courseContextsState.contexts],
   )
 
   const handleUseRememberedWizardSourceExam = useCallback(() => {
@@ -2976,6 +3011,8 @@ export default function EvaluatorClient() {
       form.setValue("nivelEducativo", "Educación Media")
     }
 
+    if (restoringCourseContextRef.current) return
+
     const count = Math.max(1, classSize)
     setStudentGroups(
       Array.from({ length: count }, (_, i) => {
@@ -3028,6 +3065,174 @@ export default function EvaluatorClient() {
     evaluationAttemptIdRef.current = ensured.attemptId
     return ensured.attemptId
   }, [])
+
+  const courseContextsStateRef = useRef(courseContextsState)
+  courseContextsStateRef.current = courseContextsState
+
+  const captureLiveCourseWorkspace = (): LiveWorkspace<StudentGroup, FilePreview> => ({
+    courseValue: String(form.getValues("curso") ?? ""),
+    classSize,
+    imagesPerStudent,
+    studentGroups,
+    unassignedFiles,
+    batchId: (evaluationBatchIdUi || evaluationBatchIdRef.current || "").trim(),
+    attemptId: (evaluationAttemptIdRef.current || "").trim(),
+    captureMode,
+    instrumentFingerprint: buildInstrumentFingerprint(
+      selectedEvaluatorSourceExamId,
+      String(form.getValues("tipoPrueba") ?? ""),
+    ),
+  })
+
+  const buildCourseContextInFlight = () =>
+    idleInFlightGuards({
+      evaluatingGroupIdsCount: evaluatingGroupIdsRef.current.size,
+      anyGroupEvaluating: studentGroups.some((g) => g.isEvaluating),
+      evaluateAllGuard: evaluateAllGuardRef.current,
+      batchProgressActive: batchProgress.isActive,
+      isLoading,
+      isExtractingNames,
+      mobileBatchSyncing: mobileBatchSyncingRef.current,
+      asyncJobActive: Boolean(asyncEvaluationWrapperEnabled && asyncEvaluationStatus.phase !== "idle"),
+      switchInProgress: switchingCourseContextRef.current,
+      restoring: restoringCourseContextRef.current,
+    })
+
+  const applyCourseContextWorkspace = (ctx: CourseContextSnapshot<StudentGroup, FilePreview>) => {
+    restoringCourseContextRef.current = true
+    setStudentGroups(ctx.studentGroups)
+    setUnassignedFiles(ctx.unassignedFiles)
+    setClassSize(Math.max(1, ctx.studentGroups.length || ctx.classSize || 1))
+    setImagesPerStudent(ctx.imagesPerStudent > 0 ? ctx.imagesPerStudent : 1)
+    form.setValue("curso", ctx.courseValue)
+    const bid = ctx.batchId || null
+    evaluationBatchIdRef.current = bid
+    setEvaluationBatchIdUi(bid)
+    evaluationAttemptIdRef.current = ctx.attemptId || null
+    if (
+      ctx.captureMode === "sm_vf" ||
+      ctx.captureMode === "terminos_pareados" ||
+      ctx.captureMode === "desarrollo" ||
+      ctx.captureMode === "closed_answer" ||
+      ctx.captureMode === null
+    ) {
+      setCaptureMode(ctx.captureMode)
+    }
+    reportGroupCacheRef.current = new Map()
+    setFocusedGroupId(null)
+    setPreviewGroupId(null)
+    writeDocenteActiveBatchId(bid)
+    window.setTimeout(() => {
+      restoringCourseContextRef.current = false
+      switchingCourseContextRef.current = false
+    }, 0)
+  }
+
+  const handleCreateCourseContext = () => {
+    if (!courseContextsEnabled) return
+    if (courseContextsState.contexts.length === 0) {
+      ensureEvaluationBatchId()
+    }
+    const live = captureLiveCourseWorkspace()
+    if (!live.batchId && courseContextsState.contexts.length === 0) {
+      live.batchId = evaluationBatchIdRef.current || ensureEvaluationBatchId()
+    }
+    const result = createContext({
+      state: courseContextsState,
+      live,
+      scaleStore: getSelectiveRetrySessionStore(),
+      newBatchId: crypto.randomUUID(),
+      emptyGroupFactory: (index) => ({
+        id: `student-${Date.now()}-${index}`,
+        studentName: `Alumno ${index + 1}`,
+        studentRut: "",
+        files: [],
+        isEvaluated: false,
+        isEvaluating: false,
+        decimasAdicionales: 0,
+      }),
+      inFlight: buildCourseContextInFlight(),
+    })
+    if (!result.ok) {
+      toast({ title: result.error, variant: "destructive" })
+      return
+    }
+    setCourseContextsState(result.state)
+    if (result.activated && result.state.activeContextId !== courseContextsState.activeContextId) {
+      switchingCourseContextRef.current = true
+      applyCourseContextWorkspace(result.activated)
+    }
+    toast({ title: "Curso preparado", description: `${result.state.contexts.length}/${MAX_COURSE_CONTEXTS} contextos.` })
+  }
+
+  const handleSwitchCourseContext = (targetId: string) => {
+    if (!courseContextsEnabled) return
+    switchingCourseContextRef.current = true
+    const scaleStore = getSelectiveRetrySessionStore()
+    const previousScale = scaleStore?.getItem ? scaleStore.getItem(COURSE_CONTEXT_SCALE_KEY) : null
+    const result = executeSwitch({
+      state: courseContextsState,
+      targetId,
+      live: captureLiveCourseWorkspace(),
+      scaleStore,
+      inFlight: buildCourseContextInFlight(),
+      globalInstrumentFingerprint: buildInstrumentFingerprint(
+        selectedEvaluatorSourceExamId,
+        String(form.getValues("tipoPrueba") ?? ""),
+      ),
+    })
+    if (!result.ok) {
+      switchingCourseContextRef.current = false
+      toast({ title: result.error, variant: "destructive" })
+      return
+    }
+    try {
+      setCourseContextsState(result.state)
+      if (result.activated) applyCourseContextWorkspace(result.activated)
+    } catch {
+      if (scaleStore) {
+        try {
+          scaleStore.setItem(COURSE_CONTEXT_SCALE_KEY, previousScale ?? "")
+        } catch {
+          /* noop */
+        }
+      }
+      switchingCourseContextRef.current = false
+      toast({ title: "No se pudo activar el curso destino. Se permanece en el actual.", variant: "destructive" })
+    }
+  }
+
+  const handleConfirmCourseContext = (contextId: string) => {
+    const result = confirmContext(courseContextsState, contextId)
+    if (!result.ok) {
+      toast({ title: result.error, variant: "destructive" })
+      return
+    }
+    setCourseContextsState(result.state)
+  }
+
+  const handleUnconfirmCourseContext = (contextId: string) => {
+    const result = unconfirmContext(courseContextsState, contextId)
+    if (!result.ok) {
+      toast({ title: result.error, variant: "destructive" })
+      return
+    }
+    setCourseContextsState(result.state)
+  }
+
+  const handleDeleteCourseContext = (contextId: string) => {
+    const result = deleteContext({
+      state: courseContextsState,
+      contextId,
+      collectUrls: collectContextPreviewUrls,
+      revokeUrls: revokeOwnedPreviewUrls,
+    })
+    if (!result.ok) {
+      toast({ title: result.error, variant: "destructive" })
+      return
+    }
+    setCourseContextsState(result.state)
+  }
 
   const buildSelectiveRetrySnapshots = useCallback((groups: StudentGroup[]): SelectiveRetryGroupSnapshot[] => {
     const batchId = evaluationBatchIdRef.current ?? readDocenteActiveBatchId()
@@ -3713,9 +3918,17 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       let cur = evaluationBatchIdRef.current
       const persisted = readDocenteActiveBatchId()
       if (!cur && persisted === bid) {
-        evaluationBatchIdRef.current = bid
-        setEvaluationBatchIdUi(bid)
-        cur = bid
+        if (
+          shouldAdoptStorageActiveBatch({
+            featureOn: isCourseContextsEnabled(),
+            incomingBatchId: bid,
+            activeBatchId: courseContextsStateRef.current.activeContextId,
+          })
+        ) {
+          evaluationBatchIdRef.current = bid
+          setEvaluationBatchIdUi(bid)
+          cur = bid
+        }
       }
       if (cur !== bid) return
       if (activeTabRef.current !== "evaluator") return
@@ -3744,6 +3957,15 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       if (!isDocenteBatchUuid(id)) return
       const v = id.trim()
       if (activeTabRef.current !== "evaluator") return
+      if (
+        !shouldAdoptStorageActiveBatch({
+          featureOn: isCourseContextsEnabled(),
+          incomingBatchId: v,
+          activeBatchId: courseContextsStateRef.current.activeContextId,
+        })
+      ) {
+        return
+      }
       evaluationBatchIdRef.current = v
       setEvaluationBatchIdUi(v)
       if (mobileBatchRealtimeDebounceRef.current) window.clearTimeout(mobileBatchRealtimeDebounceRef.current)
@@ -5222,6 +5444,14 @@ const handleCapture = (dataUrl: string, mode: CaptureMode | null, feedback?: Cam
       })()
     : ""
 
+  const activeCourseContext = courseContextsState.contexts.find(
+    (c) => c.contextId === courseContextsState.activeContextId,
+  )
+  const rosterLocked =
+    courseContextsEnabled && !!activeCourseContext && isRosterLocked(activeCourseContext.preparedStatus)
+  const instrumentLocked = courseContextsEnabled && isInstrumentLocked(courseContextsState.contexts)
+  const courseContextSwitchGuard = deriveCourseContextSwitchBlocked(buildCourseContextInFlight())
+
   return (
     <EvaluatorRootDiv className={rootThemeClass}>
       {evaluateDiagnostic != null && (
@@ -5759,6 +5989,42 @@ w-8"
               />
               <span className={`font-semibold text-xl ${wordmarkClass} font-logo`}>Evaluador</span>
             </div>
+            {shouldMountCourseContextSwitcher(courseContextsEnabled) ? (
+              <CourseContextSwitcher
+                items={courseContextsState.contexts.map((c) => ({
+                  contextId: c.contextId,
+                  courseValue:
+                    c.contextId === courseContextsState.activeContextId
+                      ? String(form.getValues("curso") ?? c.courseValue)
+                      : c.courseValue,
+                  classSize:
+                    c.contextId === courseContextsState.activeContextId
+                      ? Math.max(1, studentGroups.length || classSize)
+                      : c.classSize,
+                  displayStatus: displayContextStatus(
+                    c.preparedStatus,
+                    c.contextId,
+                    courseContextsState.activeContextId,
+                  ),
+                  batchId: c.batchId,
+                }))}
+                activeContextId={courseContextsState.activeContextId}
+                switchBlocked={courseContextSwitchGuard.blocked}
+                switchBlockedReason={
+                  courseContextSwitchGuard.reason
+                    ? SWITCH_BLOCKED_MESSAGES[courseContextSwitchGuard.reason]
+                    : null
+                }
+                rosterLocked={rosterLocked}
+                instrumentLocked={instrumentLocked}
+                canCreate={courseContextsState.contexts.length < MAX_COURSE_CONTEXTS}
+                onCreate={handleCreateCourseContext}
+                onSwitch={handleSwitchCourseContext}
+                onConfirm={handleConfirmCourseContext}
+                onUnconfirm={handleUnconfirmCourseContext}
+                onDelete={handleDeleteCourseContext}
+              />
+            ) : null}
             <Card className="bg-[var(--bg-card)] border-[var(--border-color)]">
               <CardHeader>
                 <CardTitle className="text-[var(--text-accent)]">Paso 1: Configuración de la Evaluación</CardTitle>
@@ -5786,6 +6052,12 @@ w-8"
                           onChange={(e) => setClassSize(Number(e.target.value) || 1)}
                           className="w-24 text-base"
                           min={1}
+                          disabled={rosterLocked}
+                          title={
+                            rosterLocked
+                              ? "Desconfirme el curso para cambiar el número de estudiantes"
+                              : undefined
+                          }
                         />
                       </div>
                       <div className="flex items-center space-x-3">
@@ -5938,7 +6210,7 @@ w-8"
                         <Select
                           value={selectedEvaluatorSourceExamId || "__none__"}
                           onValueChange={handleEvaluatorSourceExamSelect}
-                          disabled={evaluatorSourceExamListLoading}
+                          disabled={evaluatorSourceExamListLoading || instrumentLocked}
                         >
                           <SelectTrigger className="w-full sm:max-w-md">
                             <SelectValue
@@ -6107,6 +6379,7 @@ font-semibold"
                               </FormLabel>
                               <Select
                                 onValueChange={(value) => {
+                                  if (instrumentLocked) return
                                   field.onChange(value)
                                   form.setValue("tipoPrueba", value as TipoPruebaEvaluatePayload, {
                                     shouldDirty: true,
@@ -6121,6 +6394,7 @@ font-semibold"
                                   }
                                 }}
                                 value={field.value}
+                                disabled={instrumentLocked}
                               >
                                 <FormControl>
                                   <SelectTrigger>
@@ -6145,6 +6419,7 @@ font-semibold"
                                       : "border-violet-200 bg-white text-violet-900 hover:bg-violet-50"
                                   }`}
                                   onClick={() => {
+                                    if (instrumentLocked) return
                                     form.setValue("tipoPrueba", "solo_desarrollo", {
                                       shouldDirty: true,
                                       shouldTouch: true,
