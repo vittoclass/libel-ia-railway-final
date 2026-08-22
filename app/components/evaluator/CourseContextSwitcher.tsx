@@ -5,6 +5,7 @@
  * Solo se monta si el feature flag está ON (el padre no lo renderiza si OFF).
  */
 
+import * as React from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -55,18 +56,19 @@ export function CourseContextSwitcher(props: {
           title={!props.canCreate ? `Máximo ${MAX_COURSE_CONTEXTS} contextos` : undefined}
           onClick={props.onCreate}
         >
-          Crear curso ({props.items.length}/{MAX_COURSE_CONTEXTS})
+          + Curso
         </Button>
       </div>
 
       {props.items.length === 0 ? (
         <p className="text-xs text-[var(--text-secondary)]">
-          Aún no hay contextos. «Crear curso» guarda el workspace actual como curso A.
+          Aún no hay contextos. «+ Curso» guarda el workspace actual como curso A.
         </p>
       ) : (
-        <ul className="space-y-2">
+        <ul className="flex flex-wrap items-stretch gap-2" role="tablist" aria-label="Cursos de esta sesión">
           {props.items.map((item) => {
             const isActive = item.contextId === props.activeContextId
+            const label = item.courseValue.trim() || "(sin etiqueta)"
             return (
               <li
                 key={item.contextId}
@@ -76,24 +78,24 @@ export function CourseContextSwitcher(props: {
                     : "border-[var(--border-color)]"
                 }`}
               >
-                <span className="font-semibold min-w-[4.5rem]">{item.displayStatus}</span>
-                <span className="flex-1 truncate">
-                  {item.courseValue.trim() || "(sin etiqueta)"} · {item.classSize} est. · batch{" "}
-                  {item.batchId.slice(0, 8)}
-                </span>
-                {!isActive ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    className="h-7 text-xs"
-                    disabled={props.switchBlocked}
-                    title={props.switchBlocked ? props.switchBlockedReason ?? "Cambio bloqueado" : "Activar"}
-                    onClick={() => props.onSwitch(item.contextId)}
-                  >
-                    Activar
-                  </Button>
-                ) : null}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  data-context-id={item.contextId}
+                  className="font-semibold min-w-[4.5rem] text-left"
+                  disabled={!isActive && props.switchBlocked}
+                  title={
+                    isActive
+                      ? `${label} · activo · ${item.classSize} est.`
+                      : props.switchBlocked
+                        ? props.switchBlockedReason ?? "Cambio bloqueado"
+                        : `Activar ${label}`
+                  }
+                  onClick={isActive ? undefined : () => props.onSwitch(item.contextId)}
+                >
+                  {label}
+                </button>
                 {isActive && item.displayStatus === "ACTIVE" && !props.rosterLocked ? (
                   <Button
                     type="button"
