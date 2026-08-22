@@ -11,10 +11,13 @@ export const COURSE_CONTEXTS_FLAG_ENV = "NEXT_PUBLIC_COURSE_CONTEXTS_ENABLED"
 export const COURSE_CONTEXTS_ENABLED_DEFAULT = false
 
 export function isCourseContextsEnabled(
-  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>,
 ): boolean {
   if (COURSE_CONTEXTS_ENABLED_DEFAULT) return true
-  const v = String(env?.[COURSE_CONTEXTS_FLAG_ENV] ?? "")
+  // Literal NEXT_PUBLIC_*: Next.js 14 solo inlinea este acceso estático en el bundle cliente.
+  const fromProcess = process.env.NEXT_PUBLIC_COURSE_CONTEXTS_ENABLED
+  const raw = env !== undefined ? env[COURSE_CONTEXTS_FLAG_ENV] : fromProcess
+  const v = String(raw ?? "")
     .trim()
     .toLowerCase()
   return v === "1" || v === "true" || v === "yes" || v === "on"
