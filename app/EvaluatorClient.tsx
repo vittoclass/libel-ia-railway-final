@@ -3167,7 +3167,7 @@ export default function EvaluatorClient() {
 
   const handleSwitchCourseContext = (targetId: string) => {
     if (!courseContextsEnabled) return
-    switchingCourseContextRef.current = true
+    if (switchingCourseContextRef.current) return
     const scaleStore = getSelectiveRetrySessionStore()
     const previousScale = scaleStore?.getItem ? scaleStore.getItem(COURSE_CONTEXT_SCALE_KEY) : null
     const result = executeSwitch({
@@ -3186,6 +3186,7 @@ export default function EvaluatorClient() {
       toast({ title: result.error, variant: "destructive" })
       return
     }
+    switchingCourseContextRef.current = true
     try {
       setCourseContextsState(result.state)
       if (result.activated) applyCourseContextWorkspace(result.activated)
