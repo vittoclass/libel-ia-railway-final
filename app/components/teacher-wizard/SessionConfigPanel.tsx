@@ -2,6 +2,7 @@
 
 import Link from "next/link"
 import { useCallback, useEffect, useState } from "react"
+import { isCourseContextsEnabled } from "@/app/lib/course-contexts/flag"
 import { Loader2 } from "lucide-react"
 import {
   Select,
@@ -111,6 +112,8 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
   }, [open])
 
   if (!open) return null
+
+  const courseContextsEnabled = isCourseContextsEnabled()
 
   const handleSave = () => {
     const id = form.sessionSourceExamId?.trim()
@@ -364,6 +367,8 @@ export function SessionConfigPanel({ open, onClose, onSaved }: Props) {
             <Link
               href="/docente/estacion"
               className="mt-3 inline-flex rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+              target={courseContextsEnabled ? "_blank" : undefined}
+              rel={courseContextsEnabled ? "noopener noreferrer" : undefined}
               onClick={onClose}
             >
               Ir a estación QR
