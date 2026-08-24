@@ -22,7 +22,10 @@ import {
   WIZARD_SESSION_CHANGED_EVENT,
   WIZARD_SESSION_STORAGE_KEY,
 } from "@/app/components/teacher-wizard/sessionStorage"
+import { isCourseContextsEnabled } from "@/app/lib/course-contexts/flag"
 import {
+  DOCENTE_ACTIVE_BATCH_ID_KEY,
+  isDocenteBatchUuid,
   readDocenteActiveBatchId,
   writeDocenteActiveBatchId,
 } from "@/app/lib/docente/active-batch-id"
@@ -37,10 +40,68 @@ function isTeacherAssignmentsTableMigrationUiNoise(w: string | null): boolean {
   return s.includes("teacher_assignments") && (s.includes("no aplicada") || s.includes("paso a"))
 }
 
+/** S3.8 — vista corta del UUID real. Nunca key, persistencia ni backend. */
+export function formatQrBatchIdShort(batchId: string): string {
+  return batchId.replace(/-/g, "").slice(0, 6).toUpperCase()
+}
+
+export type QrEvaluatorSyncStatus = "synced" | "stale" | "unknown"
+
+export function deriveQrEvaluatorSyncStatus(
+  localBatch: string | null | undefined,
+  sharedBatch: string | null | undefined,
+): QrEvaluatorSyncStatus {
+  const local = typeof localBatch === "string" ? localBatch.trim() : ""
+  const shared = typeof sharedBatch === "string" ? sharedBatch.trim() : ""
+  if (!isDocenteBatchUuid(shared) || !isDocenteBatchUuid(local)) return "unknown"
+  return shared === local ? "synced" : "stale"
+}
+
+export function shouldShowQrEvaluatorSyncUi(featureOn: boolean): boolean {
+  return featureOn === true
+}
+
+export type AdoptEvaluatorBatchPlan = {
+  action: "adopt" | "noop"
+  nextBatchId: string | null
+  createsNewUuid: false
+  callsRegenerateBatch: false
+}
+
+export function planAdoptEvaluatorActiveBatch(opts: {
+  localBatch: string | null | undefined
+  sharedBatch: string | null | undefined
+}): AdoptEvaluatorBatchPlan {
+  const local = typeof opts.localBatch === "string" ? opts.localBatch.trim() : ""
+  const shared = typeof opts.sharedBatch === "string" ? opts.sharedBatch.trim() : ""
+  if (!isDocenteBatchUuid(shared) || shared === local) {
+    return { action: "noop", nextBatchId: null, createsNewUuid: false, callsRegenerateBatch: false }
+  }
+  return { action: "adopt", nextBatchId: shared, createsNewUuid: false, callsRegenerateBatch: false }
+}
+
+/** Click de «Actualizar desde Evaluador»: relee el helper y adopta. Nunca crea UUID ni llama «Nuevo lote». */
+export function runAdoptFromEvaluator(opts: {
+  readShared: () => string | null
+  localBatch: string | null
+  setBatchId: (id: string) => void
+}): { readCount: number; adopted: string | null } {
+  const shared = opts.readShared()
+  const plan = planAdoptEvaluatorActiveBatch({ localBatch: opts.localBatch, sharedBatch: shared })
+  if (plan.action === "adopt" && plan.nextBatchId) {
+    opts.setBatchId(plan.nextBatchId)
+    return { readCount: 1, adopted: plan.nextBatchId }
+  }
+  return { readCount: 1, adopted: null }
+}
+
 export function DocenteEstacionClient() {
   const supabase = useMemo(() => createClientComponentClient(), [])
   /** null en SSR y primer paint del cliente → evita hydration mismatch con crypto.randomUUID(). */
   const [batchId, setBatchId] = useState<string | null>(null)
+  const courseContextsOn = isCourseContextsEnabled()
+  /** Solo presentación S3.8 (feature ON). Nunca sustituye a batchId. */
+  const [sharedBatchId, setSharedBatchId] = useState<string | null>(null)
 
   const [assignments, setAssignments] = useState<TeacherAssignmentOption[]>([])
   const [assignmentsWarning, setAssignmentsWarning] = useState<string | null>(null)
@@ -110,6 +171,23 @@ export function DocenteEstacionClient() {
   useEffect(() => {
     if (batchId) writeDocenteActiveBatchId(batchId)
   }, [batchId])
+
+  useEffect(() => {
+    if (!courseContextsOn) return
+    const refreshShared = () => setSharedBatchId(readDocenteActiveBatchId())
+    refreshShared()
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== DOCENTE_ACTIVE_BATCH_ID_KEY) return
+      setSharedBatchId(readDocenteActiveBatchId())
+    }
+    window.addEventListener("storage", onStorage)
+    return () => window.removeEventListener("storage", onStorage)
+  }, [courseContextsOn])
+
+  useEffect(() => {
+    if (!courseContextsOn || !batchId) return
+    setSharedBatchId(readDocenteActiveBatchId())
+  }, [batchId, courseContextsOn])
 
   const batchSessionContext = useMemo(() => {
     const bits: string[] = []
@@ -192,6 +270,16 @@ export function DocenteEstacionClient() {
     setDebugError(null)
   }, [])
 
+  const onAdoptFromEvaluator = useCallback(() => {
+    runAdoptFromEvaluator({
+      readShared: () => readDocenteActiveBatchId(),
+      localBatch: batchId,
+      setBatchId,
+    })
+  }, [batchId])
+
+  const syncStatus = deriveQrEvaluatorSyncStatus(batchId, sharedBatchId)
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 space-y-8">
       {debugError != null ? (
@@ -271,6 +359,34 @@ export function DocenteEstacionClient() {
             </div>
 
             <GuidedSessionStationSummary />
+            {shouldShowQrEvaluatorSyncUi(courseContextsOn) &&
+            batchId &&
+            (syncStatus === "synced" || syncStatus === "stale") ? (
+              <div
+                className={
+                  syncStatus === "stale"
+                    ? "rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950"
+                    : "rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-950"
+                }
+                data-s38-sync={syncStatus}
+              >
+                {syncStatus === "synced" ? (
+                  <p>
+                    Lote sincronizado: <strong>{formatQrBatchIdShort(batchId)}</strong>
+                  </p>
+                ) : null}
+                {syncStatus === "stale" && sharedBatchId ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p>
+                      El Evaluador cambió de lote ({formatQrBatchIdShort(sharedBatchId)}).
+                    </p>
+                    <Button type="button" variant="outline" size="sm" onClick={onAdoptFromEvaluator} data-s38-action="adopt">
+                      Actualizar desde Evaluador
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             {batchSessionError ? (
               <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
                 <strong>QR no válido en el celular hasta corregir esto:</strong> {batchSessionError}
