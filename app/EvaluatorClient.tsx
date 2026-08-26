@@ -3095,7 +3095,13 @@ export default function EvaluatorClient() {
       isLoading,
       isExtractingNames,
       mobileBatchSyncing: mobileBatchSyncingRef.current,
-      asyncJobActive: Boolean(asyncEvaluationWrapperEnabled && asyncEvaluationStatus.phase !== "idle"),
+      asyncJobActive: Boolean(
+        asyncEvaluationWrapperEnabled &&
+          (asyncEvaluationStatus.phase === "starting" ||
+            asyncEvaluationStatus.phase === "pending" ||
+            asyncEvaluationStatus.phase === "processing" ||
+            asyncEvaluationStatus.phase === "waiting_timeout"),
+      ),
       switchInProgress: switchingCourseContextRef.current,
       restoring: restoringCourseContextRef.current,
     })
