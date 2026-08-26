@@ -1730,6 +1730,8 @@ export default function EvaluatorClient() {
   const [courseContextsState, setCourseContextsState] = useState(() =>
     createEmptyCourseContextsState<StudentGroup, FilePreview>(),
   )
+  /** Solo fuerza re-render al liberar guards in-flight de course context. Sin significado de negocio. */
+  const [, bumpCourseContextRender] = useState(0)
   /** Imágenes por estudiante para agrupación automática (solo UI, no altera contratos). */
   const [imagesPerStudent, setImagesPerStudent] = useState(1)
   const [isExtractingNames, setIsExtractingNames] = useState(false)
@@ -3125,6 +3127,7 @@ export default function EvaluatorClient() {
     window.setTimeout(() => {
       restoringCourseContextRef.current = false
       switchingCourseContextRef.current = false
+      bumpCourseContextRender((v) => v + 1)
     }, 0)
   }
 
