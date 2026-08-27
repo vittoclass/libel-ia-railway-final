@@ -12,12 +12,15 @@ import {
 import {
   diagnoseAllImages,
   qualityBlocksObservation,
+  type ImageQualityDiagnosis,
 } from "@/app/lib/multimodal/image-quality"
 import { shouldRunMultimodalArtsPath } from "@/app/lib/multimodal/flag"
 import { buildMultimodalArtsPrompt } from "@/app/lib/multimodal/multimodal-prompt"
+import { parseRubricCriteria } from "@/app/lib/development-core/parse-rubric-criteria"
 import {
   requestMultimodalArtsVision,
   selectPrimaryMultimodalImage,
+  type MultimodalVisionRequestResult,
 } from "@/app/lib/multimodal/multimodal-vision-provider"
 import type {
   MultimodalArtsEvaluationInput,
@@ -139,6 +142,144 @@ function extractJsonObject(content: string): Record<string, unknown> | null {
   return null
 }
 
+/** NORMALIZED_EXACT: trim, whitespace, case, Unicode. Sin fuzzy ni borrar palabras. */
+export function normalizedExactArtsLabel(s: string): string {
+  return String(s ?? "")
+    .trim()
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+}
+
+function isUsableArtsId(id: string): boolean {
+  const t = String(id ?? "").trim()
+  return t.length > 0 && t.toLowerCase() !== "criterio"
+}
+
+function isUsableArtsLabel(label: string): boolean {
+  const t = String(label ?? "").trim()
+  return t.length > 0 && t.toLowerCase() !== "criterio"
+}
+
+export type ArtsRubricCompleteness = {
+  expectedCount: number
+  matched: number
+  missing: string[]
+  duplicates: string[]
+  extras: string[]
+  ambiguous: string[]
+  complete: boolean
+  aligned: MultimodalCriterionEvidence[] | null
+}
+
+/**
+ * Gate local de completitud. No asigna score/status/nota.
+ * Id exacto, luego NORMALIZED_EXACT de label. Extras no puntúan.
+ */
+export function assessArtsRubricCompleteness(
+  rubricCriteria: Array<{ criterion_id: string; criterion_label: string }>,
+  evidence: MultimodalCriterionEvidence[],
+): ArtsRubricCompleteness {
+  const expectedCount = rubricCriteria.length
+  const missing: string[] = []
+  const duplicates: string[] = []
+  const extras: string[] = []
+  const ambiguous: string[] = []
+  if (expectedCount === 0) {
+    return {
+      expectedCount: 0,
+      matched: 0,
+      missing,
+      duplicates,
+      extras: evidence.map((e, i) => e.criterion_id || e.criterion_label || `idx:${i}`),
+      ambiguous,
+      complete: false,
+      aligned: null,
+    }
+  }
+
+  const assignment: Array<number | "ambiguous" | "extra"> = evidence.map(() => "extra")
+  for (let ei = 0; ei < evidence.length; ei++) {
+    const ev = evidence[ei]!
+    const idHits: number[] = []
+    if (isUsableArtsId(ev.criterion_id)) {
+      const id = String(ev.criterion_id).trim()
+      for (let ri = 0; ri < rubricCriteria.length; ri++) {
+        if (String(rubricCriteria[ri]!.criterion_id).trim() === id) idHits.push(ri)
+      }
+    }
+    if (idHits.length > 1) {
+      assignment[ei] = "ambiguous"
+      ambiguous.push(ev.criterion_id)
+      continue
+    }
+    if (idHits.length === 1) {
+      assignment[ei] = idHits[0]!
+      continue
+    }
+    const labelHits: number[] = []
+    if (isUsableArtsLabel(ev.criterion_label)) {
+      const n = normalizedExactArtsLabel(ev.criterion_label)
+      for (let ri = 0; ri < rubricCriteria.length; ri++) {
+        if (normalizedExactArtsLabel(rubricCriteria[ri]!.criterion_label) === n) {
+          labelHits.push(ri)
+        }
+      }
+    }
+    if (labelHits.length > 1) {
+      assignment[ei] = "ambiguous"
+      ambiguous.push(ev.criterion_label)
+      continue
+    }
+    if (labelHits.length === 1) {
+      assignment[ei] = labelHits[0]!
+      continue
+    }
+    extras.push(ev.criterion_id || ev.criterion_label || `idx:${ei}`)
+  }
+
+  const byRubric: number[][] = rubricCriteria.map(() => [])
+  for (let ei = 0; ei < assignment.length; ei++) {
+    const a = assignment[ei]!
+    if (typeof a === "number") byRubric[a]!.push(ei)
+  }
+
+  const alignedSlots: Array<MultimodalCriterionEvidence | null> = rubricCriteria.map(
+    () => null,
+  )
+  let matched = 0
+  for (let ri = 0; ri < rubricCriteria.length; ri++) {
+    const hits = byRubric[ri]!
+    const key =
+      rubricCriteria[ri]!.criterion_id || rubricCriteria[ri]!.criterion_label
+    if (hits.length === 0) missing.push(key)
+    else if (hits.length > 1) duplicates.push(key)
+    else {
+      matched++
+      alignedSlots[ri] = evidence[hits[0]!]!
+    }
+  }
+
+  const complete =
+    matched === expectedCount &&
+    missing.length === 0 &&
+    duplicates.length === 0 &&
+    ambiguous.length === 0
+
+  return {
+    expectedCount,
+    matched,
+    missing,
+    duplicates,
+    extras,
+    ambiguous,
+    complete,
+    aligned: complete ? (alignedSlots as MultimodalCriterionEvidence[]) : null,
+  }
+}
+
 export type RunMultimodalArtsEvaluationParams = {
   input: MultimodalArtsEvaluationInput
   areaConocimiento?: string | null
@@ -146,6 +287,10 @@ export type RunMultimodalArtsEvaluationParams = {
   allowOmr?: boolean | null
   /** Override de flag (tests). */
   enabled?: boolean
+  /** Solo tests: inyecta Vision. Producción no lo pasa. */
+  requestVision?: (
+    params: Parameters<typeof requestMultimodalArtsVision>[0],
+  ) => Promise<MultimodalVisionRequestResult>
 }
 
 /**
@@ -174,17 +319,25 @@ export async function runMultimodalArtsEvaluation(
     return failResult("no_images", diagnostics)
   }
 
-  let imageQuality
-  try {
-    imageQuality = await diagnoseAllImages(images)
-    for (const q of imageQuality) {
-      if (q.notes.length) {
-        diagnostics.push(`quality:${q.image_id}:${q.notes.join(",")}`)
+  let imageQuality: ImageQualityDiagnosis[]
+  if (params.requestVision) {
+    imageQuality = images.map((im) => ({
+      image_id: im.image_id,
+      available: true,
+      notes: [] as string[],
+    }))
+  } else {
+    try {
+      imageQuality = await diagnoseAllImages(images)
+      for (const q of imageQuality) {
+        if (q.notes.length) {
+          diagnostics.push(`quality:${q.image_id}:${q.notes.join(",")}`)
+        }
       }
+    } catch (e) {
+      console.warn("[multimodal-arts] image quality diagnosis failed (fail-open)", e)
+      return failResult("image_quality_diagnosis_failed", diagnostics)
     }
-  } catch (e) {
-    console.warn("[multimodal-arts] image quality diagnosis failed (fail-open)", e)
-    return failResult("image_quality_diagnosis_failed", diagnostics)
   }
 
   const allBlocked =
@@ -223,51 +376,115 @@ export async function runMultimodalArtsEvaluation(
     return failResult("rubric_criteria_not_verifiable", diagnostics)
   }
 
-  try {
-    const vision = await requestMultimodalArtsVision({
-      images,
-      prompt: promptBuild.prompt,
-      maxTokens: 4096,
-      temperature: 0.1,
-    })
-    diagnostics.push(`vision_calls:${vision.vision_calls}`)
-    diagnostics.push(`provider:${vision.provider_used}`)
-    diagnostics.push(`primary_image:${vision.primary_image_id}`)
+  const rubricCriteria = parseRubricCriteria(params.input.rubric_text ?? "").criteria
 
-    const parsed = extractJsonObject(vision.content)
-    if (!parsed) {
-      return failResult("multimodal_json_parse_failed", diagnostics, {
-        provider_used: vision.provider_used,
-        primary_image_id: vision.primary_image_id,
+  try {
+    async function requestArtsVisionOnce(): Promise<MultimodalVisionRequestResult> {
+      if (params.requestVision) {
+        return params.requestVision({
+          images,
+          prompt: promptBuild.prompt,
+          maxTokens: 4096,
+          temperature: 0.1,
+        })
+      }
+      return requestMultimodalArtsVision({
+        images,
+        prompt: promptBuild.prompt,
+        maxTokens: 4096,
+        temperature: 0.1,
       })
     }
 
-    let evidence = parseEvidenceList(parsed.evidence)
     const blockedIds = new Set(
       imageQuality.filter(qualityBlocksObservation).map((q) => q.image_id),
     )
-    evidence = evidence.map((ev) => {
-      const onlyBlocked =
-        ev.source_image_ids.length > 0 &&
-        ev.source_image_ids.every((id) => blockedIds.has(id))
-      if (
-        onlyBlocked ||
-        (blockedIds.size === images.length &&
-          qualityBlocksObservation(imageQuality[0]!))
-      ) {
-        return enforceNoObservableStatusInvariant({
-          ...ev,
-          observation_status: "IMAGE_QUALITY_INSUFFICIENT" as const,
-          nivel_logro: "NO_OBSERVABLE" as const,
-          justification:
-            ev.justification ||
-            "Calidad de imagen insuficiente para observar el criterio; no se interpreta como bajo logro.",
+
+    function applyQualityInvariant(
+      list: MultimodalCriterionEvidence[],
+    ): MultimodalCriterionEvidence[] {
+      return list.map((ev) => {
+        const onlyBlocked =
+          ev.source_image_ids.length > 0 &&
+          ev.source_image_ids.every((id) => blockedIds.has(id))
+        if (
+          onlyBlocked ||
+          (blockedIds.size === images.length &&
+            qualityBlocksObservation(imageQuality[0]!))
+        ) {
+          return enforceNoObservableStatusInvariant({
+            ...ev,
+            observation_status: "IMAGE_QUALITY_INSUFFICIENT" as const,
+            nivel_logro: "NO_OBSERVABLE" as const,
+            justification:
+              ev.justification ||
+              "Calidad de imagen insuficiente para observar el criterio; no se interpreta como bajo logro.",
+          })
+        }
+        return enforceNoObservableStatusInvariant(ev)
+      })
+    }
+
+    async function fetchParsedEvidence(): Promise<
+      | { kind: "json_failed"; vision: MultimodalVisionRequestResult }
+      | {
+          kind: "ok"
+          vision: MultimodalVisionRequestResult
+          parsed: Record<string, unknown>
+          evidence: MultimodalCriterionEvidence[]
+        }
+    > {
+      const vision = await requestArtsVisionOnce()
+      diagnostics.push(`vision_calls:${vision.vision_calls}`)
+      diagnostics.push(`provider:${vision.provider_used}`)
+      diagnostics.push(`primary_image:${vision.primary_image_id}`)
+      const parsed = extractJsonObject(vision.content)
+      if (!parsed) return { kind: "json_failed", vision }
+      return {
+        kind: "ok",
+        vision,
+        parsed,
+        evidence: applyQualityInvariant(parseEvidenceList(parsed.evidence)),
+      }
+    }
+
+    let attempt = await fetchParsedEvidence()
+    if (attempt.kind === "json_failed") {
+      return failResult("multimodal_json_parse_failed", diagnostics, {
+        provider_used: attempt.vision.provider_used,
+        primary_image_id: attempt.vision.primary_image_id,
+      })
+    }
+
+    let evidence = attempt.evidence
+    let parsed = attempt.parsed
+    let vision = attempt.vision
+
+    if (rubricCriteria.length > 0) {
+      let completeness = assessArtsRubricCompleteness(rubricCriteria, evidence)
+      if (!completeness.complete) {
+        diagnostics.push("pedagogical_retry:incomplete_rubric")
+        attempt = await fetchParsedEvidence()
+        if (attempt.kind === "json_failed") {
+          return failResult("multimodal_json_parse_failed", diagnostics, {
+            provider_used: attempt.vision.provider_used,
+            primary_image_id: attempt.vision.primary_image_id,
+          })
+        }
+        evidence = attempt.evidence
+        parsed = attempt.parsed
+        vision = attempt.vision
+        completeness = assessArtsRubricCompleteness(rubricCriteria, evidence)
+      }
+      if (!completeness.complete || !completeness.aligned) {
+        return failResult("multimodal_incomplete_rubric", diagnostics, {
+          fallback_recommended: false,
+          provider_used: vision.provider_used,
+          primary_image_id: vision.primary_image_id,
         })
       }
-      return enforceNoObservableStatusInvariant(ev)
-    })
-
-    if (!evidence.length) {
+      evidence = completeness.aligned
+    } else if (!evidence.length) {
       return failResult("multimodal_empty_evidence", diagnostics, {
         provider_used: vision.provider_used,
         primary_image_id: vision.primary_image_id,

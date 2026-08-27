@@ -3112,6 +3112,18 @@ export async function executeEvaluatePostBody(body: unknown): Promise<NextRespon
               ],
             }
             multimodalArtsSucceeded = true
+          } else if (
+            multimodalResult.fallback_recommended === false &&
+            multimodalResult.diagnostics.includes("multimodal_incomplete_rubric")
+          ) {
+            return NextResponse.json(
+              {
+                success: false,
+                error:
+                  "Error en la evaluación: la evidencia no cubre todos los criterios de la rúbrica. No se generó nota.",
+              },
+              { status: 422 },
+            )
           } else {
             console.warn(
               "[evaluate][multimodal-arts] fail-open → camino oficial Vision",
