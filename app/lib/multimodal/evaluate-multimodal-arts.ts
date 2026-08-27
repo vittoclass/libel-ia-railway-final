@@ -15,7 +15,10 @@ import {
   type ImageQualityDiagnosis,
 } from "@/app/lib/multimodal/image-quality"
 import { shouldRunMultimodalArtsPath } from "@/app/lib/multimodal/flag"
-import { buildMultimodalArtsPrompt } from "@/app/lib/multimodal/multimodal-prompt"
+import {
+  buildMultimodalArtsPrompt,
+  buildMultimodalArtsRepairPrompt,
+} from "@/app/lib/multimodal/multimodal-prompt"
 import { parseRubricCriteria } from "@/app/lib/development-core/parse-rubric-criteria"
 import {
   requestMultimodalArtsVision,
@@ -379,18 +382,20 @@ export async function runMultimodalArtsEvaluation(
   const rubricCriteria = parseRubricCriteria(params.input.rubric_text ?? "").criteria
 
   try {
-    async function requestArtsVisionOnce(): Promise<MultimodalVisionRequestResult> {
+    async function requestArtsVisionOnce(
+      prompt: string,
+    ): Promise<MultimodalVisionRequestResult> {
       if (params.requestVision) {
         return params.requestVision({
           images,
-          prompt: promptBuild.prompt,
+          prompt,
           maxTokens: 4096,
           temperature: 0.1,
         })
       }
       return requestMultimodalArtsVision({
         images,
-        prompt: promptBuild.prompt,
+        prompt,
         maxTokens: 4096,
         temperature: 0.1,
       })
@@ -425,7 +430,7 @@ export async function runMultimodalArtsEvaluation(
       })
     }
 
-    async function fetchParsedEvidence(): Promise<
+    async function fetchParsedEvidence(prompt: string): Promise<
       | { kind: "json_failed"; vision: MultimodalVisionRequestResult }
       | {
           kind: "ok"
@@ -434,7 +439,7 @@ export async function runMultimodalArtsEvaluation(
           evidence: MultimodalCriterionEvidence[]
         }
     > {
-      const vision = await requestArtsVisionOnce()
+      const vision = await requestArtsVisionOnce(prompt)
       diagnostics.push(`vision_calls:${vision.vision_calls}`)
       diagnostics.push(`provider:${vision.provider_used}`)
       diagnostics.push(`primary_image:${vision.primary_image_id}`)
@@ -448,7 +453,7 @@ export async function runMultimodalArtsEvaluation(
       }
     }
 
-    let attempt = await fetchParsedEvidence()
+    let attempt = await fetchParsedEvidence(promptBuild.prompt)
     if (attempt.kind === "json_failed") {
       return failResult("multimodal_json_parse_failed", diagnostics, {
         provider_used: attempt.vision.provider_used,
@@ -464,7 +469,18 @@ export async function runMultimodalArtsEvaluation(
       let completeness = assessArtsRubricCompleteness(rubricCriteria, evidence)
       if (!completeness.complete) {
         diagnostics.push("pedagogical_retry:incomplete_rubric")
-        attempt = await fetchParsedEvidence()
+        diagnostics.push("pedagogical_repair:full_informed")
+        diagnostics.push(
+          `pedagogical_repair_missing:${completeness.missing.join(",")}`,
+        )
+        const repairBuild = buildMultimodalArtsRepairPrompt({
+          input: params.input,
+          imageQuality,
+          primaryImageId,
+          secondaryImageIds,
+          completeness,
+        })
+        attempt = await fetchParsedEvidence(repairBuild.prompt)
         if (attempt.kind === "json_failed") {
           return failResult("multimodal_json_parse_failed", diagnostics, {
             provider_used: attempt.vision.provider_used,
