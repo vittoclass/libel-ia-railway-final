@@ -41,6 +41,7 @@ export interface ParseRubricCriteriaResult {
     | "numbered_tab_row"
     | "block_colon_scale"
     | "numbered_line_blocks"
+    | "dotted_title_scale"
     | "holistic"
     | "none"
   criteria: ParsedRubricCriterion[]
@@ -248,6 +249,115 @@ function parseNumberedLineBlocks(rubricText: string): ParsedRubricCriterion[] {
   return out
 }
 
+const BAND_NAME_AS_TITLE_RE =
+  /^(Logrado|Medianamente\s+Logrado|Por\s+Lograr|No\s+Logrado|Excelente|Bueno|Regular|Insuficiente|Suficiente|Por\s+Mejorar)$/i
+
+/**
+ * Título estructural inmediatamente antes de un marcador de banda de cycle-start:
+ * [Ítem N:] Título. Excelente (N pts):
+ * Exige el punto (no colon). Sin fuzzy. Sin taxonomía de asignatura.
+ */
+function extractDottedTitleBefore(
+  text: string,
+  markerIndex: number,
+): { label: string; explicitId: string | null; titleIndex: number } | null {
+  const before = text.slice(0, markerIndex)
+  const endDot = /\.\s*$/.exec(before)
+  if (!endDot) return null
+
+  const beforePeriod = before.slice(0, endDot.index)
+  const lastPeriod = beforePeriod.lastIndexOf(".")
+  const lastNl = Math.max(
+    beforePeriod.lastIndexOf("\n"),
+    beforePeriod.lastIndexOf("\r"),
+  )
+  const segmentStart = Math.max(lastPeriod + 1, lastNl + 1, 0)
+  const segment = beforePeriod.slice(segmentStart)
+  const leadWs = /^\s*/.exec(segment)?.[0].length ?? 0
+  const body = segment.slice(leadWs)
+  const absBodyStart = segmentStart + leadWs
+  if (!body) return null
+
+  const itemMatch = /^(?:Ítem|Item)\s+(\d{1,2})\s*:\s*/i.exec(body)
+  let explicitId: string | null = null
+  let titleRaw = body
+  const titleIndex = absBodyStart
+  if (itemMatch) {
+    explicitId = itemMatch[1] ?? null
+    titleRaw = body.slice(itemMatch[0].length)
+  }
+
+  const label = normalizeSpaces(titleRaw)
+  if (label.length < 3 || label.length > 160) return null
+  if (BAND_NAME_AS_TITLE_RE.test(label)) return null
+  if (/^\d+\s*pts?\b/i.test(label)) return null
+  if (/^criterio$/i.test(label)) return null
+
+  return { label, explicitId, titleIndex }
+}
+
+/**
+ * Rúbricas analíticas "Título. Excelente (N pts): …" con el cycle-start
+ * repetido ≥ 2 veces. Se inserta DESPUÉS de tab/colon/numerado y ANTES de
+ * tryHolistic. N=1 del mismo formato no dispara (cae a holístico).
+ */
+function parseDottedTitleScale(rubricText: string): ParsedRubricCriterion[] {
+  const markerRe = new RegExp(LEVEL_MARKER_RE.source, "gi")
+  const markers: Array<{ label: string; index: number }> = []
+  let m: RegExpExecArray | null
+  while ((m = markerRe.exec(rubricText)) != null) {
+    markers.push({
+      label: normalizeSpaces(m[1] ?? m[0]),
+      index: m.index,
+    })
+  }
+  if (markers.length === 0) return []
+
+  const cycleKey = markers[0]!.label.toLowerCase()
+  const cyclePositions = markers.filter((x) => x.label.toLowerCase() === cycleKey)
+  if (cyclePositions.length < 2) return []
+
+  const headers: Array<{
+    titleIndex: number
+    label: string
+    explicitId: string | null
+  }> = []
+  for (const pos of cyclePositions) {
+    const extracted = extractDottedTitleBefore(rubricText, pos.index)
+    if (!extracted) return []
+    headers.push(extracted)
+  }
+  if (headers.length < 2) return []
+
+  const out: ParsedRubricCriterion[] = []
+  for (let i = 0; i < headers.length; i++) {
+    const start = headers[i]!.titleIndex
+    const end =
+      i + 1 < headers.length ? headers[i + 1]!.titleIndex : rubricText.length
+    const slice = rubricText.slice(start, end).trim()
+    if (!slice) return []
+    const descriptors = splitDescriptorBands(slice)
+    const position = out.length + 1
+    let criterionId = headers[i]!.explicitId ?? ""
+    let idSource: CriterionIdSource = headers[i]!.explicitId
+      ? "explicit_rubric_id"
+      : "stable_label_position"
+    if (!criterionId) {
+      criterionId = stableIdFromLabelPosition(headers[i]!.label, position)
+      idSource = "stable_label_position"
+    }
+    out.push({
+      criterion_id: criterionId,
+      criterion_label: headers[i]!.label,
+      criterion_id_source: idSource,
+      position,
+      descriptors,
+      rubric_slice: slice,
+    })
+  }
+  return out
+}
+
 /**
  * Detecta si hay varios encabezados de criterio explícitos (numerados).
  * Usado para bloquear el colapso holístico.
@@ -337,6 +447,16 @@ export function parseRubricCriteria(rubricText: string): ParseRubricCriteriaResu
       status: "PARSED_EXPLICIT",
       format: "numbered_line_blocks",
       criteria: numberedBlocks,
+      warnings,
+    }
+  }
+
+  const dotted = parseDottedTitleScale(text)
+  if (dotted.length >= 2) {
+    return {
+      status: "PARSED_EXPLICIT",
+      format: "dotted_title_scale",
+      criteria: dotted,
       warnings,
     }
   }
